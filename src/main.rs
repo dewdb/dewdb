@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const WAL_ROTATION_LIMIT: u64 = 50 * 1024 * 1024;
@@ -40,19 +42,27 @@ fn current_timestamp() -> u64 {
         .as_millis() as u64
 }
 
-fn main() {
+fn main() -> std::io::Result<()> {
+    let root = PathBuf::from("./data");
+
+    fs::create_dir_all(&root)?;
+
+    let wal_path = root.join("wal-00001.log");
+
+    let wal = File::create(&wal_path)?;
+
+    let mut snapshot = IndexSnapshot {
+        last_wal_id: 1,
+        last_offset: 0,
+        map: BTreeMap::new(),
+    };
+
     let entry = LogEntry::Put {
         key: "example".into(),
         value: serde_json::json!({
             "message": "dewdb"
         }),
         ts: current_timestamp(),
-    };
-
-    let mut snapshot = IndexSnapshot {
-        last_wal_id: 0,
-        last_offset: 0,
-        map: BTreeMap::new(),
     };
 
     snapshot.map.insert(
@@ -65,8 +75,15 @@ fn main() {
 
     println!("{entry:?}");
     println!("{snapshot:#?}");
+    println!("Created {:?}", wal_path);
+    println!("File size: {}", wal.metadata()?.len());
 
-    println!("WAL rotation limit: {}", WAL_ROTATION_LIMIT);
-    println!("Max record size: {}", MAX_RECORD_SIZE);
-    println!("Index file: {}", INDEX_FILENAME);
+    println!(
+        "{} {} {}",
+        WAL_ROTATION_LIMIT,
+        MAX_RECORD_SIZE,
+        INDEX_FILENAME
+    );
+
+    Ok(())
 }
