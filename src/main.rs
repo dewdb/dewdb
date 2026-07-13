@@ -49,6 +49,15 @@ struct Collection {
     wal_writer: Mutex<WalsState>,
 }
 
+impl Collection {
+    fn current_timestamp() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+}
+
 struct Database {
     root_path: PathBuf,
 }
@@ -59,13 +68,6 @@ impl Database {
         fs::create_dir_all(&root_path)?;
         Ok(Self { root_path })
     }
-}
-
-fn current_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
 }
 
 fn main() -> std::io::Result<()> {
@@ -98,7 +100,7 @@ fn main() -> std::io::Result<()> {
         value: serde_json::json!({
             "message": "dewdb"
         }),
-        ts: current_timestamp(),
+        ts: Collection::current_timestamp(),
     };
 
     {
