@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const WAL_ROTATION_LIMIT: u64 = 50 * 1024 * 1024;
@@ -35,6 +35,18 @@ struct IndexSnapshot {
     map: BTreeMap<String, IndexEntry>,
 }
 
+struct Database {
+    root_path: PathBuf,
+}
+
+impl Database {
+    fn new(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let root_path = path.as_ref().to_path_buf();
+        fs::create_dir_all(&root_path)?;
+        Ok(Self { root_path })
+    }
+}
+
 fn current_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -43,11 +55,9 @@ fn current_timestamp() -> u64 {
 }
 
 fn main() -> std::io::Result<()> {
-    let root = PathBuf::from("./data");
+    let db = Database::new("./data")?;
 
-    fs::create_dir_all(&root)?;
-
-    let wal_path = root.join("wal-00001.log");
+    let wal_path = db.root_path.join("wal-00001.log");
 
     let wal = File::create(&wal_path)?;
 
