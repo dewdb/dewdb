@@ -1,16 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const WAL_ROTATION_LIMIT: u64 = 50 * 1024 * 1024; // 50 MB
-const MAX_RECORD_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
+const WAL_ROTATION_LIMIT: u64 = 50 * 1024 * 1024;
+const MAX_RECORD_SIZE: u64 = 10 * 1024 * 1024;
 const INDEX_FILENAME: &str = "index-current.bin";
-
-
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "op", rename_all = "lowercase")]
@@ -56,8 +54,6 @@ struct Database {
     root_path: PathBuf,
 }
 
-
-
 impl Database {
     fn new(path: impl AsRef<Path>) -> io::Result<Self> {
         let root_path = path.as_ref().to_path_buf();
@@ -67,10 +63,121 @@ impl Database {
 }
 
 impl Collection {
+    fn open(name: String, root_path: PathBuf) -> io::Result<Self> {
+        fs::create_dir_all(&root_path)?;
+
+        let mut index = BTreeMap::new();
+        let mut wal_files = Vec::new();
+
+        for entry in fs::read_dir(&root_path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if let Some(fname) = path.file_name().and_then(|s| s.to_str()) {
+                if fname.starts_with("wal-") && fname.ends_with(".log") {
+                    let id_part = &fname[4..fname.len() - 4];
+                    if let Ok(id) = id_part.parse::<u64>() {
+                        wal_files.push((id, path));
+                    }
+                }
+            }
+        }
+        wal_files.sort_by_key(|(id, _)| *id);
+
+        println!("[{}] Replaying all WALs...", name);
+        for (id, path) in &wal_files {
+            Self::replay_file_from(*id, path, 0, &mut index)?;
+        }
+
+        let current_wal_id = wal_files.last().map(|(id, _)| *id).unwrap_or(0) + 1;
+
+        let wal_path = root_path.join(format!("wal-{:05}.log", current_wal_id));
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&wal_path)?;
+
+        let current_wal_size = file.metadata()?.len();
+
+        Ok(Self {
+            name,
+            root_path,
+            index: RwLock::new(index),
+            wal_writer: std::sync::Mutex::new(WalsState {
+                current_wal: file,
+                current_wal_id,
+                current_wal_size,
+            }),
+        })
+    }
+
+    fn replay_file_from(wal_id: u64, path: &PathBuf, mut start_offset: u64, index: &mut BTreeMap<String, IndexEntry>) -> io::Result<()> {
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        let file_len = file.metadata()?.len();
+
+        if start_offset > file_len {
+            start_offset = 0;
+        }
+
+        file.seek(SeekFrom::Start(start_offset))?;
+
+        let mut offset = start_offset;
+        let mut valid_end_offset = start_offset;
+
+        loop {
+            let mut header = [0u8; 8];
+            match file.read_exact(&mut header) {
+                Ok(_) => {}
+                Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e),
+            }
+
+            let len = u32::from_le_bytes(header[0..4].try_into().unwrap());
+            let crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
+
+            if len == 0 || (len as u64) > MAX_RECORD_SIZE {
+                eprintln!("[{}] Invalid WAL frame length {}. Truncating.", path.display(), len);
+                break;
+            }
+
+            let mut payload = vec![0u8; len as usize];
+            if let Err(_) = file.read_exact(&mut payload) {
+                eprintln!("[{}] Unexpected EOF while reading payload. Truncating.", path.display());
+                break;
+            }
+
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(&payload);
+            if hasher.finalize() != crc {
+                eprintln!("[{}] CRC mismatch. Truncating file at chunk boundary.", path.display());
+                break;
+            }
+
+            if let Ok(entry) = serde_json::from_slice::<LogEntry>(&payload) {
+                match entry {
+                    LogEntry::Put { key, .. } => {
+                        index.insert(key, IndexEntry { wal_id, offset });
+                    },
+                    LogEntry::Del { key, .. } => {
+                        index.remove(&key);
+                    }
+                }
+            }
+            offset += 8 + len as u64;
+            valid_end_offset = offset;
+        }
+
+        if valid_end_offset < file_len {
+            file.set_len(valid_end_offset)?;
+            println!("[{}] Truncated corrupted WAL file down to size {}", path.display(), valid_end_offset);
+        }
+
+        Ok(())
+    }
+
     fn current_timestamp() -> u64 {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
     }
-
 
     fn put(&self, key: String, value: serde_json::Value) -> io::Result<(Vec<u8>, u64, u64)> {
         let entry = LogEntry::Put {
@@ -89,7 +196,6 @@ impl Collection {
         self.append(entry)
     }
 
-  
     fn append(&self, entry: LogEntry) -> io::Result<(Vec<u8>, u64, u64)> {
         let json_bytes = serde_json::to_vec(&entry)?;
         let len = json_bytes.len() as u64;
@@ -113,7 +219,6 @@ impl Collection {
 
         let mut wal = self.wal_writer.lock().unwrap();
 
-        
         if wal.current_wal_size >= WAL_ROTATION_LIMIT {
             wal.current_wal.sync_all()?;
             wal.current_wal_id += 1;
@@ -126,13 +231,10 @@ impl Collection {
             wal.current_wal_size = 0;
         }
 
-        
         wal.current_wal.write_all(&header)?;
         wal.current_wal.write_all(&json_bytes)?;
-        
         wal.current_wal.sync_data()?;
 
-       
         let offset = wal.current_wal_size;
         wal.current_wal_size += frame_len;
 
@@ -147,73 +249,33 @@ impl Collection {
 fn main() -> io::Result<()> {
     let db = Database::new("./data")?;
 
-    let collection_path = db.root_path.join("users");
-    fs::create_dir_all(&collection_path)?;
+    let col = Collection::open("users".into(), db.root_path.join("users"))?;
 
-    let wal_path = collection_path.join("wal-00001.log");
+    println!("Recovered {} index entries", col.index.read().unwrap().len());
 
-    let wal = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .read(true)
-        .open(&wal_path)?;
-
-    
-    let current_wal_size = wal.metadata()?.len();
-
-    let collection = Collection {
-        name: "users".into(),
-        root_path: collection_path,
-        index: RwLock::new(BTreeMap::new()),
-        wal_writer: std::sync::Mutex::new(WalsState {
-            current_wal: wal,
-            current_wal_id: 1,
-            current_wal_size,
-        }),
-    };
-
-    
-    let (frame, wal_id, offset) = collection.put(
-        "example".into(),
-        serde_json::json!({ "message": "dewdb" }),
-    )?;
-    collection
-        .index
+    let key = format!("key:{}", time_suffix());
+    let (_frame, wal_id, offset) = col.put(key.clone(), serde_json::json!({ "message": "dewdb" }))?;
+    col.index
         .write()
         .unwrap()
-        .insert("example".into(), IndexEntry { wal_id, offset });
+        .insert(key.clone(), IndexEntry { wal_id, offset });
 
+    println!("PUT '{}' -> wal {} offset {}", key, wal_id, offset);
+
+    let wal = col.wal_writer.lock().unwrap();
     println!(
-        "PUT 'example' -> frame {} bytes | wal {} | offset {}",
-        frame.len(),
-        wal_id,
-        offset
-    );
-
-    let (frame, wal_id, offset) = collection.delete("example".into())?;
-    collection.index.write().unwrap().remove("example");
-
-    println!(
-        "DEL 'example' -> frame {} bytes | wal {} | offset {}",
-        frame.len(),
-        wal_id,
-        offset
-    );
-
-    let wal = collection.wal_writer.lock().unwrap();
-    println!("Collection: {}", collection.name);
-    println!(
-        "WAL id {} | tracked size {} | file size {}",
+        "Current WAL id {} | tracked size {} | file size {}",
         wal.current_wal_id,
         wal.current_wal_size,
         wal.current_wal.metadata()?.len()
     );
-    println!("Index entries: {}", collection.index.read().unwrap().len());
+    drop(wal);
 
-    println!(
-        "{} {} {}",
-        WAL_ROTATION_LIMIT, MAX_RECORD_SIZE, INDEX_FILENAME
-    );
+    println!("Index entries now: {}", col.index.read().unwrap().len());
 
     Ok(())
+}
+
+fn time_suffix() -> u64 {
+    Collection::current_timestamp() % 100000
 }
