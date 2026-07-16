@@ -244,6 +244,58 @@ impl Collection {
 
         Ok((frame, wal_id, offset))
     }
+
+    pub fn iter(&self) -> Vec<(String, IndexEntry)> {
+        let index = self.index.read().unwrap();
+        index.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    }
+
+    pub fn range(&self, start: Option<&str>, end: Option<&str>) -> Vec<(String, IndexEntry)> {
+        let index = self.index.read().unwrap();
+
+        let range_bound = (
+            start.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Included),
+            end.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Included),
+        );
+
+        index.range::<str, _>(range_bound).map(|(k, v)| (k.clone(), *v)).collect()
+    }
+
+    fn get(&self, key: &str) -> io::Result<Option<serde_json::Value>> {
+        let idx_entry = {
+            let index = self.index.read().unwrap();
+            index.get(key).copied()
+        };
+
+        if let Some(entry) = idx_entry {
+            let path = self.root_path.join(format!("wal-{:05}.log", entry.wal_id));
+            let mut file = File::open(&path)?;
+            file.seek(SeekFrom::Start(entry.offset))?;
+
+            let mut header = [0u8; 8];
+            file.read_exact(&mut header)?;
+            let len = u32::from_le_bytes(header[0..4].try_into().unwrap());
+
+            let mut payload = vec![0u8; len as usize];
+            file.read_exact(&mut payload)?;
+
+            if let Ok(LogEntry::Put { value, .. }) = serde_json::from_slice(&payload) {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+
+    fn list_all(&self) -> io::Result<Vec<serde_json::Value>> {
+        let index = self.index.read().unwrap();
+        let mut results = Vec::new();
+        for (key, _) in index.iter() {
+           if let Some(val) = self.get(key)? {
+               results.push(val);
+           }
+        }
+        Ok(results)
+    }
 }
 
 fn main() -> io::Result<()> {
@@ -253,29 +305,36 @@ fn main() -> io::Result<()> {
 
     println!("Recovered {} index entries", col.index.read().unwrap().len());
 
-    let key = format!("key:{}", time_suffix());
-    let (_frame, wal_id, offset) = col.put(key.clone(), serde_json::json!({ "message": "dewdb" }))?;
+    let docs = col.list_all()?;
+    println!("list_all -> {} docs", docs.len());
+    for doc in docs.iter().take(3) {
+        println!("  {}", doc);
+    }
+
+    let key = format!("key:{}", Collection::current_timestamp() % 100000);
+    let (_frame, wal_id, offset) = col.put(key.clone(), serde_json::json!({ "message": "dewdb", "written_by": "reads-commit" }))?;
     col.index
         .write()
         .unwrap()
         .insert(key.clone(), IndexEntry { wal_id, offset });
 
-    println!("PUT '{}' -> wal {} offset {}", key, wal_id, offset);
+    match col.get(&key)? {
+        Some(val) => println!("GET '{}' -> {}", key, val),
+        None => println!("GET '{}' -> not found", key),
+    }
 
-    let wal = col.wal_writer.lock().unwrap();
-    println!(
-        "Current WAL id {} | tracked size {} | file size {}",
-        wal.current_wal_id,
-        wal.current_wal_size,
-        wal.current_wal.metadata()?.len()
-    );
-    drop(wal);
+    match col.get("missing-key")? {
+        Some(val) => println!("GET 'missing-key' -> {}", val),
+        None => println!("GET 'missing-key' -> not found"),
+    }
 
-    println!("Index entries now: {}", col.index.read().unwrap().len());
+    let entries = col.range(Some("key:"), None);
+    println!("range 'key:'.. -> {} entries", entries.len());
+    for (k, e) in entries.iter().take(5) {
+        println!("  {} @ wal {} offset {}", k, e.wal_id, e.offset);
+    }
+
+    println!("iter -> {} total entries", col.iter().len());
 
     Ok(())
-}
-
-fn time_suffix() -> u64 {
-    Collection::current_timestamp() % 100000
 }
