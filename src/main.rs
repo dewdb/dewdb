@@ -1,9 +1,16 @@
+use axum::{
+    extract::{Path as AxumPath, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const WAL_ROTATION_LIMIT: u64 = 50 * 1024 * 1024;
@@ -50,15 +57,43 @@ struct WalsState {
     current_wal_size: u64,
 }
 
+#[derive(Clone)]
+struct AppState {
+    db: Option<Arc<Database>>,
+}
+
 struct Database {
     root_path: PathBuf,
+    collections: RwLock<HashMap<String, Arc<Collection>>>,
 }
 
 impl Database {
-    fn new(path: impl AsRef<Path>) -> io::Result<Self> {
+    fn new(path: impl AsRef<std::path::Path>) -> io::Result<Self> {
         let root_path = path.as_ref().to_path_buf();
         fs::create_dir_all(&root_path)?;
-        Ok(Self { root_path })
+        Ok(Self {
+            root_path,
+            collections: RwLock::new(HashMap::new()),
+        })
+    }
+
+    fn get_collection(&self, name: &str) -> io::Result<Arc<Collection>> {
+        {
+            let collections = self.collections.read().unwrap();
+            if let Some(col) = collections.get(name) {
+                return Ok(col.clone());
+            }
+        }
+
+        let mut collections = self.collections.write().unwrap();
+        if let Some(col) = collections.get(name) {
+            return Ok(col.clone());
+        }
+
+        let col_path = self.root_path.join(name);
+        let col = Arc::new(Collection::open(name.to_string(), col_path)?);
+        collections.insert(name.to_string(), col.clone());
+        Ok(col)
     }
 }
 
@@ -298,43 +333,145 @@ impl Collection {
     }
 }
 
-fn main() -> io::Result<()> {
-    let db = Database::new("./data")?;
+#[derive(Serialize, Deserialize)]
+struct CreateDoc {
+    value: serde_json::Value,
+}
 
-    let col = Collection::open("users".into(), db.root_path.join("users"))?;
+async fn create_doc(
+    State(state): State<AppState>,
+    AxumPath(col_name): AxumPath<String>,
+    Json(payload): Json<CreateDoc>,
+) -> impl axum::response::IntoResponse {
+    let id = uuid::Uuid::new_v4().to_string();
+    let key = id.clone();
 
-    println!("Recovered {} index entries", col.index.read().unwrap().len());
+    let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    };
 
-    let docs = col.list_all()?;
-    println!("list_all -> {} docs", docs.len());
-    for doc in docs.iter().take(3) {
-        println!("  {}", doc);
+    let col_clone = col.clone();
+    let val_clone = payload.value.clone();
+    let key_clone = key.clone();
+
+    match tokio::task::spawn_blocking(move || col_clone.put(key_clone, val_clone)).await {
+        Ok(Ok((_frame, wal_id, offset))) => {
+            {
+                let mut index = col.index.write().unwrap();
+                index.insert(id.clone(), IndexEntry { wal_id, offset });
+            }
+            (StatusCode::CREATED, Json(serde_json::json!({"id": id}))).into_response()
+        },
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
+}
 
-    let key = format!("key:{}", Collection::current_timestamp() % 100000);
-    let (_frame, wal_id, offset) = col.put(key.clone(), serde_json::json!({ "message": "dewdb", "written_by": "reads-commit" }))?;
-    col.index
-        .write()
-        .unwrap()
-        .insert(key.clone(), IndexEntry { wal_id, offset });
+async fn get_doc(
+    State(state): State<AppState>,
+    AxumPath((col_name, id)): AxumPath<(String, String)>,
+) -> impl axum::response::IntoResponse {
+    let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    };
 
-    match col.get(&key)? {
-        Some(val) => println!("GET '{}' -> {}", key, val),
-        None => println!("GET '{}' -> not found", key),
+    let key = id.clone();
+    let col_clone = col.clone();
+
+    match tokio::task::spawn_blocking(move || col_clone.get(&key)).await {
+        Ok(Ok(Some(val))) => (StatusCode::OK, Json(val)).into_response(),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
+}
 
-    match col.get("missing-key")? {
-        Some(val) => println!("GET 'missing-key' -> {}", val),
-        None => println!("GET 'missing-key' -> not found"),
+async fn update_doc(
+    State(state): State<AppState>,
+    AxumPath((col_name, id)): AxumPath<(String, String)>,
+    Json(payload): Json<CreateDoc>,
+) -> impl axum::response::IntoResponse {
+    let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    };
+
+    let key = id.clone();
+    let col_clone = col.clone();
+    let val_clone = payload.value.clone();
+
+    match tokio::task::spawn_blocking(move || col_clone.put(key.clone(), val_clone)).await {
+        Ok(Ok((_frame, wal_id, offset))) => {
+            {
+                let mut index = col.index.write().unwrap();
+                index.insert(id.clone(), IndexEntry { wal_id, offset });
+            }
+            (StatusCode::OK, Json(serde_json::json!({"status": "updated"}))).into_response()
+        },
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
+}
 
-    let entries = col.range(Some("key:"), None);
-    println!("range 'key:'.. -> {} entries", entries.len());
-    for (k, e) in entries.iter().take(5) {
-        println!("  {} @ wal {} offset {}", k, e.wal_id, e.offset);
+async fn delete_doc(
+    State(state): State<AppState>,
+    AxumPath((col_name, id)): AxumPath<(String, String)>,
+) -> impl axum::response::IntoResponse {
+    let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    };
+
+    let key = id.clone();
+    let col_clone = col.clone();
+
+    match tokio::task::spawn_blocking(move || col_clone.delete(key)).await {
+        Ok(Ok((_frame, _wal_id, _offset))) => {
+            {
+                let mut index = col.index.write().unwrap();
+                index.remove(&id);
+            }
+            (StatusCode::OK, Json(serde_json::json!({"status": "deleted"}))).into_response()
+        },
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
+}
 
-    println!("iter -> {} total entries", col.iter().len());
+async fn list_docs(
+    State(state): State<AppState>,
+    AxumPath(col_name): AxumPath<String>,
+) -> impl axum::response::IntoResponse {
+    let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    };
+
+    let col_clone = col.clone();
+    match tokio::task::spawn_blocking(move || col_clone.list_all()).await {
+        Ok(Ok(vals)) => (StatusCode::OK, Json(vals)).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    let db = Some(Arc::new(Database::new("./data")?));
+
+    let state = AppState { db };
+
+    let app = Router::new()
+        .route("/collections/:name/docs", post(create_doc).get(list_docs))
+        .route("/collections/:name/docs/:id", get(get_doc).patch(update_doc).delete(delete_doc))
+        .with_state(state);
+
+    let listen_addr = "127.0.0.1:8080";
+    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    println!("Server starting on http://{}", listen_addr);
+    axum::serve(listener, app).await?;
 
     Ok(())
 }
