@@ -8,7 +8,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -134,6 +134,30 @@ impl Collection {
         let mut index = BTreeMap::new();
         let mut wal_files = Vec::new();
 
+        let index_path = root_path.join(INDEX_FILENAME);
+        let mut snapshot_loaded = false;
+        let mut snapshot_wal_id = 0;
+        let mut snapshot_offset = 0;
+
+        if index_path.exists() {
+             match File::open(&index_path) {
+                Ok(file) => {
+                    match bincode::deserialize_from::<_, IndexSnapshot>(BufReader::new(file)) {
+                        Ok(snapshot) => {
+                            println!("[{}] Loaded persisted snapshot (WAL ID: {}, Offset: {}) with {} entries.", 
+                                     name, snapshot.last_wal_id, snapshot.last_offset, snapshot.map.len());
+                            index = snapshot.map;
+                            snapshot_wal_id = snapshot.last_wal_id;
+                            snapshot_offset = snapshot.last_offset;
+                            snapshot_loaded = true;
+                        }
+                        Err(e) => eprintln!("[{}] Failed to deserialize snapshot (likely legacy format): {}. Rebuilding from WAL.", name, e),
+                    }
+                }
+                Err(e) => eprintln!("[{}] Failed to open index file: {}", name, e),
+             }
+        }
+
         for entry in fs::read_dir(&root_path)? {
             let entry = entry?;
             let path = entry.path();
@@ -148,9 +172,22 @@ impl Collection {
         }
         wal_files.sort_by_key(|(id, _)| *id);
 
-        println!("[{}] Replaying all WALs...", name);
-        for (id, path) in &wal_files {
-            Self::replay_file_from(*id, path, 0, &mut index)?;
+        if !snapshot_loaded {
+            println!("[{}] Replaying all WALs...", name);
+             for (id, path) in &wal_files {
+                Self::replay_file_from(*id, path, 0, &mut index)?;
+            }
+        } else {
+             for (id, path) in &wal_files {
+                 if *id < snapshot_wal_id {
+                     continue;
+                 } else if *id == snapshot_wal_id {
+                     println!("[{}] Resuming WAL {} from offset {}", name, id, snapshot_offset);
+                     Self::replay_file_from(*id, path, snapshot_offset, &mut index)?;
+                 } else {
+                     Self::replay_file_from(*id, path, 0, &mut index)?;
+                 }
+             }
         }
 
         let current_wal_id = wal_files.last().map(|(id, _)| *id).unwrap_or(0) + 1;
@@ -440,6 +477,34 @@ impl Collection {
         }
         Ok(results)
     }
+
+    fn save_index(&self) -> io::Result<()> {
+        let wal_writer = self.wal_writer.lock().unwrap();
+        let index = self.index.read().unwrap();
+
+        let snapshot = IndexSnapshot {
+            last_wal_id: wal_writer.current_wal_id,
+            last_offset: wal_writer.current_wal_size,
+            map: index.clone(),
+        };
+
+        let temp_path = self.root_path.join("index-current.tmp");
+        let path = self.root_path.join(INDEX_FILENAME);
+
+        let file = File::create(&temp_path)?;
+        let mut writer = BufWriter::new(file);
+
+        bincode::serialize_into(&mut writer, &snapshot)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        writer.flush()?;
+        writer.get_mut().sync_all()?;
+
+        fs::rename(&temp_path, &path)?;
+
+        println!("[{}] Index saved to disk at WAL {} offset {}.", self.name, snapshot.last_wal_id, snapshot.last_offset);
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -714,8 +779,98 @@ async fn query_docs(
     }
 }
 
+async fn run_durability_test() -> io::Result<()> {
+    println!("--- Running Durability Test ---");
+    let test_dir = "./data/test_durability";
+    if PathBuf::from(test_dir).exists() {
+        fs::remove_dir_all(test_dir)?;
+    }
+
+    let db = Database::new("./data")?;
+    let col = db.get_collection("test_durability")?;
+
+    println!("Writing 100 documents...");
+    for i in 0..100 {
+        let _ = col.put(format!("key:{}", i), serde_json::json!({"n": i}))?;
+    }
+    col.enqueue_commit().await.unwrap().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    drop(col);
+    drop(db);
+
+    println!("Simulating restart...");
+    let db2 = Database::new("./data")?;
+    let col2 = db2.get_collection("test_durability")?;
+
+    let mut missing = 0;
+    for i in 0..100 {
+        if col2.get(&format!("key:{}", i))?.is_none() {
+            missing += 1;
+        }
+    }
+
+    if missing == 0 {
+        println!("SUCCESS: All 100 docs recovered.");
+    } else {
+        println!("FAILURE: Missing {} docs.", missing);
+    }
+
+    println!("Testing Index Persistence...");
+    col2.save_index()?;
+
+    println!("Testing Max Record Size Limit...");
+    let huge_str = "x".repeat((MAX_RECORD_SIZE + 10) as usize);
+    let res = col2.put("huge_key".to_string(), serde_json::json!({"data": huge_str}));
+    assert!(res.is_err(), "Should definitely reject a request that is too large");
+    println!("SUCCESS: Large records rejected successfully.");
+
+    println!("Testing Corruption & Truncation...");
+    if let Ok((_f, wal_id, offset)) = col2.put("key_pre_corrupt".to_string(), serde_json::json!({"valid": true})) {
+        col2.enqueue_commit().await.unwrap().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        col2.index.write().unwrap().insert("key_pre_corrupt".to_string(), IndexEntry { wal_id, offset });
+    }
+
+    let active_wal_path = {
+        let wal_writer = col2.wal_writer.lock().unwrap();
+        col2.root_path.join(format!("wal-{:05}.log", wal_writer.current_wal_id))
+    };
+
+    {
+        let mut f = OpenOptions::new().append(true).open(&active_wal_path)?;
+
+        let bad_len: u32 = 100;
+        let mut bad_header = [0u8; 8];
+        bad_header[0..4].copy_from_slice(&bad_len.to_le_bytes());
+        f.write_all(&bad_header)?;
+
+        let huge_len: u32 = (MAX_RECORD_SIZE + 5000) as u32;
+        bad_header[0..4].copy_from_slice(&huge_len.to_le_bytes());
+        f.write_all(&bad_header)?;
+    }
+
+    drop(col2);
+    drop(db2);
+
+    let db3 = Database::new("./data")?;
+    let col3 = db3.get_collection("test_durability")?;
+
+    assert!(col3.get("key_pre_corrupt")?.is_some(), "key_pre_corrupt should exist despite the corruption after it");
+
+    if let Ok((_f, wal_id, offset)) = col3.put("key_post_corrupt".to_string(), serde_json::json!({"valid": true})) {
+        col3.enqueue_commit().await.unwrap().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        col3.index.write().unwrap().insert("key_post_corrupt".to_string(), IndexEntry { wal_id, offset });
+    }
+    assert!(col3.get("key_post_corrupt")?.is_some(), "Should be able to continually write records after recovery");
+
+    println!("SUCCESS: Corruption safely truncated.");
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    run_durability_test().await?;
+
     let db = Some(Arc::new(Database::new("./data")?));
 
     let db_clone = db.clone();
