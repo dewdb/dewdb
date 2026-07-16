@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -338,6 +338,86 @@ struct CreateDoc {
     value: serde_json::Value,
 }
 
+#[derive(Deserialize)]
+struct QueryParams {
+    start: Option<String>,
+    end: Option<String>,
+    limit: Option<usize>,
+    filter: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct Filter {
+    #[serde(flatten)]
+    fields: HashMap<String, serde_json::Value>,
+}
+
+fn get_path_value<'a>(doc: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    let mut cur = doc;
+
+    for part in path.split('.') {
+        cur = cur.get(part)?;
+    }
+
+    Some(cur)
+}
+
+fn matches_filter(doc: &serde_json::Value, filter: &Filter) -> bool {
+    for (k, cond) in &filter.fields {
+        let val = match get_path_value(doc, k) {
+            Some(v) => v,
+            None => return false,
+        };
+
+        if cond.is_object() {
+            let cmp = cond.as_object().unwrap();
+
+            if let Some(gt) = cmp.get("$gt") {
+                if !val.as_f64().zip(gt.as_f64()).map_or(false, |(a,b)| a > b) {
+                    return false;
+                }
+            }
+
+            if let Some(gte) = cmp.get("$gte") {
+                if !val.as_f64().zip(gte.as_f64()).map_or(false, |(a,b)| a >= b) {
+                    return false;
+                }
+            }
+
+            if let Some(lt) = cmp.get("$lt") {
+                if !val.as_f64().zip(lt.as_f64()).map_or(false, |(a,b)| a < b) {
+                    return false;
+                }
+            }
+
+            if let Some(lte) = cmp.get("$lte") {
+                if !val.as_f64().zip(lte.as_f64()).map_or(false, |(a,b)| a <= b) {
+                    return false;
+                }
+            }
+
+            if let Some(ne) = cmp.get("$ne") {
+                if val == ne {
+                    return false;
+                }
+            }
+
+            if let Some(in_arr) = cmp.get("$in") {
+                if let Some(arr) = in_arr.as_array() {
+                    if !arr.contains(val) {
+                        return false;
+                    }
+                }
+            }
+        } else {
+            if val != cond {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 async fn create_doc(
     State(state): State<AppState>,
     AxumPath(col_name): AxumPath<String>,
@@ -457,6 +537,53 @@ async fn list_docs(
     }
 }
 
+async fn query_docs(
+    State(state): State<AppState>,
+    AxumPath(col_name): AxumPath<String>,
+    Query(params): Query<QueryParams>,
+) -> impl axum::response::IntoResponse {
+    let limit = params.limit.unwrap_or(100);
+
+    let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    };
+
+    let col_clone = col.clone();
+
+    let filter_obj: Option<Filter> = params.filter
+        .as_ref()
+        .and_then(|f| serde_json::from_str::<Filter>(f).ok());
+
+    match tokio::task::spawn_blocking(move || {
+        let mut results = Vec::with_capacity(limit);
+
+        for (key, _entry) in col_clone.range(
+            params.start.as_deref(),
+            params.end.as_deref()
+        ).into_iter() {
+            if let Ok(Some(val)) = col_clone.get(&key) {
+                if let Some(ref f) = filter_obj {
+                    if matches_filter(&val, f) {
+                        results.push(val);
+                    }
+                } else {
+                    results.push(val);
+                }
+
+                if results.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok::<_, io::Error>(results)
+    }).await {
+        Ok(Ok(vals)) => (StatusCode::OK, Json(vals)).into_response(),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let db = Some(Arc::new(Database::new("./data")?));
@@ -465,6 +592,7 @@ async fn main() -> io::Result<()> {
 
     let app = Router::new()
         .route("/collections/:name/docs", post(create_doc).get(list_docs))
+        .route("/collections/:name/query", get(query_docs))
         .route("/collections/:name/docs/:id", get(get_doc).patch(update_doc).delete(delete_doc))
         .with_state(state);
 
