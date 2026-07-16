@@ -11,7 +11,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const WAL_ROTATION_LIMIT: u64 = 50 * 1024 * 1024;
 const MAX_RECORD_SIZE: u64 = 10 * 1024 * 1024;
@@ -49,6 +49,11 @@ struct Collection {
     root_path: PathBuf,
     index: RwLock<BTreeMap<String, IndexEntry>>,
     wal_writer: std::sync::Mutex<WalsState>,
+    commit_notifiers: Arc<std::sync::Mutex<Vec<tokio::sync::oneshot::Sender<Result<(), String>>>>>,
+    commit_signal: Arc<tokio::sync::Notify>,
+    read_pool: std::sync::Mutex<HashMap<u64, Vec<Arc<std::sync::Mutex<File>>>>>,
+    read_pool_counter: std::sync::atomic::AtomicUsize,
+    db_global_commit_index: Arc<std::sync::atomic::AtomicU64>,
 }
 
 struct WalsState {
@@ -56,6 +61,9 @@ struct WalsState {
     current_wal_id: u64,
     current_wal_size: u64,
 }
+
+const COMMIT_BATCH_THRESHOLD: usize = 32;
+const COMMIT_INTERVAL_MS: u64 = 5;
 
 #[derive(Clone)]
 struct AppState {
@@ -65,6 +73,7 @@ struct AppState {
 struct Database {
     root_path: PathBuf,
     collections: RwLock<HashMap<String, Arc<Collection>>>,
+    pub global_commit_index: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Database {
@@ -74,6 +83,7 @@ impl Database {
         Ok(Self {
             root_path,
             collections: RwLock::new(HashMap::new()),
+            global_commit_index: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -91,14 +101,34 @@ impl Database {
         }
 
         let col_path = self.root_path.join(name);
-        let col = Arc::new(Collection::open(name.to_string(), col_path)?);
+        let col = Arc::new(Collection::open(name.to_string(), col_path, self.global_commit_index.clone())?);
+        Collection::start_commit_task(col.clone());
         collections.insert(name.to_string(), col.clone());
         Ok(col)
+    }
+
+    fn force_commit_all(&self) {
+        let collections = self.collections.read().unwrap();
+        for (name, col) in collections.iter() {
+            let mut wal = col.wal_writer.lock().unwrap();
+            if let Err(e) = wal.current_wal.sync_data() {
+                eprintln!("[{}] Failed to force sync WAL on shutdown: {}", name, e);
+            }
+            let notifiers: Vec<_> = {
+                let mut q = col.commit_notifiers.lock().unwrap();
+                std::mem::take(&mut *q)
+            };
+            let count = notifiers.len();
+            for tx in notifiers {
+                let _ = tx.send(Ok(()));
+            }
+            println!("[{}] Flushed {} pending writes.", name, count);
+        }
     }
 }
 
 impl Collection {
-    fn open(name: String, root_path: PathBuf) -> io::Result<Self> {
+    fn open(name: String, root_path: PathBuf, db_global_commit_index: Arc<std::sync::atomic::AtomicU64>) -> io::Result<Self> {
         fs::create_dir_all(&root_path)?;
 
         let mut index = BTreeMap::new();
@@ -143,6 +173,11 @@ impl Collection {
                 current_wal_id,
                 current_wal_size,
             }),
+            commit_notifiers: Arc::new(std::sync::Mutex::new(Vec::new())),
+            commit_signal: Arc::new(tokio::sync::Notify::new()),
+            read_pool: std::sync::Mutex::new(HashMap::new()),
+            read_pool_counter: std::sync::atomic::AtomicUsize::new(0),
+            db_global_commit_index,
         })
     }
 
@@ -268,7 +303,6 @@ impl Collection {
 
         wal.current_wal.write_all(&header)?;
         wal.current_wal.write_all(&json_bytes)?;
-        wal.current_wal.sync_data()?;
 
         let offset = wal.current_wal_size;
         wal.current_wal_size += frame_len;
@@ -278,6 +312,66 @@ impl Collection {
         drop(wal);
 
         Ok((frame, wal_id, offset))
+    }
+
+    pub fn enqueue_commit(&self) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut q = self.commit_notifiers.lock().unwrap();
+        let is_empty = q.is_empty();
+        q.push(tx);
+        let len = q.len();
+
+        if is_empty || len >= COMMIT_BATCH_THRESHOLD {
+            self.commit_signal.notify_one();
+        }
+        rx
+    }
+
+    fn start_commit_task(col: Arc<Collection>) {
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = col.commit_signal.notified() => {},
+                    _ = tokio::time::sleep(Duration::from_millis(COMMIT_INTERVAL_MS)) => {},
+                }
+
+                let has_pending = {
+                    let q = col.commit_notifiers.lock().unwrap();
+                    !q.is_empty()
+                };
+
+                if !has_pending {
+                    continue;
+                }
+
+                let col_sync = col.clone();
+                let sync_result = tokio::task::spawn_blocking(move || {
+                    let wal = col_sync.wal_writer.lock().unwrap();
+                    wal.current_wal.sync_data()
+                }).await;
+
+                let result = match sync_result {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(format!("WAL sync failed: {}", e)),
+                    Err(e) => Err(format!("Commit task panicked: {}", e)),
+                };
+
+                let notifiers: Vec<_> = {
+                    let mut q = col.commit_notifiers.lock().unwrap();
+                    std::mem::take(&mut *q)
+                };
+
+                let count = notifiers.len();
+
+                for tx in notifiers {
+                    let _ = tx.send(result.clone());
+                }
+
+                if count > 0 && result.is_ok() {
+                    col.db_global_commit_index.fetch_add(count as u64, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
     }
 
     pub fn iter(&self) -> Vec<(String, IndexEntry)> {
@@ -303,8 +397,23 @@ impl Collection {
         };
 
         if let Some(entry) = idx_entry {
-            let path = self.root_path.join(format!("wal-{:05}.log", entry.wal_id));
-            let mut file = File::open(&path)?;
+            let file_arc = {
+                let mut pool = self.read_pool.lock().unwrap();
+                let counter = self.read_pool_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some(handles) = pool.get_mut(&entry.wal_id) {
+                    handles[counter % handles.len()].clone()
+                } else {
+                    let path = self.root_path.join(format!("wal-{:05}.log", entry.wal_id));
+                    let mut handles = Vec::new();
+                    for _ in 0..4 {
+                         handles.push(Arc::new(std::sync::Mutex::new(File::open(&path)?)));
+                    }
+                    pool.insert(entry.wal_id, handles.clone());
+                    handles[counter % 4].clone()
+                }
+            };
+
+            let mut file = file_arc.lock().unwrap();
             file.seek(SeekFrom::Start(entry.offset))?;
 
             let mut header = [0u8; 8];
@@ -437,11 +546,18 @@ async fn create_doc(
 
     match tokio::task::spawn_blocking(move || col_clone.put(key_clone, val_clone)).await {
         Ok(Ok((_frame, wal_id, offset))) => {
-            {
-                let mut index = col.index.write().unwrap();
-                index.insert(id.clone(), IndexEntry { wal_id, offset });
+            let commit_rx = col.enqueue_commit();
+            match commit_rx.await {
+                Ok(Ok(())) => {
+                    {
+                        let mut index = col.index.write().unwrap();
+                        index.insert(id.clone(), IndexEntry { wal_id, offset });
+                    }
+                    (StatusCode::CREATED, Json(serde_json::json!({"id": id}))).into_response()
+                },
+                Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
             }
-            (StatusCode::CREATED, Json(serde_json::json!({"id": id}))).into_response()
         },
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
@@ -484,11 +600,18 @@ async fn update_doc(
 
     match tokio::task::spawn_blocking(move || col_clone.put(key.clone(), val_clone)).await {
         Ok(Ok((_frame, wal_id, offset))) => {
-            {
-                let mut index = col.index.write().unwrap();
-                index.insert(id.clone(), IndexEntry { wal_id, offset });
+            let commit_rx = col.enqueue_commit();
+            match commit_rx.await {
+                Ok(Ok(())) => {
+                    {
+                        let mut index = col.index.write().unwrap();
+                        index.insert(id.clone(), IndexEntry { wal_id, offset });
+                    }
+                    (StatusCode::OK, Json(serde_json::json!({"status": "updated"}))).into_response()
+                },
+                Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
             }
-            (StatusCode::OK, Json(serde_json::json!({"status": "updated"}))).into_response()
         },
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
@@ -509,11 +632,18 @@ async fn delete_doc(
 
     match tokio::task::spawn_blocking(move || col_clone.delete(key)).await {
         Ok(Ok((_frame, _wal_id, _offset))) => {
-            {
-                let mut index = col.index.write().unwrap();
-                index.remove(&id);
+            let commit_rx = col.enqueue_commit();
+            match commit_rx.await {
+                Ok(Ok(())) => {
+                    {
+                        let mut index = col.index.write().unwrap();
+                        index.remove(&id);
+                    }
+                    (StatusCode::OK, Json(serde_json::json!({"status": "deleted"}))).into_response()
+                },
+                Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
             }
-            (StatusCode::OK, Json(serde_json::json!({"status": "deleted"}))).into_response()
         },
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
@@ -587,6 +717,16 @@ async fn query_docs(
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let db = Some(Arc::new(Database::new("./data")?));
+
+    let db_clone = db.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        println!("\nReceived Ctrl-C. Shutting down and forcing WAL commits...");
+        if let Some(d) = db_clone {
+            d.force_commit_all();
+        }
+        std::process::exit(0);
+    });
 
     let state = AppState { db };
 
