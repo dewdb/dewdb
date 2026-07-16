@@ -60,6 +60,8 @@ struct WalsState {
     current_wal: File,
     current_wal_id: u64,
     current_wal_size: u64,
+    commit_paused: bool,
+    write_paused: bool,
 }
 
 const COMMIT_BATCH_THRESHOLD: usize = 32;
@@ -209,6 +211,8 @@ impl Collection {
                 current_wal: file,
                 current_wal_id,
                 current_wal_size,
+                commit_paused: false,
+                write_paused: false,
             }),
             commit_notifiers: Arc::new(std::sync::Mutex::new(Vec::new())),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
@@ -324,7 +328,14 @@ impl Collection {
         frame.extend_from_slice(&header);
         frame.extend_from_slice(&json_bytes);
 
-        let mut wal = self.wal_writer.lock().unwrap();
+        let mut wal = loop {
+            let guard = self.wal_writer.lock().unwrap();
+            if !guard.write_paused {
+                break guard;
+            }
+            drop(guard);
+            std::thread::yield_now();
+        };
 
         if wal.current_wal_size >= WAL_ROTATION_LIMIT {
             wal.current_wal.sync_all()?;
@@ -377,7 +388,14 @@ impl Collection {
                     !q.is_empty()
                 };
 
-                if !has_pending {
+                let paused = { col.wal_writer.lock().unwrap().commit_paused };
+
+                if !has_pending && !paused {
+                    continue;
+                }
+
+                if paused {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
                     continue;
                 }
 
@@ -503,6 +521,106 @@ impl Collection {
         fs::rename(&temp_path, &path)?;
 
         println!("[{}] Index saved to disk at WAL {} offset {}.", self.name, snapshot.last_wal_id, snapshot.last_offset);
+        Ok(())
+    }
+
+    fn compact(&self) -> io::Result<()> {
+        println!("[{}] Starting compaction...", self.name);
+
+        let mut wal_guard = self.wal_writer.lock().unwrap();
+        let mut index_guard = self.index.write().unwrap();
+
+        wal_guard.current_wal.sync_data()?;
+        wal_guard.commit_paused = true;
+        wal_guard.write_paused = true;
+
+        let new_wal_id = wal_guard.current_wal_id + 1;
+        let compact_path = self.root_path.join("wal-compacted.tmp");
+        let mut compact_file = BufWriter::new(File::create(&compact_path)?);
+
+        let mut new_index_map = BTreeMap::new();
+        let mut current_offset = 0;
+
+        for (key, old_entry) in index_guard.iter() {
+             let path = self.root_path.join(format!("wal-{:05}.log", old_entry.wal_id));
+             if let Ok(mut file) = File::open(&path) {
+                 file.seek(SeekFrom::Start(old_entry.offset))?;
+                 let mut header = [0u8; 8];
+                 if file.read_exact(&mut header).is_err() { continue; }
+                 let len = u32::from_le_bytes(header[0..4].try_into().unwrap());
+
+                 let mut payload = vec![0u8; len as usize];
+                 if file.read_exact(&mut payload).is_err() { continue; }
+
+                 if let Ok(LogEntry::Put { value, .. }) = serde_json::from_slice::<LogEntry>(&payload) {
+                     let new_entry = LogEntry::Put {
+                         key: key.clone(),
+                         value,
+                         ts: Self::current_timestamp(),
+                     };
+
+                     let json_bytes = serde_json::to_vec(&new_entry)?;
+                     let new_len = json_bytes.len() as u32;
+                     let mut hasher = crc32fast::Hasher::new();
+                     hasher.update(&json_bytes);
+                     let crc = hasher.finalize();
+
+                     let mut new_header = [0u8; 8];
+                     new_header[0..4].copy_from_slice(&new_len.to_le_bytes());
+                     new_header[4..8].copy_from_slice(&crc.to_le_bytes());
+
+                     compact_file.write_all(&new_header)?;
+                     compact_file.write_all(&json_bytes)?;
+
+                     let frame_len = 8 + new_len as u64;
+                     new_index_map.insert(key.clone(), IndexEntry {
+                         wal_id: new_wal_id,
+                         offset: current_offset,
+                     });
+                     current_offset += frame_len;
+                 }
+             }
+        }
+
+        wal_guard.current_wal_size = current_offset;
+
+        compact_file.flush()?;
+        compact_file.get_mut().sync_all()?;
+
+        let final_path = self.root_path.join(format!("wal-{:05}.log", new_wal_id));
+        fs::rename(&compact_path, &final_path)?;
+
+        let new_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&final_path)?;
+
+        wal_guard.current_wal = new_file;
+        wal_guard.current_wal_id = new_wal_id;
+        wal_guard.current_wal_size = current_offset;
+
+        for entry in fs::read_dir(&self.root_path)? {
+             let entry = entry?;
+             let path = entry.path();
+             if let Some(name) = entry.file_name().to_str() {
+                 if name.starts_with("wal-") && name.ends_with(".log") {
+                     if name != format!("wal-{:05}.log", new_wal_id) {
+                         let _ = fs::remove_file(path);
+                     }
+                 }
+             }
+        }
+
+        self.read_pool.lock().unwrap().clear();
+
+        *index_guard = new_index_map;
+
+        wal_guard.commit_paused = false;
+        wal_guard.write_paused = false;
+        self.commit_signal.notify_one();
+
+        println!("[{}] Compaction complete.", self.name);
         Ok(())
     }
 }
@@ -872,6 +990,7 @@ async fn main() -> io::Result<()> {
     run_durability_test().await?;
 
     let db = Some(Arc::new(Database::new("./data")?));
+    
 
     let db_clone = db.clone();
     tokio::spawn(async move {
