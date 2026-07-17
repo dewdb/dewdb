@@ -75,6 +75,80 @@ struct NodeConfig {
 fn default_heartbeat_timeout() -> u64 { 6 }
 fn default_election_delay() -> u64 { 2000 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ReplicateRequest {
+    collection: String,
+    term: u64,
+    commit_index: Option<u64>,
+    #[serde(with = "base64_bytes")]
+    wal_frame: Vec<u8>,
+}
+
+mod base64_bytes {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::de;
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::Serialize;
+        let encoded = base64_encode(bytes);
+        encoded.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        base64_decode(&s).map_err(de::Error::custom)
+    }
+
+    fn base64_encode(input: &[u8]) -> String {
+        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut result = String::new();
+        for chunk in input.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+            let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+            let combined = (b0 << 16) | (b1 << 8) | b2;
+            result.push(CHARS[((combined >> 18) & 0x3F) as usize] as char);
+            result.push(CHARS[((combined >> 12) & 0x3F) as usize] as char);
+            if chunk.len() > 1 {
+                result.push(CHARS[((combined >> 6) & 0x3F) as usize] as char);
+            } else {
+                result.push('=');
+            }
+            if chunk.len() > 2 {
+                result.push(CHARS[(combined & 0x3F) as usize] as char);
+            } else {
+                result.push('=');
+            }
+        }
+        result
+    }
+
+    fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+        let input = input.trim_end_matches('=');
+        let mut result = Vec::new();
+        let mut buf: u32 = 0;
+        let mut bits: u32 = 0;
+        for c in input.chars() {
+            let val = match c {
+                'A'..='Z' => c as u32 - 'A' as u32,
+                'a'..='z' => c as u32 - 'a' as u32 + 26,
+                '0'..='9' => c as u32 - '0' as u32 + 52,
+                '+' => 62,
+                '/' => 63,
+                _ => return Err(format!("Invalid base64 char: {}", c)),
+            };
+            buf = (buf << 6) | val;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                result.push((buf >> bits) as u8);
+                buf &= (1 << bits) - 1;
+            }
+        }
+        Ok(result)
+    }
+}
+
 fn hash_key(col: &str, key: &str) -> u64 {
     xxhash_rust::xxh64::xxh64(format!("{}:{}", col, key).as_bytes(), 0)
 }
@@ -152,6 +226,24 @@ struct AppState {
     db: Option<Arc<Database>>,
     config: Arc<NodeConfig>,
     client: reqwest::Client,
+}
+
+impl AppState {
+    fn is_leader(&self) -> bool {
+        self.config.role == "shard" && self.config.shard_role.as_deref() == Some("primary")
+    }
+
+    fn is_shard(&self) -> bool {
+        self.config.role == "shard"
+    }
+
+    fn current_term(&self) -> u64 {
+        0
+    }
+
+    fn get_replicas(&self) -> Vec<String> {
+        self.config.replicas.clone()
+    }
 }
 
 struct Database {
@@ -442,6 +534,62 @@ impl Collection {
         drop(wal);
 
         Ok((frame, wal_id, offset))
+    }
+
+    fn append_raw_frame(&self, frame_bytes: &[u8]) -> io::Result<(u64, u64)> {
+        if frame_bytes.len() < 8 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Frame too short"));
+        }
+
+        let len = u32::from_le_bytes(frame_bytes[0..4].try_into().unwrap()) as usize;
+        let crc = u32::from_le_bytes(frame_bytes[4..8].try_into().unwrap());
+
+        if frame_bytes.len() < 8 + len {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Frame payload incomplete"));
+        }
+
+        let payload = &frame_bytes[8..8 + len];
+
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(payload);
+        if hasher.finalize() != crc {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "CRC mismatch on replicated frame"));
+        }
+
+        let _entry: LogEntry = serde_json::from_slice(payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+        let frame_len = (8 + len) as u64;
+
+        let mut wal = loop {
+            let guard = self.wal_writer.lock().unwrap();
+            if !guard.write_paused {
+                break guard;
+            }
+            drop(guard);
+            std::thread::yield_now();
+        };
+
+        if wal.current_wal_size >= WAL_ROTATION_LIMIT {
+            wal.current_wal.sync_all()?;
+            wal.current_wal_id += 1;
+            let new_path = self.root_path.join(format!("wal-{:05}.log", wal.current_wal_id));
+            wal.current_wal = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .read(true)
+                .open(&new_path)?;
+            wal.current_wal_size = 0;
+        }
+
+        wal.current_wal.write_all(&frame_bytes[..8 + len])?;
+
+        let offset = wal.current_wal_size;
+        let wal_id = wal.current_wal_id;
+
+        wal.current_wal_size += frame_len as u64;
+
+        Ok((wal_id, offset))
     }
 
     pub fn enqueue_commit(&self) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
@@ -792,11 +940,60 @@ fn matches_filter(doc: &serde_json::Value, filter: &Filter) -> bool {
     true
 }
 
+fn replicate_to_peers(
+    client: reqwest::Client,
+    replicas: Vec<String>,
+    collection: String,
+    frame: Vec<u8>,
+    term: u64,
+    commit_index: u64,
+) {
+    if replicas.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(3));
+        let mut handles = Vec::new();
+        for replica_url in replicas {
+            let client = client.clone();
+            let col = collection.clone();
+            let frame = frame.clone();
+            let sem = semaphore.clone();
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await;
+                let url = format!("{}/internal/replicate", replica_url);
+                let req_body = ReplicateRequest {
+                    collection: col,
+                    term,
+                    commit_index: Some(commit_index),
+                    wal_frame: frame,
+                };
+                match client.post(&url).json(&req_body).send().await {
+                    Ok(r) if r.status().is_success() => {},
+                    Ok(r) => {
+                        eprintln!("[replication] Replica {} returned {} (term={})", replica_url, r.status(), term);
+                    },
+                    Err(e) => {
+                        eprintln!("[replication] Replica {} failed: {} (term={})", replica_url, e, term);
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+    });
+}
+
 async fn create_doc(
     State(state): State<AppState>,
     AxumPath(col_name): AxumPath<String>,
     Json(payload): Json<CreateDoc>,
 ) -> impl axum::response::IntoResponse {
+    if state.is_shard() && !state.is_leader() {
+        return (StatusCode::FORBIDDEN, "Replica nodes reject direct writes").into_response();
+    }
+
     let id = uuid::Uuid::new_v4().to_string();
     let key = id.clone();
 
@@ -827,13 +1024,17 @@ async fn create_doc(
     let key_clone = key.clone();
 
     match tokio::task::spawn_blocking(move || col_clone.put(key_clone, val_clone)).await {
-        Ok(Ok((_frame, wal_id, offset))) => {
+        Ok(Ok((frame, wal_id, offset))) => {
             let commit_rx = col.enqueue_commit();
             match commit_rx.await {
                 Ok(Ok(())) => {
                     {
                         let mut index = col.index.write().unwrap();
                         index.insert(id.clone(), IndexEntry { wal_id, offset });
+                    }
+                    if state.is_leader() {
+                        let commit_index = state.db.as_ref().unwrap().global_commit_index.load(std::sync::atomic::Ordering::SeqCst);
+                        replicate_to_peers(state.client.clone(), state.get_replicas(), col_name, frame, state.current_term(), commit_index);
                     }
                     (StatusCode::CREATED, Json(serde_json::json!({"id": id}))).into_response()
                 },
@@ -889,6 +1090,10 @@ async fn update_doc(
     AxumPath((col_name, id)): AxumPath<(String, String)>,
     Json(payload): Json<CreateDoc>,
 ) -> impl axum::response::IntoResponse {
+    if state.is_shard() && !state.is_leader() {
+        return (StatusCode::FORBIDDEN, "Replica nodes reject direct writes").into_response();
+    }
+
     if state.config.role == "router" {
         let hash = hash_key(&col_name, &id);
         if let Some(target_url) = state.config.get_shard_url(hash) {
@@ -918,13 +1123,17 @@ async fn update_doc(
     let val_clone = payload.value.clone();
 
     match tokio::task::spawn_blocking(move || col_clone.put(key.clone(), val_clone)).await {
-        Ok(Ok((_frame, wal_id, offset))) => {
+        Ok(Ok((frame, wal_id, offset))) => {
             let commit_rx = col.enqueue_commit();
             match commit_rx.await {
                 Ok(Ok(())) => {
                     {
                         let mut index = col.index.write().unwrap();
                         index.insert(id.clone(), IndexEntry { wal_id, offset });
+                    }
+                    if state.is_leader() {
+                        let commit_index = state.db.as_ref().unwrap().global_commit_index.load(std::sync::atomic::Ordering::SeqCst);
+                        replicate_to_peers(state.client.clone(), state.get_replicas(), col_name, frame, state.current_term(), commit_index);
                     }
                     (StatusCode::OK, Json(serde_json::json!({"status": "updated"}))).into_response()
                 },
@@ -941,6 +1150,10 @@ async fn delete_doc(
     State(state): State<AppState>,
     AxumPath((col_name, id)): AxumPath<(String, String)>,
 ) -> impl axum::response::IntoResponse {
+    if state.is_shard() && !state.is_leader() {
+        return (StatusCode::FORBIDDEN, "Replica nodes reject direct writes").into_response();
+    }
+
     if state.config.role == "router" {
         let hash = hash_key(&col_name, &id);
         if let Some(target_url) = state.config.get_shard_url(hash) {
@@ -969,13 +1182,17 @@ async fn delete_doc(
     let col_clone = col.clone();
 
     match tokio::task::spawn_blocking(move || col_clone.delete(key)).await {
-        Ok(Ok((_frame, _wal_id, _offset))) => {
+        Ok(Ok((frame, wal_id, offset))) => {
             let commit_rx = col.enqueue_commit();
             match commit_rx.await {
                 Ok(Ok(())) => {
                     {
                         let mut index = col.index.write().unwrap();
                         index.remove(&id);
+                    }
+                    if state.is_leader() {
+                        let commit_index = state.db.as_ref().unwrap().global_commit_index.load(std::sync::atomic::Ordering::SeqCst);
+                        replicate_to_peers(state.client.clone(), state.get_replicas(), col_name, frame, state.current_term(), commit_index);
                     }
                     (StatusCode::OK, Json(serde_json::json!({"status": "deleted"}))).into_response()
                 },
@@ -1102,6 +1319,62 @@ async fn query_docs(
         Ok(Ok(vals)) => (StatusCode::OK, Json(vals)).into_response(),
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn replicate_handler(
+    State(state): State<AppState>,
+    Json(req): Json<ReplicateRequest>,
+) -> impl axum::response::IntoResponse {
+    if !state.is_shard() || state.is_leader() {
+        return (StatusCode::FORBIDDEN, "Only replica nodes accept replication").into_response();
+    }
+
+    let our_term = state.current_term();
+    if req.term < our_term {
+        eprintln!("[replicate] Rejecting stale frame: req term {} < our term {}", req.term, our_term);
+        return (StatusCode::CONFLICT, "Stale term").into_response();
+    }
+
+    let db = match state.db.as_ref() {
+        Some(db) => db.clone(),
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, "No database on this node").into_response(),
+    };
+
+    let col = match db.get_collection(&req.collection) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    let frame = req.wal_frame;
+    let col_clone = col.clone();
+
+    let entry_opt = serde_json::from_slice::<LogEntry>(&frame[8..]).ok();
+
+    match tokio::task::spawn_blocking(move || col_clone.append_raw_frame(&frame)).await {
+        Ok(Ok((wal_id, offset))) => {
+            let commit_rx = col.enqueue_commit();
+            match commit_rx.await {
+                Ok(Ok(())) => {
+                    if let Some(entry) = entry_opt {
+                        let mut index = col.index.write().unwrap();
+                        match entry {
+                            LogEntry::Put { key, .. } => {
+                                index.insert(key, IndexEntry { wal_id, offset });
+                            },
+                            LogEntry::Del { key, .. } => {
+                                index.remove(&key);
+                            }
+                        }
+                    }
+                    (StatusCode::OK, "replicated").into_response()
+                },
+                Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            }
+        },
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 
@@ -1246,11 +1519,17 @@ async fn main() -> io::Result<()> {
         client: client.clone(),
     };
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/collections/:name/docs", post(create_doc).get(list_docs))
         .route("/collections/:name/query", get(query_docs))
-        .route("/collections/:name/docs/:id", get(get_doc).patch(update_doc).delete(delete_doc))
-        .with_state(state.clone());
+        .route("/collections/:name/docs/:id", get(get_doc).patch(update_doc).delete(delete_doc));
+
+    if config.role == "shard" {
+        app = app
+            .route("/internal/replicate", post(replicate_handler));
+    }
+
+    let app = app.with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     println!("Server starting on http://{}", config.listen_addr);
