@@ -84,6 +84,45 @@ struct ReplicateRequest {
     wal_frame: Vec<u8>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ReplicationMeta {
+    term: u64,
+    is_leader: bool,
+}
+
+struct ReplicationState {
+    term: u64,
+    is_leader: bool,
+    last_heartbeat: Option<std::time::Instant>,
+    was_receiving_replication: bool,
+    last_replication: Option<std::time::Instant>,
+    heartbeat_running: bool,
+    primary_addr: Option<String>,
+    replicas: Vec<String>,
+    last_known_primary_position: Option<u64>,
+}
+
+impl ReplicationMeta {
+    fn load(data_dir: &str) -> Option<Self> {
+        let path = PathBuf::from(data_dir).join("replication.meta");
+        let content = fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&content).ok()
+    }
+
+    fn save(&self, data_dir: &str) -> io::Result<()> {
+        let path = PathBuf::from(data_dir).join("replication.meta");
+        let content = serde_json::to_string(self)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        fs::write(&path, content)
+    }
+}
+
+struct PrimaryOverride {
+    url: String,
+    cached_at: std::time::Instant,
+}
+
+const OVERRIDE_TTL_SECS: u64 = 30;
 mod base64_bytes {
     use serde::{Deserialize, Deserializer, Serializer};
     use serde::de;
@@ -226,11 +265,17 @@ struct AppState {
     db: Option<Arc<Database>>,
     config: Arc<NodeConfig>,
     client: reqwest::Client,
+    replication: Option<Arc<RwLock<ReplicationState>>>,
+    primary_overrides: Arc<std::sync::Mutex<HashMap<String, PrimaryOverride>>>,
+    shard_failover_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl AppState {
     fn is_leader(&self) -> bool {
-        self.config.role == "shard" && self.config.shard_role.as_deref() == Some("primary")
+        if let Some(ref repl) = self.replication {
+            return repl.read().unwrap().is_leader;
+        }
+        false
     }
 
     fn is_shard(&self) -> bool {
@@ -238,11 +283,47 @@ impl AppState {
     }
 
     fn current_term(&self) -> u64 {
+        if let Some(ref repl) = self.replication {
+            return repl.read().unwrap().term;
+        }
         0
     }
 
     fn get_replicas(&self) -> Vec<String> {
-        self.config.replicas.clone()
+        if let Some(ref repl) = self.replication {
+            return repl.read().unwrap().replicas.clone();
+        }
+        Vec::new()
+    }
+
+    fn get_effective_shard_url(&self, hash: u64) -> Option<(String, String, Vec<String>)> {
+        for shard in &self.config.shard_map {
+            let matches = if shard.start_hash <= shard.end_hash {
+                hash >= shard.start_hash && hash < shard.end_hash
+            } else {
+                hash >= shard.start_hash || hash < shard.end_hash
+            };
+            if matches {
+                let mut overrides = self.primary_overrides.lock().unwrap();
+                if let Some(ov) = overrides.get(&shard.node_url) {
+                    if ov.cached_at.elapsed().as_secs() < OVERRIDE_TTL_SECS {
+                        return Some((ov.url.clone(), shard.node_url.clone(), shard.replica_urls.clone()));
+                    } else {
+                        overrides.remove(&shard.node_url);
+                    }
+                }
+                return Some((shard.node_url.clone(), shard.node_url.clone(), shard.replica_urls.clone()));
+            }
+        }
+        None
+    }
+
+    fn set_primary_override(&self, original_url: &str, new_url: &str) {
+        let mut overrides = self.primary_overrides.lock().unwrap();
+        overrides.insert(original_url.to_string(), PrimaryOverride {
+            url: new_url.to_string(),
+            cached_at: std::time::Instant::now(),
+        });
     }
 }
 
@@ -999,14 +1080,47 @@ async fn create_doc(
 
     if state.config.role == "router" {
         let hash = hash_key(&col_name, &key);
-        if let Some(target_url) = state.config.get_shard_url(hash) {
-            let full_url = format!("{}/collections/{}/docs/{}", target_url, col_name, key);
+        if let Some((effective_url, original_url, replica_urls)) = state.get_effective_shard_url(hash) {
+            let full_url = format!("{}/collections/{}/docs/{}", effective_url, col_name, key);
             let res = state.client.patch(&full_url).json(&payload).send().await;
             match res {
                 Ok(r) if r.status().is_success() => {
+                    if effective_url != original_url {
+                        state.set_primary_override(&original_url, &effective_url);
+                    }
                     return (StatusCode::CREATED, Json(serde_json::json!({"id": key}))).into_response();
                 },
                 _ => {
+                    let failover_lock = {
+                        let mut locks = state.shard_failover_locks.lock().unwrap();
+                        locks.entry(original_url.clone())
+                            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                            .clone()
+                    };
+                    let _guard = failover_lock.lock().await;
+
+                    if let Some((latest_url, _, _)) = state.get_effective_shard_url(hash) {
+                        if latest_url != effective_url {
+                            let new_url = format!("{}/collections/{}/docs/{}", latest_url, col_name, key);
+                            if let Ok(r) = state.client.patch(&new_url).json(&payload).send().await {
+                                if r.status().is_success() {
+                                    return (StatusCode::CREATED, Json(serde_json::json!({"id": key}))).into_response();
+                                }
+                            }
+                        }
+                    }
+
+                    state.primary_overrides.lock().unwrap().remove(&original_url);
+                    for replica in &replica_urls {
+                        let fallback_url = format!("{}/collections/{}/docs/{}", replica, col_name, key);
+                        if let Ok(r) = state.client.patch(&fallback_url).json(&payload).send().await {
+                            if r.status().is_success() {
+                                state.set_primary_override(&original_url, replica);
+                                println!("[router] Cached new primary: {} → {}", original_url, replica);
+                                return (StatusCode::CREATED, Json(serde_json::json!({"id": key}))).into_response();
+                            }
+                        }
+                    }
                     return (StatusCode::BAD_GATEWAY, "All shard nodes unreachable").into_response();
                 }
             }
@@ -1053,7 +1167,7 @@ async fn get_doc(
 ) -> impl axum::response::IntoResponse {
     if state.config.role == "router" {
         let hash = hash_key(&col_name, &id);
-        if let Some(target_url) = state.config.get_shard_url(hash) {
+        if let Some((target_url, _, _)) = state.get_effective_shard_url(hash) {
             let full_url = format!("{}/collections/{}/docs/{}", target_url, col_name, id);
             let res = state.client.get(&full_url).send().await;
             match res {
@@ -1096,16 +1210,52 @@ async fn update_doc(
 
     if state.config.role == "router" {
         let hash = hash_key(&col_name, &id);
-        if let Some(target_url) = state.config.get_shard_url(hash) {
-            let full_url = format!("{}/collections/{}/docs/{}", target_url, col_name, id);
+        if let Some((effective_url, original_url, replica_urls)) = state.get_effective_shard_url(hash) {
+            let full_url = format!("{}/collections/{}/docs/{}", effective_url, col_name, id);
             let res = state.client.patch(&full_url).json(&payload).send().await;
             match res {
                 Ok(r) if r.status().is_success() => {
+                    if effective_url != original_url {
+                        state.set_primary_override(&original_url, &effective_url);
+                    }
                     let body = r.text().await.unwrap_or_default();
                     let json_body: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
                     return (StatusCode::OK, Json(json_body)).into_response();
                 },
                 _ => {
+                    let failover_lock = {
+                        let mut locks = state.shard_failover_locks.lock().unwrap();
+                        locks.entry(original_url.clone())
+                            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                            .clone()
+                    };
+                    let _guard = failover_lock.lock().await;
+
+                    if let Some((latest_url, _, _)) = state.get_effective_shard_url(hash) {
+                        if latest_url != effective_url {
+                            let new_url = format!("{}/collections/{}/docs/{}", latest_url, col_name, id);
+                            if let Ok(r) = state.client.patch(&new_url).json(&payload).send().await {
+                                if r.status().is_success() {
+                                    let body = r.text().await.unwrap_or_default();
+                                    let json_body: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
+                                    return (StatusCode::OK, Json(json_body)).into_response();
+                                }
+                            }
+                        }
+                    }
+
+                    state.primary_overrides.lock().unwrap().remove(&original_url);
+                    for replica in &replica_urls {
+                        let fb = format!("{}/collections/{}/docs/{}", replica, col_name, id);
+                        if let Ok(r) = state.client.patch(&fb).json(&payload).send().await {
+                            if r.status().is_success() {
+                                state.set_primary_override(&original_url, replica);
+                                let body = r.text().await.unwrap_or_default();
+                                let json_body: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
+                                return (StatusCode::OK, Json(json_body)).into_response();
+                            }
+                        }
+                    }
                     return (StatusCode::BAD_GATEWAY, "All shard nodes unreachable").into_response();
                 }
             }
@@ -1156,16 +1306,52 @@ async fn delete_doc(
 
     if state.config.role == "router" {
         let hash = hash_key(&col_name, &id);
-        if let Some(target_url) = state.config.get_shard_url(hash) {
-            let full_url = format!("{}/collections/{}/docs/{}", target_url, col_name, id);
+        if let Some((effective_url, original_url, replica_urls)) = state.get_effective_shard_url(hash) {
+            let full_url = format!("{}/collections/{}/docs/{}", effective_url, col_name, id);
             let res = state.client.delete(&full_url).send().await;
             match res {
                 Ok(r) if r.status().is_success() => {
+                    if effective_url != original_url {
+                        state.set_primary_override(&original_url, &effective_url);
+                    }
                     let body = r.text().await.unwrap_or_default();
                     let json_body: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
                     return (StatusCode::OK, Json(json_body)).into_response();
                 },
                 _ => {
+                    let failover_lock = {
+                        let mut locks = state.shard_failover_locks.lock().unwrap();
+                        locks.entry(original_url.clone())
+                            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                            .clone()
+                    };
+                    let _guard = failover_lock.lock().await;
+
+                    if let Some((latest_url, _, _)) = state.get_effective_shard_url(hash) {
+                        if latest_url != effective_url {
+                            let new_url = format!("{}/collections/{}/docs/{}", latest_url, col_name, id);
+                            if let Ok(r) = state.client.delete(&new_url).send().await {
+                                if r.status().is_success() {
+                                    let body = r.text().await.unwrap_or_default();
+                                    let json_body: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
+                                    return (StatusCode::OK, Json(json_body)).into_response();
+                                }
+                            }
+                        }
+                    }
+
+                    state.primary_overrides.lock().unwrap().remove(&original_url);
+                    for replica in &replica_urls {
+                        let fb = format!("{}/collections/{}/docs/{}", replica, col_name, id);
+                        if let Ok(r) = state.client.delete(&fb).send().await {
+                            if r.status().is_success() {
+                                state.set_primary_override(&original_url, replica);
+                                let body = r.text().await.unwrap_or_default();
+                                let json_body: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
+                                return (StatusCode::OK, Json(json_body)).into_response();
+                            }
+                        }
+                    }
                     return (StatusCode::BAD_GATEWAY, "All shard nodes unreachable").into_response();
                 }
             }
@@ -1326,6 +1512,13 @@ async fn replicate_handler(
     State(state): State<AppState>,
     Json(req): Json<ReplicateRequest>,
 ) -> impl axum::response::IntoResponse {
+    if let Some(idx) = req.commit_index {
+        if let Some(ref repl) = state.replication {
+            let mut r = repl.write().unwrap();
+            r.last_known_primary_position = Some(idx);
+        }
+    }
+
     if !state.is_shard() || state.is_leader() {
         return (StatusCode::FORBIDDEN, "Only replica nodes accept replication").into_response();
     }
@@ -1367,6 +1560,12 @@ async fn replicate_handler(
                             }
                         }
                     }
+
+                    if let Some(ref repl) = state.replication {
+                        let mut r = repl.write().unwrap();
+                        r.last_replication = Some(std::time::Instant::now());
+                        r.was_receiving_replication = true;
+                    }
                     (StatusCode::OK, "replicated").into_response()
                 },
                 Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
@@ -1376,6 +1575,134 @@ async fn replicate_handler(
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+async fn heartbeat_handler(
+    State(state): State<AppState>,
+) -> impl axum::response::IntoResponse {
+    let term = state.current_term();
+    let role = if state.is_leader() { "primary" } else { "replica" };
+    (StatusCode::OK, Json(serde_json::json!({
+        "term": term,
+        "role": role,
+        "node_id": state.config.node_id,
+        "commit_index": state.db.as_ref().map_or(0, |db| db.global_commit_index.load(std::sync::atomic::Ordering::SeqCst)),
+    }))).into_response()
+}
+
+fn heartbeat_poll_task(state: AppState) {
+    tokio::spawn(async move {
+        let timeout_secs = state.config.heartbeat_timeout_secs;
+        let election_delay = state.config.election_delay_ms;
+
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            if state.is_leader() {
+                println!("[heartbeat] This node is now leader, stopping heartbeat poll");
+                break;
+            }
+
+            let primary_addr = {
+                let repl = state.replication.as_ref().unwrap().read().unwrap();
+                if !repl.heartbeat_running {
+                    break;
+                }
+                match repl.primary_addr.clone() {
+                    Some(addr) => addr,
+                    None => continue,
+                }
+            };
+
+            let url = format!("{}/internal/heartbeat", primary_addr);
+            match state.client.get(&url).send().await {
+                Ok(r) if r.status().is_success() => {
+                    if let Ok(hb) = r.json::<serde_json::Value>().await {
+                        let mut repl = state.replication.as_ref().unwrap().write().unwrap();
+                        repl.last_heartbeat = Some(std::time::Instant::now());
+                        if let Some(idx) = hb.get("commit_index").and_then(|v| v.as_u64()) {
+                            repl.last_known_primary_position = Some(idx);
+                        }
+                    }
+                },
+                Ok(r) => {
+                    eprintln!("[heartbeat] Primary {} returned {}", primary_addr, r.status());
+                },
+                Err(e) => {
+                    eprintln!("[heartbeat] Primary {} unreachable: {}", primary_addr, e);
+                }
+            }
+
+            let should_elect = {
+                let repl = state.replication.as_ref().unwrap().read().unwrap();
+                let my_idx = state.db.as_ref().map_or(0, |db| db.global_commit_index.load(std::sync::atomic::Ordering::SeqCst));
+                let caught_up = repl.last_known_primary_position.map_or(false, |p| my_idx >= p);
+
+                if let Some(last_hb) = repl.last_heartbeat {
+                    let elapsed = last_hb.elapsed().as_secs();
+                    let repl_eligible = repl.was_receiving_replication && caught_up &&
+                        repl.last_replication.map_or(false, |lr| lr.elapsed().as_secs() < timeout_secs);
+                    elapsed > timeout_secs && repl_eligible
+                } else {
+                    repl.was_receiving_replication && caught_up &&
+                        repl.last_replication.map_or(false, |lr| lr.elapsed().as_secs() < timeout_secs)
+                }
+            };
+
+            if should_elect {
+                println!("[election] Heartbeat timeout detected, initiating election...");
+                try_promote(&state, election_delay).await;
+                if state.is_leader() {
+                    break;
+                }
+            }
+        }
+    });
+}
+
+async fn try_promote(state: &AppState, max_delay_ms: u64) {
+    let delay_ms = {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        state.config.node_id.hash(&mut h);
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos().hash(&mut h);
+        h.finish() % max_delay_ms
+    };
+    println!("[election] Waiting {}ms before promotion attempt...", delay_ms);
+    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+    {
+        let primary_addr = state.replication.as_ref().unwrap().read().unwrap().primary_addr.clone();
+        if let Some(addr) = primary_addr {
+            let url = format!("{}/internal/heartbeat", addr);
+            if let Ok(r) = state.client.get(&url).send().await {
+                if r.status().is_success() {
+                    println!("[election] Primary recovered during delay, aborting promotion");
+                    let mut repl = state.replication.as_ref().unwrap().write().unwrap();
+                    repl.last_heartbeat = Some(std::time::Instant::now());
+                    return;
+                }
+            }
+        }
+    }
+
+    let mut repl = state.replication.as_ref().unwrap().write().unwrap();
+    repl.term += 1;
+    repl.is_leader = true;
+    repl.heartbeat_running = false;
+    repl.primary_addr = None;
+
+    let new_term = repl.term;
+    drop(repl);
+
+    let meta = ReplicationMeta { term: new_term, is_leader: true };
+    if let Err(e) = meta.save("./data") {
+        eprintln!("[election] WARNING: Failed to persist replication meta: {}", e);
+    }
+
+    println!("[election] *** PROMOTED to primary at term {} ***", new_term);
+    println!("[election] Node {} is now accepting writes", state.config.node_id);
 }
 
 async fn run_durability_test() -> io::Result<()> {
@@ -1508,6 +1835,38 @@ async fn main() -> io::Result<()> {
         std::process::exit(0);
     });
 
+    let replication = if config.role == "shard" {
+        let meta = ReplicationMeta::load("./data");
+        let (term, is_leader) = if let Some(ref m) = meta {
+            println!("[boot] Restored replication state: term={}, is_leader={}", m.term, m.is_leader);
+            let mut boot_term = m.term;
+            if m.is_leader {
+                boot_term += 1;
+                let new_meta = ReplicationMeta { term: boot_term, is_leader: true };
+                let _ = new_meta.save("./data");
+                println!("[boot] Escalated leader term to {} to prevent split brain.", boot_term);
+            }
+            (boot_term, m.is_leader)
+        } else {
+            let is_primary = config.shard_role.as_deref() == Some("primary");
+            (0, is_primary)
+        };
+
+        Some(Arc::new(RwLock::new(ReplicationState {
+            term,
+            is_leader,
+            last_heartbeat: None,
+            last_replication: None,
+            was_receiving_replication: false,
+            heartbeat_running: !is_leader,
+            replicas: config.replicas.clone(),
+            primary_addr: config.primary_addr.clone(),
+            last_known_primary_position: None,
+        })))
+    } else {
+        None
+    };
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -1517,6 +1876,9 @@ async fn main() -> io::Result<()> {
         db: db.clone(),
         config: Arc::new(config.clone()),
         client: client.clone(),
+        replication,
+        primary_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        shard_failover_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
     };
 
     let mut app = Router::new()
@@ -1526,10 +1888,17 @@ async fn main() -> io::Result<()> {
 
     if config.role == "shard" {
         app = app
-            .route("/internal/replicate", post(replicate_handler));
+            .route("/internal/replicate", post(replicate_handler))
+            .route("/internal/heartbeat", get(heartbeat_handler));
     }
 
     let app = app.with_state(state.clone());
+
+    if config.role == "shard" && !state.is_leader() {
+        println!("[boot] Starting heartbeat poll task (timeout={}s, delay={}ms)",
+            config.heartbeat_timeout_secs, config.election_delay_ms);
+        heartbeat_poll_task(state.clone());
+    }
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     println!("Server starting on http://{}", config.listen_addr);
