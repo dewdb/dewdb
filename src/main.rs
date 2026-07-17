@@ -44,6 +44,86 @@ struct IndexSnapshot {
     map: BTreeMap<String, IndexEntry>,
 }
 
+#[derive(Deserialize, Clone, Debug)]
+struct ShardInfo {
+    start_hash: u64,
+    end_hash: u64,
+    node_url: String,
+    #[serde(default)]
+    replica_urls: Vec<String>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+struct NodeConfig {
+    node_id: String,
+    role: String,
+    listen_addr: String,
+    #[serde(default)]
+    shard_map: Vec<ShardInfo>,
+    #[serde(default)]
+    shard_role: Option<String>,
+    #[serde(default)]
+    primary_addr: Option<String>,
+    #[serde(default)]
+    replicas: Vec<String>,
+    #[serde(default = "default_heartbeat_timeout")]
+    heartbeat_timeout_secs: u64,
+    #[serde(default = "default_election_delay")]
+    election_delay_ms: u64,
+}
+
+fn default_heartbeat_timeout() -> u64 { 6 }
+fn default_election_delay() -> u64 { 2000 }
+
+fn hash_key(col: &str, key: &str) -> u64 {
+    xxhash_rust::xxh64::xxh64(format!("{}:{}", col, key).as_bytes(), 0)
+}
+
+impl NodeConfig {
+    fn validate(&self) -> Result<(), String> {
+        if self.role == "router" && self.shard_map.is_empty() {
+            return Err("Router requires at least one shard".into());
+        }
+        if self.role == "router" {
+            let mut sorted = self.shard_map.clone();
+            sorted.sort_by_key(|s| s.start_hash);
+            for i in 1..sorted.len() {
+                if sorted[i].start_hash != sorted[i - 1].end_hash {
+                    return Err("Shard map has uncovered hash ranges".into());
+                }
+            }
+            if sorted.first().unwrap().start_hash == 0 && sorted.last().unwrap().end_hash == 0 {
+            } else if sorted.last().unwrap().end_hash == sorted.first().unwrap().start_hash {
+            } else {
+                return Err("Shard map has uncovered hash ranges".into());
+            }
+        }
+        if self.role == "shard" {
+            if let Some(ref sr) = self.shard_role {
+                if sr == "replica" && self.primary_addr.is_none() {
+                    return Err("Replica shard requires primary_addr".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn get_shard_url(&self, hash: u64) -> Option<String> {
+        for shard in &self.shard_map {
+            if shard.start_hash <= shard.end_hash {
+                if hash >= shard.start_hash && hash < shard.end_hash {
+                    return Some(shard.node_url.clone());
+                }
+            } else {
+                if hash >= shard.start_hash || hash < shard.end_hash {
+                    return Some(shard.node_url.clone());
+                }
+            }
+        }
+        None
+    }
+}
+
 struct Collection {
     name: String,
     root_path: PathBuf,
@@ -70,6 +150,8 @@ const COMMIT_INTERVAL_MS: u64 = 5;
 #[derive(Clone)]
 struct AppState {
     db: Option<Arc<Database>>,
+    config: Arc<NodeConfig>,
+    client: reqwest::Client,
 }
 
 struct Database {
@@ -718,6 +800,23 @@ async fn create_doc(
     let id = uuid::Uuid::new_v4().to_string();
     let key = id.clone();
 
+    if state.config.role == "router" {
+        let hash = hash_key(&col_name, &key);
+        if let Some(target_url) = state.config.get_shard_url(hash) {
+            let full_url = format!("{}/collections/{}/docs/{}", target_url, col_name, key);
+            let res = state.client.patch(&full_url).json(&payload).send().await;
+            match res {
+                Ok(r) if r.status().is_success() => {
+                    return (StatusCode::CREATED, Json(serde_json::json!({"id": key}))).into_response();
+                },
+                _ => {
+                    return (StatusCode::BAD_GATEWAY, "All shard nodes unreachable").into_response();
+                }
+            }
+        }
+        return (StatusCode::BAD_REQUEST, "Key not owned by any shard").into_response();
+    }
+
     let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
@@ -751,6 +850,24 @@ async fn get_doc(
     State(state): State<AppState>,
     AxumPath((col_name, id)): AxumPath<(String, String)>,
 ) -> impl axum::response::IntoResponse {
+    if state.config.role == "router" {
+        let hash = hash_key(&col_name, &id);
+        if let Some(target_url) = state.config.get_shard_url(hash) {
+            let full_url = format!("{}/collections/{}/docs/{}", target_url, col_name, id);
+            let res = state.client.get(&full_url).send().await;
+            match res {
+                Ok(r) => {
+                    let status = r.status();
+                    let body = r.text().await.unwrap_or_default();
+                    let json_body: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
+                    return (status, Json(json_body)).into_response();
+                },
+                Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+            }
+        }
+        return (StatusCode::BAD_REQUEST, "Key not owned by any shard").into_response();
+    }
+
     let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
@@ -772,6 +889,25 @@ async fn update_doc(
     AxumPath((col_name, id)): AxumPath<(String, String)>,
     Json(payload): Json<CreateDoc>,
 ) -> impl axum::response::IntoResponse {
+    if state.config.role == "router" {
+        let hash = hash_key(&col_name, &id);
+        if let Some(target_url) = state.config.get_shard_url(hash) {
+            let full_url = format!("{}/collections/{}/docs/{}", target_url, col_name, id);
+            let res = state.client.patch(&full_url).json(&payload).send().await;
+            match res {
+                Ok(r) if r.status().is_success() => {
+                    let body = r.text().await.unwrap_or_default();
+                    let json_body: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
+                    return (StatusCode::OK, Json(json_body)).into_response();
+                },
+                _ => {
+                    return (StatusCode::BAD_GATEWAY, "All shard nodes unreachable").into_response();
+                }
+            }
+        }
+        return (StatusCode::BAD_REQUEST, "Key not owned by any shard").into_response();
+    }
+
     let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
@@ -805,6 +941,25 @@ async fn delete_doc(
     State(state): State<AppState>,
     AxumPath((col_name, id)): AxumPath<(String, String)>,
 ) -> impl axum::response::IntoResponse {
+    if state.config.role == "router" {
+        let hash = hash_key(&col_name, &id);
+        if let Some(target_url) = state.config.get_shard_url(hash) {
+            let full_url = format!("{}/collections/{}/docs/{}", target_url, col_name, id);
+            let res = state.client.delete(&full_url).send().await;
+            match res {
+                Ok(r) if r.status().is_success() => {
+                    let body = r.text().await.unwrap_or_default();
+                    let json_body: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
+                    return (StatusCode::OK, Json(json_body)).into_response();
+                },
+                _ => {
+                    return (StatusCode::BAD_GATEWAY, "All shard nodes unreachable").into_response();
+                }
+            }
+        }
+        return (StatusCode::BAD_REQUEST, "Key not owned by any shard").into_response();
+    }
+
     let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
@@ -837,6 +992,10 @@ async fn list_docs(
     State(state): State<AppState>,
     AxumPath(col_name): AxumPath<String>,
 ) -> impl axum::response::IntoResponse {
+    if state.config.role == "router" {
+        return (StatusCode::NOT_IMPLEMENTED, "Use /query for cross-shard iteration").into_response();
+    }
+
     let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
@@ -854,8 +1013,57 @@ async fn query_docs(
     State(state): State<AppState>,
     AxumPath(col_name): AxumPath<String>,
     Query(params): Query<QueryParams>,
+    req: axum::extract::Request,
 ) -> impl axum::response::IntoResponse {
     let limit = params.limit.unwrap_or(100);
+
+    if state.config.role == "router" {
+        let mut unique_urls = std::collections::HashSet::new();
+        for shard in &state.config.shard_map {
+            unique_urls.insert(shard.node_url.clone());
+        }
+
+        let query_str = req.uri().query().map(|q| format!("?{}", q)).unwrap_or_default();
+
+        let mut futures = Vec::new();
+        for url in unique_urls {
+            let full_url = format!("{}/collections/{}/query{}", url, col_name, query_str);
+            let client = state.client.clone();
+
+            futures.push(tokio::spawn(async move {
+                let res = client.get(&full_url).send().await?;
+                if res.status().is_success() {
+                    let text = res.text().await?;
+                    let json_arr: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap_or_default();
+                    Ok::<_, reqwest::Error>(json_arr)
+                } else {
+                    Err(reqwest::Error::from(res.error_for_status().unwrap_err()))
+                }
+            }));
+        }
+
+        let shard_results = futures::future::try_join_all(futures).await;
+        match shard_results {
+            Ok(arrays) => {
+                let mut merged_results = Vec::new();
+                for items in arrays {
+                    for item in items {
+                        merged_results.push(item);
+                        if merged_results.len() >= limit {
+                            break;
+                        }
+                    }
+                    if merged_results.len() >= limit {
+                        break;
+                    }
+                }
+                return (StatusCode::OK, Json(merged_results)).into_response();
+            },
+            Err(_) => {
+                return (StatusCode::BAD_GATEWAY, "Shard query failed").into_response();
+            }
+        }
+    }
 
     let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
         Ok(c) => c,
@@ -987,10 +1195,35 @@ async fn run_durability_test() -> io::Result<()> {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    run_durability_test().await?;
+    let args: Vec<String> = std::env::args().collect();
+    let mut config_path = "node.json".to_string();
 
-    let db = Some(Arc::new(Database::new("./data")?));
-    
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--config" && i + 1 < args.len() {
+            config_path = args[i + 1].clone();
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+
+    let config_content = fs::read_to_string(&config_path).expect("Failed to read config file");
+    let config: NodeConfig = serde_json::from_str(&config_content).expect("Invalid config JSON format");
+    config.validate().expect("Invalid config map constraints");
+
+    println!("Booting Node: {} | Role: {} | Shard Role: {:?}", config.node_id, config.role, config.shard_role);
+
+    if config.role == "router" && Path::new("./data").exists() {
+        println!("Warning: router node should not use local storage");
+    }
+
+    let db = if config.role == "shard" {
+        run_durability_test().await?;
+        Some(Arc::new(Database::new("./data")?))
+    } else {
+        None
+    };
 
     let db_clone = db.clone();
     tokio::spawn(async move {
@@ -1002,17 +1235,25 @@ async fn main() -> io::Result<()> {
         std::process::exit(0);
     });
 
-    let state = AppState { db };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    let state = AppState {
+        db: db.clone(),
+        config: Arc::new(config.clone()),
+        client: client.clone(),
+    };
 
     let app = Router::new()
         .route("/collections/:name/docs", post(create_doc).get(list_docs))
         .route("/collections/:name/query", get(query_docs))
         .route("/collections/:name/docs/:id", get(get_doc).patch(update_doc).delete(delete_doc))
-        .with_state(state);
+        .with_state(state.clone());
 
-    let listen_addr = "127.0.0.1:8080";
-    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
-    println!("Server starting on http://{}", listen_addr);
+    let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
+    println!("Server starting on http://{}", config.listen_addr);
     axum::serve(listener, app).await?;
 
     Ok(())

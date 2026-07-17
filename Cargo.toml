@@ -11,3 +11,6 @@ crc32fast = "1"
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 bincode = "1"
+reqwest = { version = "0.12", features = ["json"] }
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+futures = "0.3"

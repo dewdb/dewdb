@@ -1,0 +1,5 @@
+{
+  "node_id": "shard-1",
+  "role": "shard",
+  "listen_addr": "127.0.0.1:8081"
+}

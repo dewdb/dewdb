@@ -1,0 +1,9 @@
+{
+  "node_id": "router-1",
+  "role": "router",
+  "listen_addr": "127.0.0.1:8080",
+  "shard_map": [
+    { "start_hash": 0, "end_hash": 9223372036854775808, "node_url": "http://127.0.0.1:8081" },
+    { "start_hash": 9223372036854775808, "end_hash": 0, "node_url": "http://127.0.0.1:8082" }
+  ]
+}
