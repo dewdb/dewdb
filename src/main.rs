@@ -2,16 +2,17 @@ use axum::{
     extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, patch, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 const WAL_ROTATION_LIMIT: u64 = 50 * 1024 * 1024;
 const MAX_RECORD_SIZE: u64 = 10 * 1024 * 1024;
@@ -1508,6 +1509,13 @@ async fn query_docs(
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct SnapshotFileEntry {
+    filename: String,
+    #[serde(with = "base64_bytes")]
+    data: Vec<u8>,
+}
+
 async fn replicate_handler(
     State(state): State<AppState>,
     Json(req): Json<ReplicateRequest>,
@@ -1705,6 +1713,118 @@ async fn try_promote(state: &AppState, max_delay_ms: u64) {
     println!("[election] Node {} is now accepting writes", state.config.node_id);
 }
 
+#[derive(Deserialize)]
+struct SnapshotQuery {
+    collection: String,
+}
+
+async fn snapshot_handler(
+    State(state): State<AppState>,
+    Query(params): Query<SnapshotQuery>,
+) -> impl axum::response::IntoResponse {
+    if !state.is_leader() {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Only primary nodes serve snapshots"}))).into_response();
+    }
+
+    let db = match state.db.as_ref() {
+        Some(db) => db.clone(),
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "No database"}))).into_response(),
+    };
+
+    let col = match db.get_collection(&params.collection) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    };
+
+    let col_clone = col.clone();
+    let _ = tokio::task::spawn_blocking(move || col_clone.save_index()).await;
+
+    let col_path = col.root_path.clone();
+    let files = match tokio::task::spawn_blocking(move || -> io::Result<Vec<SnapshotFileEntry>> {
+        let mut entries = Vec::new();
+        for dir_entry in fs::read_dir(&col_path)? {
+            let dir_entry = dir_entry?;
+            let path = dir_entry.path();
+            if path.is_file() {
+                let filename = dir_entry.file_name().to_string_lossy().to_string();
+                let data = fs::read(&path)?;
+                entries.push(SnapshotFileEntry { filename, data });
+            }
+        }
+        Ok(entries)
+    }).await {
+        Ok(Ok(entries)) => entries,
+        Ok(Err(e)) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    };
+
+    (StatusCode::OK, Json(files)).into_response()
+}
+
+async fn replica_sync_from_primary(
+    client: &reqwest::Client,
+    primary_addr: &str,
+    db: &Database,
+    collection_name: &str,
+) -> Result<(), String> {
+    println!("[replica-sync] Syncing collection '{}' from primary {}", collection_name, primary_addr);
+
+    let url = format!("{}/internal/snapshot?collection={}", primary_addr, collection_name);
+    let resp = client.get(&url)
+        .timeout(Duration::from_secs(30))
+        .send().await
+        .map_err(|e| format!("Snapshot request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Primary returned {}", resp.status()));
+    }
+
+    let files: Vec<SnapshotFileEntry> = resp.json().await
+        .map_err(|e| format!("Failed to parse snapshot response: {}", e))?;
+
+    if files.is_empty() {
+        println!("[replica-sync] No files received for collection '{}', it may not exist on primary yet", collection_name);
+        return Ok(());
+    }
+
+    let col_path = db.root_path.join(collection_name);
+    let tmp_path = db.root_path.join(format!("{}.tmp", collection_name));
+
+    if tmp_path.exists() {
+        fs::remove_dir_all(&tmp_path).map_err(|e| format!("Failed to wipe tmp dir: {}", e))?;
+    }
+    fs::create_dir_all(&tmp_path).map_err(|e| format!("Failed to create tmp dir: {}", e))?;
+
+    for entry in &files {
+        let file_path = tmp_path.join(&entry.filename);
+        fs::write(&file_path, &entry.data).map_err(|e| format!("Failed to write {}: {}", entry.filename, e))?;
+    }
+
+    let old_path = db.root_path.join(format!("{}.old", collection_name));
+    if old_path.exists() {
+        let _ = fs::remove_dir_all(&old_path);
+    }
+    if col_path.exists() {
+        fs::rename(&col_path, &old_path).map_err(|e| format!("Failed to backup old col dir: {}", e))?;
+    }
+    fs::rename(&tmp_path, &col_path).map_err(|e| format!("Failed to finalize new col dir: {}", e))?;
+    if old_path.exists() {
+        let _ = fs::remove_dir_all(&old_path);
+    }
+
+    println!("[replica-sync] Restored {} files for collection '{}'", files.len(), collection_name);
+
+    {
+        let mut collections = db.collections.write().unwrap();
+        collections.remove(collection_name);
+    }
+    let _ = db.get_collection(collection_name)
+        .map_err(|e| format!("Failed to reopen collection after sync: {}", e))?;
+
+    println!("[replica-sync] Collection '{}' ready", collection_name);
+    Ok(())
+}
+
 async fn run_durability_test() -> io::Result<()> {
     println!("--- Running Durability Test ---");
     let test_dir = "./data/test_durability";
@@ -1881,6 +2001,26 @@ async fn main() -> io::Result<()> {
         shard_failover_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
     };
 
+    if config.shard_role.as_deref() == Some("replica") {
+        if let (Some(primary_addr), Some(db)) = (&config.primary_addr, &db) {
+            println!("[replica] Performing full sync from primary: {}", primary_addr);
+
+            if let Ok(entries) = fs::read_dir("./data") {
+                for entry in entries.flatten() {
+                    if entry.path().is_dir() {
+                        if let Some(name) = entry.file_name().to_str() {
+                            if name != "test_durability" {
+                                if let Err(e) = replica_sync_from_primary(&client, primary_addr, db, name).await {
+                                    eprintln!("[replica] Sync failed for '{}': {}", name, e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut app = Router::new()
         .route("/collections/:name/docs", post(create_doc).get(list_docs))
         .route("/collections/:name/query", get(query_docs))
@@ -1889,6 +2029,7 @@ async fn main() -> io::Result<()> {
     if config.role == "shard" {
         app = app
             .route("/internal/replicate", post(replicate_handler))
+            .route("/internal/snapshot", get(snapshot_handler))
             .route("/internal/heartbeat", get(heartbeat_handler));
     }
 
