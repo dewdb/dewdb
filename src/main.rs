@@ -2,15 +2,16 @@ use axum::{
     extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{delete, get, patch, post},
+    routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -42,7 +43,26 @@ struct IndexEntry {
 struct IndexSnapshot {
     last_wal_id: u64,
     last_offset: u64,
+    last_lsn: u64,
     map: BTreeMap<String, IndexEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LsnMeta {
+    commit_lsn: u64,
+}
+
+impl LsnMeta {
+    fn load(dir: &Path) -> Option<Self> {
+        let content = fs::read_to_string(dir.join("lsn.meta")).ok()?;
+        serde_json::from_str(&content).ok()
+    }
+
+    fn save(&self, dir: &Path) -> io::Result<()> {
+        let content = serde_json::to_string(self)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        fs::write(dir.join("lsn.meta"), content)
+    }
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -241,19 +261,23 @@ impl NodeConfig {
 struct Collection {
     name: String,
     root_path: PathBuf,
+    data_root: PathBuf,
     index: RwLock<BTreeMap<String, IndexEntry>>,
     wal_writer: std::sync::Mutex<WalsState>,
+    wal_pause_cv: Condvar,
     commit_notifiers: Arc<std::sync::Mutex<Vec<tokio::sync::oneshot::Sender<Result<(), String>>>>>,
     commit_signal: Arc<tokio::sync::Notify>,
     read_pool: std::sync::Mutex<HashMap<u64, Vec<Arc<std::sync::Mutex<File>>>>>,
-    read_pool_counter: std::sync::atomic::AtomicUsize,
-    db_global_commit_index: Arc<std::sync::atomic::AtomicU64>,
+    read_pool_counter: AtomicUsize,
+    db_global_commit_index: Arc<AtomicU64>,
+    db_next_lsn: Arc<AtomicU64>,
 }
 
 struct WalsState {
     current_wal: File,
     current_wal_id: u64,
     current_wal_size: u64,
+    last_appended_lsn: u64,
     commit_paused: bool,
     write_paused: bool,
 }
@@ -331,17 +355,23 @@ impl AppState {
 struct Database {
     root_path: PathBuf,
     collections: RwLock<HashMap<String, Arc<Collection>>>,
-    pub global_commit_index: Arc<std::sync::atomic::AtomicU64>,
+    pub global_commit_index: Arc<AtomicU64>,
+    pub next_lsn: Arc<AtomicU64>,
 }
 
 impl Database {
     fn new(path: impl AsRef<std::path::Path>) -> io::Result<Self> {
         let root_path = path.as_ref().to_path_buf();
         fs::create_dir_all(&root_path)?;
+        let boot_lsn = LsnMeta::load(&root_path).map(|m| m.commit_lsn).unwrap_or(0);
+        if boot_lsn > 0 {
+            println!("[db] Restored commit LSN {} from lsn.meta", boot_lsn);
+        }
         Ok(Self {
             root_path,
             collections: RwLock::new(HashMap::new()),
-            global_commit_index: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            global_commit_index: Arc::new(AtomicU64::new(boot_lsn)),
+            next_lsn: Arc::new(AtomicU64::new(boot_lsn)),
         })
     }
 
@@ -359,7 +389,12 @@ impl Database {
         }
 
         let col_path = self.root_path.join(name);
-        let col = Arc::new(Collection::open(name.to_string(), col_path, self.global_commit_index.clone())?);
+        let col = Arc::new(Collection::open(
+            name.to_string(),
+            col_path,
+            self.global_commit_index.clone(),
+            self.next_lsn.clone(),
+        )?);
         Collection::start_commit_task(col.clone());
         collections.insert(name.to_string(), col.clone());
         Ok(col)
@@ -368,10 +403,12 @@ impl Database {
     fn force_commit_all(&self) {
         let collections = self.collections.read().unwrap();
         for (name, col) in collections.iter() {
-            let mut wal = col.wal_writer.lock().unwrap();
+            let wal = col.wal_writer.lock().unwrap();
             if let Err(e) = wal.current_wal.sync_data() {
                 eprintln!("[{}] Failed to force sync WAL on shutdown: {}", name, e);
             }
+            self.global_commit_index.fetch_max(wal.last_appended_lsn, Ordering::SeqCst);
+            drop(wal);
             let notifiers: Vec<_> = {
                 let mut q = col.commit_notifiers.lock().unwrap();
                 std::mem::take(&mut *q)
@@ -382,12 +419,22 @@ impl Database {
             }
             println!("[{}] Flushed {} pending writes.", name, count);
         }
+        let meta = LsnMeta { commit_lsn: self.global_commit_index.load(Ordering::SeqCst) };
+        if let Err(e) = meta.save(&self.root_path) {
+            eprintln!("[db] Failed to persist lsn meta on shutdown: {}", e);
+        }
     }
 }
 
 impl Collection {
-    fn open(name: String, root_path: PathBuf, db_global_commit_index: Arc<std::sync::atomic::AtomicU64>) -> io::Result<Self> {
+    fn open(
+        name: String,
+        root_path: PathBuf,
+        db_global_commit_index: Arc<AtomicU64>,
+        db_next_lsn: Arc<AtomicU64>,
+    ) -> io::Result<Self> {
         fs::create_dir_all(&root_path)?;
+        let data_root = root_path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
         let mut index = BTreeMap::new();
         let mut wal_files = Vec::new();
@@ -396,17 +443,19 @@ impl Collection {
         let mut snapshot_loaded = false;
         let mut snapshot_wal_id = 0;
         let mut snapshot_offset = 0;
+        let mut snapshot_lsn: u64 = 0;
 
         if index_path.exists() {
              match File::open(&index_path) {
                 Ok(file) => {
                     match bincode::deserialize_from::<_, IndexSnapshot>(BufReader::new(file)) {
                         Ok(snapshot) => {
-                            println!("[{}] Loaded persisted snapshot (WAL ID: {}, Offset: {}) with {} entries.", 
-                                     name, snapshot.last_wal_id, snapshot.last_offset, snapshot.map.len());
+                            println!("[{}] Loaded persisted snapshot (WAL ID: {}, Offset: {}, LSN: {}) with {} entries.",
+                                     name, snapshot.last_wal_id, snapshot.last_offset, snapshot.last_lsn, snapshot.map.len());
                             index = snapshot.map;
                             snapshot_wal_id = snapshot.last_wal_id;
                             snapshot_offset = snapshot.last_offset;
+                            snapshot_lsn = snapshot.last_lsn;
                             snapshot_loaded = true;
                         }
                         Err(e) => eprintln!("[{}] Failed to deserialize snapshot (likely legacy format): {}. Rebuilding from WAL.", name, e),
@@ -430,10 +479,12 @@ impl Collection {
         }
         wal_files.sort_by_key(|(id, _)| *id);
 
+        let mut replayed: u64 = 0;
+
         if !snapshot_loaded {
             println!("[{}] Replaying all WALs...", name);
              for (id, path) in &wal_files {
-                Self::replay_file_from(*id, path, 0, &mut index)?;
+                replayed += Self::replay_file_from(*id, path, 0, &mut index)?;
             }
         } else {
              for (id, path) in &wal_files {
@@ -441,12 +492,15 @@ impl Collection {
                      continue;
                  } else if *id == snapshot_wal_id {
                      println!("[{}] Resuming WAL {} from offset {}", name, id, snapshot_offset);
-                     Self::replay_file_from(*id, path, snapshot_offset, &mut index)?;
+                     replayed += Self::replay_file_from(*id, path, snapshot_offset, &mut index)?;
                  } else {
-                     Self::replay_file_from(*id, path, 0, &mut index)?;
+                     replayed += Self::replay_file_from(*id, path, 0, &mut index)?;
                  }
              }
         }
+
+        let boot_lsn = snapshot_lsn + replayed;
+        db_next_lsn.fetch_max(boot_lsn, Ordering::SeqCst);
 
         let current_wal_id = wal_files.last().map(|(id, _)| *id).unwrap_or(0) + 1;
 
@@ -462,23 +516,27 @@ impl Collection {
         Ok(Self {
             name,
             root_path,
+            data_root,
             index: RwLock::new(index),
             wal_writer: std::sync::Mutex::new(WalsState {
                 current_wal: file,
                 current_wal_id,
                 current_wal_size,
+                last_appended_lsn: boot_lsn,
                 commit_paused: false,
                 write_paused: false,
             }),
+            wal_pause_cv: Condvar::new(),
             commit_notifiers: Arc::new(std::sync::Mutex::new(Vec::new())),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
             read_pool: std::sync::Mutex::new(HashMap::new()),
-            read_pool_counter: std::sync::atomic::AtomicUsize::new(0),
+            read_pool_counter: AtomicUsize::new(0),
             db_global_commit_index,
+            db_next_lsn,
         })
     }
 
-    fn replay_file_from(wal_id: u64, path: &PathBuf, mut start_offset: u64, index: &mut BTreeMap<String, IndexEntry>) -> io::Result<()> {
+    fn replay_file_from(wal_id: u64, path: &PathBuf, mut start_offset: u64, index: &mut BTreeMap<String, IndexEntry>) -> io::Result<u64> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         let file_len = file.metadata()?.len();
 
@@ -490,6 +548,7 @@ impl Collection {
 
         let mut offset = start_offset;
         let mut valid_end_offset = start_offset;
+        let mut records: u64 = 0;
 
         loop {
             let mut header = [0u8; 8];
@@ -529,6 +588,7 @@ impl Collection {
                         index.remove(&key);
                     }
                 }
+                records += 1;
             }
             offset += 8 + len as u64;
             valid_end_offset = offset;
@@ -539,7 +599,7 @@ impl Collection {
             println!("[{}] Truncated corrupted WAL file down to size {}", path.display(), valid_end_offset);
         }
 
-        Ok(())
+        Ok(records)
     }
 
     fn current_timestamp() -> u64 {
@@ -584,14 +644,10 @@ impl Collection {
         frame.extend_from_slice(&header);
         frame.extend_from_slice(&json_bytes);
 
-        let mut wal = loop {
-            let guard = self.wal_writer.lock().unwrap();
-            if !guard.write_paused {
-                break guard;
-            }
-            drop(guard);
-            std::thread::yield_now();
-        };
+        let mut wal = self.wal_writer.lock().unwrap();
+        while wal.write_paused {
+            wal = self.wal_pause_cv.wait(wal).unwrap();
+        }
 
         if wal.current_wal_size >= WAL_ROTATION_LIMIT {
             wal.current_wal.sync_all()?;
@@ -612,6 +668,9 @@ impl Collection {
         wal.current_wal_size += frame_len;
 
         let wal_id = wal.current_wal_id;
+
+        let lsn = self.db_next_lsn.fetch_add(1, Ordering::SeqCst) + 1;
+        wal.last_appended_lsn = lsn;
 
         drop(wal);
 
@@ -643,14 +702,10 @@ impl Collection {
 
         let frame_len = (8 + len) as u64;
 
-        let mut wal = loop {
-            let guard = self.wal_writer.lock().unwrap();
-            if !guard.write_paused {
-                break guard;
-            }
-            drop(guard);
-            std::thread::yield_now();
-        };
+        let mut wal = self.wal_writer.lock().unwrap();
+        while wal.write_paused {
+            wal = self.wal_pause_cv.wait(wal).unwrap();
+        }
 
         if wal.current_wal_size >= WAL_ROTATION_LIMIT {
             wal.current_wal.sync_all()?;
@@ -669,7 +724,10 @@ impl Collection {
         let offset = wal.current_wal_size;
         let wal_id = wal.current_wal_id;
 
-        wal.current_wal_size += frame_len as u64;
+        wal.current_wal_size += frame_len;
+
+        let lsn = self.db_next_lsn.fetch_add(1, Ordering::SeqCst) + 1;
+        wal.last_appended_lsn = lsn;
 
         Ok((wal_id, offset))
     }
@@ -735,7 +793,13 @@ impl Collection {
                 }
 
                 if count > 0 && result.is_ok() {
-                    col.db_global_commit_index.fetch_add(count as u64, std::sync::atomic::Ordering::SeqCst);
+                    let last_lsn = { col.wal_writer.lock().unwrap().last_appended_lsn };
+                    col.db_global_commit_index.fetch_max(last_lsn, Ordering::SeqCst);
+                    let commit_lsn = col.db_global_commit_index.load(Ordering::SeqCst);
+                    let meta = LsnMeta { commit_lsn };
+                    if let Err(e) = meta.save(&col.data_root) {
+                        eprintln!("[{}] Failed to persist lsn meta: {}", col.name, e);
+                    }
                 }
             }
         });
@@ -766,7 +830,7 @@ impl Collection {
         if let Some(entry) = idx_entry {
             let file_arc = {
                 let mut pool = self.read_pool.lock().unwrap();
-                let counter = self.read_pool_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let counter = self.read_pool_counter.fetch_add(1, Ordering::Relaxed);
                 if let Some(handles) = pool.get_mut(&entry.wal_id) {
                     handles[counter % handles.len()].clone()
                 } else {
@@ -815,6 +879,7 @@ impl Collection {
         let snapshot = IndexSnapshot {
             last_wal_id: wal_writer.current_wal_id,
             last_offset: wal_writer.current_wal_size,
+            last_lsn: wal_writer.last_appended_lsn,
             map: index.clone(),
         };
 
@@ -832,7 +897,7 @@ impl Collection {
 
         fs::rename(&temp_path, &path)?;
 
-        println!("[{}] Index saved to disk at WAL {} offset {}.", self.name, snapshot.last_wal_id, snapshot.last_offset);
+        println!("[{}] Index saved to disk at WAL {} offset {} lsn {}.", self.name, snapshot.last_wal_id, snapshot.last_offset, snapshot.last_lsn);
         Ok(())
     }
 
@@ -930,6 +995,7 @@ impl Collection {
 
         wal_guard.commit_paused = false;
         wal_guard.write_paused = false;
+        self.wal_pause_cv.notify_all();
         self.commit_signal.notify_one();
 
         println!("[{}] Compaction complete.", self.name);
@@ -1067,6 +1133,140 @@ fn replicate_to_peers(
     });
 }
 
+enum ForwardMethod {
+    Put,
+    Patch,
+    Delete,
+}
+
+fn build_forward(client: &reqwest::Client, method: &ForwardMethod, url: &str, body: Option<&CreateDoc>) -> reqwest::RequestBuilder {
+    let rb = match method {
+        ForwardMethod::Put => client.put(url),
+        ForwardMethod::Patch => client.patch(url),
+        ForwardMethod::Delete => client.delete(url),
+    };
+    match body {
+        Some(b) => rb.json(b),
+        None => rb,
+    }
+}
+
+async fn router_forward_write(
+    state: &AppState,
+    col_name: &str,
+    key: &str,
+    method: ForwardMethod,
+    body: Option<&CreateDoc>,
+) -> Result<reqwest::Response, axum::response::Response> {
+    let hash = hash_key(col_name, key);
+
+    let (effective_url, original_url, replica_urls) = match state.get_effective_shard_url(hash) {
+        Some(t) => t,
+        None => return Err((StatusCode::BAD_REQUEST, "Key not owned by any shard").into_response()),
+    };
+
+    let full_url = format!("{}/collections/{}/docs/{}", effective_url, col_name, key);
+    if let Ok(r) = build_forward(&state.client, &method, &full_url, body).send().await {
+        if r.status().is_success() {
+            if effective_url != original_url {
+                state.set_primary_override(&original_url, &effective_url);
+            }
+            return Ok(r);
+        }
+    }
+
+    let failover_lock = {
+        let mut locks = state.shard_failover_locks.lock().unwrap();
+        locks.entry(original_url.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _guard = failover_lock.lock().await;
+
+    if let Some((latest_url, _, _)) = state.get_effective_shard_url(hash) {
+        if latest_url != effective_url {
+            let retry_url = format!("{}/collections/{}/docs/{}", latest_url, col_name, key);
+            if let Ok(r) = build_forward(&state.client, &method, &retry_url, body).send().await {
+                if r.status().is_success() {
+                    return Ok(r);
+                }
+            }
+        }
+    }
+
+    state.primary_overrides.lock().unwrap().remove(&original_url);
+    for replica in &replica_urls {
+        let fallback_url = format!("{}/collections/{}/docs/{}", replica, col_name, key);
+        if let Ok(r) = build_forward(&state.client, &method, &fallback_url, body).send().await {
+            if r.status().is_success() {
+                state.set_primary_override(&original_url, replica);
+                println!("[router] Cached new primary: {} -> {}", original_url, replica);
+                return Ok(r);
+            }
+        }
+    }
+
+    Err((StatusCode::BAD_GATEWAY, "All shard nodes unreachable").into_response())
+}
+
+async fn passthrough_json(r: reqwest::Response) -> axum::response::Response {
+    let status = r.status();
+    let body = r.text().await.unwrap_or_default();
+    let json_body: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
+    (status, Json(json_body)).into_response()
+}
+
+async fn local_write(
+    state: &AppState,
+    col_name: &str,
+    key: String,
+    value: Option<serde_json::Value>,
+) -> Result<(), axum::response::Response> {
+    let db = state.db.as_ref().unwrap();
+    let col = match db.get_collection(col_name) {
+        Ok(c) => c,
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response()),
+    };
+
+    let col_clone = col.clone();
+    let key_clone = key.clone();
+    let is_delete = value.is_none();
+
+    let write_res = tokio::task::spawn_blocking(move || {
+        match value {
+            Some(v) => col_clone.put(key_clone, v),
+            None => col_clone.delete(key_clone),
+        }
+    }).await;
+
+    match write_res {
+        Ok(Ok((frame, wal_id, offset))) => {
+            let commit_rx = col.enqueue_commit();
+            match commit_rx.await {
+                Ok(Ok(())) => {
+                    {
+                        let mut index = col.index.write().unwrap();
+                        if is_delete {
+                            index.remove(&key);
+                        } else {
+                            index.insert(key.clone(), IndexEntry { wal_id, offset });
+                        }
+                    }
+                    if state.is_leader() {
+                        let commit_index = db.global_commit_index.load(Ordering::SeqCst);
+                        replicate_to_peers(state.client.clone(), state.get_replicas(), col_name.to_string(), frame, state.current_term(), commit_index);
+                    }
+                    Ok(())
+                },
+                Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response()),
+                Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response()),
+            }
+        },
+        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response()),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response()),
+    }
+}
+
 async fn create_doc(
     State(state): State<AppState>,
     AxumPath(col_name): AxumPath<String>,
@@ -1076,89 +1276,40 @@ async fn create_doc(
         return (StatusCode::FORBIDDEN, "Replica nodes reject direct writes").into_response();
     }
 
-    let id = uuid::Uuid::new_v4().to_string();
-    let key = id.clone();
+    let id = Uuid::new_v4().to_string();
 
     if state.config.role == "router" {
-        let hash = hash_key(&col_name, &key);
-        if let Some((effective_url, original_url, replica_urls)) = state.get_effective_shard_url(hash) {
-            let full_url = format!("{}/collections/{}/docs/{}", effective_url, col_name, key);
-            let res = state.client.patch(&full_url).json(&payload).send().await;
-            match res {
-                Ok(r) if r.status().is_success() => {
-                    if effective_url != original_url {
-                        state.set_primary_override(&original_url, &effective_url);
-                    }
-                    return (StatusCode::CREATED, Json(serde_json::json!({"id": key}))).into_response();
-                },
-                _ => {
-                    let failover_lock = {
-                        let mut locks = state.shard_failover_locks.lock().unwrap();
-                        locks.entry(original_url.clone())
-                            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                            .clone()
-                    };
-                    let _guard = failover_lock.lock().await;
-
-                    if let Some((latest_url, _, _)) = state.get_effective_shard_url(hash) {
-                        if latest_url != effective_url {
-                            let new_url = format!("{}/collections/{}/docs/{}", latest_url, col_name, key);
-                            if let Ok(r) = state.client.patch(&new_url).json(&payload).send().await {
-                                if r.status().is_success() {
-                                    return (StatusCode::CREATED, Json(serde_json::json!({"id": key}))).into_response();
-                                }
-                            }
-                        }
-                    }
-
-                    state.primary_overrides.lock().unwrap().remove(&original_url);
-                    for replica in &replica_urls {
-                        let fallback_url = format!("{}/collections/{}/docs/{}", replica, col_name, key);
-                        if let Ok(r) = state.client.patch(&fallback_url).json(&payload).send().await {
-                            if r.status().is_success() {
-                                state.set_primary_override(&original_url, replica);
-                                println!("[router] Cached new primary: {} → {}", original_url, replica);
-                                return (StatusCode::CREATED, Json(serde_json::json!({"id": key}))).into_response();
-                            }
-                        }
-                    }
-                    return (StatusCode::BAD_GATEWAY, "All shard nodes unreachable").into_response();
-                }
-            }
-        }
-        return (StatusCode::BAD_REQUEST, "Key not owned by any shard").into_response();
+        return match router_forward_write(&state, &col_name, &id, ForwardMethod::Put, Some(&payload)).await {
+            Ok(_) => (StatusCode::CREATED, Json(serde_json::json!({"id": id}))).into_response(),
+            Err(resp) => resp,
+        };
     }
 
-    let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
-    };
+    match local_write(&state, &col_name, id.clone(), Some(payload.value)).await {
+        Ok(()) => (StatusCode::CREATED, Json(serde_json::json!({"id": id}))).into_response(),
+        Err(resp) => resp,
+    }
+}
 
-    let col_clone = col.clone();
-    let val_clone = payload.value.clone();
-    let key_clone = key.clone();
+async fn put_doc(
+    State(state): State<AppState>,
+    AxumPath((col_name, id)): AxumPath<(String, String)>,
+    Json(payload): Json<CreateDoc>,
+) -> impl axum::response::IntoResponse {
+    if state.is_shard() && !state.is_leader() {
+        return (StatusCode::FORBIDDEN, "Replica nodes reject direct writes").into_response();
+    }
 
-    match tokio::task::spawn_blocking(move || col_clone.put(key_clone, val_clone)).await {
-        Ok(Ok((frame, wal_id, offset))) => {
-            let commit_rx = col.enqueue_commit();
-            match commit_rx.await {
-                Ok(Ok(())) => {
-                    {
-                        let mut index = col.index.write().unwrap();
-                        index.insert(id.clone(), IndexEntry { wal_id, offset });
-                    }
-                    if state.is_leader() {
-                        let commit_index = state.db.as_ref().unwrap().global_commit_index.load(std::sync::atomic::Ordering::SeqCst);
-                        replicate_to_peers(state.client.clone(), state.get_replicas(), col_name, frame, state.current_term(), commit_index);
-                    }
-                    (StatusCode::CREATED, Json(serde_json::json!({"id": id}))).into_response()
-                },
-                Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response(),
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
-            }
-        },
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    if state.config.role == "router" {
+        return match router_forward_write(&state, &col_name, &id, ForwardMethod::Put, Some(&payload)).await {
+            Ok(r) => passthrough_json(r).await,
+            Err(resp) => resp,
+        };
+    }
+
+    match local_write(&state, &col_name, id.clone(), Some(payload.value)).await {
+        Ok(()) => (StatusCode::CREATED, Json(serde_json::json!({"id": id}))).into_response(),
+        Err(resp) => resp,
     }
 }
 
@@ -1172,12 +1323,7 @@ async fn get_doc(
             let full_url = format!("{}/collections/{}/docs/{}", target_url, col_name, id);
             let res = state.client.get(&full_url).send().await;
             match res {
-                Ok(r) => {
-                    let status = r.status();
-                    let body = r.text().await.unwrap_or_default();
-                    let json_body: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
-                    return (status, Json(json_body)).into_response();
-                },
+                Ok(r) => return passthrough_json(r).await,
                 Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
             }
         }
@@ -1210,90 +1356,15 @@ async fn update_doc(
     }
 
     if state.config.role == "router" {
-        let hash = hash_key(&col_name, &id);
-        if let Some((effective_url, original_url, replica_urls)) = state.get_effective_shard_url(hash) {
-            let full_url = format!("{}/collections/{}/docs/{}", effective_url, col_name, id);
-            let res = state.client.patch(&full_url).json(&payload).send().await;
-            match res {
-                Ok(r) if r.status().is_success() => {
-                    if effective_url != original_url {
-                        state.set_primary_override(&original_url, &effective_url);
-                    }
-                    let body = r.text().await.unwrap_or_default();
-                    let json_body: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
-                    return (StatusCode::OK, Json(json_body)).into_response();
-                },
-                _ => {
-                    let failover_lock = {
-                        let mut locks = state.shard_failover_locks.lock().unwrap();
-                        locks.entry(original_url.clone())
-                            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                            .clone()
-                    };
-                    let _guard = failover_lock.lock().await;
-
-                    if let Some((latest_url, _, _)) = state.get_effective_shard_url(hash) {
-                        if latest_url != effective_url {
-                            let new_url = format!("{}/collections/{}/docs/{}", latest_url, col_name, id);
-                            if let Ok(r) = state.client.patch(&new_url).json(&payload).send().await {
-                                if r.status().is_success() {
-                                    let body = r.text().await.unwrap_or_default();
-                                    let json_body: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
-                                    return (StatusCode::OK, Json(json_body)).into_response();
-                                }
-                            }
-                        }
-                    }
-
-                    state.primary_overrides.lock().unwrap().remove(&original_url);
-                    for replica in &replica_urls {
-                        let fb = format!("{}/collections/{}/docs/{}", replica, col_name, id);
-                        if let Ok(r) = state.client.patch(&fb).json(&payload).send().await {
-                            if r.status().is_success() {
-                                state.set_primary_override(&original_url, replica);
-                                let body = r.text().await.unwrap_or_default();
-                                let json_body: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
-                                return (StatusCode::OK, Json(json_body)).into_response();
-                            }
-                        }
-                    }
-                    return (StatusCode::BAD_GATEWAY, "All shard nodes unreachable").into_response();
-                }
-            }
-        }
-        return (StatusCode::BAD_REQUEST, "Key not owned by any shard").into_response();
+        return match router_forward_write(&state, &col_name, &id, ForwardMethod::Patch, Some(&payload)).await {
+            Ok(r) => passthrough_json(r).await,
+            Err(resp) => resp,
+        };
     }
 
-    let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
-    };
-
-    let key = id.clone();
-    let col_clone = col.clone();
-    let val_clone = payload.value.clone();
-
-    match tokio::task::spawn_blocking(move || col_clone.put(key.clone(), val_clone)).await {
-        Ok(Ok((frame, wal_id, offset))) => {
-            let commit_rx = col.enqueue_commit();
-            match commit_rx.await {
-                Ok(Ok(())) => {
-                    {
-                        let mut index = col.index.write().unwrap();
-                        index.insert(id.clone(), IndexEntry { wal_id, offset });
-                    }
-                    if state.is_leader() {
-                        let commit_index = state.db.as_ref().unwrap().global_commit_index.load(std::sync::atomic::Ordering::SeqCst);
-                        replicate_to_peers(state.client.clone(), state.get_replicas(), col_name, frame, state.current_term(), commit_index);
-                    }
-                    (StatusCode::OK, Json(serde_json::json!({"status": "updated"}))).into_response()
-                },
-                Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response(),
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
-            }
-        },
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    match local_write(&state, &col_name, id.clone(), Some(payload.value)).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "updated"}))).into_response(),
+        Err(resp) => resp,
     }
 }
 
@@ -1306,89 +1377,15 @@ async fn delete_doc(
     }
 
     if state.config.role == "router" {
-        let hash = hash_key(&col_name, &id);
-        if let Some((effective_url, original_url, replica_urls)) = state.get_effective_shard_url(hash) {
-            let full_url = format!("{}/collections/{}/docs/{}", effective_url, col_name, id);
-            let res = state.client.delete(&full_url).send().await;
-            match res {
-                Ok(r) if r.status().is_success() => {
-                    if effective_url != original_url {
-                        state.set_primary_override(&original_url, &effective_url);
-                    }
-                    let body = r.text().await.unwrap_or_default();
-                    let json_body: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
-                    return (StatusCode::OK, Json(json_body)).into_response();
-                },
-                _ => {
-                    let failover_lock = {
-                        let mut locks = state.shard_failover_locks.lock().unwrap();
-                        locks.entry(original_url.clone())
-                            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                            .clone()
-                    };
-                    let _guard = failover_lock.lock().await;
-
-                    if let Some((latest_url, _, _)) = state.get_effective_shard_url(hash) {
-                        if latest_url != effective_url {
-                            let new_url = format!("{}/collections/{}/docs/{}", latest_url, col_name, id);
-                            if let Ok(r) = state.client.delete(&new_url).send().await {
-                                if r.status().is_success() {
-                                    let body = r.text().await.unwrap_or_default();
-                                    let json_body: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
-                                    return (StatusCode::OK, Json(json_body)).into_response();
-                                }
-                            }
-                        }
-                    }
-
-                    state.primary_overrides.lock().unwrap().remove(&original_url);
-                    for replica in &replica_urls {
-                        let fb = format!("{}/collections/{}/docs/{}", replica, col_name, id);
-                        if let Ok(r) = state.client.delete(&fb).send().await {
-                            if r.status().is_success() {
-                                state.set_primary_override(&original_url, replica);
-                                let body = r.text().await.unwrap_or_default();
-                                let json_body: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
-                                return (StatusCode::OK, Json(json_body)).into_response();
-                            }
-                        }
-                    }
-                    return (StatusCode::BAD_GATEWAY, "All shard nodes unreachable").into_response();
-                }
-            }
-        }
-        return (StatusCode::BAD_REQUEST, "Key not owned by any shard").into_response();
+        return match router_forward_write(&state, &col_name, &id, ForwardMethod::Delete, None).await {
+            Ok(r) => passthrough_json(r).await,
+            Err(resp) => resp,
+        };
     }
 
-    let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
-        Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
-    };
-
-    let key = id.clone();
-    let col_clone = col.clone();
-
-    match tokio::task::spawn_blocking(move || col_clone.delete(key)).await {
-        Ok(Ok((frame, wal_id, offset))) => {
-            let commit_rx = col.enqueue_commit();
-            match commit_rx.await {
-                Ok(Ok(())) => {
-                    {
-                        let mut index = col.index.write().unwrap();
-                        index.remove(&id);
-                    }
-                    if state.is_leader() {
-                        let commit_index = state.db.as_ref().unwrap().global_commit_index.load(std::sync::atomic::Ordering::SeqCst);
-                        replicate_to_peers(state.client.clone(), state.get_replicas(), col_name, frame, state.current_term(), commit_index);
-                    }
-                    (StatusCode::OK, Json(serde_json::json!({"status": "deleted"}))).into_response()
-                },
-                Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response(),
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
-            }
-        },
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    match local_write(&state, &col_name, id.clone(), None).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "deleted"}))).into_response(),
+        Err(resp) => resp,
     }
 }
 
@@ -1451,10 +1448,17 @@ async fn query_docs(
             Ok(arrays) => {
                 let mut merged_results = Vec::new();
                 for items in arrays {
-                    for item in items {
-                        merged_results.push(item);
-                        if merged_results.len() >= limit {
-                            break;
+                    match items {
+                        Ok(items) => {
+                            for item in items {
+                                merged_results.push(item);
+                                if merged_results.len() >= limit {
+                                    break;
+                                }
+                            }
+                        },
+                        Err(_) => {
+                            return (StatusCode::BAD_GATEWAY, "Shard query failed").into_response();
                         }
                     }
                     if merged_results.len() >= limit {
@@ -1594,7 +1598,7 @@ async fn heartbeat_handler(
         "term": term,
         "role": role,
         "node_id": state.config.node_id,
-        "commit_index": state.db.as_ref().map_or(0, |db| db.global_commit_index.load(std::sync::atomic::Ordering::SeqCst)),
+        "commit_index": state.db.as_ref().map_or(0, |db| db.global_commit_index.load(Ordering::SeqCst)),
     }))).into_response()
 }
 
@@ -1643,7 +1647,7 @@ fn heartbeat_poll_task(state: AppState) {
 
             let should_elect = {
                 let repl = state.replication.as_ref().unwrap().read().unwrap();
-                let my_idx = state.db.as_ref().map_or(0, |db| db.global_commit_index.load(std::sync::atomic::Ordering::SeqCst));
+                let my_idx = state.db.as_ref().map_or(0, |db| db.global_commit_index.load(Ordering::SeqCst));
                 let caught_up = repl.last_known_primary_position.map_or(false, |p| my_idx >= p);
 
                 if let Some(last_hb) = repl.last_heartbeat {
@@ -1825,94 +1829,6 @@ async fn replica_sync_from_primary(
     Ok(())
 }
 
-async fn run_durability_test() -> io::Result<()> {
-    println!("--- Running Durability Test ---");
-    let test_dir = "./data/test_durability";
-    if PathBuf::from(test_dir).exists() {
-        fs::remove_dir_all(test_dir)?;
-    }
-
-    let db = Database::new("./data")?;
-    let col = db.get_collection("test_durability")?;
-
-    println!("Writing 100 documents...");
-    for i in 0..100 {
-        let _ = col.put(format!("key:{}", i), serde_json::json!({"n": i}))?;
-    }
-    col.enqueue_commit().await.unwrap().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-    drop(col);
-    drop(db);
-
-    println!("Simulating restart...");
-    let db2 = Database::new("./data")?;
-    let col2 = db2.get_collection("test_durability")?;
-
-    let mut missing = 0;
-    for i in 0..100 {
-        if col2.get(&format!("key:{}", i))?.is_none() {
-            missing += 1;
-        }
-    }
-
-    if missing == 0 {
-        println!("SUCCESS: All 100 docs recovered.");
-    } else {
-        println!("FAILURE: Missing {} docs.", missing);
-    }
-
-    println!("Testing Index Persistence...");
-    col2.save_index()?;
-
-    println!("Testing Max Record Size Limit...");
-    let huge_str = "x".repeat((MAX_RECORD_SIZE + 10) as usize);
-    let res = col2.put("huge_key".to_string(), serde_json::json!({"data": huge_str}));
-    assert!(res.is_err(), "Should definitely reject a request that is too large");
-    println!("SUCCESS: Large records rejected successfully.");
-
-    println!("Testing Corruption & Truncation...");
-    if let Ok((_f, wal_id, offset)) = col2.put("key_pre_corrupt".to_string(), serde_json::json!({"valid": true})) {
-        col2.enqueue_commit().await.unwrap().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        col2.index.write().unwrap().insert("key_pre_corrupt".to_string(), IndexEntry { wal_id, offset });
-    }
-
-    let active_wal_path = {
-        let wal_writer = col2.wal_writer.lock().unwrap();
-        col2.root_path.join(format!("wal-{:05}.log", wal_writer.current_wal_id))
-    };
-
-    {
-        let mut f = OpenOptions::new().append(true).open(&active_wal_path)?;
-
-        let bad_len: u32 = 100;
-        let mut bad_header = [0u8; 8];
-        bad_header[0..4].copy_from_slice(&bad_len.to_le_bytes());
-        f.write_all(&bad_header)?;
-
-        let huge_len: u32 = (MAX_RECORD_SIZE + 5000) as u32;
-        bad_header[0..4].copy_from_slice(&huge_len.to_le_bytes());
-        f.write_all(&bad_header)?;
-    }
-
-    drop(col2);
-    drop(db2);
-
-    let db3 = Database::new("./data")?;
-    let col3 = db3.get_collection("test_durability")?;
-
-    assert!(col3.get("key_pre_corrupt")?.is_some(), "key_pre_corrupt should exist despite the corruption after it");
-
-    if let Ok((_f, wal_id, offset)) = col3.put("key_post_corrupt".to_string(), serde_json::json!({"valid": true})) {
-        col3.enqueue_commit().await.unwrap().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        col3.index.write().unwrap().insert("key_post_corrupt".to_string(), IndexEntry { wal_id, offset });
-    }
-    assert!(col3.get("key_post_corrupt")?.is_some(), "Should be able to continually write records after recovery");
-
-    println!("SUCCESS: Corruption safely truncated.");
-
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -1939,7 +1855,6 @@ async fn main() -> io::Result<()> {
     }
 
     let db = if config.role == "shard" {
-        run_durability_test().await?;
         Some(Arc::new(Database::new("./data")?))
     } else {
         None
@@ -2009,10 +1924,8 @@ async fn main() -> io::Result<()> {
                 for entry in entries.flatten() {
                     if entry.path().is_dir() {
                         if let Some(name) = entry.file_name().to_str() {
-                            if name != "test_durability" {
-                                if let Err(e) = replica_sync_from_primary(&client, primary_addr, db, name).await {
-                                    eprintln!("[replica] Sync failed for '{}': {}", name, e);
-                                }
+                            if let Err(e) = replica_sync_from_primary(&client, primary_addr, db, name).await {
+                                eprintln!("[replica] Sync failed for '{}': {}", name, e);
                             }
                         }
                     }
@@ -2024,7 +1937,7 @@ async fn main() -> io::Result<()> {
     let mut app = Router::new()
         .route("/collections/:name/docs", post(create_doc).get(list_docs))
         .route("/collections/:name/query", get(query_docs))
-        .route("/collections/:name/docs/:id", get(get_doc).patch(update_doc).delete(delete_doc));
+        .route("/collections/:name/docs/:id", get(get_doc).put(put_doc).patch(update_doc).delete(delete_doc));
 
     if config.role == "shard" {
         app = app
@@ -2046,4 +1959,116 @@ async fn main() -> io::Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root() -> PathBuf {
+        let p = std::env::temp_dir().join(format!("dewdb-test-{}", Uuid::new_v4()));
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn durability_recovery_size_limit_and_corruption() {
+        let root = temp_root();
+
+        {
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("test_durability").unwrap();
+
+            for i in 0..100 {
+                let _ = col.put(format!("key:{}", i), serde_json::json!({"n": i})).unwrap();
+            }
+            col.enqueue_commit().await.unwrap().unwrap();
+        }
+
+        let db2 = Database::new(&root).unwrap();
+        let col2 = db2.get_collection("test_durability").unwrap();
+
+        let mut missing = 0;
+        for i in 0..100 {
+            if col2.get(&format!("key:{}", i)).unwrap().is_none() {
+                missing += 1;
+            }
+        }
+        assert_eq!(missing, 0, "All 100 docs should be recovered after restart");
+
+        assert!(db2.global_commit_index.load(Ordering::SeqCst) >= 100, "Commit LSN should survive restart");
+
+        col2.save_index().unwrap();
+
+        let huge_str = "x".repeat((MAX_RECORD_SIZE + 10) as usize);
+        let res = col2.put("huge_key".to_string(), serde_json::json!({"data": huge_str}));
+        assert!(res.is_err(), "Should reject a record that exceeds MAX_RECORD_SIZE");
+
+        if let Ok((_f, wal_id, offset)) = col2.put("key_pre_corrupt".to_string(), serde_json::json!({"valid": true})) {
+            col2.enqueue_commit().await.unwrap().unwrap();
+            col2.index.write().unwrap().insert("key_pre_corrupt".to_string(), IndexEntry { wal_id, offset });
+        }
+
+        let active_wal_path = {
+            let wal_writer = col2.wal_writer.lock().unwrap();
+            col2.root_path.join(format!("wal-{:05}.log", wal_writer.current_wal_id))
+        };
+
+        {
+            let mut f = OpenOptions::new().append(true).open(&active_wal_path).unwrap();
+
+            let bad_len: u32 = 100;
+            let mut bad_header = [0u8; 8];
+            bad_header[0..4].copy_from_slice(&bad_len.to_le_bytes());
+            f.write_all(&bad_header).unwrap();
+
+            let huge_len: u32 = (MAX_RECORD_SIZE + 5000) as u32;
+            bad_header[0..4].copy_from_slice(&huge_len.to_le_bytes());
+            f.write_all(&bad_header).unwrap();
+        }
+
+        drop(col2);
+        drop(db2);
+
+        let db3 = Database::new(&root).unwrap();
+        let col3 = db3.get_collection("test_durability").unwrap();
+
+        assert!(col3.get("key_pre_corrupt").unwrap().is_some(), "key_pre_corrupt should survive corruption after it");
+
+        if let Ok((_f, wal_id, offset)) = col3.put("key_post_corrupt".to_string(), serde_json::json!({"valid": true})) {
+            col3.enqueue_commit().await.unwrap().unwrap();
+            col3.index.write().unwrap().insert("key_post_corrupt".to_string(), IndexEntry { wal_id, offset });
+        }
+        assert!(col3.get("key_post_corrupt").unwrap().is_some(), "Writes should continue after recovery");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn lsn_is_monotonic_across_restarts() {
+        let root = temp_root();
+
+        {
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("lsn_check").unwrap();
+            for i in 0..10 {
+                let _ = col.put(format!("a:{}", i), serde_json::json!({"i": i})).unwrap();
+            }
+            col.enqueue_commit().await.unwrap().unwrap();
+            assert_eq!(db.global_commit_index.load(Ordering::SeqCst), 10);
+        }
+
+        {
+            let db = Database::new(&root).unwrap();
+            assert_eq!(db.global_commit_index.load(Ordering::SeqCst), 10, "Commit LSN must be restored from lsn.meta");
+            let col = db.get_collection("lsn_check").unwrap();
+            for i in 0..5 {
+                let _ = col.put(format!("b:{}", i), serde_json::json!({"i": i})).unwrap();
+            }
+            col.enqueue_commit().await.unwrap().unwrap();
+            assert_eq!(db.global_commit_index.load(Ordering::SeqCst), 15, "LSN must continue from restored value, not reset to zero");
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }
