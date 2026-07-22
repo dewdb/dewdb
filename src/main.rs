@@ -1157,6 +1157,130 @@ fn matches_filter(doc: &serde_json::Value, filter: &Filter) -> bool {
     true
 }
 
+fn apply_demotion(repl: &mut ReplicationState, new_term: u64) -> Option<bool> {
+    if new_term <= repl.term {
+        return None;
+    }
+    repl.term = new_term;
+    repl.is_leader = false;
+    repl.last_heartbeat = Some(std::time::Instant::now());
+    repl.last_replication = None;
+    repl.was_receiving_replication = false;
+    let restart = !repl.heartbeat_running;
+    repl.heartbeat_running = true;
+    Some(restart)
+}
+
+async fn discover_leader(state: &AppState) -> Option<String> {
+    let mut peers: Vec<String> = state.config.replicas.clone();
+    if let Some(r) = state.replication.as_ref() {
+        if let Some(p) = r.read().unwrap().primary_addr.clone() {
+            peers.push(p);
+        }
+    }
+    peers.sort();
+    peers.dedup();
+
+    let mut best: Option<(u64, String)> = None;
+    for peer in peers {
+        let url = format!("{}/internal/heartbeat", peer);
+        if let Ok(resp) = state.client.get(&url).send().await {
+            if let Ok(hb) = resp.json::<serde_json::Value>().await {
+                let role = hb.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                let term = hb.get("term").and_then(|v| v.as_u64()).unwrap_or(0);
+                if role == "primary" && best.as_ref().map_or(true, |(t, _)| term > *t) {
+                    best = Some((term, peer.clone()));
+                }
+            }
+        }
+    }
+    best.map(|(_, url)| url)
+}
+
+async fn resync_all_from(state: &AppState, leader: &str) {
+    let db = match state.db.as_ref() {
+        Some(d) => d.clone(),
+        None => return,
+    };
+
+    let mut names: Vec<String> = { db.collections.read().unwrap().keys().cloned().collect() };
+    if let Ok(entries) = fs::read_dir(&db.root_path) {
+        for e in entries.flatten() {
+            if e.path().is_dir() {
+                if let Some(n) = e.file_name().to_str() {
+                    if !n.contains('.') {
+                        names.push(n.to_string());
+                    }
+                }
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+
+    for name in names {
+        if let Err(e) = replica_sync_from_primary(&state.client, leader, &db, &name).await {
+            eprintln!("[demote] resync of '{}' from {} failed: {}", name, leader, e);
+        }
+    }
+}
+
+async fn demote(state: &AppState, new_term: u64) {
+    let restart = {
+        let repl = match state.replication.as_ref() {
+            Some(r) => r,
+            None => return,
+        };
+        let mut g = repl.write().unwrap();
+        match apply_demotion(&mut g, new_term) {
+            Some(r) => r,
+            None => return,
+        }
+    };
+
+    let _ = ReplicationMeta { term: new_term, is_leader: false }.save("./data");
+    println!("[demote] Discovered higher term {}, stepping down to replica", new_term);
+
+    if restart {
+        heartbeat_poll_task(state.clone());
+    }
+
+    let state2 = state.clone();
+    tokio::spawn(async move {
+        if let Some(leader) = discover_leader(&state2).await {
+            {
+                let mut g = state2.replication.as_ref().unwrap().write().unwrap();
+                g.primary_addr = Some(leader.clone());
+            }
+            println!("[demote] Following new leader {}; resyncing", leader);
+            resync_all_from(&state2, &leader).await;
+        } else {
+            eprintln!("[demote] New leader not found yet; heartbeat poll will keep retrying");
+        }
+    });
+}
+
+enum ConflictKind {
+    StaleTerm(u64),
+    Gap(u64),
+}
+
+fn classify_conflict(body: &Option<serde_json::Value>) -> ConflictKind {
+    if let Some(b) = body {
+        if b.get("status").and_then(|s| s.as_str()) == Some("stale_term") {
+            return ConflictKind::StaleTerm(b.get("term").and_then(|v| v.as_u64()).unwrap_or(0));
+        }
+        return ConflictKind::Gap(b.get("last_lsn").and_then(|v| v.as_u64()).unwrap_or(0));
+    }
+    ConflictKind::Gap(0)
+}
+
+fn forbidden_term(body: &Option<serde_json::Value>) -> u64 {
+    body.as_ref()
+        .and_then(|b| b.get("term").and_then(|v| v.as_u64()))
+        .unwrap_or(0)
+}
+
 fn replicate_to_peers(
     state: AppState,
     collection: String,
@@ -1195,11 +1319,24 @@ fn replicate_to_peers(
                     Ok(r) if r.status().is_success() => {},
                     Ok(r) if r.status() == StatusCode::CONFLICT => {
                         let body = r.json::<serde_json::Value>().await.ok();
-                        let last_lsn = body
-                            .and_then(|b| b.get("last_lsn").and_then(|v| v.as_u64()))
-                            .unwrap_or(0);
-                        eprintln!("[replication] Replica {} gap at lsn {} (its last_lsn={}), starting repair", replica_url, lsn, last_lsn);
-                        let _ = repair_replica(state, replica_url.clone(), col, last_lsn).await;
+                        match classify_conflict(&body) {
+                            ConflictKind::StaleTerm(t) => {
+                                eprintln!("[replication] Replica {} reports higher term {}; demoting", replica_url, t);
+                                demote(&state, t).await;
+                            },
+                            ConflictKind::Gap(last_lsn) => {
+                                eprintln!("[replication] Replica {} gap at lsn {} (its last_lsn={}), starting repair", replica_url, lsn, last_lsn);
+                                let _ = repair_replica(state, replica_url.clone(), col, last_lsn).await;
+                            }
+                        }
+                    },
+                    Ok(r) if r.status() == StatusCode::FORBIDDEN => {
+                        let body = r.json::<serde_json::Value>().await.ok();
+                        let their_term = forbidden_term(&body);
+                        if their_term > term {
+                            eprintln!("[replication] Replica {} rejected us with higher term {}; demoting", replica_url, their_term);
+                            demote(&state, their_term).await;
+                        }
                     },
                     Ok(r) => {
                         eprintln!("[replication] Replica {} returned {} (term={}, lsn={})", replica_url, r.status(), term, lsn);
@@ -1316,8 +1453,27 @@ async fn repair_replica(state: AppState, replica_url: String, collection: String
                 prev = lsn;
             },
             Ok(r) if r.status() == StatusCode::CONFLICT => {
-                eprintln!("[repair] Replica {} still gapped during backfill at lsn {}, falling back to snapshot", replica_url, lsn);
-                trigger_resync(&state, &replica_url, &collection).await;
+                let body = r.json::<serde_json::Value>().await.ok();
+                match classify_conflict(&body) {
+                    ConflictKind::StaleTerm(t) => {
+                        eprintln!("[repair] Replica {} reports higher term {} during backfill; demoting", replica_url, t);
+                        demote(&state, t).await;
+                        return false;
+                    },
+                    ConflictKind::Gap(_) => {
+                        eprintln!("[repair] Replica {} still gapped during backfill at lsn {}, falling back to snapshot", replica_url, lsn);
+                        trigger_resync(&state, &replica_url, &collection).await;
+                        return false;
+                    }
+                }
+            },
+            Ok(r) if r.status() == StatusCode::FORBIDDEN => {
+                let body = r.json::<serde_json::Value>().await.ok();
+                let their_term = forbidden_term(&body);
+                if their_term > term {
+                    eprintln!("[repair] Replica {} rejected us with higher term {}; demoting", replica_url, their_term);
+                    demote(&state, their_term).await;
+                }
                 return false;
             },
             Ok(r) => {
@@ -1390,10 +1546,23 @@ async fn replicate_one_await(
         Ok(r) if r.status().is_success() => true,
         Ok(r) if r.status() == StatusCode::CONFLICT => {
             let body = r.json::<serde_json::Value>().await.ok();
-            let last_lsn = body
-                .and_then(|b| b.get("last_lsn").and_then(|v| v.as_u64()))
-                .unwrap_or(0);
-            repair_replica(state.clone(), replica_url.to_string(), collection.to_string(), last_lsn).await
+            match classify_conflict(&body) {
+                ConflictKind::StaleTerm(t) => {
+                    demote(state, t).await;
+                    false
+                },
+                ConflictKind::Gap(last_lsn) => {
+                    repair_replica(state.clone(), replica_url.to_string(), collection.to_string(), last_lsn).await
+                }
+            }
+        },
+        Ok(r) if r.status() == StatusCode::FORBIDDEN => {
+            let body = r.json::<serde_json::Value>().await.ok();
+            let their_term = forbidden_term(&body);
+            if their_term > term {
+                demote(state, their_term).await;
+            }
+            false
         },
         _ => false,
     }
@@ -1926,13 +2095,37 @@ async fn replicate_handler(
     }
 
     if !state.is_shard() || state.is_leader() {
-        return (StatusCode::FORBIDDEN, "Only replica nodes accept replication").into_response();
+        let our_term = state.current_term();
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "status": "not_a_replica",
+            "term": our_term,
+        }))).into_response();
     }
 
     let our_term = state.current_term();
     if req.term < our_term {
-        eprintln!("[replicate] Rejecting stale frame: req term {} < our term {}", req.term, our_term);
-        return (StatusCode::CONFLICT, "Stale term").into_response();
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "status": "stale_term",
+            "term": our_term,
+        }))).into_response();
+    }
+
+    if req.term > our_term {
+        if let Some(ref repl) = state.replication {
+            let new_term = {
+                let mut r = repl.write().unwrap();
+                if req.term > r.term {
+                    r.term = req.term;
+                    Some(r.term)
+                } else {
+                    None
+                }
+            };
+            if let Some(t) = new_term {
+                let _ = ReplicationMeta { term: t, is_leader: false }.save("./data");
+                println!("[replicate] Adopted higher term {} from primary", t);
+            }
+        }
     }
 
     let db = match state.db.as_ref() {
@@ -2096,10 +2289,23 @@ fn heartbeat_poll_task(state: AppState) {
             match state.client.get(&url).send().await {
                 Ok(r) if r.status().is_success() => {
                     if let Ok(hb) = r.json::<serde_json::Value>().await {
-                        let mut repl = state.replication.as_ref().unwrap().write().unwrap();
-                        repl.last_heartbeat = Some(std::time::Instant::now());
-                        if let Some(idx) = hb.get("commit_index").and_then(|v| v.as_u64()) {
-                            repl.last_known_primary_position = Some(idx);
+                        let mut adopted = None;
+                        {
+                            let mut repl = state.replication.as_ref().unwrap().write().unwrap();
+                            repl.last_heartbeat = Some(std::time::Instant::now());
+                            if let Some(idx) = hb.get("commit_index").and_then(|v| v.as_u64()) {
+                                repl.last_known_primary_position = Some(idx);
+                            }
+                            if let Some(t) = hb.get("term").and_then(|v| v.as_u64()) {
+                                if t > repl.term {
+                                    repl.term = t;
+                                    adopted = Some(t);
+                                }
+                            }
+                        }
+                        if let Some(t) = adopted {
+                            let _ = ReplicationMeta { term: t, is_leader: false }.save("./data");
+                            println!("[heartbeat] Adopted higher term {} from primary {}", t, primary_addr);
                         }
                     }
                 },
@@ -2728,5 +2934,63 @@ mod tests {
 
         let p3 = WriteConcernParams { w: Some("all".into()), wtimeout: None };
         assert_eq!(wc_query_string(&p3), "?w=all");
+    }
+
+    fn leader_state(term: u64) -> ReplicationState {
+        ReplicationState {
+            term,
+            is_leader: true,
+            last_heartbeat: None,
+            was_receiving_replication: true,
+            last_replication: Some(std::time::Instant::now()),
+            heartbeat_running: false,
+            primary_addr: None,
+            replicas: vec![],
+            last_known_primary_position: None,
+        }
+    }
+
+    #[test]
+    fn demotion_transitions_leader_to_follower() {
+        let mut r = leader_state(2);
+
+        assert_eq!(apply_demotion(&mut r, 2), None, "equal term is not a demotion");
+        assert!(r.is_leader);
+        assert_eq!(apply_demotion(&mut r, 1), None, "lower term is not a demotion");
+        assert!(r.is_leader);
+
+        assert_eq!(apply_demotion(&mut r, 5), Some(true), "higher term demotes and needs poll restart");
+        assert!(!r.is_leader);
+        assert_eq!(r.term, 5);
+        assert!(r.heartbeat_running);
+        assert!(!r.was_receiving_replication);
+
+        assert_eq!(apply_demotion(&mut r, 7), Some(false), "already-following node adopts term without restarting poll");
+        assert_eq!(r.term, 7);
+        assert!(!r.is_leader);
+    }
+
+    #[test]
+    fn conflict_classification() {
+        let stale = Some(serde_json::json!({"status": "stale_term", "term": 9}));
+        match classify_conflict(&stale) {
+            ConflictKind::StaleTerm(t) => assert_eq!(t, 9),
+            _ => panic!("expected StaleTerm"),
+        }
+
+        let gap = Some(serde_json::json!({"status": "gap", "last_lsn": 42}));
+        match classify_conflict(&gap) {
+            ConflictKind::Gap(l) => assert_eq!(l, 42),
+            _ => panic!("expected Gap"),
+        }
+
+        match classify_conflict(&None) {
+            ConflictKind::Gap(l) => assert_eq!(l, 0),
+            _ => panic!("expected Gap default"),
+        }
+
+        let fb = Some(serde_json::json!({"status": "not_a_replica", "term": 4}));
+        assert_eq!(forbidden_term(&fb), 4);
+        assert_eq!(forbidden_term(&None), 0);
     }
 }
