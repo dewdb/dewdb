@@ -18,6 +18,7 @@ use uuid::Uuid;
 const WAL_ROTATION_LIMIT: u64 = 50 * 1024 * 1024;
 const MAX_RECORD_SIZE: u64 = 10 * 1024 * 1024;
 const INDEX_FILENAME: &str = "index-current.bin";
+const HEADER_LEN: usize = 24;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "op", rename_all = "lowercase")]
@@ -100,9 +101,18 @@ fn default_election_delay() -> u64 { 2000 }
 struct ReplicateRequest {
     collection: String,
     term: u64,
+    lsn: u64,
+    prev_lsn: u64,
     commit_index: Option<u64>,
     #[serde(with = "base64_bytes")]
     wal_frame: Vec<u8>,
+}
+
+#[derive(Debug)]
+enum ReplicaApply {
+    Applied { wal_id: u64, offset: u64, lsn: u64 },
+    Duplicate { last_lsn: u64 },
+    Gap { last_lsn: u64 },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -479,12 +489,12 @@ impl Collection {
         }
         wal_files.sort_by_key(|(id, _)| *id);
 
-        let mut replayed: u64 = 0;
+        let mut max_lsn = snapshot_lsn;
 
         if !snapshot_loaded {
             println!("[{}] Replaying all WALs...", name);
              for (id, path) in &wal_files {
-                replayed += Self::replay_file_from(*id, path, 0, &mut index)?;
+                max_lsn = max_lsn.max(Self::replay_file_from(*id, path, 0, &mut index)?);
             }
         } else {
              for (id, path) in &wal_files {
@@ -492,14 +502,14 @@ impl Collection {
                      continue;
                  } else if *id == snapshot_wal_id {
                      println!("[{}] Resuming WAL {} from offset {}", name, id, snapshot_offset);
-                     replayed += Self::replay_file_from(*id, path, snapshot_offset, &mut index)?;
+                     max_lsn = max_lsn.max(Self::replay_file_from(*id, path, snapshot_offset, &mut index)?);
                  } else {
-                     replayed += Self::replay_file_from(*id, path, 0, &mut index)?;
+                     max_lsn = max_lsn.max(Self::replay_file_from(*id, path, 0, &mut index)?);
                  }
              }
         }
 
-        let boot_lsn = snapshot_lsn + replayed;
+        let boot_lsn = max_lsn;
         db_next_lsn.fetch_max(boot_lsn, Ordering::SeqCst);
 
         let current_wal_id = wal_files.last().map(|(id, _)| *id).unwrap_or(0) + 1;
@@ -548,10 +558,10 @@ impl Collection {
 
         let mut offset = start_offset;
         let mut valid_end_offset = start_offset;
-        let mut records: u64 = 0;
+        let mut max_lsn: u64 = 0;
 
         loop {
-            let mut header = [0u8; 8];
+            let mut header = [0u8; HEADER_LEN];
             match file.read_exact(&mut header) {
                 Ok(_) => {}
                 Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
@@ -560,6 +570,7 @@ impl Collection {
 
             let len = u32::from_le_bytes(header[0..4].try_into().unwrap());
             let crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
+            let lsn = u64::from_le_bytes(header[16..24].try_into().unwrap());
 
             if len == 0 || (len as u64) > MAX_RECORD_SIZE {
                 eprintln!("[{}] Invalid WAL frame length {}. Truncating.", path.display(), len);
@@ -588,9 +599,9 @@ impl Collection {
                         index.remove(&key);
                     }
                 }
-                records += 1;
+                max_lsn = max_lsn.max(lsn);
             }
-            offset += 8 + len as u64;
+            offset += HEADER_LEN as u64 + len as u64;
             valid_end_offset = offset;
         }
 
@@ -599,31 +610,31 @@ impl Collection {
             println!("[{}] Truncated corrupted WAL file down to size {}", path.display(), valid_end_offset);
         }
 
-        Ok(records)
+        Ok(max_lsn)
     }
 
     fn current_timestamp() -> u64 {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
     }
 
-    fn put(&self, key: String, value: serde_json::Value) -> io::Result<(Vec<u8>, u64, u64)> {
+    fn put(&self, key: String, value: serde_json::Value, term: u64) -> io::Result<(Vec<u8>, u64, u64, u64)> {
         let entry = LogEntry::Put {
             key: key.clone(),
             value,
             ts: Self::current_timestamp(),
         };
-        self.append(entry)
+        self.append(entry, term)
     }
 
-    fn delete(&self, key: String) -> io::Result<(Vec<u8>, u64, u64)> {
+    fn delete(&self, key: String, term: u64) -> io::Result<(Vec<u8>, u64, u64, u64)> {
         let entry = LogEntry::Del {
             key: key.clone(),
             ts: Self::current_timestamp(),
         };
-        self.append(entry)
+        self.append(entry, term)
     }
 
-    fn append(&self, entry: LogEntry) -> io::Result<(Vec<u8>, u64, u64)> {
+    fn append(&self, entry: LogEntry, term: u64) -> io::Result<(Vec<u8>, u64, u64, u64)> {
         let json_bytes = serde_json::to_vec(&entry)?;
         let len = json_bytes.len() as u64;
 
@@ -635,14 +646,7 @@ impl Collection {
         hasher.update(&json_bytes);
         let crc = hasher.finalize();
 
-        let mut header = [0u8; 8];
-        header[0..4].copy_from_slice(&(len as u32).to_le_bytes());
-        header[4..8].copy_from_slice(&crc.to_le_bytes());
-        let frame_len = 8 + len;
-
-        let mut frame = Vec::with_capacity(frame_len as usize);
-        frame.extend_from_slice(&header);
-        frame.extend_from_slice(&json_bytes);
+        let frame_len = HEADER_LEN as u64 + len;
 
         let mut wal = self.wal_writer.lock().unwrap();
         while wal.write_paused {
@@ -661,6 +665,18 @@ impl Collection {
             wal.current_wal_size = 0;
         }
 
+        let lsn = self.db_next_lsn.fetch_add(1, Ordering::SeqCst) + 1;
+
+        let mut header = [0u8; HEADER_LEN];
+        header[0..4].copy_from_slice(&(len as u32).to_le_bytes());
+        header[4..8].copy_from_slice(&crc.to_le_bytes());
+        header[8..16].copy_from_slice(&term.to_le_bytes());
+        header[16..24].copy_from_slice(&lsn.to_le_bytes());
+
+        let mut frame = Vec::with_capacity(frame_len as usize);
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(&json_bytes);
+
         wal.current_wal.write_all(&header)?;
         wal.current_wal.write_all(&json_bytes)?;
 
@@ -668,28 +684,27 @@ impl Collection {
         wal.current_wal_size += frame_len;
 
         let wal_id = wal.current_wal_id;
-
-        let lsn = self.db_next_lsn.fetch_add(1, Ordering::SeqCst) + 1;
         wal.last_appended_lsn = lsn;
 
         drop(wal);
 
-        Ok((frame, wal_id, offset))
+        Ok((frame, wal_id, offset, lsn))
     }
 
-    fn append_raw_frame(&self, frame_bytes: &[u8]) -> io::Result<(u64, u64)> {
-        if frame_bytes.len() < 8 {
+    fn append_raw_frame(&self, frame_bytes: &[u8], prev_lsn: u64) -> io::Result<ReplicaApply> {
+        if frame_bytes.len() < HEADER_LEN {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Frame too short"));
         }
 
         let len = u32::from_le_bytes(frame_bytes[0..4].try_into().unwrap()) as usize;
         let crc = u32::from_le_bytes(frame_bytes[4..8].try_into().unwrap());
+        let frame_lsn = u64::from_le_bytes(frame_bytes[16..24].try_into().unwrap());
 
-        if frame_bytes.len() < 8 + len {
+        if frame_bytes.len() < HEADER_LEN + len {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Frame payload incomplete"));
         }
 
-        let payload = &frame_bytes[8..8 + len];
+        let payload = &frame_bytes[HEADER_LEN..HEADER_LEN + len];
 
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(payload);
@@ -700,11 +715,21 @@ impl Collection {
         let _entry: LogEntry = serde_json::from_slice(payload)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-        let frame_len = (8 + len) as u64;
+        let frame_len = (HEADER_LEN + len) as u64;
 
         let mut wal = self.wal_writer.lock().unwrap();
         while wal.write_paused {
             wal = self.wal_pause_cv.wait(wal).unwrap();
+        }
+
+        let last = wal.last_appended_lsn;
+
+        if frame_lsn <= last {
+            return Ok(ReplicaApply::Duplicate { last_lsn: last });
+        }
+
+        if prev_lsn != last {
+            return Ok(ReplicaApply::Gap { last_lsn: last });
         }
 
         if wal.current_wal_size >= WAL_ROTATION_LIMIT {
@@ -719,17 +744,16 @@ impl Collection {
             wal.current_wal_size = 0;
         }
 
-        wal.current_wal.write_all(&frame_bytes[..8 + len])?;
+        wal.current_wal.write_all(&frame_bytes[..HEADER_LEN + len])?;
 
         let offset = wal.current_wal_size;
         let wal_id = wal.current_wal_id;
 
         wal.current_wal_size += frame_len;
+        wal.last_appended_lsn = frame_lsn;
+        self.db_next_lsn.fetch_max(frame_lsn, Ordering::SeqCst);
 
-        let lsn = self.db_next_lsn.fetch_add(1, Ordering::SeqCst) + 1;
-        wal.last_appended_lsn = lsn;
-
-        Ok((wal_id, offset))
+        Ok(ReplicaApply::Applied { wal_id, offset, lsn: frame_lsn })
     }
 
     pub fn enqueue_commit(&self) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
@@ -847,7 +871,7 @@ impl Collection {
             let mut file = file_arc.lock().unwrap();
             file.seek(SeekFrom::Start(entry.offset))?;
 
-            let mut header = [0u8; 8];
+            let mut header = [0u8; HEADER_LEN];
             file.read_exact(&mut header)?;
             let len = u32::from_le_bytes(header[0..4].try_into().unwrap());
 
@@ -922,34 +946,18 @@ impl Collection {
              let path = self.root_path.join(format!("wal-{:05}.log", old_entry.wal_id));
              if let Ok(mut file) = File::open(&path) {
                  file.seek(SeekFrom::Start(old_entry.offset))?;
-                 let mut header = [0u8; 8];
+                 let mut header = [0u8; HEADER_LEN];
                  if file.read_exact(&mut header).is_err() { continue; }
-                 let len = u32::from_le_bytes(header[0..4].try_into().unwrap());
+                 let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
 
-                 let mut payload = vec![0u8; len as usize];
+                 let mut payload = vec![0u8; len];
                  if file.read_exact(&mut payload).is_err() { continue; }
 
-                 if let Ok(LogEntry::Put { value, .. }) = serde_json::from_slice::<LogEntry>(&payload) {
-                     let new_entry = LogEntry::Put {
-                         key: key.clone(),
-                         value,
-                         ts: Self::current_timestamp(),
-                     };
+                 if let Ok(LogEntry::Put { .. }) = serde_json::from_slice::<LogEntry>(&payload) {
+                     compact_file.write_all(&header)?;
+                     compact_file.write_all(&payload)?;
 
-                     let json_bytes = serde_json::to_vec(&new_entry)?;
-                     let new_len = json_bytes.len() as u32;
-                     let mut hasher = crc32fast::Hasher::new();
-                     hasher.update(&json_bytes);
-                     let crc = hasher.finalize();
-
-                     let mut new_header = [0u8; 8];
-                     new_header[0..4].copy_from_slice(&new_len.to_le_bytes());
-                     new_header[4..8].copy_from_slice(&crc.to_le_bytes());
-
-                     compact_file.write_all(&new_header)?;
-                     compact_file.write_all(&json_bytes)?;
-
-                     let frame_len = 8 + new_len as u64;
+                     let frame_len = (HEADER_LEN + len) as u64;
                      new_index_map.insert(key.clone(), IndexEntry {
                          wal_id: new_wal_id,
                          offset: current_offset,
@@ -988,6 +996,8 @@ impl Collection {
                  }
              }
         }
+
+        let _ = fs::remove_file(self.root_path.join(INDEX_FILENAME));
 
         self.read_pool.lock().unwrap().clear();
 
@@ -1095,6 +1105,8 @@ fn replicate_to_peers(
     frame: Vec<u8>,
     term: u64,
     commit_index: u64,
+    lsn: u64,
+    prev_lsn: u64,
 ) {
     if replicas.is_empty() {
         return;
@@ -1113,16 +1125,22 @@ fn replicate_to_peers(
                 let req_body = ReplicateRequest {
                     collection: col,
                     term,
+                    lsn,
+                    prev_lsn,
                     commit_index: Some(commit_index),
                     wal_frame: frame,
                 };
                 match client.post(&url).json(&req_body).send().await {
                     Ok(r) if r.status().is_success() => {},
+                    Ok(r) if r.status() == StatusCode::CONFLICT => {
+                        let body = r.text().await.unwrap_or_default();
+                        eprintln!("[replication] Replica {} reports gap at lsn {} (prev_lsn {}): {}", replica_url, lsn, prev_lsn, body);
+                    },
                     Ok(r) => {
-                        eprintln!("[replication] Replica {} returned {} (term={})", replica_url, r.status(), term);
+                        eprintln!("[replication] Replica {} returned {} (term={}, lsn={})", replica_url, r.status(), term, lsn);
                     },
                     Err(e) => {
-                        eprintln!("[replication] Replica {} failed: {} (term={})", replica_url, e, term);
+                        eprintln!("[replication] Replica {} failed: {} (term={}, lsn={})", replica_url, e, term, lsn);
                     }
                 }
             }));
@@ -1231,16 +1249,17 @@ async fn local_write(
     let col_clone = col.clone();
     let key_clone = key.clone();
     let is_delete = value.is_none();
+    let term = state.current_term();
 
     let write_res = tokio::task::spawn_blocking(move || {
         match value {
-            Some(v) => col_clone.put(key_clone, v),
-            None => col_clone.delete(key_clone),
+            Some(v) => col_clone.put(key_clone, v, term),
+            None => col_clone.delete(key_clone, term),
         }
     }).await;
 
     match write_res {
-        Ok(Ok((frame, wal_id, offset))) => {
+        Ok(Ok((frame, wal_id, offset, lsn))) => {
             let commit_rx = col.enqueue_commit();
             match commit_rx.await {
                 Ok(Ok(())) => {
@@ -1254,7 +1273,7 @@ async fn local_write(
                     }
                     if state.is_leader() {
                         let commit_index = db.global_commit_index.load(Ordering::SeqCst);
-                        replicate_to_peers(state.client.clone(), state.get_replicas(), col_name.to_string(), frame, state.current_term(), commit_index);
+                        replicate_to_peers(state.client.clone(), state.get_replicas(), col_name.to_string(), frame, term, commit_index, lsn, lsn.saturating_sub(1));
                     }
                     Ok(())
                 },
@@ -1552,12 +1571,25 @@ async fn replicate_handler(
     };
 
     let frame = req.wal_frame;
+
+    if frame.len() >= HEADER_LEN {
+        let frame_lsn = u64::from_le_bytes(frame[16..24].try_into().unwrap());
+        if frame_lsn != req.lsn {
+            return (StatusCode::BAD_REQUEST, "Frame lsn does not match request lsn").into_response();
+        }
+    }
+
     let col_clone = col.clone();
+    let prev_lsn = req.prev_lsn;
 
-    let entry_opt = serde_json::from_slice::<LogEntry>(&frame[8..]).ok();
+    let entry_opt = if frame.len() >= HEADER_LEN {
+        serde_json::from_slice::<LogEntry>(&frame[HEADER_LEN..]).ok()
+    } else {
+        None
+    };
 
-    match tokio::task::spawn_blocking(move || col_clone.append_raw_frame(&frame)).await {
-        Ok(Ok((wal_id, offset))) => {
+    match tokio::task::spawn_blocking(move || col_clone.append_raw_frame(&frame, prev_lsn)).await {
+        Ok(Ok(ReplicaApply::Applied { wal_id, offset, lsn })) => {
             let commit_rx = col.enqueue_commit();
             match commit_rx.await {
                 Ok(Ok(())) => {
@@ -1578,11 +1610,23 @@ async fn replicate_handler(
                         r.last_replication = Some(std::time::Instant::now());
                         r.was_receiving_replication = true;
                     }
-                    (StatusCode::OK, "replicated").into_response()
+                    (StatusCode::OK, Json(serde_json::json!({"status": "applied", "lsn": lsn}))).into_response()
                 },
                 Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
             }
+        },
+        Ok(Ok(ReplicaApply::Duplicate { last_lsn })) => {
+            if let Some(ref repl) = state.replication {
+                let mut r = repl.write().unwrap();
+                r.last_replication = Some(std::time::Instant::now());
+                r.was_receiving_replication = true;
+            }
+            (StatusCode::OK, Json(serde_json::json!({"status": "duplicate", "last_lsn": last_lsn}))).into_response()
+        },
+        Ok(Ok(ReplicaApply::Gap { last_lsn })) => {
+            eprintln!("[replicate] Gap detected: got prev_lsn {} but replica is at lsn {}", req.prev_lsn, last_lsn);
+            (StatusCode::CONFLICT, Json(serde_json::json!({"status": "gap", "last_lsn": last_lsn}))).into_response()
         },
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -1980,7 +2024,7 @@ mod tests {
             let col = db.get_collection("test_durability").unwrap();
 
             for i in 0..100 {
-                let _ = col.put(format!("key:{}", i), serde_json::json!({"n": i})).unwrap();
+                let _ = col.put(format!("key:{}", i), serde_json::json!({"n": i}), 1).unwrap();
             }
             col.enqueue_commit().await.unwrap().unwrap();
         }
@@ -2001,10 +2045,10 @@ mod tests {
         col2.save_index().unwrap();
 
         let huge_str = "x".repeat((MAX_RECORD_SIZE + 10) as usize);
-        let res = col2.put("huge_key".to_string(), serde_json::json!({"data": huge_str}));
+        let res = col2.put("huge_key".to_string(), serde_json::json!({"data": huge_str}), 1);
         assert!(res.is_err(), "Should reject a record that exceeds MAX_RECORD_SIZE");
 
-        if let Ok((_f, wal_id, offset)) = col2.put("key_pre_corrupt".to_string(), serde_json::json!({"valid": true})) {
+        if let Ok((_f, wal_id, offset, _lsn)) = col2.put("key_pre_corrupt".to_string(), serde_json::json!({"valid": true}), 1) {
             col2.enqueue_commit().await.unwrap().unwrap();
             col2.index.write().unwrap().insert("key_pre_corrupt".to_string(), IndexEntry { wal_id, offset });
         }
@@ -2017,14 +2061,12 @@ mod tests {
         {
             let mut f = OpenOptions::new().append(true).open(&active_wal_path).unwrap();
 
-            let bad_len: u32 = 100;
-            let mut bad_header = [0u8; 8];
-            bad_header[0..4].copy_from_slice(&bad_len.to_le_bytes());
-            f.write_all(&bad_header).unwrap();
-
+            let mut bad_header = [0u8; HEADER_LEN];
             let huge_len: u32 = (MAX_RECORD_SIZE + 5000) as u32;
             bad_header[0..4].copy_from_slice(&huge_len.to_le_bytes());
             f.write_all(&bad_header).unwrap();
+
+            f.write_all(&[0u8; 10]).unwrap();
         }
 
         drop(col2);
@@ -2035,7 +2077,7 @@ mod tests {
 
         assert!(col3.get("key_pre_corrupt").unwrap().is_some(), "key_pre_corrupt should survive corruption after it");
 
-        if let Ok((_f, wal_id, offset)) = col3.put("key_post_corrupt".to_string(), serde_json::json!({"valid": true})) {
+        if let Ok((_f, wal_id, offset, _lsn)) = col3.put("key_post_corrupt".to_string(), serde_json::json!({"valid": true}), 1) {
             col3.enqueue_commit().await.unwrap().unwrap();
             col3.index.write().unwrap().insert("key_post_corrupt".to_string(), IndexEntry { wal_id, offset });
         }
@@ -2052,7 +2094,7 @@ mod tests {
             let db = Database::new(&root).unwrap();
             let col = db.get_collection("lsn_check").unwrap();
             for i in 0..10 {
-                let _ = col.put(format!("a:{}", i), serde_json::json!({"i": i})).unwrap();
+                let _ = col.put(format!("a:{}", i), serde_json::json!({"i": i}), 1).unwrap();
             }
             col.enqueue_commit().await.unwrap().unwrap();
             assert_eq!(db.global_commit_index.load(Ordering::SeqCst), 10);
@@ -2063,12 +2105,84 @@ mod tests {
             assert_eq!(db.global_commit_index.load(Ordering::SeqCst), 10, "Commit LSN must be restored from lsn.meta");
             let col = db.get_collection("lsn_check").unwrap();
             for i in 0..5 {
-                let _ = col.put(format!("b:{}", i), serde_json::json!({"i": i})).unwrap();
+                let _ = col.put(format!("b:{}", i), serde_json::json!({"i": i}), 1).unwrap();
             }
             col.enqueue_commit().await.unwrap().unwrap();
             assert_eq!(db.global_commit_index.load(Ordering::SeqCst), 15, "LSN must continue from restored value, not reset to zero");
         }
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn frames_carry_term_and_lsn_in_header() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("hdr").unwrap();
+
+        let (frame, _wal_id, _offset, lsn) = col.put("k".into(), serde_json::json!({"v": 1}), 7).unwrap();
+        assert_eq!(lsn, 1);
+
+        let term_in_frame = u64::from_le_bytes(frame[8..16].try_into().unwrap());
+        let lsn_in_frame = u64::from_le_bytes(frame[16..24].try_into().unwrap());
+        assert_eq!(term_in_frame, 7, "term must be stamped into the frame header");
+        assert_eq!(lsn_in_frame, 1, "lsn must be stamped into the frame header");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn replica_detects_gaps_and_dedupes() {
+        let proot = temp_root();
+        let rroot = temp_root();
+
+        let pdb = Database::new(&proot).unwrap();
+        let pcol = pdb.get_collection("c").unwrap();
+        let rdb = Database::new(&rroot).unwrap();
+        let rcol = rdb.get_collection("c").unwrap();
+
+        let (f1, _, _, l1) = pcol.put("k1".into(), serde_json::json!({"v": 1}), 1).unwrap();
+        let (f2, _, _, l2) = pcol.put("k2".into(), serde_json::json!({"v": 2}), 1).unwrap();
+        let (f3, _, _, l3) = pcol.put("k3".into(), serde_json::json!({"v": 3}), 1).unwrap();
+        assert_eq!((l1, l2, l3), (1, 2, 3));
+
+        match rcol.append_raw_frame(&f1, 0).unwrap() {
+            ReplicaApply::Applied { lsn, .. } => assert_eq!(lsn, 1),
+            other => panic!("expected Applied, got {:?}", other),
+        }
+
+        match rcol.append_raw_frame(&f3, 2).unwrap() {
+            ReplicaApply::Gap { last_lsn } => assert_eq!(last_lsn, 1),
+            other => panic!("expected Gap, got {:?}", other),
+        }
+
+        match rcol.append_raw_frame(&f2, 1).unwrap() {
+            ReplicaApply::Applied { lsn, .. } => assert_eq!(lsn, 2),
+            other => panic!("expected Applied, got {:?}", other),
+        }
+
+        match rcol.append_raw_frame(&f3, 2).unwrap() {
+            ReplicaApply::Applied { lsn, .. } => assert_eq!(lsn, 3),
+            other => panic!("expected Applied, got {:?}", other),
+        }
+
+        match rcol.append_raw_frame(&f2, 1).unwrap() {
+            ReplicaApply::Duplicate { last_lsn } => assert_eq!(last_lsn, 3),
+            other => panic!("expected Duplicate, got {:?}", other),
+        }
+
+        rcol.enqueue_commit().await.unwrap().unwrap();
+        drop(rcol);
+        drop(rdb);
+
+        let rdb2 = Database::new(&rroot).unwrap();
+        let rcol2 = rdb2.get_collection("c").unwrap();
+        assert_eq!(rcol2.get("k1").unwrap(), Some(serde_json::json!({"v": 1})));
+        assert_eq!(rcol2.get("k2").unwrap(), Some(serde_json::json!({"v": 2})));
+        assert_eq!(rcol2.get("k3").unwrap(), Some(serde_json::json!({"v": 3})));
+        assert_eq!(rdb2.global_commit_index.load(Ordering::SeqCst), 3, "Replica LSN must match the frames it applied from the primary");
+
+        let _ = fs::remove_dir_all(&proot);
+        let _ = fs::remove_dir_all(&rroot);
     }
 }
