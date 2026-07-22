@@ -6,7 +6,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -303,6 +303,8 @@ struct AppState {
     replication: Option<Arc<RwLock<ReplicationState>>>,
     primary_overrides: Arc<std::sync::Mutex<HashMap<String, PrimaryOverride>>>,
     shard_failover_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    repair_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    resyncing: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 impl AppState {
@@ -756,6 +758,63 @@ impl Collection {
         Ok(ReplicaApply::Applied { wal_id, offset, lsn: frame_lsn })
     }
 
+    fn read_frames_after(&self, after_lsn: u64, up_to_lsn: u64) -> io::Result<Vec<(u64, Vec<u8>)>> {
+        let mut wal_files: Vec<(u64, PathBuf)> = Vec::new();
+        for entry in fs::read_dir(&self.root_path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if let Some(fname) = path.file_name().and_then(|s| s.to_str()) {
+                if fname.starts_with("wal-") && fname.ends_with(".log") {
+                    let id_part = &fname[4..fname.len() - 4];
+                    if let Ok(id) = id_part.parse::<u64>() {
+                        wal_files.push((id, path));
+                    }
+                }
+            }
+        }
+        wal_files.sort_by_key(|(id, _)| *id);
+
+        let mut out = Vec::new();
+        for (_id, path) in wal_files {
+            let mut file = match File::open(&path) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            loop {
+                let mut header = [0u8; HEADER_LEN];
+                if file.read_exact(&mut header).is_err() {
+                    break;
+                }
+                let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+                let crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
+                let lsn = u64::from_le_bytes(header[16..24].try_into().unwrap());
+
+                if len == 0 || len as u64 > MAX_RECORD_SIZE {
+                    break;
+                }
+
+                let mut payload = vec![0u8; len];
+                if file.read_exact(&mut payload).is_err() {
+                    break;
+                }
+
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(&payload);
+                if hasher.finalize() != crc {
+                    break;
+                }
+
+                if lsn > after_lsn && lsn <= up_to_lsn {
+                    let mut frame = Vec::with_capacity(HEADER_LEN + len);
+                    frame.extend_from_slice(&header);
+                    frame.extend_from_slice(&payload);
+                    out.push((lsn, frame));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn enqueue_commit(&self) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut q = self.commit_notifiers.lock().unwrap();
@@ -1099,8 +1158,7 @@ fn matches_filter(doc: &serde_json::Value, filter: &Filter) -> bool {
 }
 
 fn replicate_to_peers(
-    client: reqwest::Client,
-    replicas: Vec<String>,
+    state: AppState,
     collection: String,
     frame: Vec<u8>,
     term: u64,
@@ -1108,9 +1166,11 @@ fn replicate_to_peers(
     lsn: u64,
     prev_lsn: u64,
 ) {
+    let replicas = state.get_replicas();
     if replicas.is_empty() {
         return;
     }
+    let client = state.client.clone();
     tokio::spawn(async move {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(3));
         let mut handles = Vec::new();
@@ -1119,11 +1179,12 @@ fn replicate_to_peers(
             let col = collection.clone();
             let frame = frame.clone();
             let sem = semaphore.clone();
+            let state = state.clone();
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await;
                 let url = format!("{}/internal/replicate", replica_url);
                 let req_body = ReplicateRequest {
-                    collection: col,
+                    collection: col.clone(),
                     term,
                     lsn,
                     prev_lsn,
@@ -1133,8 +1194,12 @@ fn replicate_to_peers(
                 match client.post(&url).json(&req_body).send().await {
                     Ok(r) if r.status().is_success() => {},
                     Ok(r) if r.status() == StatusCode::CONFLICT => {
-                        let body = r.text().await.unwrap_or_default();
-                        eprintln!("[replication] Replica {} reports gap at lsn {} (prev_lsn {}): {}", replica_url, lsn, prev_lsn, body);
+                        let body = r.json::<serde_json::Value>().await.ok();
+                        let last_lsn = body
+                            .and_then(|b| b.get("last_lsn").and_then(|v| v.as_u64()))
+                            .unwrap_or(0);
+                        eprintln!("[replication] Replica {} gap at lsn {} (its last_lsn={}), starting repair", replica_url, lsn, last_lsn);
+                        repair_replica(state, replica_url.clone(), col, last_lsn).await;
                     },
                     Ok(r) => {
                         eprintln!("[replication] Replica {} returned {} (term={}, lsn={})", replica_url, r.status(), term, lsn);
@@ -1149,6 +1214,110 @@ fn replicate_to_peers(
             let _ = h.await;
         }
     });
+}
+
+fn contiguous_prefix(after_lsn: u64, mut frames: Vec<(u64, Vec<u8>)>) -> Vec<(u64, Vec<u8>)> {
+    frames.sort_by_key(|(lsn, _)| *lsn);
+    let mut expected = after_lsn + 1;
+    let mut out = Vec::new();
+    for (lsn, frame) in frames {
+        if lsn == expected {
+            out.push((lsn, frame));
+            expected += 1;
+        } else if lsn > expected {
+            break;
+        }
+    }
+    out
+}
+
+async fn trigger_resync(state: &AppState, replica_url: &str, collection: &str) {
+    let url = format!("{}/internal/resync", replica_url);
+    let body = ResyncRequest { collection: collection.to_string() };
+    match state.client.post(&url).json(&body).send().await {
+        Ok(r) if r.status().is_success() => {
+            println!("[repair] Triggered snapshot resync on {} for '{}'", replica_url, collection);
+        },
+        Ok(r) => eprintln!("[repair] Resync trigger on {} returned {}", replica_url, r.status()),
+        Err(e) => eprintln!("[repair] Resync trigger on {} failed: {}", replica_url, e),
+    }
+}
+
+async fn repair_replica(state: AppState, replica_url: String, collection: String, replica_last_lsn: u64) {
+    let lock = {
+        let mut locks = state.repair_locks.lock().unwrap();
+        locks.entry(replica_url.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _guard = lock.lock().await;
+
+    let db = match state.db.as_ref() {
+        Some(d) => d.clone(),
+        None => return,
+    };
+    let col = match db.get_collection(&collection) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let target = db.global_commit_index.load(Ordering::SeqCst);
+    if replica_last_lsn >= target {
+        return;
+    }
+
+    let col_scan = col.clone();
+    let after = replica_last_lsn;
+    let frames = match tokio::task::spawn_blocking(move || col_scan.read_frames_after(after, target)).await {
+        Ok(Ok(f)) => f,
+        _ => return,
+    };
+
+    let contiguous = contiguous_prefix(replica_last_lsn, frames);
+    let reaches_target = contiguous.last().map_or(false, |(lsn, _)| *lsn >= target);
+
+    if !reaches_target {
+        println!("[repair] Replica {} too far behind for '{}' (last_lsn={}, target={}), falling back to snapshot", replica_url, collection, replica_last_lsn, target);
+        trigger_resync(&state, &replica_url, &collection).await;
+        return;
+    }
+
+    let term = state.current_term();
+    let commit_index = db.global_commit_index.load(Ordering::SeqCst);
+    let sent = contiguous.len();
+    let mut prev = replica_last_lsn;
+
+    for (lsn, frame) in contiguous {
+        let req = ReplicateRequest {
+            collection: collection.clone(),
+            term,
+            lsn,
+            prev_lsn: prev,
+            commit_index: Some(commit_index),
+            wal_frame: frame,
+        };
+        let url = format!("{}/internal/replicate", replica_url);
+        match state.client.post(&url).json(&req).send().await {
+            Ok(r) if r.status().is_success() => {
+                prev = lsn;
+            },
+            Ok(r) if r.status() == StatusCode::CONFLICT => {
+                eprintln!("[repair] Replica {} still gapped during backfill at lsn {}, falling back to snapshot", replica_url, lsn);
+                trigger_resync(&state, &replica_url, &collection).await;
+                return;
+            },
+            Ok(r) => {
+                eprintln!("[repair] Replica {} returned {} during backfill", replica_url, r.status());
+                return;
+            },
+            Err(e) => {
+                eprintln!("[repair] Replica {} unreachable during backfill: {}", replica_url, e);
+                return;
+            }
+        }
+    }
+
+    println!("[repair] Streamed {} frames to {}; caught up to lsn {} for '{}'", sent, replica_url, prev, collection);
 }
 
 enum ForwardMethod {
@@ -1273,7 +1442,7 @@ async fn local_write(
                     }
                     if state.is_leader() {
                         let commit_index = db.global_commit_index.load(Ordering::SeqCst);
-                        replicate_to_peers(state.client.clone(), state.get_replicas(), col_name.to_string(), frame, term, commit_index, lsn, lsn.saturating_sub(1));
+                        replicate_to_peers(state.clone(), col_name.to_string(), frame, term, commit_index, lsn, lsn.saturating_sub(1));
                     }
                     Ok(())
                 },
@@ -1633,6 +1802,53 @@ async fn replicate_handler(
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct ResyncRequest {
+    collection: String,
+}
+
+async fn resync_handler(
+    State(state): State<AppState>,
+    Json(req): Json<ResyncRequest>,
+) -> impl axum::response::IntoResponse {
+    if !state.is_shard() || state.is_leader() {
+        return (StatusCode::FORBIDDEN, "Only replica nodes accept resync").into_response();
+    }
+
+    let primary_addr = match state.replication.as_ref().and_then(|r| r.read().unwrap().primary_addr.clone()) {
+        Some(a) => a,
+        None => return (StatusCode::BAD_REQUEST, "No primary configured").into_response(),
+    };
+
+    let col = req.collection.clone();
+
+    {
+        let mut set = state.resyncing.lock().unwrap();
+        if set.contains(&col) {
+            return (StatusCode::OK, "resync already in progress").into_response();
+        }
+        set.insert(col.clone());
+    }
+
+    let db = state.db.as_ref().unwrap().clone();
+    let client = state.client.clone();
+    let repl = state.replication.clone();
+    let resyncing = state.resyncing.clone();
+
+    tokio::spawn(async move {
+        if let Err(e) = replica_sync_from_primary(&client, &primary_addr, &db, &col).await {
+            eprintln!("[resync] Failed for '{}': {}", col, e);
+        } else if let Some(r) = repl {
+            let mut g = r.write().unwrap();
+            g.last_replication = Some(std::time::Instant::now());
+            g.was_receiving_replication = true;
+        }
+        resyncing.lock().unwrap().remove(&col);
+    });
+
+    (StatusCode::OK, "resync started").into_response()
+}
+
 async fn heartbeat_handler(
     State(state): State<AppState>,
 ) -> impl axum::response::IntoResponse {
@@ -1958,6 +2174,8 @@ async fn main() -> io::Result<()> {
         replication,
         primary_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),
         shard_failover_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        repair_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        resyncing: Arc::new(std::sync::Mutex::new(HashSet::new())),
     };
 
     if config.shard_role.as_deref() == Some("replica") {
@@ -1987,6 +2205,7 @@ async fn main() -> io::Result<()> {
         app = app
             .route("/internal/replicate", post(replicate_handler))
             .route("/internal/snapshot", get(snapshot_handler))
+            .route("/internal/resync", post(resync_handler))
             .route("/internal/heartbeat", get(heartbeat_handler));
     }
 
@@ -2184,5 +2403,93 @@ mod tests {
 
         let _ = fs::remove_dir_all(&proot);
         let _ = fs::remove_dir_all(&rroot);
+    }
+
+    #[tokio::test]
+    async fn backfill_reads_and_applies_missing_frames() {
+        let proot = temp_root();
+        let rroot = temp_root();
+
+        let pdb = Database::new(&proot).unwrap();
+        let pcol = pdb.get_collection("c").unwrap();
+        for i in 1..=5 {
+            let _ = pcol.put(format!("k{}", i), serde_json::json!({"i": i}), 1).unwrap();
+        }
+        pcol.enqueue_commit().await.unwrap().unwrap();
+        assert_eq!(pdb.global_commit_index.load(Ordering::SeqCst), 5);
+
+        let all = contiguous_prefix(0, pcol.read_frames_after(0, 5).unwrap());
+        let lsns: Vec<u64> = all.iter().map(|(l, _)| *l).collect();
+        assert_eq!(lsns, vec![1, 2, 3, 4, 5]);
+
+        let rdb = Database::new(&rroot).unwrap();
+        let rcol = rdb.get_collection("c").unwrap();
+
+        let mut prev = 0;
+        for (lsn, fr) in &all[..2] {
+            match rcol.append_raw_frame(fr, prev).unwrap() {
+                ReplicaApply::Applied { lsn: a, .. } => assert_eq!(a, *lsn),
+                other => panic!("expected Applied, got {:?}", other),
+            }
+            prev = *lsn;
+        }
+
+        let backfill = contiguous_prefix(2, pcol.read_frames_after(2, 5).unwrap());
+        let bf_lsns: Vec<u64> = backfill.iter().map(|(l, _)| *l).collect();
+        assert_eq!(bf_lsns, vec![3, 4, 5]);
+
+        for (lsn, fr) in &backfill {
+            match rcol.append_raw_frame(fr, prev).unwrap() {
+                ReplicaApply::Applied { lsn: a, .. } => assert_eq!(a, *lsn),
+                other => panic!("expected Applied during backfill, got {:?}", other),
+            }
+            prev = *lsn;
+        }
+
+        rcol.enqueue_commit().await.unwrap().unwrap();
+        drop(rcol);
+        drop(rdb);
+
+        let rdb2 = Database::new(&rroot).unwrap();
+        let rcol2 = rdb2.get_collection("c").unwrap();
+        for i in 1..=5 {
+            assert_eq!(rcol2.get(&format!("k{}", i)).unwrap(), Some(serde_json::json!({"i": i})));
+        }
+        assert_eq!(rdb2.global_commit_index.load(Ordering::SeqCst), 5, "replica must reach primary's LSN after backfill");
+
+        let _ = fs::remove_dir_all(&proot);
+        let _ = fs::remove_dir_all(&rroot);
+    }
+
+    #[tokio::test]
+    async fn compaction_holes_force_snapshot_fallback() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        let _ = col.put("a".into(), serde_json::json!({"v": 1}), 1).unwrap();
+        let _ = col.put("a".into(), serde_json::json!({"v": 2}), 1).unwrap();
+        let (_, w, o, _) = col.put("a".into(), serde_json::json!({"v": 3}), 1).unwrap();
+        col.index.write().unwrap().insert("a".into(), IndexEntry { wal_id: w, offset: o });
+        let (_, w2, o2, _) = col.put("b".into(), serde_json::json!({"v": 9}), 1).unwrap();
+        col.index.write().unwrap().insert("b".into(), IndexEntry { wal_id: w2, offset: o2 });
+        col.enqueue_commit().await.unwrap().unwrap();
+        assert_eq!(db.global_commit_index.load(Ordering::SeqCst), 4);
+
+        col.compact().unwrap();
+
+        let frames = col.read_frames_after(0, 4).unwrap();
+        let mut lsns: Vec<u64> = frames.iter().map(|(l, _)| *l).collect();
+        lsns.sort();
+        assert_eq!(lsns, vec![3, 4], "compaction should drop overwritten lsns 1 and 2");
+
+        let from_zero = contiguous_prefix(0, col.read_frames_after(0, 4).unwrap());
+        assert!(from_zero.is_empty(), "no contiguous run from lsn 1 exists -> repair must snapshot");
+
+        let from_two = contiguous_prefix(2, col.read_frames_after(2, 4).unwrap());
+        let two_lsns: Vec<u64> = from_two.iter().map(|(l, _)| *l).collect();
+        assert_eq!(two_lsns, vec![3, 4], "a replica already at lsn 2 can still backfill");
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
