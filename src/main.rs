@@ -1199,7 +1199,7 @@ fn replicate_to_peers(
                             .and_then(|b| b.get("last_lsn").and_then(|v| v.as_u64()))
                             .unwrap_or(0);
                         eprintln!("[replication] Replica {} gap at lsn {} (its last_lsn={}), starting repair", replica_url, lsn, last_lsn);
-                        repair_replica(state, replica_url.clone(), col, last_lsn).await;
+                        let _ = repair_replica(state, replica_url.clone(), col, last_lsn).await;
                     },
                     Ok(r) => {
                         eprintln!("[replication] Replica {} returned {} (term={}, lsn={})", replica_url, r.status(), term, lsn);
@@ -1243,7 +1243,17 @@ async fn trigger_resync(state: &AppState, replica_url: &str, collection: &str) {
     }
 }
 
-async fn repair_replica(state: AppState, replica_url: String, collection: String, replica_last_lsn: u64) {
+async fn probe_replica_lsn(state: &AppState, replica_url: &str) -> Option<u64> {
+    let url = format!("{}/internal/heartbeat", replica_url);
+    let r = state.client.get(&url).send().await.ok()?;
+    if !r.status().is_success() {
+        return None;
+    }
+    let v = r.json::<serde_json::Value>().await.ok()?;
+    v.get("commit_index").and_then(|x| x.as_u64())
+}
+
+async fn repair_replica(state: AppState, replica_url: String, collection: String, reported_last_lsn: u64) -> bool {
     let lock = {
         let mut locks = state.repair_locks.lock().unwrap();
         locks.entry(replica_url.clone())
@@ -1254,23 +1264,27 @@ async fn repair_replica(state: AppState, replica_url: String, collection: String
 
     let db = match state.db.as_ref() {
         Some(d) => d.clone(),
-        None => return,
+        None => return false,
     };
     let col = match db.get_collection(&collection) {
         Ok(c) => c,
-        Err(_) => return,
+        Err(_) => return false,
     };
 
     let target = db.global_commit_index.load(Ordering::SeqCst);
+
+    let probed = probe_replica_lsn(&state, &replica_url).await.unwrap_or(0);
+    let replica_last_lsn = reported_last_lsn.max(probed);
+
     if replica_last_lsn >= target {
-        return;
+        return true;
     }
 
     let col_scan = col.clone();
     let after = replica_last_lsn;
     let frames = match tokio::task::spawn_blocking(move || col_scan.read_frames_after(after, target)).await {
         Ok(Ok(f)) => f,
-        _ => return,
+        _ => return false,
     };
 
     let contiguous = contiguous_prefix(replica_last_lsn, frames);
@@ -1279,7 +1293,7 @@ async fn repair_replica(state: AppState, replica_url: String, collection: String
     if !reaches_target {
         println!("[repair] Replica {} too far behind for '{}' (last_lsn={}, target={}), falling back to snapshot", replica_url, collection, replica_last_lsn, target);
         trigger_resync(&state, &replica_url, &collection).await;
-        return;
+        return false;
     }
 
     let term = state.current_term();
@@ -1304,20 +1318,130 @@ async fn repair_replica(state: AppState, replica_url: String, collection: String
             Ok(r) if r.status() == StatusCode::CONFLICT => {
                 eprintln!("[repair] Replica {} still gapped during backfill at lsn {}, falling back to snapshot", replica_url, lsn);
                 trigger_resync(&state, &replica_url, &collection).await;
-                return;
+                return false;
             },
             Ok(r) => {
                 eprintln!("[repair] Replica {} returned {} during backfill", replica_url, r.status());
-                return;
+                return false;
             },
             Err(e) => {
                 eprintln!("[repair] Replica {} unreachable during backfill: {}", replica_url, e);
-                return;
+                return false;
             }
         }
     }
 
     println!("[repair] Streamed {} frames to {}; caught up to lsn {} for '{}'", sent, replica_url, prev, collection);
+    prev >= target
+}
+
+enum WriteConcern {
+    Local,
+    Majority,
+    All,
+    N(usize),
+}
+
+fn parse_write_concern(w: Option<&str>) -> WriteConcern {
+    match w {
+        None | Some("1") => WriteConcern::Local,
+        Some("majority") => WriteConcern::Majority,
+        Some("all") => WriteConcern::All,
+        Some(s) => s.parse::<usize>().map(WriteConcern::N).unwrap_or(WriteConcern::Local),
+    }
+}
+
+fn required_acks(wc: &WriteConcern, replica_count: usize) -> usize {
+    let total = 1 + replica_count;
+    match wc {
+        WriteConcern::Local => 1,
+        WriteConcern::Majority => total / 2 + 1,
+        WriteConcern::All => total,
+        WriteConcern::N(n) => (*n).max(1).min(total),
+    }
+}
+
+struct WriteOutcome {
+    met: bool,
+    acks: usize,
+    required: usize,
+}
+
+async fn replicate_one_await(
+    state: &AppState,
+    replica_url: &str,
+    collection: &str,
+    frame: &[u8],
+    term: u64,
+    commit_index: u64,
+    lsn: u64,
+    prev_lsn: u64,
+) -> bool {
+    let url = format!("{}/internal/replicate", replica_url);
+    let req = ReplicateRequest {
+        collection: collection.to_string(),
+        term,
+        lsn,
+        prev_lsn,
+        commit_index: Some(commit_index),
+        wal_frame: frame.to_vec(),
+    };
+    match state.client.post(&url).json(&req).send().await {
+        Ok(r) if r.status().is_success() => true,
+        Ok(r) if r.status() == StatusCode::CONFLICT => {
+            let body = r.json::<serde_json::Value>().await.ok();
+            let last_lsn = body
+                .and_then(|b| b.get("last_lsn").and_then(|v| v.as_u64()))
+                .unwrap_or(0);
+            repair_replica(state.clone(), replica_url.to_string(), collection.to_string(), last_lsn).await
+        },
+        _ => false,
+    }
+}
+
+async fn replicate_and_await(
+    state: AppState,
+    collection: String,
+    frame: Vec<u8>,
+    term: u64,
+    commit_index: u64,
+    lsn: u64,
+    prev_lsn: u64,
+    required_acks: usize,
+    timeout: Duration,
+) -> usize {
+    let replicas = state.get_replicas();
+    if replicas.is_empty() || required_acks <= 1 {
+        replicate_to_peers(state, collection, frame, term, commit_index, lsn, prev_lsn);
+        return 1;
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<bool>(replicas.len());
+    for replica_url in replicas {
+        let state = state.clone();
+        let col = collection.clone();
+        let frame = frame.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let ok = replicate_one_await(&state, &replica_url, &col, &frame, term, commit_index, lsn, prev_lsn).await;
+            let _ = tx.send(ok).await;
+        });
+    }
+    drop(tx);
+
+    let acks = Arc::new(AtomicUsize::new(1));
+    let acks_inner = acks.clone();
+    let _ = tokio::time::timeout(timeout, async move {
+        while acks_inner.load(Ordering::Relaxed) < required_acks {
+            match rx.recv().await {
+                Some(true) => { acks_inner.fetch_add(1, Ordering::Relaxed); },
+                Some(false) => {},
+                None => break,
+            }
+        }
+    }).await;
+
+    acks.load(Ordering::Relaxed)
 }
 
 enum ForwardMethod {
@@ -1344,6 +1468,7 @@ async fn router_forward_write(
     key: &str,
     method: ForwardMethod,
     body: Option<&CreateDoc>,
+    wc_query: &str,
 ) -> Result<reqwest::Response, axum::response::Response> {
     let hash = hash_key(col_name, key);
 
@@ -1352,7 +1477,7 @@ async fn router_forward_write(
         None => return Err((StatusCode::BAD_REQUEST, "Key not owned by any shard").into_response()),
     };
 
-    let full_url = format!("{}/collections/{}/docs/{}", effective_url, col_name, key);
+    let full_url = format!("{}/collections/{}/docs/{}{}", effective_url, col_name, key, wc_query);
     if let Ok(r) = build_forward(&state.client, &method, &full_url, body).send().await {
         if r.status().is_success() {
             if effective_url != original_url {
@@ -1372,7 +1497,7 @@ async fn router_forward_write(
 
     if let Some((latest_url, _, _)) = state.get_effective_shard_url(hash) {
         if latest_url != effective_url {
-            let retry_url = format!("{}/collections/{}/docs/{}", latest_url, col_name, key);
+            let retry_url = format!("{}/collections/{}/docs/{}{}", latest_url, col_name, key, wc_query);
             if let Ok(r) = build_forward(&state.client, &method, &retry_url, body).send().await {
                 if r.status().is_success() {
                     return Ok(r);
@@ -1383,7 +1508,7 @@ async fn router_forward_write(
 
     state.primary_overrides.lock().unwrap().remove(&original_url);
     for replica in &replica_urls {
-        let fallback_url = format!("{}/collections/{}/docs/{}", replica, col_name, key);
+        let fallback_url = format!("{}/collections/{}/docs/{}{}", replica, col_name, key, wc_query);
         if let Ok(r) = build_forward(&state.client, &method, &fallback_url, body).send().await {
             if r.status().is_success() {
                 state.set_primary_override(&original_url, replica);
@@ -1408,7 +1533,9 @@ async fn local_write(
     col_name: &str,
     key: String,
     value: Option<serde_json::Value>,
-) -> Result<(), axum::response::Response> {
+    wc: WriteConcern,
+    wtimeout: Duration,
+) -> Result<WriteOutcome, axum::response::Response> {
     let db = state.db.as_ref().unwrap();
     let col = match db.get_collection(col_name) {
         Ok(c) => c,
@@ -1440,11 +1567,23 @@ async fn local_write(
                             index.insert(key.clone(), IndexEntry { wal_id, offset });
                         }
                     }
-                    if state.is_leader() {
-                        let commit_index = db.global_commit_index.load(Ordering::SeqCst);
-                        replicate_to_peers(state.clone(), col_name.to_string(), frame, term, commit_index, lsn, lsn.saturating_sub(1));
+
+                    if !state.is_leader() {
+                        return Ok(WriteOutcome { met: true, acks: 1, required: 1 });
                     }
-                    Ok(())
+
+                    let commit_index = db.global_commit_index.load(Ordering::SeqCst);
+                    let replicas = state.get_replicas();
+                    let required = required_acks(&wc, replicas.len());
+
+                    let acks = if required <= 1 {
+                        replicate_to_peers(state.clone(), col_name.to_string(), frame, term, commit_index, lsn, lsn.saturating_sub(1));
+                        1
+                    } else {
+                        replicate_and_await(state.clone(), col_name.to_string(), frame, term, commit_index, lsn, lsn.saturating_sub(1), required, wtimeout).await
+                    };
+
+                    Ok(WriteOutcome { met: acks >= required, acks, required })
                 },
                 Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response()),
                 Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response()),
@@ -1455,9 +1594,33 @@ async fn local_write(
     }
 }
 
+#[derive(Deserialize)]
+struct WriteConcernParams {
+    w: Option<String>,
+    wtimeout: Option<u64>,
+}
+
+const DEFAULT_WTIMEOUT_MS: u64 = 5000;
+
+fn wc_query_string(p: &WriteConcernParams) -> String {
+    let mut parts = Vec::new();
+    if let Some(w) = &p.w {
+        parts.push(format!("w={}", w));
+    }
+    if let Some(t) = p.wtimeout {
+        parts.push(format!("wtimeout={}", t));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", parts.join("&"))
+    }
+}
+
 async fn create_doc(
     State(state): State<AppState>,
     AxumPath(col_name): AxumPath<String>,
+    Query(wcp): Query<WriteConcernParams>,
     Json(payload): Json<CreateDoc>,
 ) -> impl axum::response::IntoResponse {
     if state.is_shard() && !state.is_leader() {
@@ -1467,14 +1630,24 @@ async fn create_doc(
     let id = Uuid::new_v4().to_string();
 
     if state.config.role == "router" {
-        return match router_forward_write(&state, &col_name, &id, ForwardMethod::Put, Some(&payload)).await {
-            Ok(_) => (StatusCode::CREATED, Json(serde_json::json!({"id": id}))).into_response(),
+        let wc_query = wc_query_string(&wcp);
+        return match router_forward_write(&state, &col_name, &id, ForwardMethod::Put, Some(&payload), &wc_query).await {
+            Ok(r) => passthrough_json(r).await,
             Err(resp) => resp,
         };
     }
 
-    match local_write(&state, &col_name, id.clone(), Some(payload.value)).await {
-        Ok(()) => (StatusCode::CREATED, Json(serde_json::json!({"id": id}))).into_response(),
+    let wc = parse_write_concern(wcp.w.as_deref());
+    let wtimeout = Duration::from_millis(wcp.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
+
+    match local_write(&state, &col_name, id.clone(), Some(payload.value), wc, wtimeout).await {
+        Ok(o) if o.met => (StatusCode::CREATED, Json(serde_json::json!({"id": id}))).into_response(),
+        Ok(o) => (StatusCode::ACCEPTED, Json(serde_json::json!({
+            "id": id,
+            "warning": "write concern not met",
+            "acks": o.acks,
+            "required": o.required,
+        }))).into_response(),
         Err(resp) => resp,
     }
 }
@@ -1482,6 +1655,7 @@ async fn create_doc(
 async fn put_doc(
     State(state): State<AppState>,
     AxumPath((col_name, id)): AxumPath<(String, String)>,
+    Query(wcp): Query<WriteConcernParams>,
     Json(payload): Json<CreateDoc>,
 ) -> impl axum::response::IntoResponse {
     if state.is_shard() && !state.is_leader() {
@@ -1489,14 +1663,24 @@ async fn put_doc(
     }
 
     if state.config.role == "router" {
-        return match router_forward_write(&state, &col_name, &id, ForwardMethod::Put, Some(&payload)).await {
+        let wc_query = wc_query_string(&wcp);
+        return match router_forward_write(&state, &col_name, &id, ForwardMethod::Put, Some(&payload), &wc_query).await {
             Ok(r) => passthrough_json(r).await,
             Err(resp) => resp,
         };
     }
 
-    match local_write(&state, &col_name, id.clone(), Some(payload.value)).await {
-        Ok(()) => (StatusCode::CREATED, Json(serde_json::json!({"id": id}))).into_response(),
+    let wc = parse_write_concern(wcp.w.as_deref());
+    let wtimeout = Duration::from_millis(wcp.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
+
+    match local_write(&state, &col_name, id.clone(), Some(payload.value), wc, wtimeout).await {
+        Ok(o) if o.met => (StatusCode::CREATED, Json(serde_json::json!({"id": id}))).into_response(),
+        Ok(o) => (StatusCode::ACCEPTED, Json(serde_json::json!({
+            "id": id,
+            "warning": "write concern not met",
+            "acks": o.acks,
+            "required": o.required,
+        }))).into_response(),
         Err(resp) => resp,
     }
 }
@@ -1537,6 +1721,7 @@ async fn get_doc(
 async fn update_doc(
     State(state): State<AppState>,
     AxumPath((col_name, id)): AxumPath<(String, String)>,
+    Query(wcp): Query<WriteConcernParams>,
     Json(payload): Json<CreateDoc>,
 ) -> impl axum::response::IntoResponse {
     if state.is_shard() && !state.is_leader() {
@@ -1544,14 +1729,24 @@ async fn update_doc(
     }
 
     if state.config.role == "router" {
-        return match router_forward_write(&state, &col_name, &id, ForwardMethod::Patch, Some(&payload)).await {
+        let wc_query = wc_query_string(&wcp);
+        return match router_forward_write(&state, &col_name, &id, ForwardMethod::Patch, Some(&payload), &wc_query).await {
             Ok(r) => passthrough_json(r).await,
             Err(resp) => resp,
         };
     }
 
-    match local_write(&state, &col_name, id.clone(), Some(payload.value)).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "updated"}))).into_response(),
+    let wc = parse_write_concern(wcp.w.as_deref());
+    let wtimeout = Duration::from_millis(wcp.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
+
+    match local_write(&state, &col_name, id.clone(), Some(payload.value), wc, wtimeout).await {
+        Ok(o) if o.met => (StatusCode::OK, Json(serde_json::json!({"status": "updated"}))).into_response(),
+        Ok(o) => (StatusCode::ACCEPTED, Json(serde_json::json!({
+            "status": "updated",
+            "warning": "write concern not met",
+            "acks": o.acks,
+            "required": o.required,
+        }))).into_response(),
         Err(resp) => resp,
     }
 }
@@ -1559,20 +1754,31 @@ async fn update_doc(
 async fn delete_doc(
     State(state): State<AppState>,
     AxumPath((col_name, id)): AxumPath<(String, String)>,
+    Query(wcp): Query<WriteConcernParams>,
 ) -> impl axum::response::IntoResponse {
     if state.is_shard() && !state.is_leader() {
         return (StatusCode::FORBIDDEN, "Replica nodes reject direct writes").into_response();
     }
 
     if state.config.role == "router" {
-        return match router_forward_write(&state, &col_name, &id, ForwardMethod::Delete, None).await {
+        let wc_query = wc_query_string(&wcp);
+        return match router_forward_write(&state, &col_name, &id, ForwardMethod::Delete, None, &wc_query).await {
             Ok(r) => passthrough_json(r).await,
             Err(resp) => resp,
         };
     }
 
-    match local_write(&state, &col_name, id.clone(), None).await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "deleted"}))).into_response(),
+    let wc = parse_write_concern(wcp.w.as_deref());
+    let wtimeout = Duration::from_millis(wcp.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
+
+    match local_write(&state, &col_name, id.clone(), None, wc, wtimeout).await {
+        Ok(o) if o.met => (StatusCode::OK, Json(serde_json::json!({"status": "deleted"}))).into_response(),
+        Ok(o) => (StatusCode::ACCEPTED, Json(serde_json::json!({
+            "status": "deleted",
+            "warning": "write concern not met",
+            "acks": o.acks,
+            "required": o.required,
+        }))).into_response(),
         Err(resp) => resp,
     }
 }
@@ -2491,5 +2697,36 @@ mod tests {
         assert_eq!(two_lsns, vec![3, 4], "a replica already at lsn 2 can still backfill");
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_concern_resolves_required_acks() {
+        assert_eq!(required_acks(&parse_write_concern(None), 2), 1);
+        assert_eq!(required_acks(&parse_write_concern(Some("1")), 2), 1);
+
+        assert_eq!(required_acks(&parse_write_concern(Some("majority")), 2), 2);
+        assert_eq!(required_acks(&parse_write_concern(Some("majority")), 1), 2);
+        assert_eq!(required_acks(&parse_write_concern(Some("majority")), 4), 3);
+
+        assert_eq!(required_acks(&parse_write_concern(Some("all")), 2), 3);
+        assert_eq!(required_acks(&parse_write_concern(Some("all")), 0), 1);
+
+        assert_eq!(required_acks(&parse_write_concern(Some("3")), 2), 3);
+        assert_eq!(required_acks(&parse_write_concern(Some("9")), 2), 3, "N is capped at total node count");
+        assert_eq!(required_acks(&parse_write_concern(Some("0")), 2), 1, "N is floored at 1");
+
+        assert_eq!(required_acks(&parse_write_concern(Some("garbage")), 2), 1, "unparseable w falls back to local");
+    }
+
+    #[test]
+    fn wc_query_string_roundtrips() {
+        let p = WriteConcernParams { w: Some("majority".into()), wtimeout: Some(2000) };
+        assert_eq!(wc_query_string(&p), "?w=majority&wtimeout=2000");
+
+        let p2 = WriteConcernParams { w: None, wtimeout: None };
+        assert_eq!(wc_query_string(&p2), "");
+
+        let p3 = WriteConcernParams { w: Some("all".into()), wtimeout: None };
+        assert_eq!(wc_query_string(&p3), "?w=all");
     }
 }
