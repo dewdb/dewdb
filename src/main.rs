@@ -1200,6 +1200,8 @@ struct QueryParams {
     filter: Option<String>,
     read: Option<String>,
     cursor: Option<String>,
+    sort: Option<String>,
+    fields: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1242,6 +1244,138 @@ fn get_path_value<'a>(doc: &'a serde_json::Value, path: &str) -> Option<&'a serd
     }
 
     Some(cur)
+}
+
+struct SortSpec {
+    field: String,
+    desc: bool,
+}
+
+fn parse_sort(s: Option<&str>) -> Option<SortSpec> {
+    let s = s?;
+    let (field, dir) = match s.split_once(':') {
+        Some((f, d)) => (f, d),
+        None => (s, "asc"),
+    };
+    if field.is_empty() {
+        return None;
+    }
+    Some(SortSpec { field: field.to_string(), desc: dir.eq_ignore_ascii_case("desc") })
+}
+
+fn parse_fields(s: Option<&str>) -> Vec<String> {
+    match s {
+        Some(s) => s.split(',').map(|f| f.trim().to_string()).filter(|f| !f.is_empty()).collect(),
+        None => Vec::new(),
+    }
+}
+
+fn type_rank(v: &serde_json::Value) -> u8 {
+    match v {
+        serde_json::Value::Null => 0,
+        serde_json::Value::Bool(_) => 1,
+        serde_json::Value::Number(_) => 2,
+        serde_json::Value::String(_) => 3,
+        serde_json::Value::Array(_) => 4,
+        serde_json::Value::Object(_) => 5,
+    }
+}
+
+fn json_cmp(a: &serde_json::Value, b: &serde_json::Value) -> std::cmp::Ordering {
+    use serde_json::Value;
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::Number(_), Value::Number(_)) => {
+            let x = a.as_f64().unwrap_or(f64::NAN);
+            let y = b.as_f64().unwrap_or(f64::NAN);
+            x.partial_cmp(&y).unwrap_or(Ordering::Equal)
+        },
+        (Value::String(x), Value::String(y)) => x.cmp(y),
+        (Value::Array(x), Value::Array(y)) => {
+            for (ex, ey) in x.iter().zip(y.iter()) {
+                let o = json_cmp(ex, ey);
+                if o != Ordering::Equal {
+                    return o;
+                }
+            }
+            x.len().cmp(&y.len())
+        },
+        (Value::Object(x), Value::Object(y)) => x.len().cmp(&y.len()),
+        _ => type_rank(a).cmp(&type_rank(b)),
+    }
+}
+
+fn compare_by_sort(a: &serde_json::Value, b: &serde_json::Value, sort: &SortSpec) -> std::cmp::Ordering {
+    let va = get_path_value(a, &sort.field).cloned().unwrap_or(serde_json::Value::Null);
+    let vb = get_path_value(b, &sort.field).cloned().unwrap_or(serde_json::Value::Null);
+    let ord = json_cmp(&va, &vb);
+    if sort.desc {
+        ord.reverse()
+    } else {
+        ord
+    }
+}
+
+fn kway_merge(lists: Vec<Vec<serde_json::Value>>, sort: &SortSpec, limit: usize) -> Vec<serde_json::Value> {
+    let mut heads = vec![0usize; lists.len()];
+    let mut out = Vec::with_capacity(limit);
+
+    while out.len() < limit {
+        let mut best: Option<usize> = None;
+        for i in 0..lists.len() {
+            if heads[i] < lists[i].len() {
+                match best {
+                    None => best = Some(i),
+                    Some(b) => {
+                        if compare_by_sort(&lists[i][heads[i]], &lists[b][heads[b]], sort) == std::cmp::Ordering::Less {
+                            best = Some(i);
+                        }
+                    }
+                }
+            }
+        }
+        match best {
+            Some(i) => {
+                out.push(lists[i][heads[i]].clone());
+                heads[i] += 1;
+            },
+            None => break,
+        }
+    }
+    out
+}
+
+fn set_path(map: &mut serde_json::Map<String, serde_json::Value>, parts: &[&str], val: serde_json::Value) {
+    if parts.is_empty() {
+        return;
+    }
+    if parts.len() == 1 {
+        map.insert(parts[0].to_string(), val);
+        return;
+    }
+    let entry = map.entry(parts[0].to_string()).or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !entry.is_object() {
+        *entry = serde_json::Value::Object(serde_json::Map::new());
+    }
+    if let Some(m) = entry.as_object_mut() {
+        set_path(m, &parts[1..], val);
+    }
+}
+
+fn project(doc: &serde_json::Value, fields: &[String]) -> serde_json::Value {
+    if fields.is_empty() {
+        return doc.clone();
+    }
+    let mut out = serde_json::Map::new();
+    for path in fields {
+        if let Some(v) = get_path_value(doc, path) {
+            let parts: Vec<&str> = path.split('.').collect();
+            set_path(&mut out, &parts, v.clone());
+        }
+    }
+    serde_json::Value::Object(out)
 }
 
 fn matches_filter(doc: &serde_json::Value, filter: &Filter) -> bool {
@@ -2297,22 +2431,32 @@ async fn query_docs(
     _req: axum::extract::Request,
 ) -> impl axum::response::IntoResponse {
     let limit = params.limit.unwrap_or(100).max(1);
+    let sort = parse_sort(params.sort.as_deref());
+    let fields = parse_fields(params.fields.as_deref());
 
     if state.config.role == "router" {
         let pref = parse_read_pref(params.read.as_deref());
-        let incoming = params.cursor.as_deref().and_then(decode_cursor);
+        let incoming = if sort.is_none() {
+            params.cursor.as_deref().and_then(decode_cursor)
+        } else {
+            None
+        };
         let shards = unique_shards(&state);
         let n = shards.len().max(1);
-        let per_shard = ((limit + n - 1) / n).max(1);
+        let per_shard = if sort.is_some() { limit } else { ((limit + n - 1) / n).max(1) };
 
         let mut futures = Vec::new();
         for (original, replicas) in shards {
-            let after: Option<String> = match &incoming {
-                Some(c) => match c.positions.get(&original) {
-                    Some(k) => Some(k.clone()),
-                    None => continue,
-                },
-                None => None,
+            let after: Option<String> = if sort.is_some() {
+                None
+            } else {
+                match &incoming {
+                    Some(c) => match c.positions.get(&original) {
+                        Some(k) => Some(k.clone()),
+                        None => continue,
+                    },
+                    None => None,
+                }
             };
 
             let effective = state.effective_primary(&original);
@@ -2325,6 +2469,7 @@ async fn query_docs(
             if let Some(s) = &params.start { q.push(("start".to_string(), s.clone())); }
             if let Some(e) = &params.end { q.push(("end".to_string(), e.clone())); }
             if let Some(f) = &params.filter { q.push(("filter".to_string(), f.clone())); }
+            if let Some(s) = &params.sort { q.push(("sort".to_string(), s.clone())); }
             if let Some(a) = &after { q.push(("cursor".to_string(), a.clone())); }
 
             futures.push(tokio::spawn(async move {
@@ -2343,6 +2488,24 @@ async fn query_docs(
         }
 
         let joined = futures::future::join_all(futures).await;
+
+        if let Some(sort) = &sort {
+            let mut lists = Vec::new();
+            for res in joined {
+                let (_original, page) = match res {
+                    Ok(t) => t,
+                    Err(_) => return (StatusCode::BAD_GATEWAY, "Shard query task failed").into_response(),
+                };
+                match page {
+                    Some(p) => lists.push(p.items),
+                    None => return (StatusCode::BAD_GATEWAY, "Shard query failed").into_response(),
+                }
+            }
+            let merged = kway_merge(lists, sort, limit);
+            let items: Vec<serde_json::Value> = merged.iter().map(|v| project(v, &fields)).collect();
+            return (StatusCode::OK, Json(QueryPage { items, next_cursor: None })).into_response();
+        }
+
         let mut merged = Vec::new();
         let mut positions = BTreeMap::new();
         for res in joined {
@@ -2352,7 +2515,9 @@ async fn query_docs(
             };
             match page {
                 Some(p) => {
-                    merged.extend(p.items);
+                    for item in p.items {
+                        merged.push(project(&item, &fields));
+                    }
                     if let Some(k) = p.next_cursor {
                         positions.insert(original, k);
                     }
@@ -2383,9 +2548,29 @@ async fn query_docs(
     let start = params.start.clone();
     let end = params.end.clone();
 
-    match tokio::task::spawn_blocking(move || {
-        col_clone.query_page(after.as_deref(), start.as_deref(), end.as_deref(), &filter_obj, limit)
-    }).await {
+    let result = tokio::task::spawn_blocking(move || -> io::Result<(Vec<serde_json::Value>, Option<String>)> {
+        if let Some(sort) = &sort {
+            let mut items = Vec::new();
+            for (key, _entry) in col_clone.range_from(None, start.as_deref(), end.as_deref()).into_iter() {
+                if let Some(val) = col_clone.get(&key)? {
+                    let matched = filter_obj.as_ref().map_or(true, |f| matches_filter(&val, f));
+                    if matched {
+                        items.push(val);
+                    }
+                }
+            }
+            items.sort_by(|a, b| compare_by_sort(a, b, sort));
+            items.truncate(limit);
+            let projected = items.iter().map(|v| project(v, &fields)).collect();
+            Ok((projected, None))
+        } else {
+            let (items, next_cursor) = col_clone.query_page(after.as_deref(), start.as_deref(), end.as_deref(), &filter_obj, limit)?;
+            let projected = items.iter().map(|v| project(v, &fields)).collect();
+            Ok((projected, next_cursor))
+        }
+    }).await;
+
+    match result {
         Ok(Ok((items, next_cursor))) => (StatusCode::OK, Json(QueryPage { items, next_cursor })).into_response(),
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
@@ -3750,5 +3935,74 @@ mod tests {
         assert_eq!(decoded.positions.get("http://s2").map(|s| s.as_str()), Some("k17"));
 
         assert!(decode_cursor("!!!not base64 json!!!").is_none());
+    }
+
+    #[test]
+    fn parse_sort_directions() {
+        let a = parse_sort(Some("age")).unwrap();
+        assert_eq!(a.field, "age");
+        assert!(!a.desc);
+
+        let d = parse_sort(Some("age:desc")).unwrap();
+        assert!(d.desc);
+
+        let asc = parse_sort(Some("score:asc")).unwrap();
+        assert!(!asc.desc);
+
+        assert!(parse_sort(None).is_none());
+        assert!(parse_sort(Some("")).is_none());
+    }
+
+    #[test]
+    fn json_cmp_orders_across_and_within_types() {
+        use std::cmp::Ordering;
+        use serde_json::json;
+        assert_eq!(json_cmp(&json!(1), &json!(2)), Ordering::Less);
+        assert_eq!(json_cmp(&json!("b"), &json!("a")), Ordering::Greater);
+        assert_eq!(json_cmp(&json!(false), &json!(true)), Ordering::Less);
+        assert_eq!(json_cmp(&json!(null), &json!(0)), Ordering::Less, "null sorts before numbers");
+        assert_eq!(json_cmp(&json!(5), &json!("5")), Ordering::Less, "numbers sort before strings");
+    }
+
+    #[test]
+    fn kway_merge_produces_global_order_bounded_by_limit() {
+        use serde_json::json;
+        let sort = SortSpec { field: "n".to_string(), desc: false };
+        let l1 = vec![json!({"n": 1}), json!({"n": 4}), json!({"n": 7})];
+        let l2 = vec![json!({"n": 2}), json!({"n": 3}), json!({"n": 8})];
+        let l3 = vec![json!({"n": 5}), json!({"n": 6})];
+
+        let merged = kway_merge(vec![l1, l2, l3], &sort, 5);
+        let ns: Vec<i64> = merged.iter().map(|v| v["n"].as_i64().unwrap()).collect();
+        assert_eq!(ns, vec![1, 2, 3, 4, 5], "globally sorted, bounded to limit");
+    }
+
+    #[test]
+    fn kway_merge_desc() {
+        use serde_json::json;
+        let sort = SortSpec { field: "n".to_string(), desc: true };
+        let l1 = vec![json!({"n": 9}), json!({"n": 3})];
+        let l2 = vec![json!({"n": 7}), json!({"n": 1})];
+        let merged = kway_merge(vec![l1, l2], &sort, 3);
+        let ns: Vec<i64> = merged.iter().map(|v| v["n"].as_i64().unwrap()).collect();
+        assert_eq!(ns, vec![9, 7, 3]);
+    }
+
+    #[test]
+    fn projection_keeps_only_requested_paths() {
+        use serde_json::json;
+        let doc = json!({"a": 1, "b": {"c": 2, "d": 3}, "e": 4});
+
+        let flat = project(&doc, &["a".to_string(), "e".to_string()]);
+        assert_eq!(flat, json!({"a": 1, "e": 4}));
+
+        let nested = project(&doc, &["b.c".to_string()]);
+        assert_eq!(nested, json!({"b": {"c": 2}}), "nested path projects into nested object");
+
+        let missing = project(&doc, &["a".to_string(), "zzz".to_string()]);
+        assert_eq!(missing, json!({"a": 1}), "missing fields are omitted");
+
+        let empty = project(&doc, &[]);
+        assert_eq!(empty, doc, "empty projection returns the full doc");
     }
 }
