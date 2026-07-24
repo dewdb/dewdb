@@ -45,6 +45,8 @@ struct IndexSnapshot {
     last_wal_id: u64,
     last_offset: u64,
     last_lsn: u64,
+    #[serde(default)]
+    last_term: u64,
     map: BTreeMap<String, IndexEntry>,
 }
 
@@ -88,6 +90,8 @@ struct NodeConfig {
     primary_addr: Option<String>,
     #[serde(default)]
     replicas: Vec<String>,
+    #[serde(default)]
+    peers: Vec<String>,
     #[serde(default = "default_heartbeat_timeout")]
     heartbeat_timeout_secs: u64,
     #[serde(default = "default_election_delay")]
@@ -119,11 +123,14 @@ enum ReplicaApply {
 struct ReplicationMeta {
     term: u64,
     is_leader: bool,
+    #[serde(default)]
+    voted_for: Option<String>,
 }
 
 struct ReplicationState {
     term: u64,
     is_leader: bool,
+    voted_for: Option<String>,
     last_heartbeat: Option<std::time::Instant>,
     was_receiving_replication: bool,
     last_replication: Option<std::time::Instant>,
@@ -281,6 +288,7 @@ struct Collection {
     read_pool_counter: AtomicUsize,
     db_global_commit_index: Arc<AtomicU64>,
     db_next_lsn: Arc<AtomicU64>,
+    db_last_log_term: Arc<AtomicU64>,
 }
 
 struct WalsState {
@@ -288,6 +296,7 @@ struct WalsState {
     current_wal_id: u64,
     current_wal_size: u64,
     last_appended_lsn: u64,
+    last_appended_term: u64,
     commit_paused: bool,
     write_paused: bool,
 }
@@ -369,6 +378,7 @@ struct Database {
     collections: RwLock<HashMap<String, Arc<Collection>>>,
     pub global_commit_index: Arc<AtomicU64>,
     pub next_lsn: Arc<AtomicU64>,
+    pub last_log_term: Arc<AtomicU64>,
 }
 
 impl Database {
@@ -384,6 +394,7 @@ impl Database {
             collections: RwLock::new(HashMap::new()),
             global_commit_index: Arc::new(AtomicU64::new(boot_lsn)),
             next_lsn: Arc::new(AtomicU64::new(boot_lsn)),
+            last_log_term: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -406,6 +417,7 @@ impl Database {
             col_path,
             self.global_commit_index.clone(),
             self.next_lsn.clone(),
+            self.last_log_term.clone(),
         )?);
         Collection::start_commit_task(col.clone());
         collections.insert(name.to_string(), col.clone());
@@ -444,6 +456,7 @@ impl Collection {
         root_path: PathBuf,
         db_global_commit_index: Arc<AtomicU64>,
         db_next_lsn: Arc<AtomicU64>,
+        db_last_log_term: Arc<AtomicU64>,
     ) -> io::Result<Self> {
         fs::create_dir_all(&root_path)?;
         let data_root = root_path.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -456,6 +469,7 @@ impl Collection {
         let mut snapshot_wal_id = 0;
         let mut snapshot_offset = 0;
         let mut snapshot_lsn: u64 = 0;
+        let mut snapshot_term: u64 = 0;
 
         if index_path.exists() {
              match File::open(&index_path) {
@@ -468,6 +482,7 @@ impl Collection {
                             snapshot_wal_id = snapshot.last_wal_id;
                             snapshot_offset = snapshot.last_offset;
                             snapshot_lsn = snapshot.last_lsn;
+                            snapshot_term = snapshot.last_term;
                             snapshot_loaded = true;
                         }
                         Err(e) => eprintln!("[{}] Failed to deserialize snapshot (likely legacy format): {}. Rebuilding from WAL.", name, e),
@@ -492,11 +507,21 @@ impl Collection {
         wal_files.sort_by_key(|(id, _)| *id);
 
         let mut max_lsn = snapshot_lsn;
+        let mut max_term = snapshot_term;
+
+        let fold = |res: (u64, u64), max_lsn: &mut u64, max_term: &mut u64| {
+            let (lsn, term) = res;
+            if lsn > *max_lsn {
+                *max_lsn = lsn;
+                *max_term = term;
+            }
+        };
 
         if !snapshot_loaded {
             println!("[{}] Replaying all WALs...", name);
              for (id, path) in &wal_files {
-                max_lsn = max_lsn.max(Self::replay_file_from(*id, path, 0, &mut index)?);
+                let r = Self::replay_file_from(*id, path, 0, &mut index)?;
+                fold(r, &mut max_lsn, &mut max_term);
             }
         } else {
              for (id, path) in &wal_files {
@@ -504,15 +529,20 @@ impl Collection {
                      continue;
                  } else if *id == snapshot_wal_id {
                      println!("[{}] Resuming WAL {} from offset {}", name, id, snapshot_offset);
-                     max_lsn = max_lsn.max(Self::replay_file_from(*id, path, snapshot_offset, &mut index)?);
+                     let r = Self::replay_file_from(*id, path, snapshot_offset, &mut index)?;
+                     fold(r, &mut max_lsn, &mut max_term);
                  } else {
-                     max_lsn = max_lsn.max(Self::replay_file_from(*id, path, 0, &mut index)?);
+                     let r = Self::replay_file_from(*id, path, 0, &mut index)?;
+                     fold(r, &mut max_lsn, &mut max_term);
                  }
              }
         }
 
         let boot_lsn = max_lsn;
-        db_next_lsn.fetch_max(boot_lsn, Ordering::SeqCst);
+        let prev_global = db_next_lsn.fetch_max(boot_lsn, Ordering::SeqCst);
+        if boot_lsn > prev_global {
+            db_last_log_term.store(max_term, Ordering::SeqCst);
+        }
 
         let current_wal_id = wal_files.last().map(|(id, _)| *id).unwrap_or(0) + 1;
 
@@ -535,6 +565,7 @@ impl Collection {
                 current_wal_id,
                 current_wal_size,
                 last_appended_lsn: boot_lsn,
+                last_appended_term: max_term,
                 commit_paused: false,
                 write_paused: false,
             }),
@@ -545,10 +576,11 @@ impl Collection {
             read_pool_counter: AtomicUsize::new(0),
             db_global_commit_index,
             db_next_lsn,
+            db_last_log_term,
         })
     }
 
-    fn replay_file_from(wal_id: u64, path: &PathBuf, mut start_offset: u64, index: &mut BTreeMap<String, IndexEntry>) -> io::Result<u64> {
+    fn replay_file_from(wal_id: u64, path: &PathBuf, mut start_offset: u64, index: &mut BTreeMap<String, IndexEntry>) -> io::Result<(u64, u64)> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         let file_len = file.metadata()?.len();
 
@@ -561,6 +593,7 @@ impl Collection {
         let mut offset = start_offset;
         let mut valid_end_offset = start_offset;
         let mut max_lsn: u64 = 0;
+        let mut max_term: u64 = 0;
 
         loop {
             let mut header = [0u8; HEADER_LEN];
@@ -572,6 +605,7 @@ impl Collection {
 
             let len = u32::from_le_bytes(header[0..4].try_into().unwrap());
             let crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
+            let term = u64::from_le_bytes(header[8..16].try_into().unwrap());
             let lsn = u64::from_le_bytes(header[16..24].try_into().unwrap());
 
             if len == 0 || (len as u64) > MAX_RECORD_SIZE {
@@ -601,7 +635,10 @@ impl Collection {
                         index.remove(&key);
                     }
                 }
-                max_lsn = max_lsn.max(lsn);
+                if lsn > max_lsn {
+                    max_lsn = lsn;
+                    max_term = term;
+                }
             }
             offset += HEADER_LEN as u64 + len as u64;
             valid_end_offset = offset;
@@ -612,7 +649,7 @@ impl Collection {
             println!("[{}] Truncated corrupted WAL file down to size {}", path.display(), valid_end_offset);
         }
 
-        Ok(max_lsn)
+        Ok((max_lsn, max_term))
     }
 
     fn current_timestamp() -> u64 {
@@ -687,6 +724,8 @@ impl Collection {
 
         let wal_id = wal.current_wal_id;
         wal.last_appended_lsn = lsn;
+        wal.last_appended_term = term;
+        self.db_last_log_term.store(term, Ordering::SeqCst);
 
         drop(wal);
 
@@ -700,6 +739,7 @@ impl Collection {
 
         let len = u32::from_le_bytes(frame_bytes[0..4].try_into().unwrap()) as usize;
         let crc = u32::from_le_bytes(frame_bytes[4..8].try_into().unwrap());
+        let frame_term = u64::from_le_bytes(frame_bytes[8..16].try_into().unwrap());
         let frame_lsn = u64::from_le_bytes(frame_bytes[16..24].try_into().unwrap());
 
         if frame_bytes.len() < HEADER_LEN + len {
@@ -753,7 +793,9 @@ impl Collection {
 
         wal.current_wal_size += frame_len;
         wal.last_appended_lsn = frame_lsn;
+        wal.last_appended_term = frame_term;
         self.db_next_lsn.fetch_max(frame_lsn, Ordering::SeqCst);
+        self.db_last_log_term.store(frame_term, Ordering::SeqCst);
 
         Ok(ReplicaApply::Applied { wal_id, offset, lsn: frame_lsn })
     }
@@ -963,6 +1005,7 @@ impl Collection {
             last_wal_id: wal_writer.current_wal_id,
             last_offset: wal_writer.current_wal_size,
             last_lsn: wal_writer.last_appended_lsn,
+            last_term: wal_writer.last_appended_term,
             map: index.clone(),
         };
 
@@ -1162,6 +1205,7 @@ fn apply_demotion(repl: &mut ReplicationState, new_term: u64) -> Option<bool> {
         return None;
     }
     repl.term = new_term;
+    repl.voted_for = None;
     repl.is_leader = false;
     repl.last_heartbeat = Some(std::time::Instant::now());
     repl.last_replication = None;
@@ -1195,6 +1239,39 @@ async fn discover_leader(state: &AppState) -> Option<String> {
         }
     }
     best.map(|(_, url)| url)
+}
+
+async fn maybe_follow_new_leader(state: &AppState, current_primary: &str) {
+    if state.is_leader() {
+        return;
+    }
+    let leader = match discover_leader(state).await {
+        Some(l) => l,
+        None => return,
+    };
+    if leader == current_primary {
+        return;
+    }
+
+    let changed = {
+        let mut repl = state.replication.as_ref().unwrap().write().unwrap();
+        if repl.primary_addr.as_deref() == Some(leader.as_str()) {
+            false
+        } else {
+            repl.primary_addr = Some(leader.clone());
+            repl.last_heartbeat = Some(std::time::Instant::now());
+            true
+        }
+    };
+
+    if changed {
+        println!("[failover] Following new leader {} (was {})", leader, current_primary);
+        let state2 = state.clone();
+        let leader2 = leader.clone();
+        tokio::spawn(async move {
+            resync_all_from(&state2, &leader2).await;
+        });
+    }
 }
 
 async fn resync_all_from(state: &AppState, leader: &str) {
@@ -1238,7 +1315,7 @@ async fn demote(state: &AppState, new_term: u64) {
         }
     };
 
-    let _ = ReplicationMeta { term: new_term, is_leader: false }.save("./data");
+    let _ = ReplicationMeta { term: new_term, is_leader: false, voted_for: None }.save("./data");
     println!("[demote] Discovered higher term {}, stepping down to replica", new_term);
 
     if restart {
@@ -2116,13 +2193,14 @@ async fn replicate_handler(
                 let mut r = repl.write().unwrap();
                 if req.term > r.term {
                     r.term = req.term;
+                    r.voted_for = None;
                     Some(r.term)
                 } else {
                     None
                 }
             };
             if let Some(t) = new_term {
-                let _ = ReplicationMeta { term: t, is_leader: false }.save("./data");
+                let _ = ReplicationMeta { term: t, is_leader: false, voted_for: None }.save("./data");
                 println!("[replicate] Adopted higher term {} from primary", t);
             }
         }
@@ -2299,21 +2377,24 @@ fn heartbeat_poll_task(state: AppState) {
                             if let Some(t) = hb.get("term").and_then(|v| v.as_u64()) {
                                 if t > repl.term {
                                     repl.term = t;
+                                    repl.voted_for = None;
                                     adopted = Some(t);
                                 }
                             }
                         }
                         if let Some(t) = adopted {
-                            let _ = ReplicationMeta { term: t, is_leader: false }.save("./data");
+                            let _ = ReplicationMeta { term: t, is_leader: false, voted_for: None }.save("./data");
                             println!("[heartbeat] Adopted higher term {} from primary {}", t, primary_addr);
                         }
                     }
                 },
                 Ok(r) => {
                     eprintln!("[heartbeat] Primary {} returned {}", primary_addr, r.status());
+                    maybe_follow_new_leader(&state, &primary_addr).await;
                 },
                 Err(e) => {
                     eprintln!("[heartbeat] Primary {} unreachable: {}", primary_addr, e);
+                    maybe_follow_new_leader(&state, &primary_addr).await;
                 }
             }
 
@@ -2335,7 +2416,7 @@ fn heartbeat_poll_task(state: AppState) {
 
             if should_elect {
                 println!("[election] Heartbeat timeout detected, initiating election...");
-                try_promote(&state, election_delay).await;
+                run_election(&state, election_delay).await;
                 if state.is_leader() {
                     break;
                 }
@@ -2344,17 +2425,133 @@ fn heartbeat_poll_task(state: AppState) {
     });
 }
 
-async fn try_promote(state: &AppState, max_delay_ms: u64) {
-    let delay_ms = {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut h = DefaultHasher::new();
-        state.config.node_id.hash(&mut h);
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos().hash(&mut h);
-        h.finish() % max_delay_ms
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct VoteRequest {
+    term: u64,
+    candidate_id: String,
+    last_lsn: u64,
+    last_term: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct VoteResponse {
+    term: u64,
+    vote_granted: bool,
+}
+
+struct VoteDecision {
+    granted: bool,
+    term: u64,
+    voted_for: Option<String>,
+}
+
+fn majority(cluster_size: usize) -> usize {
+    cluster_size / 2 + 1
+}
+
+fn election_jitter(node_id: &str, max_delay_ms: u64) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    if max_delay_ms == 0 {
+        return 0;
+    }
+    let mut h = DefaultHasher::new();
+    node_id.hash(&mut h);
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos().hash(&mut h);
+    h.finish() % max_delay_ms
+}
+
+fn decide_vote(
+    cur_term: u64,
+    cur_voted_for: &Option<String>,
+    my_log_term: u64,
+    my_lsn: u64,
+    req: &VoteRequest,
+) -> VoteDecision {
+    if req.term < cur_term {
+        return VoteDecision { granted: false, term: cur_term, voted_for: cur_voted_for.clone() };
+    }
+
+    let mut term = cur_term;
+    let mut voted_for = cur_voted_for.clone();
+    if req.term > cur_term {
+        term = req.term;
+        voted_for = None;
+    }
+
+    let can_vote = match &voted_for {
+        None => true,
+        Some(v) => v == &req.candidate_id,
     };
-    println!("[election] Waiting {}ms before promotion attempt...", delay_ms);
+    let up_to_date = (req.last_term, req.last_lsn) >= (my_log_term, my_lsn);
+
+    if can_vote && up_to_date {
+        VoteDecision { granted: true, term, voted_for: Some(req.candidate_id.clone()) }
+    } else {
+        VoteDecision { granted: false, term, voted_for }
+    }
+}
+
+async fn vote_handler(
+    State(state): State<AppState>,
+    Json(req): Json<VoteRequest>,
+) -> impl axum::response::IntoResponse {
+    if !state.is_shard() {
+        return (StatusCode::FORBIDDEN, "Not a voting node").into_response();
+    }
+
+    let repl = match state.replication.as_ref() {
+        Some(r) => r,
+        None => return (StatusCode::FORBIDDEN, "No replication state").into_response(),
+    };
+
+    let my_lsn = state.db.as_ref().map_or(0, |db| db.global_commit_index.load(Ordering::SeqCst));
+    let my_log_term = state.db.as_ref().map_or(0, |db| db.last_log_term.load(Ordering::SeqCst));
+
+    let (granted, resp_term, restart_poll, persist) = {
+        let mut g = repl.write().unwrap();
+        let was_leader = g.is_leader;
+        let old_term = g.term;
+
+        let d = decide_vote(g.term, &g.voted_for, my_log_term, my_lsn, &req);
+
+        let mut restart = false;
+        g.term = d.term;
+        g.voted_for = d.voted_for.clone();
+
+        if d.term > old_term && was_leader {
+            g.is_leader = false;
+            restart = !g.heartbeat_running;
+            g.heartbeat_running = true;
+        }
+
+        if d.granted {
+            g.last_heartbeat = Some(std::time::Instant::now());
+        }
+
+        let persist = ReplicationMeta { term: g.term, is_leader: g.is_leader, voted_for: g.voted_for.clone() };
+        (d.granted, d.term, restart, persist)
+    };
+
+    let _ = persist.save("./data");
+    if restart_poll {
+        heartbeat_poll_task(state.clone());
+    }
+    if granted {
+        println!("[vote] Granted vote to {} for term {}", req.candidate_id, req.term);
+    }
+
+    (StatusCode::OK, Json(VoteResponse { term: resp_term, vote_granted: granted })).into_response()
+}
+
+async fn run_election(state: &AppState, max_delay_ms: u64) {
+    let delay_ms = election_jitter(&state.config.node_id, max_delay_ms);
+    println!("[election] Waiting {}ms before requesting votes...", delay_ms);
     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+    if state.is_leader() {
+        return;
+    }
 
     {
         let primary_addr = state.replication.as_ref().unwrap().read().unwrap().primary_addr.clone();
@@ -2362,7 +2559,7 @@ async fn try_promote(state: &AppState, max_delay_ms: u64) {
             let url = format!("{}/internal/heartbeat", addr);
             if let Ok(r) = state.client.get(&url).send().await {
                 if r.status().is_success() {
-                    println!("[election] Primary recovered during delay, aborting promotion");
+                    println!("[election] Primary recovered during delay, aborting election");
                     let mut repl = state.replication.as_ref().unwrap().write().unwrap();
                     repl.last_heartbeat = Some(std::time::Instant::now());
                     return;
@@ -2371,22 +2568,108 @@ async fn try_promote(state: &AppState, max_delay_ms: u64) {
         }
     }
 
-    let mut repl = state.replication.as_ref().unwrap().write().unwrap();
-    repl.term += 1;
-    repl.is_leader = true;
-    repl.heartbeat_running = false;
-    repl.primary_addr = None;
+    let my_lsn = state.db.as_ref().map_or(0, |db| db.global_commit_index.load(Ordering::SeqCst));
+    let my_log_term = state.db.as_ref().map_or(0, |db| db.last_log_term.load(Ordering::SeqCst));
+    let candidate_id = state.config.node_id.clone();
 
-    let new_term = repl.term;
-    drop(repl);
+    let new_term = {
+        let mut repl = state.replication.as_ref().unwrap().write().unwrap();
+        repl.term += 1;
+        repl.voted_for = Some(candidate_id.clone());
+        repl.term
+    };
+    let _ = ReplicationMeta { term: new_term, is_leader: false, voted_for: Some(candidate_id.clone()) }.save("./data");
 
-    let meta = ReplicationMeta { term: new_term, is_leader: true };
-    if let Err(e) = meta.save("./data") {
-        eprintln!("[election] WARNING: Failed to persist replication meta: {}", e);
+    let peers = state.config.peers.clone();
+    let cluster_size = peers.len() + 1;
+    let needed = majority(cluster_size);
+    println!("[election] Node {} standing for term {} ({} peers, need {} votes)", candidate_id, new_term, peers.len(), needed);
+
+    if peers.is_empty() {
+        if needed <= 1 {
+            become_leader(state, new_term, &candidate_id).await;
+        } else {
+            eprintln!("[election] No peers configured; cannot form a majority. Set 'peers' in config for automatic failover.");
+        }
+        return;
     }
 
-    println!("[election] *** PROMOTED to primary at term {} ***", new_term);
-    println!("[election] Node {} is now accepting writes", state.config.node_id);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(bool, u64)>(peers.len());
+    for peer in peers {
+        let client = state.client.clone();
+        let req = VoteRequest {
+            term: new_term,
+            candidate_id: candidate_id.clone(),
+            last_lsn: my_lsn,
+            last_term: my_log_term,
+        };
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let url = format!("{}/internal/vote", peer);
+            let result = match client.post(&url).json(&req).send().await {
+                Ok(r) if r.status().is_success() => {
+                    match r.json::<VoteResponse>().await {
+                        Ok(v) => (v.vote_granted, v.term),
+                        Err(_) => (false, 0),
+                    }
+                },
+                _ => (false, 0),
+            };
+            let _ = tx.send(result).await;
+        });
+    }
+    drop(tx);
+
+    let votes = Arc::new(AtomicUsize::new(1));
+    let highest_term = Arc::new(AtomicU64::new(new_term));
+    let votes_inner = votes.clone();
+    let ht_inner = highest_term.clone();
+    let election_timeout = Duration::from_millis(max_delay_ms.max(1000) + 2000);
+    let _ = tokio::time::timeout(election_timeout, async move {
+        while votes_inner.load(Ordering::Relaxed) < needed {
+            match rx.recv().await {
+                Some((granted, term)) => {
+                    if term > ht_inner.load(Ordering::Relaxed) {
+                        ht_inner.store(term, Ordering::Relaxed);
+                    }
+                    if granted {
+                        votes_inner.fetch_add(1, Ordering::Relaxed);
+                    }
+                },
+                None => break,
+            }
+        }
+    }).await;
+
+    let seen_term = highest_term.load(Ordering::Relaxed);
+    if seen_term > new_term {
+        println!("[election] Saw higher term {} during election; stepping down", seen_term);
+        demote(state, seen_term).await;
+        return;
+    }
+
+    let tally = votes.load(Ordering::Relaxed);
+    if tally >= needed {
+        become_leader(state, new_term, &candidate_id).await;
+    } else {
+        println!("[election] Only {}/{} votes for term {}; election failed, will retry", tally, needed, new_term);
+    }
+}
+
+async fn become_leader(state: &AppState, term: u64, candidate_id: &str) {
+    {
+        let mut repl = state.replication.as_ref().unwrap().write().unwrap();
+        if repl.term != term || repl.voted_for.as_deref() != Some(candidate_id) {
+            println!("[election] State changed during election (term now {}); not assuming leadership", repl.term);
+            return;
+        }
+        repl.is_leader = true;
+        repl.heartbeat_running = false;
+        repl.primary_addr = None;
+    }
+    let _ = ReplicationMeta { term, is_leader: true, voted_for: Some(candidate_id.to_string()) }.save("./data");
+    println!("[election] *** WON election: PROMOTED to primary at term {} ***", term);
+    println!("[election] Node {} is now accepting writes", candidate_id);
 }
 
 #[derive(Deserialize)]
@@ -2544,24 +2827,27 @@ async fn main() -> io::Result<()> {
 
     let replication = if config.role == "shard" {
         let meta = ReplicationMeta::load("./data");
-        let (term, is_leader) = if let Some(ref m) = meta {
+        let (term, is_leader, voted_for) = if let Some(ref m) = meta {
             println!("[boot] Restored replication state: term={}, is_leader={}", m.term, m.is_leader);
             let mut boot_term = m.term;
+            let mut boot_voted = m.voted_for.clone();
             if m.is_leader {
                 boot_term += 1;
-                let new_meta = ReplicationMeta { term: boot_term, is_leader: true };
+                boot_voted = Some(config.node_id.clone());
+                let new_meta = ReplicationMeta { term: boot_term, is_leader: true, voted_for: boot_voted.clone() };
                 let _ = new_meta.save("./data");
                 println!("[boot] Escalated leader term to {} to prevent split brain.", boot_term);
             }
-            (boot_term, m.is_leader)
+            (boot_term, m.is_leader, boot_voted)
         } else {
             let is_primary = config.shard_role.as_deref() == Some("primary");
-            (0, is_primary)
+            (0, is_primary, None)
         };
 
         Some(Arc::new(RwLock::new(ReplicationState {
             term,
             is_leader,
+            voted_for,
             last_heartbeat: None,
             last_replication: None,
             was_receiving_replication: false,
@@ -2618,6 +2904,7 @@ async fn main() -> io::Result<()> {
             .route("/internal/replicate", post(replicate_handler))
             .route("/internal/snapshot", get(snapshot_handler))
             .route("/internal/resync", post(resync_handler))
+            .route("/internal/vote", post(vote_handler))
             .route("/internal/heartbeat", get(heartbeat_handler));
     }
 
@@ -2940,6 +3227,7 @@ mod tests {
         ReplicationState {
             term,
             is_leader: true,
+            voted_for: None,
             last_heartbeat: None,
             was_receiving_replication: true,
             last_replication: Some(std::time::Instant::now()),
@@ -2948,6 +3236,70 @@ mod tests {
             replicas: vec![],
             last_known_primary_position: None,
         }
+    }
+
+    fn vote_req(term: u64, candidate: &str, last_term: u64, last_lsn: u64) -> VoteRequest {
+        VoteRequest { term, candidate_id: candidate.to_string(), last_term, last_lsn }
+    }
+
+    #[test]
+    fn majority_math() {
+        assert_eq!(majority(1), 1);
+        assert_eq!(majority(2), 2);
+        assert_eq!(majority(3), 2);
+        assert_eq!(majority(4), 3);
+        assert_eq!(majority(5), 3);
+    }
+
+    #[test]
+    fn vote_granted_for_fresh_higher_term_when_up_to_date() {
+        let d = decide_vote(2, &None, 2, 100, &vote_req(3, "n1", 2, 100));
+        assert!(d.granted);
+        assert_eq!(d.term, 3);
+        assert_eq!(d.voted_for.as_deref(), Some("n1"));
+    }
+
+    #[test]
+    fn vote_denied_for_stale_candidate_term() {
+        let d = decide_vote(5, &None, 5, 100, &vote_req(4, "n1", 5, 100));
+        assert!(!d.granted);
+        assert_eq!(d.term, 5);
+        assert_eq!(d.voted_for, None);
+    }
+
+    #[test]
+    fn vote_at_most_once_per_term() {
+        let d1 = decide_vote(3, &None, 1, 50, &vote_req(3, "n1", 1, 50));
+        assert!(d1.granted);
+        assert_eq!(d1.voted_for.as_deref(), Some("n1"));
+
+        let d2 = decide_vote(3, &d1.voted_for, 1, 50, &vote_req(3, "n2", 1, 50));
+        assert!(!d2.granted, "must not vote for a second candidate in the same term");
+        assert_eq!(d2.voted_for.as_deref(), Some("n1"));
+
+        let d3 = decide_vote(3, &d1.voted_for, 1, 50, &vote_req(3, "n1", 1, 50));
+        assert!(d3.granted, "re-voting for the same candidate is idempotent");
+    }
+
+    #[test]
+    fn vote_denied_when_candidate_log_behind() {
+        let behind_lsn = decide_vote(3, &None, 2, 100, &vote_req(4, "n1", 2, 99));
+        assert!(!behind_lsn.granted, "candidate with lower lsn at same log term must lose");
+
+        let behind_term = decide_vote(3, &None, 2, 100, &vote_req(4, "n1", 1, 500));
+        assert!(!behind_term.granted, "candidate with lower last log term must lose even with higher lsn");
+
+        let ahead = decide_vote(3, &None, 2, 100, &vote_req(4, "n1", 3, 1));
+        assert!(ahead.granted, "higher last log term wins regardless of lsn");
+    }
+
+    #[test]
+    fn higher_term_vote_resets_prior_vote() {
+        let prior = Some("n2".to_string());
+        let d = decide_vote(3, &prior, 1, 50, &vote_req(4, "n1", 1, 50));
+        assert!(d.granted, "a higher term clears the old vote, so n1 can win");
+        assert_eq!(d.term, 4);
+        assert_eq!(d.voted_for.as_deref(), Some("n1"));
     }
 
     #[test]
