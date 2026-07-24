@@ -176,7 +176,7 @@ mod base64_bytes {
         base64_decode(&s).map_err(de::Error::custom)
     }
 
-    fn base64_encode(input: &[u8]) -> String {
+    pub fn base64_encode(input: &[u8]) -> String {
         const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut result = String::new();
         for chunk in input.chunks(3) {
@@ -200,7 +200,7 @@ mod base64_bytes {
         result
     }
 
-    fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
+    pub fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
         let input = input.trim_end_matches('=');
         let mut result = Vec::new();
         let mut buf: u32 = 0;
@@ -962,6 +962,62 @@ impl Collection {
         index.range::<str, _>(range_bound).map(|(k, v)| (k.clone(), *v)).collect()
     }
 
+    pub fn range_from(&self, after: Option<&str>, start: Option<&str>, end: Option<&str>) -> Vec<(String, IndexEntry)> {
+        let index = self.index.read().unwrap();
+
+        let start_bound = if let Some(a) = after {
+            std::ops::Bound::Excluded(a)
+        } else if let Some(s) = start {
+            std::ops::Bound::Included(s)
+        } else {
+            std::ops::Bound::Unbounded
+        };
+        let end_bound = end.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Included);
+
+        index.range::<str, _>((start_bound, end_bound)).map(|(k, v)| (k.clone(), *v)).collect()
+    }
+
+    fn query_page(
+        &self,
+        after: Option<&str>,
+        start: Option<&str>,
+        end: Option<&str>,
+        filter: &Option<Filter>,
+        limit: usize,
+    ) -> io::Result<(Vec<serde_json::Value>, Option<String>)> {
+        let mut items = Vec::with_capacity(limit);
+        let mut last_key: Option<String> = None;
+        let mut has_more = false;
+
+        for (key, _entry) in self.range_from(after, start, end).into_iter() {
+            if items.len() >= limit {
+                match filter {
+                    None => {
+                        has_more = true;
+                        break;
+                    },
+                    Some(f) => {
+                        if let Some(val) = self.get(&key)? {
+                            if matches_filter(&val, f) {
+                                has_more = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            } else if let Some(val) = self.get(&key)? {
+                let matched = filter.as_ref().map_or(true, |f| matches_filter(&val, f));
+                if matched {
+                    items.push(val);
+                    last_key = Some(key.clone());
+                }
+            }
+        }
+
+        let next_cursor = if has_more { last_key } else { None };
+        Ok((items, next_cursor))
+    }
+
     fn get(&self, key: &str) -> io::Result<Option<serde_json::Value>> {
         let idx_entry = {
             let index = self.index.read().unwrap();
@@ -1143,6 +1199,28 @@ struct QueryParams {
     limit: Option<usize>,
     filter: Option<String>,
     read: Option<String>,
+    cursor: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct QueryPage {
+    items: Vec<serde_json::Value>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct ShardCursor {
+    positions: BTreeMap<String, String>,
+}
+
+fn encode_cursor(c: &ShardCursor) -> String {
+    let json = serde_json::to_vec(c).unwrap_or_default();
+    base64_bytes::base64_encode(&json)
+}
+
+fn decode_cursor(s: &str) -> Option<ShardCursor> {
+    let bytes = base64_bytes::base64_decode(s).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 #[derive(Deserialize)]
@@ -2216,57 +2294,80 @@ async fn query_docs(
     State(state): State<AppState>,
     AxumPath(col_name): AxumPath<String>,
     Query(params): Query<QueryParams>,
-    req: axum::extract::Request,
+    _req: axum::extract::Request,
 ) -> impl axum::response::IntoResponse {
-    let limit = params.limit.unwrap_or(100);
+    let limit = params.limit.unwrap_or(100).max(1);
 
     if state.config.role == "router" {
-        let query_str = req.uri().query().map(|q| format!("?{}", q)).unwrap_or_default();
         let pref = parse_read_pref(params.read.as_deref());
+        let incoming = params.cursor.as_deref().and_then(decode_cursor);
+        let shards = unique_shards(&state);
+        let n = shards.len().max(1);
+        let per_shard = ((limit + n - 1) / n).max(1);
 
         let mut futures = Vec::new();
-        for (original, replicas) in unique_shards(&state) {
+        for (original, replicas) in shards {
+            let after: Option<String> = match &incoming {
+                Some(c) => match c.positions.get(&original) {
+                    Some(k) => Some(k.clone()),
+                    None => continue,
+                },
+                None => None,
+            };
+
             let effective = state.effective_primary(&original);
             let rr = state.read_rr.fetch_add(1, Ordering::Relaxed);
             let targets = read_targets(&pref, &effective, &replicas, rr);
             let client = state.client.clone();
             let col = col_name.clone();
-            let qs = query_str.clone();
+
+            let mut q: Vec<(String, String)> = vec![("limit".to_string(), per_shard.to_string())];
+            if let Some(s) = &params.start { q.push(("start".to_string(), s.clone())); }
+            if let Some(e) = &params.end { q.push(("end".to_string(), e.clone())); }
+            if let Some(f) = &params.filter { q.push(("filter".to_string(), f.clone())); }
+            if let Some(a) = &after { q.push(("cursor".to_string(), a.clone())); }
 
             futures.push(tokio::spawn(async move {
                 for target in targets {
-                    let full_url = format!("{}/collections/{}/query{}", target, col, qs);
-                    if let Ok(res) = client.get(&full_url).send().await {
+                    let url = format!("{}/collections/{}/query", target, col);
+                    if let Ok(res) = client.get(&url).query(&q).send().await {
                         if res.status().is_success() {
-                            if let Ok(text) = res.text().await {
-                                let json_arr: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap_or_default();
-                                return Some(json_arr);
+                            if let Ok(page) = res.json::<QueryPage>().await {
+                                return (original, Some(page));
                             }
                         }
                     }
                 }
-                None
+                (original, None)
             }));
         }
 
         let joined = futures::future::join_all(futures).await;
-        let mut merged_results = Vec::new();
+        let mut merged = Vec::new();
+        let mut positions = BTreeMap::new();
         for res in joined {
-            let items = match res {
-                Ok(Some(items)) => items,
-                _ => return (StatusCode::BAD_GATEWAY, "Shard query failed").into_response(),
+            let (original, page) = match res {
+                Ok(t) => t,
+                Err(_) => return (StatusCode::BAD_GATEWAY, "Shard query task failed").into_response(),
             };
-            for item in items {
-                merged_results.push(item);
-                if merged_results.len() >= limit {
-                    break;
-                }
-            }
-            if merged_results.len() >= limit {
-                break;
+            match page {
+                Some(p) => {
+                    merged.extend(p.items);
+                    if let Some(k) = p.next_cursor {
+                        positions.insert(original, k);
+                    }
+                },
+                None => return (StatusCode::BAD_GATEWAY, "Shard query failed").into_response(),
             }
         }
-        return (StatusCode::OK, Json(merged_results)).into_response();
+
+        let next_cursor = if positions.is_empty() {
+            None
+        } else {
+            Some(encode_cursor(&ShardCursor { positions }))
+        };
+
+        return (StatusCode::OK, Json(QueryPage { items: merged, next_cursor })).into_response();
     }
 
     let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
@@ -2275,35 +2376,17 @@ async fn query_docs(
     };
 
     let col_clone = col.clone();
-
     let filter_obj: Option<Filter> = params.filter
         .as_ref()
         .and_then(|f| serde_json::from_str::<Filter>(f).ok());
+    let after = params.cursor.clone();
+    let start = params.start.clone();
+    let end = params.end.clone();
 
     match tokio::task::spawn_blocking(move || {
-        let mut results = Vec::with_capacity(limit);
-
-        for (key, _entry) in col_clone.range(
-            params.start.as_deref(),
-            params.end.as_deref()
-        ).into_iter() {
-            if let Ok(Some(val)) = col_clone.get(&key) {
-                if let Some(ref f) = filter_obj {
-                    if matches_filter(&val, f) {
-                        results.push(val);
-                    }
-                } else {
-                    results.push(val);
-                }
-
-                if results.len() >= limit {
-                    break;
-                }
-            }
-        }
-        Ok::<_, io::Error>(results)
+        col_clone.query_page(after.as_deref(), start.as_deref(), end.as_deref(), &filter_obj, limit)
     }).await {
-        Ok(Ok(vals)) => (StatusCode::OK, Json(vals)).into_response(),
+        Ok(Ok((items, next_cursor))) => (StatusCode::OK, Json(QueryPage { items, next_cursor })).into_response(),
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
     }
@@ -3580,5 +3663,92 @@ mod tests {
         assert!(matches!(parse_read_pref(Some("primary")), ReadPreference::Primary));
         assert!(matches!(parse_read_pref(Some("garbage")), ReadPreference::Primary));
         assert!(matches!(parse_read_pref(Some("replica")), ReadPreference::Replica));
+    }
+
+    #[tokio::test]
+    async fn range_from_resumes_exclusively() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+        for k in ["a", "b", "c", "d"] {
+            let (_, w, o, _) = col.put(k.to_string(), serde_json::json!({"k": k}), 1).unwrap();
+            col.index.write().unwrap().insert(k.to_string(), IndexEntry { wal_id: w, offset: o });
+        }
+
+        let inclusive: Vec<String> = col.range_from(None, Some("b"), None).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(inclusive, vec!["b", "c", "d"], "start is inclusive");
+
+        let exclusive: Vec<String> = col.range_from(Some("b"), None, None).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(exclusive, vec!["c", "d"], "cursor resumes strictly after the key");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn query_page_paginates_without_loss_or_duplication() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+        for i in 1..=5 {
+            let k = format!("k{}", i);
+            let (_, w, o, _) = col.put(k.clone(), serde_json::json!({"i": i}), 1).unwrap();
+            col.index.write().unwrap().insert(k, IndexEntry { wal_id: w, offset: o });
+        }
+        col.enqueue_commit().await.unwrap().unwrap();
+
+        let (p1, c1) = col.query_page(None, None, None, &None, 2).unwrap();
+        assert_eq!(p1.len(), 2);
+        assert_eq!(c1.as_deref(), Some("k2"), "next_cursor is the last key when more remain");
+
+        let (p2, c2) = col.query_page(c1.as_deref(), None, None, &None, 2).unwrap();
+        assert_eq!(p2.len(), 2);
+        assert_eq!(p2[0], serde_json::json!({"i": 3}));
+        assert_eq!(c2.as_deref(), Some("k4"));
+
+        let (p3, c3) = col.query_page(c2.as_deref(), None, None, &None, 2).unwrap();
+        assert_eq!(p3.len(), 1, "final short page");
+        assert_eq!(p3[0], serde_json::json!({"i": 5}));
+        assert_eq!(c3, None, "no cursor once the range is exhausted");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn query_page_no_cursor_when_last_page_is_exactly_full() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+        for i in 1..=4 {
+            let k = format!("k{}", i);
+            let (_, w, o, _) = col.put(k.clone(), serde_json::json!({"i": i}), 1).unwrap();
+            col.index.write().unwrap().insert(k, IndexEntry { wal_id: w, offset: o });
+        }
+        col.enqueue_commit().await.unwrap().unwrap();
+
+        let (_p1, c1) = col.query_page(None, None, None, &None, 2).unwrap();
+        assert_eq!(c1.as_deref(), Some("k2"));
+
+        let (p2, c2) = col.query_page(c1.as_deref(), None, None, &None, 2).unwrap();
+        assert_eq!(p2.len(), 2);
+        assert_eq!(c2, None, "a full final page with nothing after must not emit a cursor");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shard_cursor_round_trips_through_base64() {
+        let mut positions = BTreeMap::new();
+        positions.insert("http://s1".to_string(), "k42".to_string());
+        positions.insert("http://s2".to_string(), "k17".to_string());
+        let c = ShardCursor { positions };
+
+        let encoded = encode_cursor(&c);
+        assert!(!encoded.contains('{'), "encoded cursor should be opaque, not raw JSON");
+
+        let decoded = decode_cursor(&encoded).expect("must decode");
+        assert_eq!(decoded.positions.get("http://s1").map(|s| s.as_str()), Some("k42"));
+        assert_eq!(decoded.positions.get("http://s2").map(|s| s.as_str()), Some("k17"));
+
+        assert!(decode_cursor("!!!not base64 json!!!").is_none());
     }
 }
