@@ -371,6 +371,21 @@ impl AppState {
             cached_at: std::time::Instant::now(),
         });
     }
+
+    fn clear_primary_override(&self, original_url: &str) {
+        self.primary_overrides.lock().unwrap().remove(original_url);
+    }
+
+    fn effective_primary(&self, original_url: &str) -> String {
+        let mut overrides = self.primary_overrides.lock().unwrap();
+        if let Some(ov) = overrides.get(original_url) {
+            if ov.cached_at.elapsed().as_secs() < OVERRIDE_TTL_SECS {
+                return ov.url.clone();
+            }
+            overrides.remove(original_url);
+        }
+        original_url.to_string()
+    }
 }
 
 struct Database {
@@ -1774,6 +1789,121 @@ async fn passthrough_json(r: reqwest::Response) -> axum::response::Response {
     (status, Json(json_body)).into_response()
 }
 
+const ROUTER_PROBE_INTERVAL_SECS: u64 = 3;
+
+async fn probe_node(client: &reqwest::Client, url: &str) -> Option<(String, u64)> {
+    let hb = format!("{}/internal/heartbeat", url);
+    let r = client.get(&hb).send().await.ok()?;
+    if !r.status().is_success() {
+        return None;
+    }
+    let v = r.json::<serde_json::Value>().await.ok()?;
+    let role = v.get("role").and_then(|x| x.as_str())?.to_string();
+    let term = v.get("term").and_then(|x| x.as_u64()).unwrap_or(0);
+    Some((role, term))
+}
+
+fn select_primary(probes: &[(String, Option<(String, u64)>)]) -> Option<String> {
+    let mut best: Option<(u64, String)> = None;
+    for (url, res) in probes {
+        if let Some((role, term)) = res {
+            if role == "primary" && best.as_ref().map_or(true, |(t, _)| *term > *t) {
+                best = Some((*term, url.clone()));
+            }
+        }
+    }
+    best.map(|(_, u)| u)
+}
+
+fn unique_shards(state: &AppState) -> Vec<(String, Vec<String>)> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for shard in &state.config.shard_map {
+        if seen.insert(shard.node_url.clone()) {
+            out.push((shard.node_url.clone(), shard.replica_urls.clone()));
+        }
+    }
+    out
+}
+
+fn router_probe_task(state: AppState) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(ROUTER_PROBE_INTERVAL_SECS)).await;
+
+            for (original, replicas) in unique_shards(&state) {
+                let effective = state.effective_primary(&original);
+
+                if let Some((role, _term)) = probe_node(&state.client, &effective).await {
+                    if role == "primary" {
+                        if effective != original {
+                            state.set_primary_override(&original, &effective);
+                        }
+                        continue;
+                    }
+                }
+
+                let mut candidates = vec![original.clone()];
+                candidates.extend(replicas.iter().cloned());
+                candidates.sort();
+                candidates.dedup();
+
+                let mut probes = Vec::new();
+                for c in candidates {
+                    let res = probe_node(&state.client, &c).await;
+                    probes.push((c, res));
+                }
+
+                match select_primary(&probes) {
+                    Some(winner) => {
+                        if winner == original {
+                            state.clear_primary_override(&original);
+                        } else if winner != effective {
+                            state.set_primary_override(&original, &winner);
+                            println!("[router-probe] Shard {} primary is now {}", original, winner);
+                        } else {
+                            state.set_primary_override(&original, &winner);
+                        }
+                    },
+                    None => {
+                        eprintln!("[router-probe] Shard {} has no reachable primary (election in progress?)", original);
+                    }
+                }
+            }
+        }
+    });
+}
+
+async fn router_read_doc(state: &AppState, col_name: &str, id: &str) -> axum::response::Response {
+    let hash = hash_key(col_name, id);
+    let (effective, _original, replicas) = match state.get_effective_shard_url(hash) {
+        Some(t) => t,
+        None => return (StatusCode::BAD_REQUEST, "Key not owned by any shard").into_response(),
+    };
+
+    let path = format!("/collections/{}/docs/{}", col_name, id);
+
+    let full_url = format!("{}{}", effective, path);
+    if let Ok(r) = state.client.get(&full_url).send().await {
+        let status = r.status();
+        if status.is_success() || status == StatusCode::NOT_FOUND {
+            return passthrough_json(r).await;
+        }
+    }
+
+    for replica in &replicas {
+        let replica_url = format!("{}{}", replica, path);
+        if let Ok(r) = state.client.get(&replica_url).send().await {
+            let status = r.status();
+            if status.is_success() || status == StatusCode::NOT_FOUND {
+                return passthrough_json(r).await;
+            }
+        }
+    }
+
+    (StatusCode::BAD_GATEWAY, "No shard node could serve the read").into_response()
+}
+
 async fn local_write(
     state: &AppState,
     col_name: &str,
@@ -1936,16 +2066,7 @@ async fn get_doc(
     AxumPath((col_name, id)): AxumPath<(String, String)>,
 ) -> impl axum::response::IntoResponse {
     if state.config.role == "router" {
-        let hash = hash_key(&col_name, &id);
-        if let Some((target_url, _, _)) = state.get_effective_shard_url(hash) {
-            let full_url = format!("{}/collections/{}/docs/{}", target_url, col_name, id);
-            let res = state.client.get(&full_url).send().await;
-            match res {
-                Ok(r) => return passthrough_json(r).await,
-                Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
-            }
-        }
-        return (StatusCode::BAD_REQUEST, "Key not owned by any shard").into_response();
+        return router_read_doc(&state, &col_name, &id).await;
     }
 
     let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
@@ -2059,58 +2180,55 @@ async fn query_docs(
     let limit = params.limit.unwrap_or(100);
 
     if state.config.role == "router" {
-        let mut unique_urls = std::collections::HashSet::new();
-        for shard in &state.config.shard_map {
-            unique_urls.insert(shard.node_url.clone());
-        }
-
         let query_str = req.uri().query().map(|q| format!("?{}", q)).unwrap_or_default();
 
         let mut futures = Vec::new();
-        for url in unique_urls {
-            let full_url = format!("{}/collections/{}/query{}", url, col_name, query_str);
+        for (original, replicas) in unique_shards(&state) {
+            let effective = state.effective_primary(&original);
             let client = state.client.clone();
+            let col = col_name.clone();
+            let qs = query_str.clone();
 
             futures.push(tokio::spawn(async move {
-                let res = client.get(&full_url).send().await?;
-                if res.status().is_success() {
-                    let text = res.text().await?;
-                    let json_arr: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap_or_default();
-                    Ok::<_, reqwest::Error>(json_arr)
-                } else {
-                    Err(reqwest::Error::from(res.error_for_status().unwrap_err()))
+                let mut targets = vec![effective];
+                for r in replicas {
+                    if !targets.contains(&r) {
+                        targets.push(r);
+                    }
                 }
+                for target in targets {
+                    let full_url = format!("{}/collections/{}/query{}", target, col, qs);
+                    if let Ok(res) = client.get(&full_url).send().await {
+                        if res.status().is_success() {
+                            if let Ok(text) = res.text().await {
+                                let json_arr: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap_or_default();
+                                return Some(json_arr);
+                            }
+                        }
+                    }
+                }
+                None
             }));
         }
 
-        let shard_results = futures::future::try_join_all(futures).await;
-        match shard_results {
-            Ok(arrays) => {
-                let mut merged_results = Vec::new();
-                for items in arrays {
-                    match items {
-                        Ok(items) => {
-                            for item in items {
-                                merged_results.push(item);
-                                if merged_results.len() >= limit {
-                                    break;
-                                }
-                            }
-                        },
-                        Err(_) => {
-                            return (StatusCode::BAD_GATEWAY, "Shard query failed").into_response();
-                        }
-                    }
-                    if merged_results.len() >= limit {
-                        break;
-                    }
+        let joined = futures::future::join_all(futures).await;
+        let mut merged_results = Vec::new();
+        for res in joined {
+            let items = match res {
+                Ok(Some(items)) => items,
+                _ => return (StatusCode::BAD_GATEWAY, "Shard query failed").into_response(),
+            };
+            for item in items {
+                merged_results.push(item);
+                if merged_results.len() >= limit {
+                    break;
                 }
-                return (StatusCode::OK, Json(merged_results)).into_response();
-            },
-            Err(_) => {
-                return (StatusCode::BAD_GATEWAY, "Shard query failed").into_response();
+            }
+            if merged_results.len() >= limit {
+                break;
             }
         }
+        return (StatusCode::OK, Json(merged_results)).into_response();
     }
 
     let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
@@ -2916,6 +3034,11 @@ async fn main() -> io::Result<()> {
         heartbeat_poll_task(state.clone());
     }
 
+    if config.role == "router" {
+        println!("[boot] Starting router primary-probe task (interval={}s)", ROUTER_PROBE_INTERVAL_SECS);
+        router_probe_task(state.clone());
+    }
+
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     println!("Server starting on http://{}", config.listen_addr);
     axum::serve(listener, app).await?;
@@ -3344,5 +3467,37 @@ mod tests {
         let fb = Some(serde_json::json!({"status": "not_a_replica", "term": 4}));
         assert_eq!(forbidden_term(&fb), 4);
         assert_eq!(forbidden_term(&None), 0);
+    }
+
+    fn probe(url: &str, role: &str, term: u64) -> (String, Option<(String, u64)>) {
+        (url.to_string(), Some((role.to_string(), term)))
+    }
+
+    #[test]
+    fn select_primary_picks_the_reachable_leader() {
+        let probes = vec![
+            probe("http://a", "replica", 5),
+            probe("http://b", "primary", 5),
+            probe("http://c", "replica", 5),
+        ];
+        assert_eq!(select_primary(&probes).as_deref(), Some("http://b"));
+    }
+
+    #[test]
+    fn select_primary_prefers_highest_term_on_split() {
+        let probes = vec![
+            probe("http://old", "primary", 4),
+            probe("http://new", "primary", 6),
+        ];
+        assert_eq!(select_primary(&probes).as_deref(), Some("http://new"));
+    }
+
+    #[test]
+    fn select_primary_none_when_no_leader() {
+        let probes = vec![
+            probe("http://a", "replica", 5),
+            ("http://b".to_string(), None),
+        ];
+        assert_eq!(select_primary(&probes), None);
     }
 }
