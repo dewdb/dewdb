@@ -314,6 +314,7 @@ struct AppState {
     shard_failover_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     repair_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     resyncing: Arc<std::sync::Mutex<HashSet<String>>>,
+    read_rr: Arc<AtomicUsize>,
 }
 
 impl AppState {
@@ -1141,6 +1142,12 @@ struct QueryParams {
     end: Option<String>,
     limit: Option<usize>,
     filter: Option<String>,
+    read: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ReadParams {
+    read: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1874,7 +1881,45 @@ fn router_probe_task(state: AppState) {
     });
 }
 
-async fn router_read_doc(state: &AppState, col_name: &str, id: &str) -> axum::response::Response {
+enum ReadPreference {
+    Primary,
+    Replica,
+}
+
+fn parse_read_pref(r: Option<&str>) -> ReadPreference {
+    match r {
+        Some("replica") => ReadPreference::Replica,
+        _ => ReadPreference::Primary,
+    }
+}
+
+fn read_targets(pref: &ReadPreference, effective_primary: &str, replicas: &[String], rr: usize) -> Vec<String> {
+    let mut targets = Vec::new();
+    match pref {
+        ReadPreference::Primary => {
+            targets.push(effective_primary.to_string());
+            for r in replicas {
+                targets.push(r.clone());
+            }
+        },
+        ReadPreference::Replica => {
+            let n = replicas.len();
+            if n == 0 {
+                targets.push(effective_primary.to_string());
+            } else {
+                for i in 0..n {
+                    targets.push(replicas[(rr + i) % n].clone());
+                }
+                targets.push(effective_primary.to_string());
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    targets.retain(|t| seen.insert(t.clone()));
+    targets
+}
+
+async fn router_read_doc(state: &AppState, col_name: &str, id: &str, pref: ReadPreference) -> axum::response::Response {
     let hash = hash_key(col_name, id);
     let (effective, _original, replicas) = match state.get_effective_shard_url(hash) {
         Some(t) => t,
@@ -1882,18 +1927,12 @@ async fn router_read_doc(state: &AppState, col_name: &str, id: &str) -> axum::re
     };
 
     let path = format!("/collections/{}/docs/{}", col_name, id);
+    let rr = state.read_rr.fetch_add(1, Ordering::Relaxed);
+    let targets = read_targets(&pref, &effective, &replicas, rr);
 
-    let full_url = format!("{}{}", effective, path);
-    if let Ok(r) = state.client.get(&full_url).send().await {
-        let status = r.status();
-        if status.is_success() || status == StatusCode::NOT_FOUND {
-            return passthrough_json(r).await;
-        }
-    }
-
-    for replica in &replicas {
-        let replica_url = format!("{}{}", replica, path);
-        if let Ok(r) = state.client.get(&replica_url).send().await {
+    for target in targets {
+        let url = format!("{}{}", target, path);
+        if let Ok(r) = state.client.get(&url).send().await {
             let status = r.status();
             if status.is_success() || status == StatusCode::NOT_FOUND {
                 return passthrough_json(r).await;
@@ -2064,9 +2103,11 @@ async fn put_doc(
 async fn get_doc(
     State(state): State<AppState>,
     AxumPath((col_name, id)): AxumPath<(String, String)>,
+    Query(rp): Query<ReadParams>,
 ) -> impl axum::response::IntoResponse {
     if state.config.role == "router" {
-        return router_read_doc(&state, &col_name, &id).await;
+        let pref = parse_read_pref(rp.read.as_deref());
+        return router_read_doc(&state, &col_name, &id, pref).await;
     }
 
     let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
@@ -2181,21 +2222,18 @@ async fn query_docs(
 
     if state.config.role == "router" {
         let query_str = req.uri().query().map(|q| format!("?{}", q)).unwrap_or_default();
+        let pref = parse_read_pref(params.read.as_deref());
 
         let mut futures = Vec::new();
         for (original, replicas) in unique_shards(&state) {
             let effective = state.effective_primary(&original);
+            let rr = state.read_rr.fetch_add(1, Ordering::Relaxed);
+            let targets = read_targets(&pref, &effective, &replicas, rr);
             let client = state.client.clone();
             let col = col_name.clone();
             let qs = query_str.clone();
 
             futures.push(tokio::spawn(async move {
-                let mut targets = vec![effective];
-                for r in replicas {
-                    if !targets.contains(&r) {
-                        targets.push(r);
-                    }
-                }
                 for target in targets {
                     let full_url = format!("{}/collections/{}/query{}", target, col, qs);
                     if let Ok(res) = client.get(&full_url).send().await {
@@ -2992,6 +3030,7 @@ async fn main() -> io::Result<()> {
         shard_failover_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         repair_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         resyncing: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        read_rr: Arc::new(AtomicUsize::new(0)),
     };
 
     if config.shard_role.as_deref() == Some("replica") {
@@ -3499,5 +3538,47 @@ mod tests {
             ("http://b".to_string(), None),
         ];
         assert_eq!(select_primary(&probes), None);
+    }
+
+    #[test]
+    fn read_targets_primary_prefers_leader() {
+        let replicas = vec!["http://r1".to_string(), "http://r2".to_string()];
+        let t = read_targets(&ReadPreference::Primary, "http://p", &replicas, 0);
+        assert_eq!(t, vec!["http://p", "http://r1", "http://r2"]);
+    }
+
+    #[test]
+    fn read_targets_replica_prefers_replicas_and_spreads() {
+        let replicas = vec!["http://r1".to_string(), "http://r2".to_string()];
+
+        let t0 = read_targets(&ReadPreference::Replica, "http://p", &replicas, 0);
+        assert_eq!(t0, vec!["http://r1", "http://r2", "http://p"]);
+
+        let t1 = read_targets(&ReadPreference::Replica, "http://p", &replicas, 1);
+        assert_eq!(t1, vec!["http://r2", "http://r1", "http://p"], "round-robin rotates the starting replica");
+
+        let t2 = read_targets(&ReadPreference::Replica, "http://p", &replicas, 2);
+        assert_eq!(t2, vec!["http://r1", "http://r2", "http://p"], "rotation wraps");
+    }
+
+    #[test]
+    fn read_targets_replica_falls_back_to_primary_when_no_replicas() {
+        let t = read_targets(&ReadPreference::Replica, "http://p", &[], 0);
+        assert_eq!(t, vec!["http://p"]);
+    }
+
+    #[test]
+    fn read_targets_dedupes_when_override_points_at_a_replica() {
+        let replicas = vec!["http://r1".to_string(), "http://r2".to_string()];
+        let t = read_targets(&ReadPreference::Primary, "http://r1", &replicas, 0);
+        assert_eq!(t, vec!["http://r1", "http://r2"], "promoted replica isn't tried twice");
+    }
+
+    #[test]
+    fn parse_read_pref_defaults_to_primary() {
+        assert!(matches!(parse_read_pref(None), ReadPreference::Primary));
+        assert!(matches!(parse_read_pref(Some("primary")), ReadPreference::Primary));
+        assert!(matches!(parse_read_pref(Some("garbage")), ReadPreference::Primary));
+        assert!(matches!(parse_read_pref(Some("replica")), ReadPreference::Replica));
     }
 }
