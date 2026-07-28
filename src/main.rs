@@ -19,6 +19,7 @@ const WAL_ROTATION_LIMIT: u64 = 50 * 1024 * 1024;
 const MAX_RECORD_SIZE: u64 = 10 * 1024 * 1024;
 const INDEX_FILENAME: &str = "index-current.bin";
 const HEADER_LEN: usize = 24;
+const KEY_LOCK_STRIPES: usize = 64;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "op", rename_all = "lowercase")]
@@ -282,6 +283,7 @@ struct Collection {
     index: RwLock<BTreeMap<String, IndexEntry>>,
     wal_writer: std::sync::Mutex<WalsState>,
     wal_pause_cv: Condvar,
+    key_locks: Vec<tokio::sync::Mutex<()>>,
     commit_notifiers: Arc<std::sync::Mutex<Vec<tokio::sync::oneshot::Sender<Result<(), String>>>>>,
     commit_signal: Arc<tokio::sync::Notify>,
     read_pool: std::sync::Mutex<HashMap<u64, Vec<Arc<std::sync::Mutex<File>>>>>,
@@ -586,6 +588,7 @@ impl Collection {
                 write_paused: false,
             }),
             wal_pause_cv: Condvar::new(),
+            key_locks: (0..KEY_LOCK_STRIPES).map(|_| tokio::sync::Mutex::new(())).collect(),
             commit_notifiers: Arc::new(std::sync::Mutex::new(Vec::new())),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
             read_pool: std::sync::Mutex::new(HashMap::new()),
@@ -594,6 +597,15 @@ impl Collection {
             db_next_lsn,
             db_last_log_term,
         })
+    }
+
+    fn key_lock(&self, key: &str) -> &tokio::sync::Mutex<()> {
+        let h = xxhash_rust::xxh64::xxh64(key.as_bytes(), 0) as usize;
+        &self.key_locks[h % KEY_LOCK_STRIPES]
+    }
+
+    fn exists(&self, key: &str) -> bool {
+        self.index.read().unwrap().contains_key(key)
     }
 
     fn replay_file_from(wal_id: u64, path: &PathBuf, mut start_offset: u64, index: &mut BTreeMap<String, IndexEntry>) -> io::Result<(u64, u64)> {
@@ -1378,6 +1390,29 @@ fn project(doc: &serde_json::Value, fields: &[String]) -> serde_json::Value {
     serde_json::Value::Object(out)
 }
 
+fn merge_patch(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    match patch {
+        serde_json::Value::Object(pmap) => {
+            if !target.is_object() {
+                *target = serde_json::Value::Object(serde_json::Map::new());
+            }
+            let tmap = target.as_object_mut().unwrap();
+            for (k, v) in pmap {
+                if v.is_null() {
+                    tmap.remove(k);
+                } else if let Some(existing) = tmap.get_mut(k) {
+                    merge_patch(existing, v);
+                } else {
+                    let mut fresh = serde_json::Value::Null;
+                    merge_patch(&mut fresh, v);
+                    tmap.insert(k.clone(), fresh);
+                }
+            }
+        },
+        other => *target = other.clone(),
+    }
+}
+
 fn matches_filter(doc: &serde_json::Value, filter: &Filter) -> bool {
     for (k, cond) in &filter.fields {
         let val = match get_path_value(doc, k) {
@@ -1832,6 +1867,14 @@ struct WriteOutcome {
     met: bool,
     acks: usize,
     required: usize,
+    existed: bool,
+}
+
+struct PendingWrite {
+    frame: Vec<u8>,
+    term: u64,
+    lsn: u64,
+    existed: bool,
 }
 
 async fn replicate_one_await(
@@ -1942,6 +1985,15 @@ fn build_forward(client: &reqwest::Client, method: &ForwardMethod, url: &str, bo
     }
 }
 
+fn authoritative_write_status(s: StatusCode) -> bool {
+    s.is_success()
+        || s == StatusCode::BAD_REQUEST
+        || s == StatusCode::NOT_FOUND
+        || s == StatusCode::CONFLICT
+        || s == StatusCode::PAYLOAD_TOO_LARGE
+        || s == StatusCode::UNPROCESSABLE_ENTITY
+}
+
 async fn router_forward_write(
     state: &AppState,
     col_name: &str,
@@ -1959,7 +2011,7 @@ async fn router_forward_write(
 
     let full_url = format!("{}/collections/{}/docs/{}{}", effective_url, col_name, key, wc_query);
     if let Ok(r) = build_forward(&state.client, &method, &full_url, body).send().await {
-        if r.status().is_success() {
+        if authoritative_write_status(r.status()) {
             if effective_url != original_url {
                 state.set_primary_override(&original_url, &effective_url);
             }
@@ -1979,7 +2031,7 @@ async fn router_forward_write(
         if latest_url != effective_url {
             let retry_url = format!("{}/collections/{}/docs/{}{}", latest_url, col_name, key, wc_query);
             if let Ok(r) = build_forward(&state.client, &method, &retry_url, body).send().await {
-                if r.status().is_success() {
+                if authoritative_write_status(r.status()) {
                     return Ok(r);
                 }
             }
@@ -1990,7 +2042,7 @@ async fn router_forward_write(
     for replica in &replica_urls {
         let fallback_url = format!("{}/collections/{}/docs/{}{}", replica, col_name, key, wc_query);
         if let Ok(r) = build_forward(&state.client, &method, &fallback_url, body).send().await {
-            if r.status().is_success() {
+            if authoritative_write_status(r.status()) {
                 state.set_primary_override(&original_url, replica);
                 println!("[router] Cached new primary: {} -> {}", original_url, replica);
                 return Ok(r);
@@ -2155,6 +2207,98 @@ async fn router_read_doc(state: &AppState, col_name: &str, id: &str, pref: ReadP
     (StatusCode::BAD_GATEWAY, "No shard node could serve the read").into_response()
 }
 
+fn err_json(status: StatusCode, msg: String) -> axum::response::Response {
+    (status, Json(serde_json::json!({"error": msg}))).into_response()
+}
+
+async fn local_write_inner(
+    state: &AppState,
+    col: &Arc<Collection>,
+    key: String,
+    value: Option<serde_json::Value>,
+) -> Result<PendingWrite, axum::response::Response> {
+    let col_clone = col.clone();
+    let key_clone = key.clone();
+    let is_delete = value.is_none();
+    let term = state.current_term();
+    let existed = col.exists(&key);
+
+    let write_res = tokio::task::spawn_blocking(move || {
+        match value {
+            Some(v) => col_clone.put(key_clone, v, term),
+            None => col_clone.delete(key_clone, term),
+        }
+    }).await;
+
+    let (frame, wal_id, offset, lsn) = match write_res {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    };
+
+    match col.enqueue_commit().await {
+        Ok(Ok(())) => {},
+        Ok(Err(e)) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e)),
+        Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+
+    {
+        let mut index = col.index.write().unwrap();
+        if is_delete {
+            index.remove(&key);
+        } else {
+            index.insert(key.clone(), IndexEntry { wal_id, offset });
+        }
+    }
+
+    Ok(PendingWrite { frame, term, lsn, existed })
+}
+
+async fn finish_write(
+    state: &AppState,
+    col_name: &str,
+    pending: PendingWrite,
+    wc: WriteConcern,
+    wtimeout: Duration,
+) -> WriteOutcome {
+    if !state.is_leader() {
+        return WriteOutcome { met: true, acks: 1, required: 1, existed: pending.existed };
+    }
+
+    let db = state.db.as_ref().unwrap();
+    let commit_index = db.global_commit_index.load(Ordering::SeqCst);
+    let replicas = state.get_replicas();
+    let required = required_acks(&wc, replicas.len());
+    let prev_lsn = pending.lsn.saturating_sub(1);
+
+    let acks = if required <= 1 {
+        replicate_to_peers(
+            state.clone(),
+            col_name.to_string(),
+            pending.frame,
+            pending.term,
+            commit_index,
+            pending.lsn,
+            prev_lsn,
+        );
+        1
+    } else {
+        replicate_and_await(
+            state.clone(),
+            col_name.to_string(),
+            pending.frame,
+            pending.term,
+            commit_index,
+            pending.lsn,
+            prev_lsn,
+            required,
+            wtimeout,
+        ).await
+    };
+
+    WriteOutcome { met: acks >= required, acks, required, existed: pending.existed }
+}
+
 async fn local_write(
     state: &AppState,
     col_name: &str,
@@ -2166,59 +2310,53 @@ async fn local_write(
     let db = state.db.as_ref().unwrap();
     let col = match db.get_collection(col_name) {
         Ok(c) => c,
-        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response()),
+        Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     };
 
-    let col_clone = col.clone();
-    let key_clone = key.clone();
-    let is_delete = value.is_none();
-    let term = state.current_term();
+    let pending = {
+        let _guard = col.key_lock(&key).lock().await;
+        local_write_inner(state, &col, key, value).await?
+    };
 
-    let write_res = tokio::task::spawn_blocking(move || {
-        match value {
-            Some(v) => col_clone.put(key_clone, v, term),
-            None => col_clone.delete(key_clone, term),
-        }
-    }).await;
+    Ok(finish_write(state, col_name, pending, wc, wtimeout).await)
+}
 
-    match write_res {
-        Ok(Ok((frame, wal_id, offset, lsn))) => {
-            let commit_rx = col.enqueue_commit();
-            match commit_rx.await {
-                Ok(Ok(())) => {
-                    {
-                        let mut index = col.index.write().unwrap();
-                        if is_delete {
-                            index.remove(&key);
-                        } else {
-                            index.insert(key.clone(), IndexEntry { wal_id, offset });
-                        }
-                    }
+async fn local_patch(
+    state: &AppState,
+    col_name: &str,
+    key: String,
+    patch: serde_json::Value,
+    wc: WriteConcern,
+    wtimeout: Duration,
+) -> Result<Option<WriteOutcome>, axum::response::Response> {
+    let db = state.db.as_ref().unwrap();
+    let col = match db.get_collection(col_name) {
+        Ok(c) => c,
+        Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    };
 
-                    if !state.is_leader() {
-                        return Ok(WriteOutcome { met: true, acks: 1, required: 1 });
-                    }
+    let pending = {
+        let _guard = col.key_lock(&key).lock().await;
 
-                    let commit_index = db.global_commit_index.load(Ordering::SeqCst);
-                    let replicas = state.get_replicas();
-                    let required = required_acks(&wc, replicas.len());
+        let col_read = col.clone();
+        let key_read = key.clone();
+        let current = match tokio::task::spawn_blocking(move || col_read.get(&key_read)).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+            Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        };
 
-                    let acks = if required <= 1 {
-                        replicate_to_peers(state.clone(), col_name.to_string(), frame, term, commit_index, lsn, lsn.saturating_sub(1));
-                        1
-                    } else {
-                        replicate_and_await(state.clone(), col_name.to_string(), frame, term, commit_index, lsn, lsn.saturating_sub(1), required, wtimeout).await
-                    };
+        let mut doc = match current {
+            Some(d) => d,
+            None => return Ok(None),
+        };
 
-                    Ok(WriteOutcome { met: acks >= required, acks, required })
-                },
-                Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))).into_response()),
-                Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response()),
-            }
-        },
-        Ok(Err(e)) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response()),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response()),
-    }
+        merge_patch(&mut doc, &patch);
+
+        local_write_inner(state, &col, key, Some(doc)).await?
+    };
+
+    Ok(Some(finish_write(state, col_name, pending, wc, wtimeout).await))
 }
 
 #[derive(Deserialize)]
@@ -2268,9 +2406,10 @@ async fn create_doc(
     let wtimeout = Duration::from_millis(wcp.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
 
     match local_write(&state, &col_name, id.clone(), Some(payload.value), wc, wtimeout).await {
-        Ok(o) if o.met => (StatusCode::CREATED, Json(serde_json::json!({"id": id}))).into_response(),
+        Ok(o) if o.met => (StatusCode::CREATED, Json(serde_json::json!({"id": id, "status": "created"}))).into_response(),
         Ok(o) => (StatusCode::ACCEPTED, Json(serde_json::json!({
             "id": id,
+            "status": "created",
             "warning": "write concern not met",
             "acks": o.acks,
             "required": o.required,
@@ -2301,9 +2440,14 @@ async fn put_doc(
     let wtimeout = Duration::from_millis(wcp.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
 
     match local_write(&state, &col_name, id.clone(), Some(payload.value), wc, wtimeout).await {
-        Ok(o) if o.met => (StatusCode::CREATED, Json(serde_json::json!({"id": id}))).into_response(),
+        Ok(o) if o.met => {
+            let status = if o.existed { StatusCode::OK } else { StatusCode::CREATED };
+            let label = if o.existed { "replaced" } else { "created" };
+            (status, Json(serde_json::json!({"id": id, "status": label}))).into_response()
+        },
         Ok(o) => (StatusCode::ACCEPTED, Json(serde_json::json!({
             "id": id,
+            "status": if o.existed { "replaced" } else { "created" },
             "warning": "write concern not met",
             "acks": o.acks,
             "required": o.required,
@@ -2324,7 +2468,7 @@ async fn get_doc(
 
     let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
         Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
 
     let key = id.clone();
@@ -2332,9 +2476,9 @@ async fn get_doc(
 
     match tokio::task::spawn_blocking(move || col_clone.get(&key)).await {
         Ok(Ok(Some(val))) => (StatusCode::OK, Json(val)).into_response(),
-        Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"}))).into_response(),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Ok(Ok(None)) => err_json(StatusCode::NOT_FOUND, "not found".to_string()),
+        Ok(Err(e)) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
@@ -2348,6 +2492,10 @@ async fn update_doc(
         return (StatusCode::FORBIDDEN, "Replica nodes reject direct writes").into_response();
     }
 
+    if payload.value.is_null() {
+        return err_json(StatusCode::BAD_REQUEST, "PATCH body must not be null; use DELETE to remove a document".to_string());
+    }
+
     if state.config.role == "router" {
         let wc_query = wc_query_string(&wcp);
         return match router_forward_write(&state, &col_name, &id, ForwardMethod::Patch, Some(&payload), &wc_query).await {
@@ -2359,9 +2507,11 @@ async fn update_doc(
     let wc = parse_write_concern(wcp.w.as_deref());
     let wtimeout = Duration::from_millis(wcp.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
 
-    match local_write(&state, &col_name, id.clone(), Some(payload.value), wc, wtimeout).await {
-        Ok(o) if o.met => (StatusCode::OK, Json(serde_json::json!({"status": "updated"}))).into_response(),
-        Ok(o) => (StatusCode::ACCEPTED, Json(serde_json::json!({
+    match local_patch(&state, &col_name, id.clone(), payload.value, wc, wtimeout).await {
+        Ok(None) => err_json(StatusCode::NOT_FOUND, "not found".to_string()),
+        Ok(Some(o)) if o.met => (StatusCode::OK, Json(serde_json::json!({"id": id, "status": "updated"}))).into_response(),
+        Ok(Some(o)) => (StatusCode::ACCEPTED, Json(serde_json::json!({
+            "id": id,
             "status": "updated",
             "warning": "write concern not met",
             "acks": o.acks,
@@ -2392,9 +2542,10 @@ async fn delete_doc(
     let wtimeout = Duration::from_millis(wcp.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
 
     match local_write(&state, &col_name, id.clone(), None, wc, wtimeout).await {
-        Ok(o) if o.met => (StatusCode::OK, Json(serde_json::json!({"status": "deleted"}))).into_response(),
+        Ok(o) if o.met => (StatusCode::OK, Json(serde_json::json!({"status": "deleted", "existed": o.existed}))).into_response(),
         Ok(o) => (StatusCode::ACCEPTED, Json(serde_json::json!({
             "status": "deleted",
+            "existed": o.existed,
             "warning": "write concern not met",
             "acks": o.acks,
             "required": o.required,
@@ -2413,14 +2564,14 @@ async fn list_docs(
 
     let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
         Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
 
     let col_clone = col.clone();
     match tokio::task::spawn_blocking(move || col_clone.list_all()).await {
         Ok(Ok(vals)) => (StatusCode::OK, Json(vals)).into_response(),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Ok(Err(e)) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
@@ -2537,7 +2688,7 @@ async fn query_docs(
 
     let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
         Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
 
     let col_clone = col.clone();
@@ -2572,8 +2723,8 @@ async fn query_docs(
 
     match result {
         Ok(Ok((items, next_cursor))) => (StatusCode::OK, Json(QueryPage { items, next_cursor })).into_response(),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Ok(Err(e)) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
@@ -3111,12 +3262,12 @@ async fn snapshot_handler(
 
     let db = match state.db.as_ref() {
         Some(db) => db.clone(),
-        None => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "No database"}))).into_response(),
+        None => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "No database".to_string()),
     };
 
     let col = match db.get_collection(&params.collection) {
         Ok(c) => c,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
 
     let col_clone = col.clone();
@@ -3137,8 +3288,8 @@ async fn snapshot_handler(
         Ok(entries)
     }).await {
         Ok(Ok(entries)) => entries,
-        Ok(Err(e)) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+        Ok(Err(e)) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
 
     (StatusCode::OK, Json(files)).into_response()
@@ -4004,5 +4155,133 @@ mod tests {
 
         let empty = project(&doc, &[]);
         assert_eq!(empty, doc, "empty projection returns the full doc");
+    }
+
+    #[test]
+    fn merge_patch_follows_rfc7386() {
+        use serde_json::json;
+
+        let mut basic = json!({"a": "b", "c": {"d": "e", "f": "g"}});
+        merge_patch(&mut basic, &json!({"a": "z", "c": {"f": null}}));
+        assert_eq!(basic, json!({"a": "z", "c": {"d": "e"}}), "null removes a member, siblings survive");
+
+        let mut arrays = json!({"a": [1, 2, 3]});
+        merge_patch(&mut arrays, &json!({"a": [4]}));
+        assert_eq!(arrays, json!({"a": [4]}), "arrays are replaced wholesale, never element-merged");
+
+        let mut scalar_to_object = json!({"a": "flat"});
+        merge_patch(&mut scalar_to_object, &json!({"a": {"b": 1}}));
+        assert_eq!(scalar_to_object, json!({"a": {"b": 1}}), "object patch overwrites a scalar");
+
+        let mut created = json!({});
+        merge_patch(&mut created, &json!({"a": {"b": 1, "c": null}}));
+        assert_eq!(created, json!({"a": {"b": 1}}), "nulls are dropped while creating a new member");
+
+        let mut whole = json!({"a": 1});
+        merge_patch(&mut whole, &json!("replaced"));
+        assert_eq!(whole, json!("replaced"), "a non-object patch replaces the whole target");
+
+        let mut deep = json!({"x": {"y": {"z": 1, "keep": true}}});
+        merge_patch(&mut deep, &json!({"x": {"y": {"z": 2}}}));
+        assert_eq!(deep, json!({"x": {"y": {"z": 2, "keep": true}}}), "deep merge preserves untouched siblings");
+
+        let mut absent_delete = json!({"a": 1});
+        merge_patch(&mut absent_delete, &json!({"missing": null}));
+        assert_eq!(absent_delete, json!({"a": 1}), "deleting an absent member is a no-op");
+
+        let mut noop = json!({"a": 1});
+        merge_patch(&mut noop, &json!({}));
+        assert_eq!(noop, json!({"a": 1}), "an empty patch changes nothing");
+    }
+
+    #[test]
+    fn merge_patch_never_leaves_null_placeholders_in_new_subtrees() {
+        use serde_json::json;
+        let mut doc = json!({"keep": 1});
+        merge_patch(&mut doc, &json!({"new": {"deep": {"k": "v", "gone": null}}}));
+        assert_eq!(doc, json!({"keep": 1, "new": {"deep": {"k": "v"}}}));
+    }
+
+    #[tokio::test]
+    async fn patch_persists_the_merged_document_not_the_patch() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        let (_, w, o, _) = col.put(
+            "d1".into(),
+            serde_json::json!({"name": "alpha", "tags": ["x", "y"], "meta": {"v": 1, "owner": "latha"}}),
+            1,
+        ).unwrap();
+        col.index.write().unwrap().insert("d1".into(), IndexEntry { wal_id: w, offset: o });
+
+        let mut doc = col.get("d1").unwrap().unwrap();
+        merge_patch(&mut doc, &serde_json::json!({"meta": {"v": 2}, "tags": null, "status": "live"}));
+        let (_, w2, o2, _) = col.put("d1".into(), doc, 1).unwrap();
+        col.index.write().unwrap().insert("d1".into(), IndexEntry { wal_id: w2, offset: o2 });
+        col.enqueue_commit().await.unwrap().unwrap();
+
+        drop(col);
+        drop(db);
+
+        let db2 = Database::new(&root).unwrap();
+        let col2 = db2.get_collection("c").unwrap();
+        assert_eq!(
+            col2.get("d1").unwrap(),
+            Some(serde_json::json!({"name": "alpha", "meta": {"v": 2, "owner": "latha"}, "status": "live"})),
+            "the merged document survives a restart, with the patched field replaced and the sibling intact"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn key_locks_are_stable_and_striped() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        assert!(std::ptr::eq(col.key_lock("doc-1"), col.key_lock("doc-1")), "same key always maps to the same stripe");
+        assert_eq!(col.key_locks.len(), KEY_LOCK_STRIPES);
+
+        let mut distinct = HashSet::new();
+        for i in 0..512 {
+            distinct.insert(col.key_lock(&format!("doc-{}", i)) as *const _);
+        }
+        assert!(distinct.len() > 1, "keys must spread across more than one stripe");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn exists_tracks_index_membership() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        assert!(!col.exists("k"), "nothing exists before the first write");
+
+        let (_, w, o, _) = col.put("k".into(), serde_json::json!({"v": 1}), 1).unwrap();
+        col.index.write().unwrap().insert("k".into(), IndexEntry { wal_id: w, offset: o });
+        assert!(col.exists("k"));
+
+        col.index.write().unwrap().remove("k");
+        assert!(!col.exists("k"), "a deleted key stops existing");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn router_treats_client_errors_as_authoritative() {
+        assert!(authoritative_write_status(StatusCode::OK));
+        assert!(authoritative_write_status(StatusCode::CREATED));
+        assert!(authoritative_write_status(StatusCode::ACCEPTED));
+        assert!(authoritative_write_status(StatusCode::NOT_FOUND), "a PATCH 404 must not trigger shard failover");
+        assert!(authoritative_write_status(StatusCode::BAD_REQUEST));
+
+        assert!(!authoritative_write_status(StatusCode::FORBIDDEN), "a replica rejecting writes must trigger failover");
+        assert!(!authoritative_write_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!authoritative_write_status(StatusCode::BAD_GATEWAY));
+        assert!(!authoritative_write_status(StatusCode::SERVICE_UNAVAILABLE));
     }
 }
