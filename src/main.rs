@@ -40,6 +40,13 @@ enum LogEntry {
 struct IndexEntry {
     wal_id: u64,
     offset: u64,
+    len: u32,
+}
+
+impl IndexEntry {
+    fn frame_bytes(&self) -> u64 {
+        HEADER_LEN as u64 + self.len as u64
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -98,10 +105,79 @@ struct NodeConfig {
     heartbeat_timeout_secs: u64,
     #[serde(default = "default_election_delay")]
     election_delay_ms: u64,
+    #[serde(default)]
+    maintenance: MaintenanceConfig,
 }
 
 fn default_heartbeat_timeout() -> u64 { 6 }
 fn default_election_delay() -> u64 { 2000 }
+
+#[derive(Deserialize, Clone, Debug)]
+struct MaintenanceConfig {
+    #[serde(default = "default_maintenance_enabled")]
+    enabled: bool,
+    #[serde(default = "default_maintenance_interval")]
+    interval_secs: u64,
+    #[serde(default = "default_compaction_dead_ratio")]
+    compaction_dead_ratio: f64,
+    #[serde(default = "default_compaction_min_bytes")]
+    compaction_min_wal_bytes: u64,
+    #[serde(default = "default_snapshot_interval")]
+    snapshot_interval_secs: u64,
+}
+
+fn default_maintenance_enabled() -> bool { true }
+fn default_maintenance_interval() -> u64 { 60 }
+fn default_compaction_dead_ratio() -> f64 { 0.4 }
+fn default_compaction_min_bytes() -> u64 { 8 * 1024 * 1024 }
+fn default_snapshot_interval() -> u64 { 300 }
+
+impl Default for MaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_maintenance_enabled(),
+            interval_secs: default_maintenance_interval(),
+            compaction_dead_ratio: default_compaction_dead_ratio(),
+            compaction_min_wal_bytes: default_compaction_min_bytes(),
+            snapshot_interval_secs: default_snapshot_interval(),
+        }
+    }
+}
+
+impl MaintenanceConfig {
+    fn validate(&self) -> Result<(), String> {
+        if !(0.0..=1.0).contains(&self.compaction_dead_ratio) {
+            return Err(format!("maintenance.compaction_dead_ratio must be between 0.0 and 1.0, got {}", self.compaction_dead_ratio));
+        }
+        if self.enabled && self.interval_secs == 0 {
+            return Err("maintenance.interval_secs must be greater than zero".to_string());
+        }
+        Ok(())
+    }
+}
+
+struct SpaceUsage {
+    total_bytes: u64,
+    live_bytes: u64,
+    live_keys: usize,
+}
+
+impl SpaceUsage {
+    fn dead_bytes(&self) -> u64 {
+        self.total_bytes.saturating_sub(self.live_bytes)
+    }
+
+    fn dead_ratio(&self) -> f64 {
+        if self.total_bytes == 0 {
+            return 0.0;
+        }
+        self.dead_bytes() as f64 / self.total_bytes as f64
+    }
+}
+
+fn should_compact(usage: &SpaceUsage, cfg: &MaintenanceConfig) -> bool {
+    usage.total_bytes >= cfg.compaction_min_wal_bytes && usage.dead_ratio() >= cfg.compaction_dead_ratio
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct ReplicateRequest {
@@ -258,6 +334,7 @@ impl NodeConfig {
                 }
             }
         }
+        self.maintenance.validate()?;
         Ok(())
     }
 
@@ -751,7 +828,7 @@ impl Collection {
             if let Ok(entry) = serde_json::from_slice::<LogEntry>(&payload) {
                 match entry {
                     LogEntry::Put { key, .. } => {
-                        index.insert(key, IndexEntry { wal_id, offset });
+                        index.insert(key, IndexEntry { wal_id, offset, len: len as u32 });
                     },
                     LogEntry::Del { key, .. } => {
                         index.remove(&key);
@@ -1182,7 +1259,31 @@ impl Collection {
         Ok(results)
     }
 
-    fn save_index(&self) -> io::Result<()> {
+    fn space_usage(&self) -> io::Result<SpaceUsage> {
+        let mut total_bytes = 0u64;
+        for entry in fs::read_dir(&self.root_path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = match name.to_str() {
+                Some(n) => n,
+                None => continue,
+            };
+            if name.starts_with("wal-") && name.ends_with(".log") {
+                total_bytes += fs::metadata(entry.path())?.len();
+            }
+        }
+
+        let index = self.index.read().unwrap();
+        let live_bytes = index.values().map(|e| e.frame_bytes()).sum();
+
+        Ok(SpaceUsage { total_bytes, live_bytes, live_keys: index.len() })
+    }
+
+    fn last_appended_lsn(&self) -> u64 {
+        self.wal_writer.lock().unwrap().last_appended_lsn
+    }
+
+    fn save_index(&self) -> io::Result<u64> {
         let wal_writer = self.wal_writer.lock().unwrap();
         let index = self.index.read().unwrap();
 
@@ -1208,8 +1309,9 @@ impl Collection {
 
         fs::rename(&temp_path, &path)?;
 
-        println!("[{}] Index saved to disk at WAL {} offset {} lsn {}.", self.name, snapshot.last_wal_id, snapshot.last_offset, snapshot.last_lsn);
-        Ok(())
+        let saved_lsn = snapshot.last_lsn;
+        println!("[{}] Index saved to disk at WAL {} offset {} lsn {}.", self.name, snapshot.last_wal_id, snapshot.last_offset, saved_lsn);
+        Ok(saved_lsn)
     }
 
     fn compact(&self) -> io::Result<()> {
@@ -1336,7 +1438,7 @@ impl Collection {
             relocated.push((
                 key.clone(),
                 *old_entry,
-                IndexEntry { wal_id: compact_id, offset: current_offset },
+                IndexEntry { wal_id: compact_id, offset: current_offset, len: len as u32 },
             ));
             current_offset += (HEADER_LEN + len) as u64;
         }
@@ -2404,6 +2506,88 @@ fn unique_shards(state: &AppState) -> Vec<(String, Vec<String>)> {
     out
 }
 
+fn maintenance_task(db: Arc<Database>, cfg: MaintenanceConfig, node_id: String) {
+    tokio::spawn(async move {
+        println!("[maintenance] Scheduler active on {} (every {}s; compact at dead>={:.0}% of >={} bytes; snapshot every {}s)",
+            node_id, cfg.interval_secs, cfg.compaction_dead_ratio * 100.0, cfg.compaction_min_wal_bytes, cfg.snapshot_interval_secs);
+
+        let mut last_snapshot: HashMap<String, (std::time::Instant, u64)> = HashMap::new();
+
+        loop {
+            tokio::time::sleep(Duration::from_secs(cfg.interval_secs)).await;
+
+            let collections: Vec<(String, Arc<Collection>)> = {
+                db.collections.read().unwrap().iter().map(|(n, c)| (n.clone(), c.clone())).collect()
+            };
+
+            for (name, col) in collections {
+                if col.released.load(Ordering::SeqCst) {
+                    last_snapshot.remove(&name);
+                    continue;
+                }
+
+                let probe = col.clone();
+                let usage = match tokio::task::spawn_blocking(move || probe.space_usage()).await {
+                    Ok(Ok(u)) => u,
+                    Ok(Err(e)) => {
+                        eprintln!("[maintenance] Could not measure '{}': {}", name, e);
+                        continue;
+                    },
+                    Err(e) => {
+                        eprintln!("[maintenance] Measurement task failed for '{}': {}", name, e);
+                        continue;
+                    }
+                };
+
+                let compacted = if should_compact(&usage, &cfg) {
+                    println!("[maintenance] '{}' is {:.1}% dead ({} of {} bytes across {} live keys); compacting",
+                        name, usage.dead_ratio() * 100.0, usage.dead_bytes(), usage.total_bytes, usage.live_keys);
+
+                    let target = col.clone();
+                    match tokio::task::spawn_blocking(move || target.compact()).await {
+                        Ok(Ok(())) => true,
+                        Ok(Err(ref e)) if e.kind() == io::ErrorKind::WouldBlock => false,
+                        Ok(Err(e)) => {
+                            eprintln!("[maintenance] Compaction of '{}' failed: {}", name, e);
+                            false
+                        },
+                        Err(e) => {
+                            eprintln!("[maintenance] Compaction task for '{}' panicked: {}", name, e);
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+
+                let due = match last_snapshot.get(&name) {
+                    Some((at, _)) => at.elapsed().as_secs() >= cfg.snapshot_interval_secs,
+                    None => true,
+                };
+                let last_saved_lsn = last_snapshot.get(&name).map(|(_, l)| *l);
+                let current_lsn = col.last_appended_lsn();
+
+                if !(due || compacted) {
+                    continue;
+                }
+                if !compacted && last_saved_lsn == Some(current_lsn) {
+                    last_snapshot.insert(name, (std::time::Instant::now(), current_lsn));
+                    continue;
+                }
+
+                let target = col.clone();
+                match tokio::task::spawn_blocking(move || target.save_index()).await {
+                    Ok(Ok(saved_lsn)) => {
+                        last_snapshot.insert(name, (std::time::Instant::now(), saved_lsn));
+                    },
+                    Ok(Err(e)) => eprintln!("[maintenance] Snapshot of '{}' failed: {}", name, e),
+                    Err(e) => eprintln!("[maintenance] Snapshot task for '{}' panicked: {}", name, e),
+                }
+            }
+        }
+    });
+}
+
 fn router_probe_task(state: AppState) {
     tokio::spawn(async move {
         loop {
@@ -2542,6 +2726,7 @@ async fn local_write_inner(
         Ok(Err(e)) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
         Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     };
+    let payload_len = frame.len().saturating_sub(HEADER_LEN) as u32;
 
     match col.enqueue_commit().await {
         Ok(Ok(())) => {},
@@ -2554,7 +2739,7 @@ async fn local_write_inner(
         if is_delete {
             index.remove(&key);
         } else {
-            index.insert(key.clone(), IndexEntry { wal_id, offset });
+            index.insert(key.clone(), IndexEntry { wal_id, offset, len: payload_len });
         }
     }
 
@@ -2698,8 +2883,9 @@ async fn local_write_batch_inner(
 
     {
         let mut index = col.index.write().unwrap();
-        for (key, _, wal_id, offset, _) in &frames {
-            index.insert(key.clone(), IndexEntry { wal_id: *wal_id, offset: *offset });
+        for (key, frame, wal_id, offset, _) in &frames {
+            let len = frame.len().saturating_sub(HEADER_LEN) as u32;
+            index.insert(key.clone(), IndexEntry { wal_id: *wal_id, offset: *offset, len });
         }
     }
 
@@ -3197,16 +3383,21 @@ async fn compact_collection(
         Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
 
+    let before = col.space_usage().ok();
+
     let col_clone = col.clone();
     match tokio::task::spawn_blocking(move || col_clone.compact()).await {
         Ok(Ok(())) => {
-            let wal = col.wal_writer.lock().unwrap();
+            let after = col.space_usage().ok();
+            let wal_id = col.wal_writer.lock().unwrap().current_wal_id;
             (StatusCode::OK, Json(serde_json::json!({
                 "collection": col_name,
                 "status": "compacted",
-                "wal_id": wal.current_wal_id,
-                "wal_size": wal.current_wal_size,
+                "wal_id": wal_id,
                 "documents": col.index.read().unwrap().len(),
+                "bytes_before": before.as_ref().map(|u| u.total_bytes),
+                "bytes_after": after.as_ref().map(|u| u.total_bytes),
+                "dead_ratio_before": before.as_ref().map(|u| u.dead_ratio()),
             }))).into_response()
         },
         Ok(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -3232,12 +3423,11 @@ async fn snapshot_collection(
 
     let col_clone = col.clone();
     match tokio::task::spawn_blocking(move || col_clone.save_index()).await {
-        Ok(Ok(())) => {
-            let wal = col.wal_writer.lock().unwrap();
+        Ok(Ok(saved_lsn)) => {
             (StatusCode::OK, Json(serde_json::json!({
                 "collection": col_name,
                 "status": "snapshotted",
-                "last_lsn": wal.last_appended_lsn,
+                "last_lsn": saved_lsn,
                 "documents": col.index.read().unwrap().len(),
             }))).into_response()
         },
@@ -3500,6 +3690,7 @@ async fn replicate_handler(
     };
 
     let frame = req.wal_frame;
+    let payload_len = frame.len().saturating_sub(HEADER_LEN) as u32;
 
     if frame.len() >= HEADER_LEN {
         let frame_lsn = u64::from_le_bytes(frame[16..24].try_into().unwrap());
@@ -3526,7 +3717,7 @@ async fn replicate_handler(
                         let mut index = col.index.write().unwrap();
                         match entry {
                             LogEntry::Put { key, .. } => {
-                                index.insert(key, IndexEntry { wal_id, offset });
+                                index.insert(key, IndexEntry { wal_id, offset, len: payload_len });
                             },
                             LogEntry::Del { key, .. } => {
                                 index.remove(&key);
@@ -4213,6 +4404,14 @@ async fn main() -> io::Result<()> {
         router_probe_task(state.clone());
     }
 
+    if let Some(ref database) = state.db {
+        if config.maintenance.enabled {
+            maintenance_task(database.clone(), config.maintenance.clone(), config.node_id.clone());
+        } else {
+            println!("[boot] Maintenance scheduler disabled by config");
+        }
+    }
+
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     println!("Server starting on http://{}", config.listen_addr);
     axum::serve(listener, app).await?;
@@ -4223,6 +4422,10 @@ async fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn idx(frame: &[u8], wal_id: u64, offset: u64) -> IndexEntry {
+        IndexEntry { wal_id, offset, len: (frame.len() - HEADER_LEN) as u32 }
+    }
 
     fn temp_root() -> PathBuf {
         let p = std::env::temp_dir().join(format!("dewdb-test-{}", Uuid::new_v4()));
@@ -4263,9 +4466,9 @@ mod tests {
         let res = col2.put("huge_key".to_string(), serde_json::json!({"data": huge_str}), 1);
         assert!(res.is_err(), "Should reject a record that exceeds MAX_RECORD_SIZE");
 
-        if let Ok((_f, wal_id, offset, _lsn)) = col2.put("key_pre_corrupt".to_string(), serde_json::json!({"valid": true}), 1) {
+        if let Ok((f, wal_id, offset, _lsn)) = col2.put("key_pre_corrupt".to_string(), serde_json::json!({"valid": true}), 1) {
             col2.enqueue_commit().await.unwrap().unwrap();
-            col2.index.write().unwrap().insert("key_pre_corrupt".to_string(), IndexEntry { wal_id, offset });
+            col2.index.write().unwrap().insert("key_pre_corrupt".to_string(), idx(&f, wal_id, offset));
         }
 
         let active_wal_path = {
@@ -4292,9 +4495,9 @@ mod tests {
 
         assert!(col3.get("key_pre_corrupt").unwrap().is_some(), "key_pre_corrupt should survive corruption after it");
 
-        if let Ok((_f, wal_id, offset, _lsn)) = col3.put("key_post_corrupt".to_string(), serde_json::json!({"valid": true}), 1) {
+        if let Ok((f, wal_id, offset, _lsn)) = col3.put("key_post_corrupt".to_string(), serde_json::json!({"valid": true}), 1) {
             col3.enqueue_commit().await.unwrap().unwrap();
-            col3.index.write().unwrap().insert("key_post_corrupt".to_string(), IndexEntry { wal_id, offset });
+            col3.index.write().unwrap().insert("key_post_corrupt".to_string(), idx(&f, wal_id, offset));
         }
         assert!(col3.get("key_post_corrupt").unwrap().is_some(), "Writes should continue after recovery");
 
@@ -4465,10 +4668,10 @@ mod tests {
 
         let _ = col.put("a".into(), serde_json::json!({"v": 1}), 1).unwrap();
         let _ = col.put("a".into(), serde_json::json!({"v": 2}), 1).unwrap();
-        let (_, w, o, _) = col.put("a".into(), serde_json::json!({"v": 3}), 1).unwrap();
-        col.index.write().unwrap().insert("a".into(), IndexEntry { wal_id: w, offset: o });
-        let (_, w2, o2, _) = col.put("b".into(), serde_json::json!({"v": 9}), 1).unwrap();
-        col.index.write().unwrap().insert("b".into(), IndexEntry { wal_id: w2, offset: o2 });
+        let (f, w, o, _) = col.put("a".into(), serde_json::json!({"v": 3}), 1).unwrap();
+        col.index.write().unwrap().insert("a".into(), idx(&f, w, o));
+        let (f2, w2, o2, _) = col.put("b".into(), serde_json::json!({"v": 9}), 1).unwrap();
+        col.index.write().unwrap().insert("b".into(), idx(&f2, w2, o2));
         col.enqueue_commit().await.unwrap().unwrap();
         assert_eq!(db.global_commit_index.load(Ordering::SeqCst), 4);
 
@@ -4723,8 +4926,8 @@ mod tests {
         let db = Database::new(&root).unwrap();
         let col = db.get_collection("c").unwrap();
         for k in ["a", "b", "c", "d"] {
-            let (_, w, o, _) = col.put(k.to_string(), serde_json::json!({"k": k}), 1).unwrap();
-            col.index.write().unwrap().insert(k.to_string(), IndexEntry { wal_id: w, offset: o });
+            let (f, w, o, _) = col.put(k.to_string(), serde_json::json!({"k": k}), 1).unwrap();
+            col.index.write().unwrap().insert(k.to_string(), idx(&f, w, o));
         }
 
         let inclusive: Vec<String> = col.range_from(None, Some("b"), None).into_iter().map(|(k, _)| k).collect();
@@ -4743,8 +4946,8 @@ mod tests {
         let col = db.get_collection("c").unwrap();
         for i in 1..=5 {
             let k = format!("k{}", i);
-            let (_, w, o, _) = col.put(k.clone(), serde_json::json!({"i": i}), 1).unwrap();
-            col.index.write().unwrap().insert(k, IndexEntry { wal_id: w, offset: o });
+            let (f, w, o, _) = col.put(k.clone(), serde_json::json!({"i": i}), 1).unwrap();
+            col.index.write().unwrap().insert(k, idx(&f, w, o));
         }
         col.enqueue_commit().await.unwrap().unwrap();
 
@@ -4772,8 +4975,8 @@ mod tests {
         let col = db.get_collection("c").unwrap();
         for i in 1..=4 {
             let k = format!("k{}", i);
-            let (_, w, o, _) = col.put(k.clone(), serde_json::json!({"i": i}), 1).unwrap();
-            col.index.write().unwrap().insert(k, IndexEntry { wal_id: w, offset: o });
+            let (f, w, o, _) = col.put(k.clone(), serde_json::json!({"i": i}), 1).unwrap();
+            col.index.write().unwrap().insert(k, idx(&f, w, o));
         }
         col.enqueue_commit().await.unwrap().unwrap();
 
@@ -4924,17 +5127,17 @@ mod tests {
         let db = Database::new(&root).unwrap();
         let col = db.get_collection("c").unwrap();
 
-        let (_, w, o, _) = col.put(
+        let (f, w, o, _) = col.put(
             "d1".into(),
             serde_json::json!({"name": "alpha", "tags": ["x", "y"], "meta": {"v": 1, "owner": "latha"}}),
             1,
         ).unwrap();
-        col.index.write().unwrap().insert("d1".into(), IndexEntry { wal_id: w, offset: o });
+        col.index.write().unwrap().insert("d1".into(), idx(&f, w, o));
 
         let mut doc = col.get("d1").unwrap().unwrap();
         merge_patch(&mut doc, &serde_json::json!({"meta": {"v": 2}, "tags": null, "status": "live"}));
-        let (_, w2, o2, _) = col.put("d1".into(), doc, 1).unwrap();
-        col.index.write().unwrap().insert("d1".into(), IndexEntry { wal_id: w2, offset: o2 });
+        let (f2, w2, o2, _) = col.put("d1".into(), doc, 1).unwrap();
+        col.index.write().unwrap().insert("d1".into(), idx(&f2, w2, o2));
         col.enqueue_commit().await.unwrap().unwrap();
 
         drop(col);
@@ -4977,8 +5180,8 @@ mod tests {
 
         assert!(!col.exists("k"), "nothing exists before the first write");
 
-        let (_, w, o, _) = col.put("k".into(), serde_json::json!({"v": 1}), 1).unwrap();
-        col.index.write().unwrap().insert("k".into(), IndexEntry { wal_id: w, offset: o });
+        let (f, w, o, _) = col.put("k".into(), serde_json::json!({"v": 1}), 1).unwrap();
+        col.index.write().unwrap().insert("k".into(), idx(&f, w, o));
         assert!(col.exists("k"));
 
         col.index.write().unwrap().remove("k");
@@ -5028,8 +5231,8 @@ mod tests {
         let db = Database::new(&root).unwrap();
 
         let col = db.get_collection("users").unwrap();
-        let (_, w, o, _) = col.put("k".into(), serde_json::json!({"v": 1}), 1).unwrap();
-        col.index.write().unwrap().insert("k".into(), IndexEntry { wal_id: w, offset: o });
+        let (f, w, o, _) = col.put("k".into(), serde_json::json!({"v": 1}), 1).unwrap();
+        col.index.write().unwrap().insert("k".into(), idx(&f, w, o));
 
         assert!(root.join("users").is_dir());
 
@@ -5050,8 +5253,8 @@ mod tests {
     }
 
     fn live_put(col: &Arc<Collection>, key: &str, v: i64) {
-        let (_, w, o, _) = col.put(key.into(), serde_json::json!({"v": v}), 1).unwrap();
-        col.index.write().unwrap().insert(key.into(), IndexEntry { wal_id: w, offset: o });
+        let (f, w, o, _) = col.put(key.into(), serde_json::json!({"v": v}), 1).unwrap();
+        col.index.write().unwrap().insert(key.into(), idx(&f, w, o));
     }
 
     fn wal_ids_on_disk(root: &Path) -> Vec<u64> {
@@ -5063,6 +5266,116 @@ mod tests {
             .collect();
         ids.sort();
         ids
+    }
+
+    fn maint(ratio: f64, min_bytes: u64) -> MaintenanceConfig {
+        MaintenanceConfig {
+            enabled: true,
+            interval_secs: 60,
+            compaction_dead_ratio: ratio,
+            compaction_min_wal_bytes: min_bytes,
+            snapshot_interval_secs: 300,
+        }
+    }
+
+    #[test]
+    fn compaction_trigger_respects_both_ratio_and_floor() {
+        let cfg = maint(0.4, 1000);
+
+        let mostly_dead_but_tiny = SpaceUsage { total_bytes: 900, live_bytes: 10, live_keys: 1 };
+        assert!(!should_compact(&mostly_dead_but_tiny, &cfg),
+            "a log under the byte floor must not be compacted no matter how dead it is");
+
+        let big_but_fresh = SpaceUsage { total_bytes: 10_000, live_bytes: 9_000, live_keys: 10 };
+        assert!(!should_compact(&big_but_fresh, &cfg), "10% dead is below the 40% threshold");
+
+        let big_and_dead = SpaceUsage { total_bytes: 10_000, live_bytes: 6_000, live_keys: 10 };
+        assert!(should_compact(&big_and_dead, &cfg), "exactly at the threshold must trigger");
+
+        let empty = SpaceUsage { total_bytes: 0, live_bytes: 0, live_keys: 0 };
+        assert_eq!(empty.dead_ratio(), 0.0, "an empty log must not divide by zero");
+        assert!(!should_compact(&empty, &cfg));
+    }
+
+    #[test]
+    fn maintenance_config_defaults_and_validation() {
+        let cfg = MaintenanceConfig::default();
+        assert!(cfg.enabled);
+        assert!(cfg.validate().is_ok());
+
+        let parsed: NodeConfig = serde_json::from_str(
+            r#"{"node_id":"n","role":"shard","listen_addr":"127.0.0.1:1"}"#).unwrap();
+        assert!(parsed.maintenance.enabled, "maintenance must default on when the block is absent");
+        assert_eq!(parsed.maintenance.compaction_dead_ratio, 0.4);
+
+        let partial: NodeConfig = serde_json::from_str(
+            r#"{"node_id":"n","role":"shard","listen_addr":"127.0.0.1:1",
+                "maintenance":{"compaction_dead_ratio":0.75}}"#).unwrap();
+        assert_eq!(partial.maintenance.compaction_dead_ratio, 0.75);
+        assert_eq!(partial.maintenance.snapshot_interval_secs, 300, "unspecified knobs keep their defaults");
+
+        let bad: NodeConfig = serde_json::from_str(
+            r#"{"node_id":"n","role":"shard","listen_addr":"127.0.0.1:1",
+                "maintenance":{"compaction_dead_ratio":1.5}}"#).unwrap();
+        assert!(bad.validate().is_err(), "an out-of-range ratio must be rejected at boot");
+
+        let zero: NodeConfig = serde_json::from_str(
+            r#"{"node_id":"n","role":"shard","listen_addr":"127.0.0.1:1",
+                "maintenance":{"interval_secs":0}}"#).unwrap();
+        assert!(zero.validate().is_err(), "a zero interval would spin the scheduler");
+    }
+
+    #[tokio::test]
+    async fn space_usage_tracks_dead_bytes_from_overwrites() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        live_put(&col, "a", 1);
+        let fresh = col.space_usage().unwrap();
+        assert_eq!(fresh.live_keys, 1);
+        assert_eq!(fresh.dead_bytes(), 0, "a log with no overwrites has no dead bytes");
+
+        for v in 2..=10 {
+            live_put(&col, "a", v);
+        }
+
+        let churned = col.space_usage().unwrap();
+        assert_eq!(churned.live_keys, 1, "ten writes to one key leave one live key");
+        assert!(churned.dead_bytes() > 0);
+        assert!(churned.dead_ratio() > 0.8,
+            "nine superseded versions should dominate the log, got {:.2}", churned.dead_ratio());
+
+        col.compact().unwrap();
+
+        let reclaimed = col.space_usage().unwrap();
+        assert_eq!(reclaimed.live_keys, 1);
+        assert_eq!(reclaimed.dead_bytes(), 0, "compaction must reclaim every dead byte");
+        assert!(reclaimed.total_bytes < churned.total_bytes);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn space_usage_counts_only_this_collections_wals() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let a = db.get_collection("a").unwrap();
+        let b = db.get_collection("b").unwrap();
+
+        live_put(&a, "k", 1);
+        for v in 0..20 {
+            live_put(&b, &format!("k{}", v), v);
+        }
+
+        let ua = a.space_usage().unwrap();
+        let ub = b.space_usage().unwrap();
+
+        assert_eq!(ua.live_keys, 1);
+        assert_eq!(ub.live_keys, 20);
+        assert!(ua.total_bytes < ub.total_bytes, "each collection measures its own WAL directory only");
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -5240,8 +5553,8 @@ mod tests {
         let db = Database::new(&root).unwrap();
 
         let col = db.get_collection("users").unwrap();
-        let (_, w, o, _) = col.put("k".into(), serde_json::json!({"v": 1}), 1).unwrap();
-        col.index.write().unwrap().insert("k".into(), IndexEntry { wal_id: w, offset: o });
+        let (f, w, o, _) = col.put("k".into(), serde_json::json!({"v": 1}), 1).unwrap();
+        col.index.write().unwrap().insert("k".into(), idx(&f, w, o));
 
         db.drop_collection("users").unwrap();
 
