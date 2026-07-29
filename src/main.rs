@@ -1205,6 +1205,13 @@ struct CreateDoc {
 }
 
 #[derive(Deserialize)]
+struct BulkDoc {
+    #[serde(default)]
+    id: Option<String>,
+    value: serde_json::Value,
+}
+
+#[derive(Deserialize)]
 struct QueryParams {
     start: Option<String>,
     end: Option<String>,
@@ -1837,6 +1844,7 @@ async fn repair_replica(state: AppState, replica_url: String, collection: String
     prev >= target
 }
 
+#[derive(Clone, Copy)]
 enum WriteConcern {
     Local,
     Majority,
@@ -2051,6 +2059,112 @@ async fn router_forward_write(
     }
 
     Err((StatusCode::BAD_GATEWAY, "All shard nodes unreachable").into_response())
+}
+
+async fn router_forward_bulk(
+    state: &AppState,
+    col_name: &str,
+    effective_url: &str,
+    original_url: &str,
+    replica_urls: &[String],
+    body: &[serde_json::Value],
+    wc_query: &str,
+) -> Result<reqwest::Response, String> {
+    let full_url = format!("{}/collections/{}/docs/bulk{}", effective_url, col_name, wc_query);
+    if let Ok(r) = state.client.post(&full_url).json(body).send().await {
+        if authoritative_write_status(r.status()) {
+            if effective_url != original_url {
+                state.set_primary_override(original_url, effective_url);
+            }
+            return Ok(r);
+        }
+    }
+
+    let failover_lock = {
+        let mut locks = state.shard_failover_locks.lock().unwrap();
+        locks.entry(original_url.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let _guard = failover_lock.lock().await;
+
+    state.primary_overrides.lock().unwrap().remove(original_url);
+    for replica in replica_urls {
+        let fallback_url = format!("{}/collections/{}/docs/bulk{}", replica, col_name, wc_query);
+        if let Ok(r) = state.client.post(&fallback_url).json(body).send().await {
+            if authoritative_write_status(r.status()) {
+                state.set_primary_override(original_url, replica);
+                println!("[router] Cached new primary: {} -> {}", original_url, replica);
+                return Ok(r);
+            }
+        }
+    }
+
+    Err("All shard nodes unreachable".to_string())
+}
+
+async fn bulk_router_forward(
+    state: &AppState,
+    col_name: &str,
+    docs: Vec<BulkDoc>,
+    wc_query: &str,
+) -> axum::response::Response {
+    let n = docs.len();
+    let mut groups: HashMap<String, (String, String, Vec<String>, Vec<(usize, String, serde_json::Value)>)> = HashMap::new();
+
+    for (idx, d) in docs.into_iter().enumerate() {
+        let id = d.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        let hash = hash_key(col_name, &id);
+        let (effective_url, original_url, replica_urls) = match state.get_effective_shard_url(hash) {
+            Some(t) => t,
+            None => return err_json(StatusCode::BAD_REQUEST, format!("Key {} not owned by any shard", id)),
+        };
+        groups.entry(original_url.clone())
+            .or_insert_with(|| (effective_url, original_url, replica_urls, Vec::new()))
+            .3.push((idx, id, d.value));
+    }
+
+    let futures = groups.into_values().map(|(effective_url, original_url, replica_urls, items)| {
+        let state = state.clone();
+        let col_name = col_name.to_string();
+        let wc_query = wc_query.to_string();
+        async move {
+            let body: Vec<serde_json::Value> = items.iter()
+                .map(|(_, id, value)| serde_json::json!({"id": id, "value": value}))
+                .collect();
+            let resp = router_forward_bulk(&state, &col_name, &effective_url, &original_url, &replica_urls, &body, &wc_query).await;
+            (items, resp)
+        }
+    });
+
+    let results = futures::future::join_all(futures).await;
+
+    let mut ordered: Vec<serde_json::Value> = vec![serde_json::Value::Null; n];
+    for (items, resp) in results {
+        match resp {
+            Ok(r) => {
+                let shard_results: Vec<serde_json::Value> = r.json::<serde_json::Value>().await.ok()
+                    .and_then(|b| b.get("results").and_then(|v| v.as_array().cloned()))
+                    .unwrap_or_default();
+                if shard_results.len() == items.len() {
+                    for ((idx, _, _), res) in items.iter().zip(shard_results.into_iter()) {
+                        ordered[*idx] = res;
+                    }
+                } else {
+                    for (idx, id, _) in &items {
+                        ordered[*idx] = serde_json::json!({"id": id, "status": "error", "error": "malformed shard response"});
+                    }
+                }
+            }
+            Err(e) => {
+                for (idx, id, _) in &items {
+                    ordered[*idx] = serde_json::json!({"id": id, "status": "error", "error": e});
+                }
+            }
+        }
+    }
+
+    (StatusCode::CREATED, Json(serde_json::json!({"results": ordered}))).into_response()
 }
 
 async fn passthrough_json(r: reqwest::Response) -> axum::response::Response {
@@ -2359,6 +2473,75 @@ async fn local_patch(
     Ok(Some(finish_write(state, col_name, pending, wc, wtimeout).await))
 }
 
+async fn local_write_batch_inner(
+    state: &AppState,
+    col: &Arc<Collection>,
+    items: Vec<(String, serde_json::Value)>,
+) -> Result<Vec<PendingWrite>, axum::response::Response> {
+    let term = state.current_term();
+    let existed: Vec<bool> = items.iter().map(|(key, _)| col.exists(key)).collect();
+
+    let col_clone = col.clone();
+    let write_res = tokio::task::spawn_blocking(move || {
+        let mut out = Vec::with_capacity(items.len());
+        for (key, value) in items {
+            let (frame, wal_id, offset, lsn) = col_clone.put(key.clone(), value, term)?;
+            out.push((key, frame, wal_id, offset, lsn));
+        }
+        Ok::<_, io::Error>(out)
+    }).await;
+
+    let frames = match write_res {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    };
+
+    match col.enqueue_commit().await {
+        Ok(Ok(())) => {},
+        Ok(Err(e)) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e)),
+        Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+
+    {
+        let mut index = col.index.write().unwrap();
+        for (key, _, wal_id, offset, _) in &frames {
+            index.insert(key.clone(), IndexEntry { wal_id: *wal_id, offset: *offset });
+        }
+    }
+
+    Ok(frames.into_iter().zip(existed.into_iter())
+        .map(|((_, frame, _, _, lsn), existed)| PendingWrite { frame, term, lsn, existed })
+        .collect())
+}
+
+async fn local_write_batch(
+    state: &AppState,
+    col_name: &str,
+    items: Vec<(String, serde_json::Value)>,
+    wc: WriteConcern,
+    wtimeout: Duration,
+) -> Result<Vec<WriteOutcome>, axum::response::Response> {
+    let db = state.db.as_ref().unwrap();
+    let col = match db.get_collection(col_name) {
+        Ok(c) => c,
+        Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    };
+
+    let mut lock_order: Vec<usize> = (0..items.len()).collect();
+    lock_order.sort_by(|&a, &b| items[a].0.cmp(&items[b].0));
+    let mut _guards = Vec::with_capacity(lock_order.len());
+    for i in lock_order {
+        _guards.push(col.key_lock(&items[i].0).lock().await);
+    }
+
+    let pending = local_write_batch_inner(state, &col, items).await?;
+
+    Ok(futures::future::join_all(
+        pending.into_iter().map(|p| finish_write(state, col_name, p, wc, wtimeout))
+    ).await)
+}
+
 #[derive(Deserialize)]
 struct WriteConcernParams {
     w: Option<String>,
@@ -2452,6 +2635,57 @@ async fn put_doc(
             "acks": o.acks,
             "required": o.required,
         }))).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+async fn bulk_create_docs(
+    State(state): State<AppState>,
+    AxumPath(col_name): AxumPath<String>,
+    Query(wcp): Query<WriteConcernParams>,
+    Json(payload): Json<Vec<BulkDoc>>,
+) -> impl axum::response::IntoResponse {
+    if state.is_shard() && !state.is_leader() {
+        return (StatusCode::FORBIDDEN, "Replica nodes reject direct writes").into_response();
+    }
+
+    if payload.is_empty() {
+        return err_json(StatusCode::BAD_REQUEST, "bulk request must contain at least one document".to_string());
+    }
+
+    let wc_query = wc_query_string(&wcp);
+
+    if state.config.role == "router" {
+        return bulk_router_forward(&state, &col_name, payload, &wc_query).await;
+    }
+
+    let wc = parse_write_concern(wcp.w.as_deref());
+    let wtimeout = Duration::from_millis(wcp.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
+
+    let ids: Vec<String> = payload.iter()
+        .map(|d| d.id.clone().unwrap_or_else(|| Uuid::new_v4().to_string()))
+        .collect();
+    let items: Vec<(String, serde_json::Value)> = ids.iter().cloned()
+        .zip(payload.into_iter().map(|d| d.value))
+        .collect();
+
+    match local_write_batch(&state, &col_name, items, wc, wtimeout).await {
+        Ok(outcomes) => {
+            let results: Vec<serde_json::Value> = ids.into_iter().zip(outcomes.into_iter()).map(|(id, o)| {
+                if o.met {
+                    serde_json::json!({"id": id, "status": "created"})
+                } else {
+                    serde_json::json!({
+                        "id": id,
+                        "status": "created",
+                        "warning": "write concern not met",
+                        "acks": o.acks,
+                        "required": o.required,
+                    })
+                }
+            }).collect();
+            (StatusCode::CREATED, Json(serde_json::json!({"results": results}))).into_response()
+        }
         Err(resp) => resp,
     }
 }
@@ -3472,6 +3706,7 @@ async fn main() -> io::Result<()> {
 
     let mut app = Router::new()
         .route("/collections/:name/docs", post(create_doc).get(list_docs))
+        .route("/collections/:name/docs/bulk", post(bulk_create_docs))
         .route("/collections/:name/query", get(query_docs))
         .route("/collections/:name/docs/:id", get(get_doc).put(put_doc).patch(update_doc).delete(delete_doc));
 
