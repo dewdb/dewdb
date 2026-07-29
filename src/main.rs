@@ -2,7 +2,7 @@ use axum::{
     extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -20,6 +20,7 @@ const MAX_RECORD_SIZE: u64 = 10 * 1024 * 1024;
 const INDEX_FILENAME: &str = "index-current.bin";
 const HEADER_LEN: usize = 24;
 const KEY_LOCK_STRIPES: usize = 64;
+const DIR_REMOVE_ATTEMPTS: usize = 5;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "op", rename_all = "lowercase")]
@@ -288,6 +289,7 @@ struct Collection {
     commit_signal: Arc<tokio::sync::Notify>,
     read_pool: std::sync::Mutex<HashMap<u64, Vec<Arc<std::sync::Mutex<File>>>>>,
     read_pool_counter: AtomicUsize,
+    released: AtomicBool,
     db_global_commit_index: Arc<AtomicU64>,
     db_next_lsn: Arc<AtomicU64>,
     db_last_log_term: Arc<AtomicU64>,
@@ -391,6 +393,21 @@ impl AppState {
     }
 }
 
+fn remove_dir_with_retry(path: &Path) -> io::Result<()> {
+    let mut last_err = None;
+    for attempt in 0..DIR_REMOVE_ATTEMPTS {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(20 * (attempt + 1) as u64));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to remove directory")))
+}
+
 struct Database {
     root_path: PathBuf,
     collections: RwLock<HashMap<String, Arc<Collection>>>,
@@ -440,6 +457,58 @@ impl Database {
         Collection::start_commit_task(col.clone());
         collections.insert(name.to_string(), col.clone());
         Ok(col)
+    }
+
+    fn list_collections(&self) -> io::Result<Vec<String>> {
+        let mut names: HashSet<String> = self.collections.read().unwrap().keys().cloned().collect();
+
+        for entry in fs::read_dir(&self.root_path)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            if let Some(name) = entry.file_name().to_str() {
+                if name.starts_with('.') || name.ends_with(".tmp") || name.ends_with(".old") {
+                    continue;
+                }
+                names.insert(name.to_string());
+            }
+        }
+
+        let mut out: Vec<String> = names.into_iter().collect();
+        out.sort();
+        Ok(out)
+    }
+
+    fn release_collection(&self, name: &str) -> io::Result<Option<PathBuf>> {
+        let existing = self.collections.write().unwrap().remove(name);
+        match existing {
+            Some(col) => Ok(Some(col.release_handles()?)),
+            None => Ok(None),
+        }
+    }
+
+    fn drop_collection(&self, name: &str) -> io::Result<bool> {
+        let tombstone = self.release_collection(name)?;
+
+        let col_path = self.root_path.join(name);
+        let existed = col_path.is_dir();
+
+        for candidate in [
+            col_path,
+            self.root_path.join(format!("{}.tmp", name)),
+            self.root_path.join(format!("{}.old", name)),
+        ] {
+            if candidate.is_dir() {
+                remove_dir_with_retry(&candidate)?;
+            }
+        }
+
+        if let Some(path) = tombstone {
+            let _ = fs::remove_file(path);
+        }
+
+        Ok(existed)
     }
 
     fn force_commit_all(&self) {
@@ -593,6 +662,7 @@ impl Collection {
             commit_signal: Arc::new(tokio::sync::Notify::new()),
             read_pool: std::sync::Mutex::new(HashMap::new()),
             read_pool_counter: AtomicUsize::new(0),
+            released: AtomicBool::new(false),
             db_global_commit_index,
             db_next_lsn,
             db_last_log_term,
@@ -720,6 +790,10 @@ impl Collection {
             wal = self.wal_pause_cv.wait(wal).unwrap();
         }
 
+        if self.released.load(Ordering::SeqCst) {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "Collection handle is no longer active"));
+        }
+
         if wal.current_wal_size >= WAL_ROTATION_LIMIT {
             wal.current_wal.sync_all()?;
             wal.current_wal_id += 1;
@@ -790,6 +864,10 @@ impl Collection {
         let mut wal = self.wal_writer.lock().unwrap();
         while wal.write_paused {
             wal = self.wal_pause_cv.wait(wal).unwrap();
+        }
+
+        if self.released.load(Ordering::SeqCst) {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "Collection handle is no longer active"));
         }
 
         let last = wal.last_appended_lsn;
@@ -904,6 +982,18 @@ impl Collection {
                 tokio::select! {
                     _ = col.commit_signal.notified() => {},
                     _ = tokio::time::sleep(Duration::from_millis(COMMIT_INTERVAL_MS)) => {},
+                }
+
+                if col.released.load(Ordering::SeqCst) {
+                    let notifiers: Vec<_> = {
+                        let mut q = col.commit_notifiers.lock().unwrap();
+                        std::mem::take(&mut *q)
+                    };
+                    for tx in notifiers {
+                        let _ = tx.send(Err(format!("Collection '{}' handle is no longer active", col.name)));
+                    }
+                    println!("[{}] Commit task stopped; handle released.", col.name);
+                    return;
                 }
 
                 let has_pending = {
@@ -1196,6 +1286,31 @@ impl Collection {
 
         println!("[{}] Compaction complete.", self.name);
         Ok(())
+    }
+
+    fn release_handles(&self) -> io::Result<PathBuf> {
+        self.released.store(true, Ordering::SeqCst);
+
+        let tombstone = self.data_root.join(format!(".released-{}.wal", self.name));
+
+        {
+            let mut wal = self.wal_writer.lock().unwrap();
+            wal.current_wal = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .read(true)
+                .open(&tombstone)?;
+            wal.current_wal_size = 0;
+            wal.commit_paused = false;
+            wal.write_paused = false;
+        }
+
+        self.wal_pause_cv.notify_all();
+        self.commit_signal.notify_one();
+        self.read_pool.lock().unwrap().clear();
+        self.index.write().unwrap().clear();
+
+        Ok(tombstone)
     }
 }
 
@@ -2809,6 +2924,282 @@ async fn list_docs(
     }
 }
 
+async fn admin_call(client: &reqwest::Client, post: bool, url: &str) -> Option<(StatusCode, serde_json::Value)> {
+    let rb = if post { client.post(url) } else { client.delete(url) };
+    let r = rb.send().await.ok()?;
+    let status = r.status();
+    let body = r.json::<serde_json::Value>().await.unwrap_or(serde_json::Value::Null);
+    Some((status, body))
+}
+
+fn node_result(node: &str, outcome: Option<(StatusCode, serde_json::Value)>) -> serde_json::Value {
+    match outcome {
+        Some((status, body)) => serde_json::json!({
+            "node": node,
+            "status": status.as_u16(),
+            "response": body,
+        }),
+        None => serde_json::json!({
+            "node": node,
+            "status": serde_json::Value::Null,
+            "error": "unreachable",
+        }),
+    }
+}
+
+async fn router_fanout_maintenance(state: &AppState, col_name: &str, action: &str) -> axum::response::Response {
+    let mut targets = Vec::new();
+    for (original, replicas) in unique_shards(state) {
+        targets.push(state.effective_primary(&original));
+        for r in replicas {
+            targets.push(r);
+        }
+    }
+    targets.sort();
+    targets.dedup();
+
+    let results = futures::future::join_all(targets.into_iter().map(|node| {
+        let client = state.client.clone();
+        let col_name = col_name.to_string();
+        let action = action.to_string();
+        async move {
+            let url = format!("{}/collections/{}/{}", node, col_name, action);
+            let outcome = admin_call(&client, true, &url).await;
+            node_result(&node, outcome)
+        }
+    })).await;
+
+    let all_ok = results.iter().all(|r| r.get("status").and_then(|s| s.as_u64()).map_or(false, |s| s < 300));
+    let status = if all_ok { StatusCode::OK } else { StatusCode::MULTI_STATUS };
+    (status, Json(serde_json::json!({"nodes": results}))).into_response()
+}
+
+async fn router_fanout_drop(state: &AppState, col_name: &str) -> axum::response::Response {
+    let results = futures::future::join_all(unique_shards(state).into_iter().map(|(original, replicas)| {
+        let state = state.clone();
+        let col_name = col_name.to_string();
+        async move {
+            let effective = state.effective_primary(&original);
+            let mut candidates = vec![effective.clone()];
+            if original != effective {
+                candidates.push(original.clone());
+            }
+            candidates.extend(replicas.into_iter().filter(|r| *r != effective));
+
+            for node in candidates {
+                let url = format!("{}/collections/{}", node, col_name);
+                if let Some((status, body)) = admin_call(&state.client, false, &url).await {
+                    if authoritative_write_status(status) {
+                        if node != original {
+                            state.set_primary_override(&original, &node);
+                        }
+                        return node_result(&node, Some((status, body)));
+                    }
+                }
+            }
+            node_result(&original, None)
+        }
+    })).await;
+
+    let all_ok = results.iter().all(|r| r.get("status").and_then(|s| s.as_u64()).map_or(false, |s| s < 300));
+    let status = if all_ok { StatusCode::OK } else { StatusCode::MULTI_STATUS };
+    (status, Json(serde_json::json!({"shards": results}))).into_response()
+}
+
+async fn list_collections(
+    State(state): State<AppState>,
+) -> impl axum::response::IntoResponse {
+    if state.config.role == "router" {
+        let mut targets = Vec::new();
+        for (original, replicas) in unique_shards(&state) {
+            targets.push((state.effective_primary(&original), replicas));
+        }
+
+        let per_shard = futures::future::join_all(targets.into_iter().map(|(primary, replicas)| {
+            let client = state.client.clone();
+            async move {
+                let mut candidates = vec![primary];
+                candidates.extend(replicas);
+                for node in candidates {
+                    let url = format!("{}/collections", node);
+                    if let Ok(r) = client.get(&url).send().await {
+                        if r.status().is_success() {
+                            if let Ok(body) = r.json::<serde_json::Value>().await {
+                                return body.get("collections")
+                                    .and_then(|c| c.as_array().cloned())
+                                    .unwrap_or_default();
+                            }
+                        }
+                    }
+                }
+                Vec::new()
+            }
+        })).await;
+
+        let mut names: HashSet<String> = HashSet::new();
+        for list in per_shard {
+            for v in list {
+                if let Some(s) = v.as_str() {
+                    names.insert(s.to_string());
+                }
+            }
+        }
+        let mut out: Vec<String> = names.into_iter().collect();
+        out.sort();
+        return (StatusCode::OK, Json(serde_json::json!({"collections": out}))).into_response();
+    }
+
+    let db = state.db.as_ref().unwrap().clone();
+    match tokio::task::spawn_blocking(move || db.list_collections()).await {
+        Ok(Ok(names)) => (StatusCode::OK, Json(serde_json::json!({"collections": names}))).into_response(),
+        Ok(Err(e)) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn drop_collection(
+    State(state): State<AppState>,
+    AxumPath(col_name): AxumPath<String>,
+) -> impl axum::response::IntoResponse {
+    if state.config.role == "router" {
+        return router_fanout_drop(&state, &col_name).await;
+    }
+
+    if state.is_shard() && !state.is_leader() {
+        return (StatusCode::FORBIDDEN, "Replica nodes reject direct writes").into_response();
+    }
+
+    let term = state.current_term();
+    let replicas = state.get_replicas();
+
+    let db = state.db.as_ref().unwrap().clone();
+    let name = col_name.clone();
+    let existed = match tokio::task::spawn_blocking(move || db.drop_collection(&name)).await {
+        Ok(Ok(e)) => e,
+        Ok(Err(e)) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    let acks = futures::future::join_all(replicas.iter().map(|replica| {
+        let client = state.client.clone();
+        let url = format!("{}/internal/drop", replica);
+        let req = DropRequest { collection: col_name.clone(), term };
+        async move {
+            match client.post(&url).json(&req).send().await {
+                Ok(r) if r.status().is_success() => true,
+                _ => false,
+            }
+        }
+    })).await;
+
+    let replicated = acks.iter().filter(|ok| **ok).count();
+    println!("[{}] Collection dropped; {}/{} replicas acked", col_name, replicated, replicas.len());
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "collection": col_name,
+        "status": "dropped",
+        "existed": existed,
+        "replicas_acked": replicated,
+        "replicas": replicas.len(),
+    }))).into_response()
+}
+
+async fn compact_collection(
+    State(state): State<AppState>,
+    AxumPath(col_name): AxumPath<String>,
+) -> impl axum::response::IntoResponse {
+    if state.config.role == "router" {
+        return router_fanout_maintenance(&state, &col_name, "compact").await;
+    }
+
+    let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
+        Ok(c) => c,
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    let col_clone = col.clone();
+    match tokio::task::spawn_blocking(move || col_clone.compact()).await {
+        Ok(Ok(())) => {
+            let wal = col.wal_writer.lock().unwrap();
+            (StatusCode::OK, Json(serde_json::json!({
+                "collection": col_name,
+                "status": "compacted",
+                "wal_id": wal.current_wal_id,
+                "wal_size": wal.current_wal_size,
+                "documents": col.index.read().unwrap().len(),
+            }))).into_response()
+        },
+        Ok(Err(e)) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+async fn snapshot_collection(
+    State(state): State<AppState>,
+    AxumPath(col_name): AxumPath<String>,
+) -> impl axum::response::IntoResponse {
+    if state.config.role == "router" {
+        return router_fanout_maintenance(&state, &col_name, "snapshot").await;
+    }
+
+    let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
+        Ok(c) => c,
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    let col_clone = col.clone();
+    match tokio::task::spawn_blocking(move || col_clone.save_index()).await {
+        Ok(Ok(())) => {
+            let wal = col.wal_writer.lock().unwrap();
+            (StatusCode::OK, Json(serde_json::json!({
+                "collection": col_name,
+                "status": "snapshotted",
+                "last_lsn": wal.last_appended_lsn,
+                "documents": col.index.read().unwrap().len(),
+            }))).into_response()
+        },
+        Ok(Err(e)) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct DropRequest {
+    collection: String,
+    term: u64,
+}
+
+async fn internal_drop_handler(
+    State(state): State<AppState>,
+    Json(req): Json<DropRequest>,
+) -> impl axum::response::IntoResponse {
+    if !state.is_shard() || state.is_leader() {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "status": "not_a_replica",
+            "term": state.current_term(),
+        }))).into_response();
+    }
+
+    let our_term = state.current_term();
+    if req.term < our_term {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "status": "stale_term",
+            "term": our_term,
+        }))).into_response();
+    }
+
+    let db = state.db.as_ref().unwrap().clone();
+    let name = req.collection.clone();
+    match tokio::task::spawn_blocking(move || db.drop_collection(&name)).await {
+        Ok(Ok(existed)) => {
+            println!("[replica] Dropped collection '{}' on primary's instruction", req.collection);
+            (StatusCode::OK, Json(serde_json::json!({"status": "dropped", "existed": existed}))).into_response()
+        },
+        Ok(Err(e)) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 async fn query_docs(
     State(state): State<AppState>,
     AxumPath(col_name): AxumPath<String>,
@@ -3568,24 +3959,26 @@ async fn replica_sync_from_primary(
         fs::write(&file_path, &entry.data).map_err(|e| format!("Failed to write {}: {}", entry.filename, e))?;
     }
 
+    let tombstone = db.release_collection(collection_name)
+        .map_err(|e| format!("Failed to release collection handles: {}", e))?;
+
     let old_path = db.root_path.join(format!("{}.old", collection_name));
     if old_path.exists() {
-        let _ = fs::remove_dir_all(&old_path);
+        let _ = remove_dir_with_retry(&old_path);
     }
     if col_path.exists() {
         fs::rename(&col_path, &old_path).map_err(|e| format!("Failed to backup old col dir: {}", e))?;
     }
     fs::rename(&tmp_path, &col_path).map_err(|e| format!("Failed to finalize new col dir: {}", e))?;
     if old_path.exists() {
-        let _ = fs::remove_dir_all(&old_path);
+        let _ = remove_dir_with_retry(&old_path);
+    }
+    if let Some(path) = tombstone {
+        let _ = fs::remove_file(path);
     }
 
     println!("[replica-sync] Restored {} files for collection '{}'", files.len(), collection_name);
 
-    {
-        let mut collections = db.collections.write().unwrap();
-        collections.remove(collection_name);
-    }
     let _ = db.get_collection(collection_name)
         .map_err(|e| format!("Failed to reopen collection after sync: {}", e))?;
 
@@ -3705,6 +4098,10 @@ async fn main() -> io::Result<()> {
     }
 
     let mut app = Router::new()
+        .route("/collections", get(list_collections))
+        .route("/collections/:name", delete(drop_collection))
+        .route("/collections/:name/compact", post(compact_collection))
+        .route("/collections/:name/snapshot", post(snapshot_collection))
         .route("/collections/:name/docs", post(create_doc).get(list_docs))
         .route("/collections/:name/docs/bulk", post(bulk_create_docs))
         .route("/collections/:name/query", get(query_docs))
@@ -3716,6 +4113,7 @@ async fn main() -> io::Result<()> {
             .route("/internal/snapshot", get(snapshot_handler))
             .route("/internal/resync", post(resync_handler))
             .route("/internal/vote", post(vote_handler))
+            .route("/internal/drop", post(internal_drop_handler))
             .route("/internal/heartbeat", get(heartbeat_handler));
     }
 
@@ -4518,5 +4916,71 @@ mod tests {
         assert!(!authoritative_write_status(StatusCode::INTERNAL_SERVER_ERROR));
         assert!(!authoritative_write_status(StatusCode::BAD_GATEWAY));
         assert!(!authoritative_write_status(StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[tokio::test]
+    async fn list_collections_merges_disk_and_memory_and_hides_transient_dirs() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+
+        db.get_collection("users").unwrap();
+        fs::create_dir_all(root.join("orders")).unwrap();
+        fs::create_dir_all(root.join("orders.tmp")).unwrap();
+        fs::create_dir_all(root.join("orders.old")).unwrap();
+        fs::write(root.join("lsn.meta"), b"x").unwrap();
+
+        let names = db.list_collections().unwrap();
+
+        assert_eq!(names, vec!["orders".to_string(), "users".to_string()],
+            "listing merges the open collection with on-disk dirs, sorted");
+        assert!(!names.iter().any(|n| n.ends_with(".tmp") || n.ends_with(".old")),
+            "in-flight resync scratch dirs must never surface as collections");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn drop_collection_deletes_files_despite_open_wal_handle() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+
+        let col = db.get_collection("users").unwrap();
+        let (_, w, o, _) = col.put("k".into(), serde_json::json!({"v": 1}), 1).unwrap();
+        col.index.write().unwrap().insert("k".into(), IndexEntry { wal_id: w, offset: o });
+
+        assert!(root.join("users").is_dir());
+
+        let existed = db.drop_collection("users").unwrap();
+
+        assert!(existed, "dropping a live collection reports that it existed");
+        assert!(!root.join("users").exists(),
+            "the collection dir must be gone even though a WAL handle was open");
+        assert!(db.list_collections().unwrap().is_empty());
+        assert!(!root.join(".released-users.wal").exists(), "the tombstone WAL must be cleaned up");
+
+        assert!(col.put("k2".into(), serde_json::json!({"v": 2}), 1).is_err(),
+            "a stale handle to a released collection must refuse further writes");
+
+        assert!(!db.drop_collection("users").unwrap(), "dropping a missing collection is a no-op");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn reopening_after_drop_starts_empty() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+
+        let col = db.get_collection("users").unwrap();
+        let (_, w, o, _) = col.put("k".into(), serde_json::json!({"v": 1}), 1).unwrap();
+        col.index.write().unwrap().insert("k".into(), IndexEntry { wal_id: w, offset: o });
+
+        db.drop_collection("users").unwrap();
+
+        let fresh = db.get_collection("users").unwrap();
+        assert!(fresh.index.read().unwrap().is_empty(), "dropped data must not resurrect on reopen");
+        assert!(fresh.get("k").unwrap().is_none());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
