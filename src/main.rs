@@ -20,6 +20,7 @@ const MAX_RECORD_SIZE: u64 = 10 * 1024 * 1024;
 const INDEX_FILENAME: &str = "index-current.bin";
 const HEADER_LEN: usize = 24;
 const KEY_LOCK_STRIPES: usize = 64;
+const READ_POOL_HANDLES: usize = 4;
 const DIR_REMOVE_ATTEMPTS: usize = 5;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -36,16 +37,42 @@ enum LogEntry {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct IndexEntry {
     wal_id: u64,
     offset: u64,
     len: u32,
+    #[serde(default)]
+    inline: Option<Box<[u8]>>,
 }
 
 impl IndexEntry {
     fn frame_bytes(&self) -> u64 {
         HEADER_LEN as u64 + self.len as u64
+    }
+
+    fn inline_bytes(&self) -> u64 {
+        self.inline.as_ref().map_or(0, |b| b.len() as u64)
+    }
+}
+
+#[derive(Deserialize, Clone, Debug)]
+struct ReadCacheConfig {
+    #[serde(default = "default_inline_max_bytes")]
+    inline_max_value_bytes: u32,
+    #[serde(default = "default_inline_budget")]
+    inline_budget_bytes: u64,
+}
+
+fn default_inline_max_bytes() -> u32 { 512 }
+fn default_inline_budget() -> u64 { 64 * 1024 * 1024 }
+
+impl Default for ReadCacheConfig {
+    fn default() -> Self {
+        Self {
+            inline_max_value_bytes: default_inline_max_bytes(),
+            inline_budget_bytes: default_inline_budget(),
+        }
     }
 }
 
@@ -107,6 +134,8 @@ struct NodeConfig {
     election_delay_ms: u64,
     #[serde(default)]
     maintenance: MaintenanceConfig,
+    #[serde(default)]
+    read_cache: ReadCacheConfig,
 }
 
 fn default_heartbeat_timeout() -> u64 { 6 }
@@ -367,6 +396,8 @@ struct Collection {
     read_pool_counter: AtomicUsize,
     released: AtomicBool,
     compacting: AtomicBool,
+    cache: ReadCacheConfig,
+    inline_bytes: AtomicU64,
     db_global_commit_index: Arc<AtomicU64>,
     db_next_lsn: Arc<AtomicU64>,
     db_last_log_term: Arc<AtomicU64>,
@@ -510,6 +541,7 @@ fn remove_dir_with_retry(path: &Path) -> io::Result<()> {
 
 struct Database {
     root_path: PathBuf,
+    cache: ReadCacheConfig,
     collections: RwLock<HashMap<String, Arc<Collection>>>,
     pub global_commit_index: Arc<AtomicU64>,
     pub next_lsn: Arc<AtomicU64>,
@@ -518,6 +550,10 @@ struct Database {
 
 impl Database {
     fn new(path: impl AsRef<std::path::Path>) -> io::Result<Self> {
+        Self::with_cache(path, ReadCacheConfig::default())
+    }
+
+    fn with_cache(path: impl AsRef<std::path::Path>, cache: ReadCacheConfig) -> io::Result<Self> {
         let root_path = path.as_ref().to_path_buf();
         fs::create_dir_all(&root_path)?;
         let boot_lsn = LsnMeta::load(&root_path).map(|m| m.commit_lsn).unwrap_or(0);
@@ -526,6 +562,7 @@ impl Database {
         }
         Ok(Self {
             root_path,
+            cache,
             collections: RwLock::new(HashMap::new()),
             global_commit_index: Arc::new(AtomicU64::new(boot_lsn)),
             next_lsn: Arc::new(AtomicU64::new(boot_lsn)),
@@ -553,6 +590,7 @@ impl Database {
             self.global_commit_index.clone(),
             self.next_lsn.clone(),
             self.last_log_term.clone(),
+            self.cache.clone(),
         )?);
         Collection::start_commit_task(col.clone());
         collections.insert(name.to_string(), col.clone());
@@ -644,11 +682,13 @@ impl Collection {
         db_global_commit_index: Arc<AtomicU64>,
         db_next_lsn: Arc<AtomicU64>,
         db_last_log_term: Arc<AtomicU64>,
+        cache: ReadCacheConfig,
     ) -> io::Result<Self> {
         fs::create_dir_all(&root_path)?;
         let data_root = root_path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
         let mut index = BTreeMap::new();
+        let mut inline_used: u64 = 0;
         let mut wal_files = Vec::new();
 
         let index_path = root_path.join(INDEX_FILENAME);
@@ -665,6 +705,7 @@ impl Collection {
                         Ok(snapshot) => {
                             println!("[{}] Loaded persisted snapshot (WAL ID: {}, Offset: {}, LSN: {}) with {} entries.",
                                      name, snapshot.last_wal_id, snapshot.last_offset, snapshot.last_lsn, snapshot.map.len());
+                            inline_used = snapshot.map.values().map(|e| e.inline_bytes()).sum();
                             index = snapshot.map;
                             snapshot_wal_id = snapshot.last_wal_id;
                             snapshot_offset = snapshot.last_offset;
@@ -707,7 +748,7 @@ impl Collection {
         if !snapshot_loaded {
             println!("[{}] Replaying all WALs...", name);
              for (id, path) in &wal_files {
-                let r = Self::replay_file_from(*id, path, 0, &mut index)?;
+                let r = Self::replay_file_from(*id, path, 0, &mut index, &cache, &mut inline_used)?;
                 fold(r, &mut max_lsn, &mut max_term);
             }
         } else {
@@ -716,10 +757,10 @@ impl Collection {
                      continue;
                  } else if *id == snapshot_wal_id {
                      println!("[{}] Resuming WAL {} from offset {}", name, id, snapshot_offset);
-                     let r = Self::replay_file_from(*id, path, snapshot_offset, &mut index)?;
+                     let r = Self::replay_file_from(*id, path, snapshot_offset, &mut index, &cache, &mut inline_used)?;
                      fold(r, &mut max_lsn, &mut max_term);
                  } else {
-                     let r = Self::replay_file_from(*id, path, 0, &mut index)?;
+                     let r = Self::replay_file_from(*id, path, 0, &mut index, &cache, &mut inline_used)?;
                      fold(r, &mut max_lsn, &mut max_term);
                  }
              }
@@ -741,6 +782,7 @@ impl Collection {
             .open(&wal_path)?;
 
         let current_wal_size = file.metadata()?.len();
+        let inline_total = inline_used;
 
         Ok(Self {
             name,
@@ -761,10 +803,40 @@ impl Collection {
             read_pool_counter: AtomicUsize::new(0),
             released: AtomicBool::new(false),
             compacting: AtomicBool::new(false),
+            cache,
+            inline_bytes: AtomicU64::new(inline_total),
             db_global_commit_index,
             db_next_lsn,
             db_last_log_term,
         })
+    }
+
+    fn build_entry(&self, wal_id: u64, offset: u64, payload: &[u8]) -> IndexEntry {
+        let len = payload.len() as u32;
+        let inline = if len <= self.cache.inline_max_value_bytes
+            && self.inline_bytes.load(Ordering::Relaxed) + len as u64 <= self.cache.inline_budget_bytes
+        {
+            Some(payload.to_vec().into_boxed_slice())
+        } else {
+            None
+        };
+        IndexEntry { wal_id, offset, len, inline }
+    }
+
+    fn apply_index_put(&self, index: &mut BTreeMap<String, IndexEntry>, key: String, entry: IndexEntry) {
+        let added = entry.inline_bytes();
+        let replaced = index.insert(key, entry).map_or(0, |old| old.inline_bytes());
+        if added >= replaced {
+            self.inline_bytes.fetch_add(added - replaced, Ordering::Relaxed);
+        } else {
+            self.inline_bytes.fetch_sub(replaced - added, Ordering::Relaxed);
+        }
+    }
+
+    fn apply_index_remove(&self, index: &mut BTreeMap<String, IndexEntry>, key: &str) {
+        if let Some(old) = index.remove(key) {
+            self.inline_bytes.fetch_sub(old.inline_bytes(), Ordering::Relaxed);
+        }
     }
 
     fn key_stripe(&self, key: &str) -> usize {
@@ -779,7 +851,7 @@ impl Collection {
         self.index.read().unwrap().contains_key(key)
     }
 
-    fn replay_file_from(wal_id: u64, path: &PathBuf, mut start_offset: u64, index: &mut BTreeMap<String, IndexEntry>) -> io::Result<(u64, u64)> {
+    fn replay_file_from(wal_id: u64, path: &PathBuf, mut start_offset: u64, index: &mut BTreeMap<String, IndexEntry>, cache: &ReadCacheConfig, inline_used: &mut u64) -> io::Result<(u64, u64)> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         let file_len = file.metadata()?.len();
 
@@ -828,10 +900,22 @@ impl Collection {
             if let Ok(entry) = serde_json::from_slice::<LogEntry>(&payload) {
                 match entry {
                     LogEntry::Put { key, .. } => {
-                        index.insert(key, IndexEntry { wal_id, offset, len: len as u32 });
+                        let inline = if len as u32 <= cache.inline_max_value_bytes
+                            && *inline_used + len as u64 <= cache.inline_budget_bytes
+                        {
+                            *inline_used += len as u64;
+                            Some(payload.clone().into_boxed_slice())
+                        } else {
+                            None
+                        };
+                        if let Some(old) = index.insert(key, IndexEntry { wal_id, offset, len: len as u32, inline }) {
+                            *inline_used -= old.inline_bytes();
+                        }
                     },
                     LogEntry::Del { key, .. } => {
-                        index.remove(&key);
+                        if let Some(old) = index.remove(&key) {
+                            *inline_used -= old.inline_bytes();
+                        }
                     }
                 }
                 if lsn > max_lsn {
@@ -1136,23 +1220,7 @@ impl Collection {
         });
     }
 
-    pub fn iter(&self) -> Vec<(String, IndexEntry)> {
-        let index = self.index.read().unwrap();
-        index.iter().map(|(k, v)| (k.clone(), *v)).collect()
-    }
-
-    pub fn range(&self, start: Option<&str>, end: Option<&str>) -> Vec<(String, IndexEntry)> {
-        let index = self.index.read().unwrap();
-
-        let range_bound = (
-            start.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Included),
-            end.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Included),
-        );
-
-        index.range::<str, _>(range_bound).map(|(k, v)| (k.clone(), *v)).collect()
-    }
-
-    pub fn range_from(&self, after: Option<&str>, start: Option<&str>, end: Option<&str>) -> Vec<(String, IndexEntry)> {
+    pub fn range_from(&self, after: Option<&str>, start: Option<&str>, end: Option<&str>) -> Vec<String> {
         let index = self.index.read().unwrap();
 
         let start_bound = if let Some(a) = after {
@@ -1164,7 +1232,7 @@ impl Collection {
         };
         let end_bound = end.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Included);
 
-        index.range::<str, _>((start_bound, end_bound)).map(|(k, v)| (k.clone(), *v)).collect()
+        index.range::<str, _>((start_bound, end_bound)).map(|(k, _)| k.clone()).collect()
     }
 
     fn query_page(
@@ -1179,7 +1247,7 @@ impl Collection {
         let mut last_key: Option<String> = None;
         let mut has_more = false;
 
-        for (key, _entry) in self.range_from(after, start, end).into_iter() {
+        for key in self.range_from(after, start, end).into_iter() {
             if items.len() >= limit {
                 match filter {
                     None => {
@@ -1208,55 +1276,84 @@ impl Collection {
         Ok((items, next_cursor))
     }
 
+    fn value_from_payload(payload: &[u8]) -> Option<serde_json::Value> {
+        match serde_json::from_slice(payload) {
+            Ok(LogEntry::Put { value, .. }) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn wal_reader(&self, wal_id: u64) -> io::Result<Arc<std::sync::Mutex<File>>> {
+        let mut pool = self.read_pool.lock().unwrap();
+        let counter = self.read_pool_counter.fetch_add(1, Ordering::Relaxed);
+        if let Some(handles) = pool.get_mut(&wal_id) {
+            return Ok(handles[counter % handles.len()].clone());
+        }
+        let path = self.root_path.join(format!("wal-{:05}.log", wal_id));
+        let mut handles = Vec::new();
+        for _ in 0..READ_POOL_HANDLES {
+            handles.push(Arc::new(std::sync::Mutex::new(File::open(&path)?)));
+        }
+        pool.insert(wal_id, handles.clone());
+        Ok(handles[counter % READ_POOL_HANDLES].clone())
+    }
+
+    fn read_frame_payload(&self, wal_id: u64, offset: u64) -> io::Result<Vec<u8>> {
+        let file_arc = self.wal_reader(wal_id)?;
+        let mut file = file_arc.lock().unwrap();
+        file.seek(SeekFrom::Start(offset))?;
+
+        let mut header = [0u8; HEADER_LEN];
+        file.read_exact(&mut header)?;
+        let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+
+        let mut payload = vec![0u8; len];
+        file.read_exact(&mut payload)?;
+        Ok(payload)
+    }
+
     fn get(&self, key: &str) -> io::Result<Option<serde_json::Value>> {
-        let idx_entry = {
+        let located = {
             let index = self.index.read().unwrap();
-            index.get(key).copied()
+            match index.get(key) {
+                None => return Ok(None),
+                Some(entry) => match &entry.inline {
+                    Some(payload) => return Ok(Self::value_from_payload(payload)),
+                    None => (entry.wal_id, entry.offset),
+                },
+            }
         };
 
-        if let Some(entry) = idx_entry {
-            let file_arc = {
-                let mut pool = self.read_pool.lock().unwrap();
-                let counter = self.read_pool_counter.fetch_add(1, Ordering::Relaxed);
-                if let Some(handles) = pool.get_mut(&entry.wal_id) {
-                    handles[counter % handles.len()].clone()
-                } else {
-                    let path = self.root_path.join(format!("wal-{:05}.log", entry.wal_id));
-                    let mut handles = Vec::new();
-                    for _ in 0..4 {
-                         handles.push(Arc::new(std::sync::Mutex::new(File::open(&path)?)));
-                    }
-                    pool.insert(entry.wal_id, handles.clone());
-                    handles[counter % 4].clone()
-                }
-            };
-
-            let mut file = file_arc.lock().unwrap();
-            file.seek(SeekFrom::Start(entry.offset))?;
-
-            let mut header = [0u8; HEADER_LEN];
-            file.read_exact(&mut header)?;
-            let len = u32::from_le_bytes(header[0..4].try_into().unwrap());
-
-            let mut payload = vec![0u8; len as usize];
-            file.read_exact(&mut payload)?;
-
-            if let Ok(LogEntry::Put { value, .. }) = serde_json::from_slice(&payload) {
-                return Ok(Some(value));
-            }
-        }
-        Ok(None)
+        let payload = self.read_frame_payload(located.0, located.1)?;
+        Ok(Self::value_from_payload(&payload))
     }
 
     fn list_all(&self) -> io::Result<Vec<serde_json::Value>> {
-        let index = self.index.read().unwrap();
-        let mut results = Vec::new();
-        for (key, _) in index.iter() {
-           if let Some(val) = self.get(key)? {
-               results.push(val);
-           }
+        let mut resolved = Vec::new();
+        let mut pending = Vec::new();
+
+        {
+            let index = self.index.read().unwrap();
+            for (key, entry) in index.iter() {
+                match &entry.inline {
+                    Some(payload) => {
+                        if let Some(v) = Self::value_from_payload(payload) {
+                            resolved.push(v);
+                        }
+                    },
+                    None => pending.push((key.clone(), entry.wal_id, entry.offset)),
+                }
+            }
         }
-        Ok(results)
+
+        for (_key, wal_id, offset) in pending {
+            let payload = self.read_frame_payload(wal_id, offset)?;
+            if let Some(v) = Self::value_from_payload(&payload) {
+                resolved.push(v);
+            }
+        }
+
+        Ok(resolved)
     }
 
     fn space_usage(&self) -> io::Result<SpaceUsage> {
@@ -1338,10 +1435,10 @@ impl Collection {
             wal.current_wal_id = active_id;
             wal.current_wal_size = 0;
 
-            let frozen: Vec<(String, IndexEntry)> = self.index.read().unwrap()
+            let frozen: Vec<(String, u64, u64)> = self.index.read().unwrap()
                 .iter()
                 .filter(|(_, e)| e.wal_id <= frozen_through)
-                .map(|(k, e)| (k.clone(), *e))
+                .map(|(k, e)| (k.clone(), e.wal_id, e.offset))
                 .collect();
 
             (frozen, frozen_through, compact_id)
@@ -1368,13 +1465,14 @@ impl Collection {
             let _wal = self.wal_writer.lock().unwrap();
             let mut index = self.index.write().unwrap();
 
-            for (key, old_entry, new_entry) in relocated {
-                match index.get(&key) {
-                    Some(current) if *current == old_entry => {
-                        index.insert(key, new_entry);
-                        remapped += 1;
-                    },
-                    _ => superseded += 1,
+            for (key, old_wal_id, old_offset, new_entry) in relocated {
+                let unchanged = index.get(&key)
+                    .map_or(false, |cur| cur.wal_id == old_wal_id && cur.offset == old_offset);
+                if unchanged {
+                    self.apply_index_put(&mut index, key, new_entry);
+                    remapped += 1;
+                } else {
+                    superseded += 1;
                 }
             }
 
@@ -1395,24 +1493,24 @@ impl Collection {
     fn write_compacted_wal(
         &self,
         compact_path: &Path,
-        frozen_index: &[(String, IndexEntry)],
+        frozen_index: &[(String, u64, u64)],
         compact_id: u64,
-    ) -> io::Result<Vec<(String, IndexEntry, IndexEntry)>> {
+    ) -> io::Result<Vec<(String, u64, u64, IndexEntry)>> {
         let mut compact_file = BufWriter::new(File::create(compact_path)?);
         let mut relocated = Vec::with_capacity(frozen_index.len());
         let mut current_offset = 0u64;
         let mut readers: HashMap<u64, File> = HashMap::new();
 
-        for (key, old_entry) in frozen_index {
-            let file = match readers.entry(old_entry.wal_id) {
+        for (key, old_wal_id, old_offset) in frozen_index {
+            let file = match readers.entry(*old_wal_id) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    let path = self.root_path.join(format!("wal-{:05}.log", old_entry.wal_id));
+                    let path = self.root_path.join(format!("wal-{:05}.log", old_wal_id));
                     e.insert(File::open(&path)?)
                 }
             };
 
-            file.seek(SeekFrom::Start(old_entry.offset))?;
+            file.seek(SeekFrom::Start(*old_offset))?;
 
             let mut header = [0u8; HEADER_LEN];
             file.read_exact(&mut header)?;
@@ -1420,7 +1518,7 @@ impl Collection {
 
             if len == 0 || len as u64 > MAX_RECORD_SIZE {
                 return Err(io::Error::new(io::ErrorKind::InvalidData,
-                    format!("Live key '{}' has an invalid frame length in WAL {}", key, old_entry.wal_id)));
+                    format!("Live key '{}' has an invalid frame length in WAL {}", key, old_wal_id)));
             }
 
             let mut payload = vec![0u8; len];
@@ -1429,7 +1527,7 @@ impl Collection {
             match serde_json::from_slice::<LogEntry>(&payload) {
                 Ok(LogEntry::Put { .. }) => {},
                 _ => return Err(io::Error::new(io::ErrorKind::InvalidData,
-                    format!("Live key '{}' does not resolve to a Put frame in WAL {}", key, old_entry.wal_id))),
+                    format!("Live key '{}' does not resolve to a Put frame in WAL {}", key, old_wal_id))),
             }
 
             compact_file.write_all(&header)?;
@@ -1437,8 +1535,9 @@ impl Collection {
 
             relocated.push((
                 key.clone(),
-                *old_entry,
-                IndexEntry { wal_id: compact_id, offset: current_offset, len: len as u32 },
+                *old_wal_id,
+                *old_offset,
+                self.build_entry(compact_id, current_offset, &payload),
             ));
             current_offset += (HEADER_LEN + len) as u64;
         }
@@ -2726,7 +2825,6 @@ async fn local_write_inner(
         Ok(Err(e)) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
         Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     };
-    let payload_len = frame.len().saturating_sub(HEADER_LEN) as u32;
 
     match col.enqueue_commit().await {
         Ok(Ok(())) => {},
@@ -2739,7 +2837,7 @@ async fn local_write_inner(
         if is_delete {
             index.remove(&key);
         } else {
-            index.insert(key.clone(), IndexEntry { wal_id, offset, len: payload_len });
+            col.apply_index_put(&mut index, key.clone(), col.build_entry(wal_id, offset, &frame[HEADER_LEN..]));
         }
     }
 
@@ -2884,8 +2982,8 @@ async fn local_write_batch_inner(
     {
         let mut index = col.index.write().unwrap();
         for (key, frame, wal_id, offset, _) in &frames {
-            let len = frame.len().saturating_sub(HEADER_LEN) as u32;
-            index.insert(key.clone(), IndexEntry { wal_id: *wal_id, offset: *offset, len });
+            let entry = col.build_entry(*wal_id, *offset, &frame[HEADER_LEN..]);
+            col.apply_index_put(&mut index, key.clone(), entry);
         }
     }
 
@@ -3600,7 +3698,7 @@ async fn query_docs(
     let result = tokio::task::spawn_blocking(move || -> io::Result<(Vec<serde_json::Value>, Option<String>)> {
         if let Some(sort) = &sort {
             let mut items = Vec::new();
-            for (key, _entry) in col_clone.range_from(None, start.as_deref(), end.as_deref()).into_iter() {
+            for key in col_clone.range_from(None, start.as_deref(), end.as_deref()).into_iter() {
                 if let Some(val) = col_clone.get(&key)? {
                     let matched = filter_obj.as_ref().map_or(true, |f| matches_filter(&val, f));
                     if matched {
@@ -3690,7 +3788,11 @@ async fn replicate_handler(
     };
 
     let frame = req.wal_frame;
-    let payload_len = frame.len().saturating_sub(HEADER_LEN) as u32;
+    let payload_for_index: Vec<u8> = if frame.len() > HEADER_LEN {
+        frame[HEADER_LEN..].to_vec()
+    } else {
+        Vec::new()
+    };
 
     if frame.len() >= HEADER_LEN {
         let frame_lsn = u64::from_le_bytes(frame[16..24].try_into().unwrap());
@@ -3717,10 +3819,11 @@ async fn replicate_handler(
                         let mut index = col.index.write().unwrap();
                         match entry {
                             LogEntry::Put { key, .. } => {
-                                index.insert(key, IndexEntry { wal_id, offset, len: payload_len });
+                                let e = col.build_entry(wal_id, offset, &payload_for_index);
+                                col.apply_index_put(&mut index, key, e);
                             },
                             LogEntry::Del { key, .. } => {
-                                index.remove(&key);
+                                col.apply_index_remove(&mut index, &key);
                             }
                         }
                     }
@@ -4286,7 +4389,7 @@ async fn main() -> io::Result<()> {
     }
 
     let db = if config.role == "shard" {
-        Some(Arc::new(Database::new("./data")?))
+        Some(Arc::new(Database::with_cache("./data", config.read_cache.clone())?))
     } else {
         None
     };
@@ -4424,7 +4527,7 @@ mod tests {
     use super::*;
 
     fn idx(frame: &[u8], wal_id: u64, offset: u64) -> IndexEntry {
-        IndexEntry { wal_id, offset, len: (frame.len() - HEADER_LEN) as u32 }
+        IndexEntry { wal_id, offset, len: (frame.len() - HEADER_LEN) as u32, inline: None }
     }
 
     fn temp_root() -> PathBuf {
@@ -4930,10 +5033,10 @@ mod tests {
             col.index.write().unwrap().insert(k.to_string(), idx(&f, w, o));
         }
 
-        let inclusive: Vec<String> = col.range_from(None, Some("b"), None).into_iter().map(|(k, _)| k).collect();
+        let inclusive: Vec<String> = col.range_from(None, Some("b"), None);
         assert_eq!(inclusive, vec!["b", "c", "d"], "start is inclusive");
 
-        let exclusive: Vec<String> = col.range_from(Some("b"), None, None).into_iter().map(|(k, _)| k).collect();
+        let exclusive: Vec<String> = col.range_from(Some("b"), None, None);
         assert_eq!(exclusive, vec!["c", "d"], "cursor resumes strictly after the key");
 
         let _ = fs::remove_dir_all(&root);
@@ -5254,7 +5357,9 @@ mod tests {
 
     fn live_put(col: &Arc<Collection>, key: &str, v: i64) {
         let (f, w, o, _) = col.put(key.into(), serde_json::json!({"v": v}), 1).unwrap();
-        col.index.write().unwrap().insert(key.into(), idx(&f, w, o));
+        let entry = col.build_entry(w, o, &f[HEADER_LEN..]);
+        let mut index = col.index.write().unwrap();
+        col.apply_index_put(&mut index, key.into(), entry);
     }
 
     fn wal_ids_on_disk(root: &Path) -> Vec<u64> {
@@ -5323,6 +5428,152 @@ mod tests {
             r#"{"node_id":"n","role":"shard","listen_addr":"127.0.0.1:1",
                 "maintenance":{"interval_secs":0}}"#).unwrap();
         assert!(zero.validate().is_err(), "a zero interval would spin the scheduler");
+    }
+
+    fn cache_cfg(max_value: u32, budget: u64) -> ReadCacheConfig {
+        ReadCacheConfig { inline_max_value_bytes: max_value, inline_budget_bytes: budget }
+    }
+
+    fn inline_count(col: &Arc<Collection>) -> usize {
+        col.index.read().unwrap().values().filter(|e| e.inline.is_some()).count()
+    }
+
+    #[tokio::test]
+    async fn cached_reads_do_not_touch_the_wal_at_all() {
+        let root = temp_root();
+        let db = Database::with_cache(&root, cache_cfg(512, 1 << 20)).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        for i in 0..20 {
+            live_put(&col, &format!("k{}", i), i);
+        }
+        assert_eq!(inline_count(&col), 20, "small values must be inlined on write");
+
+        col.read_pool.lock().unwrap().clear();
+        for wal in fs::read_dir(&col.root_path).unwrap() {
+            let path = wal.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) == Some("log") {
+                remove_file_with_retry(&path).unwrap();
+            }
+        }
+
+        assert_eq!(col.get("k7").unwrap(), Some(serde_json::json!({"v": 7})),
+            "a cached read must be served without opening the WAL");
+        assert_eq!(col.list_all().unwrap().len(), 20,
+            "list_all must serve every cached doc without a single random read");
+        assert_eq!(col.query_page(None, None, None, &None, 100).unwrap().0.len(), 20);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn values_over_the_threshold_stay_on_disk() {
+        let root = temp_root();
+        let db = Database::with_cache(&root, cache_cfg(64, 1 << 20)).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        let (f, w, o, _) = col.put("small".into(), serde_json::json!({"v": 1}), 1).unwrap();
+        col.index.write().unwrap().insert("small".into(), col.build_entry(w, o, &f[HEADER_LEN..]));
+
+        let big = "x".repeat(500);
+        let (f2, w2, o2, _) = col.put("big".into(), serde_json::json!({"v": big.clone()}), 1).unwrap();
+        col.index.write().unwrap().insert("big".into(), col.build_entry(w2, o2, &f2[HEADER_LEN..]));
+
+        let index = col.index.read().unwrap();
+        assert!(index.get("small").unwrap().inline.is_some(), "a value under the threshold is cached");
+        assert!(index.get("big").unwrap().inline.is_none(), "a value over the threshold is not cached");
+        drop(index);
+
+        assert_eq!(col.get("big").unwrap(), Some(serde_json::json!({"v": big})),
+            "an uncached value still reads correctly from the WAL");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn inline_budget_caps_memory_and_is_released_on_delete() {
+        let root = temp_root();
+        let db = Database::with_cache(&root, cache_cfg(512, 400)).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        for i in 0..20 {
+            live_put(&col, &format!("k{}", i), i);
+        }
+
+        let cached = inline_count(&col);
+        assert!(cached > 0, "some entries fit in the budget");
+        assert!(cached < 20, "the budget must stop inlining once exhausted, got {}", cached);
+        assert!(col.inline_bytes.load(Ordering::Relaxed) <= 400,
+            "tracked inline memory must never exceed the budget");
+
+        for i in 0..20 {
+            assert_eq!(col.get(&format!("k{}", i)).unwrap(), Some(serde_json::json!({"v": i})),
+                "uncached keys still resolve from disk");
+        }
+
+        let before = col.inline_bytes.load(Ordering::Relaxed);
+        {
+            let mut index = col.index.write().unwrap();
+            for i in 0..20 {
+                col.apply_index_remove(&mut index, &format!("k{}", i));
+            }
+        }
+        assert_eq!(col.inline_bytes.load(Ordering::Relaxed), 0,
+            "removing every key must return the full budget (was {})", before);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn overwriting_a_key_refreshes_its_cached_value() {
+        let root = temp_root();
+        let db = Database::with_cache(&root, cache_cfg(512, 1 << 20)).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        live_put(&col, "k", 1);
+        let after_first = col.inline_bytes.load(Ordering::Relaxed);
+
+        live_put(&col, "k", 2);
+        assert_eq!(col.get("k").unwrap(), Some(serde_json::json!({"v": 2})),
+            "the cache must return the new value, not the stale one");
+        assert_eq!(col.inline_bytes.load(Ordering::Relaxed), after_first,
+            "an overwrite of equal size must not double-count budget");
+
+        col.delete("k".into(), 1).unwrap();
+        {
+            let mut index = col.index.write().unwrap();
+            col.apply_index_remove(&mut index, "k");
+        }
+        assert!(col.get("k").unwrap().is_none(), "a deleted key must not be served from cache");
+        assert_eq!(col.inline_bytes.load(Ordering::Relaxed), 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn the_cache_survives_restart_and_compaction() {
+        let root = temp_root();
+
+        {
+            let db = Database::with_cache(&root, cache_cfg(512, 1 << 20)).unwrap();
+            let col = db.get_collection("c").unwrap();
+            for i in 0..10 {
+                live_put(&col, &format!("k{}", i), i);
+            }
+            col.compact().unwrap();
+            assert_eq!(inline_count(&col), 10, "compaction must re-populate the cache as it relocates");
+            col.save_index().unwrap();
+        }
+
+        let db2 = Database::with_cache(&root, cache_cfg(512, 1 << 20)).unwrap();
+        let col2 = db2.get_collection("c").unwrap();
+        assert_eq!(inline_count(&col2), 10, "a snapshot restore must come back warm, not cold");
+        assert_eq!(col2.inline_bytes.load(Ordering::Relaxed),
+            col2.index.read().unwrap().values().map(|e| e.inline_bytes()).sum::<u64>(),
+            "the budget counter must be rebuilt to match the restored entries");
+        assert_eq!(col2.get("k3").unwrap(), Some(serde_json::json!({"v": 3})));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
