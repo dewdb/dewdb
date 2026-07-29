@@ -11,7 +11,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -36,7 +36,7 @@ enum LogEntry {
     },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 struct IndexEntry {
     wal_id: u64,
     offset: u64,
@@ -283,13 +283,13 @@ struct Collection {
     data_root: PathBuf,
     index: RwLock<BTreeMap<String, IndexEntry>>,
     wal_writer: std::sync::Mutex<WalsState>,
-    wal_pause_cv: Condvar,
     key_locks: Vec<tokio::sync::Mutex<()>>,
     commit_notifiers: Arc<std::sync::Mutex<Vec<tokio::sync::oneshot::Sender<Result<(), String>>>>>,
     commit_signal: Arc<tokio::sync::Notify>,
     read_pool: std::sync::Mutex<HashMap<u64, Vec<Arc<std::sync::Mutex<File>>>>>,
     read_pool_counter: AtomicUsize,
     released: AtomicBool,
+    compacting: AtomicBool,
     db_global_commit_index: Arc<AtomicU64>,
     db_next_lsn: Arc<AtomicU64>,
     db_last_log_term: Arc<AtomicU64>,
@@ -301,8 +301,6 @@ struct WalsState {
     current_wal_size: u64,
     last_appended_lsn: u64,
     last_appended_term: u64,
-    commit_paused: bool,
-    write_paused: bool,
 }
 
 const COMMIT_BATCH_THRESHOLD: usize = 32;
@@ -391,6 +389,31 @@ impl AppState {
         }
         original_url.to_string()
     }
+}
+
+struct CompactionGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+impl<'a> Drop for CompactionGuard<'a> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+}
+
+fn remove_file_with_retry(path: &Path) -> io::Result<()> {
+    let mut last_err = None;
+    for attempt in 0..DIR_REMOVE_ATTEMPTS {
+        match fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(20 * (attempt + 1) as u64));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to remove file")))
 }
 
 fn remove_dir_with_retry(path: &Path) -> io::Result<()> {
@@ -653,25 +676,26 @@ impl Collection {
                 current_wal_size,
                 last_appended_lsn: boot_lsn,
                 last_appended_term: max_term,
-                commit_paused: false,
-                write_paused: false,
             }),
-            wal_pause_cv: Condvar::new(),
             key_locks: (0..KEY_LOCK_STRIPES).map(|_| tokio::sync::Mutex::new(())).collect(),
             commit_notifiers: Arc::new(std::sync::Mutex::new(Vec::new())),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
             read_pool: std::sync::Mutex::new(HashMap::new()),
             read_pool_counter: AtomicUsize::new(0),
             released: AtomicBool::new(false),
+            compacting: AtomicBool::new(false),
             db_global_commit_index,
             db_next_lsn,
             db_last_log_term,
         })
     }
 
+    fn key_stripe(&self, key: &str) -> usize {
+        xxhash_rust::xxh64::xxh64(key.as_bytes(), 0) as usize % KEY_LOCK_STRIPES
+    }
+
     fn key_lock(&self, key: &str) -> &tokio::sync::Mutex<()> {
-        let h = xxhash_rust::xxh64::xxh64(key.as_bytes(), 0) as usize;
-        &self.key_locks[h % KEY_LOCK_STRIPES]
+        &self.key_locks[self.key_stripe(key)]
     }
 
     fn exists(&self, key: &str) -> bool {
@@ -786,9 +810,6 @@ impl Collection {
         let frame_len = HEADER_LEN as u64 + len;
 
         let mut wal = self.wal_writer.lock().unwrap();
-        while wal.write_paused {
-            wal = self.wal_pause_cv.wait(wal).unwrap();
-        }
 
         if self.released.load(Ordering::SeqCst) {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Collection handle is no longer active"));
@@ -862,9 +883,6 @@ impl Collection {
         let frame_len = (HEADER_LEN + len) as u64;
 
         let mut wal = self.wal_writer.lock().unwrap();
-        while wal.write_paused {
-            wal = self.wal_pause_cv.wait(wal).unwrap();
-        }
 
         if self.released.load(Ordering::SeqCst) {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Collection handle is no longer active"));
@@ -1001,14 +1019,7 @@ impl Collection {
                     !q.is_empty()
                 };
 
-                let paused = { col.wal_writer.lock().unwrap().commit_paused };
-
-                if !has_pending && !paused {
-                    continue;
-                }
-
-                if paused {
-                    tokio::time::sleep(Duration::from_millis(2)).await;
+                if !has_pending {
                     continue;
                 }
 
@@ -1202,89 +1213,159 @@ impl Collection {
     }
 
     fn compact(&self) -> io::Result<()> {
-        println!("[{}] Starting compaction...", self.name);
+        if self.compacting.swap(true, Ordering::SeqCst) {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Compaction already in progress"));
+        }
+        let _guard = CompactionGuard { flag: &self.compacting };
 
-        let mut wal_guard = self.wal_writer.lock().unwrap();
-        let mut index_guard = self.index.write().unwrap();
+        let (frozen_index, frozen_through, compact_id) = {
+            let mut wal = self.wal_writer.lock().unwrap();
 
-        wal_guard.current_wal.sync_data()?;
-        wal_guard.commit_paused = true;
-        wal_guard.write_paused = true;
+            wal.current_wal.sync_data()?;
 
-        let new_wal_id = wal_guard.current_wal_id + 1;
+            let frozen_through = wal.current_wal_id;
+            let compact_id = frozen_through + 1;
+            let active_id = frozen_through + 2;
+
+            let active_path = self.root_path.join(format!("wal-{:05}.log", active_id));
+            wal.current_wal = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .read(true)
+                .open(&active_path)?;
+            wal.current_wal_id = active_id;
+            wal.current_wal_size = 0;
+
+            let frozen: Vec<(String, IndexEntry)> = self.index.read().unwrap()
+                .iter()
+                .filter(|(_, e)| e.wal_id <= frozen_through)
+                .map(|(k, e)| (k.clone(), *e))
+                .collect();
+
+            (frozen, frozen_through, compact_id)
+        };
+
+        println!("[{}] Compacting {} live keys from WAL <= {} into WAL {}; writes continue on WAL {}.",
+            self.name, frozen_index.len(), frozen_through, compact_id, frozen_through + 2);
+
         let compact_path = self.root_path.join("wal-compacted.tmp");
-        let mut compact_file = BufWriter::new(File::create(&compact_path)?);
+        let relocated = match self.write_compacted_wal(&compact_path, &frozen_index, compact_id) {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = fs::remove_file(&compact_path);
+                return Err(e);
+            }
+        };
 
-        let mut new_index_map = BTreeMap::new();
-        let mut current_offset = 0;
+        let final_path = self.root_path.join(format!("wal-{:05}.log", compact_id));
+        fs::rename(&compact_path, &final_path)?;
 
-        for (key, old_entry) in index_guard.iter() {
-             let path = self.root_path.join(format!("wal-{:05}.log", old_entry.wal_id));
-             if let Ok(mut file) = File::open(&path) {
-                 file.seek(SeekFrom::Start(old_entry.offset))?;
-                 let mut header = [0u8; HEADER_LEN];
-                 if file.read_exact(&mut header).is_err() { continue; }
-                 let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+        let mut remapped = 0usize;
+        let mut superseded = 0usize;
+        {
+            let _wal = self.wal_writer.lock().unwrap();
+            let mut index = self.index.write().unwrap();
 
-                 let mut payload = vec![0u8; len];
-                 if file.read_exact(&mut payload).is_err() { continue; }
+            for (key, old_entry, new_entry) in relocated {
+                match index.get(&key) {
+                    Some(current) if *current == old_entry => {
+                        index.insert(key, new_entry);
+                        remapped += 1;
+                    },
+                    _ => superseded += 1,
+                }
+            }
 
-                 if let Ok(LogEntry::Put { .. }) = serde_json::from_slice::<LogEntry>(&payload) {
-                     compact_file.write_all(&header)?;
-                     compact_file.write_all(&payload)?;
+            let _ = fs::remove_file(self.root_path.join(INDEX_FILENAME));
 
-                     let frame_len = (HEADER_LEN + len) as u64;
-                     new_index_map.insert(key.clone(), IndexEntry {
-                         wal_id: new_wal_id,
-                         offset: current_offset,
-                     });
-                     current_offset += frame_len;
-                 }
-             }
+            self.read_pool.lock().unwrap().clear();
+
+            self.remove_wals_through(frozen_through)?;
         }
 
-        wal_guard.current_wal_size = current_offset;
+        self.commit_signal.notify_one();
+
+        println!("[{}] Compaction complete: {} keys relocated, {} superseded by concurrent writes.",
+            self.name, remapped, superseded);
+        Ok(())
+    }
+
+    fn write_compacted_wal(
+        &self,
+        compact_path: &Path,
+        frozen_index: &[(String, IndexEntry)],
+        compact_id: u64,
+    ) -> io::Result<Vec<(String, IndexEntry, IndexEntry)>> {
+        let mut compact_file = BufWriter::new(File::create(compact_path)?);
+        let mut relocated = Vec::with_capacity(frozen_index.len());
+        let mut current_offset = 0u64;
+        let mut readers: HashMap<u64, File> = HashMap::new();
+
+        for (key, old_entry) in frozen_index {
+            let file = match readers.entry(old_entry.wal_id) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let path = self.root_path.join(format!("wal-{:05}.log", old_entry.wal_id));
+                    e.insert(File::open(&path)?)
+                }
+            };
+
+            file.seek(SeekFrom::Start(old_entry.offset))?;
+
+            let mut header = [0u8; HEADER_LEN];
+            file.read_exact(&mut header)?;
+            let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+
+            if len == 0 || len as u64 > MAX_RECORD_SIZE {
+                return Err(io::Error::new(io::ErrorKind::InvalidData,
+                    format!("Live key '{}' has an invalid frame length in WAL {}", key, old_entry.wal_id)));
+            }
+
+            let mut payload = vec![0u8; len];
+            file.read_exact(&mut payload)?;
+
+            match serde_json::from_slice::<LogEntry>(&payload) {
+                Ok(LogEntry::Put { .. }) => {},
+                _ => return Err(io::Error::new(io::ErrorKind::InvalidData,
+                    format!("Live key '{}' does not resolve to a Put frame in WAL {}", key, old_entry.wal_id))),
+            }
+
+            compact_file.write_all(&header)?;
+            compact_file.write_all(&payload)?;
+
+            relocated.push((
+                key.clone(),
+                *old_entry,
+                IndexEntry { wal_id: compact_id, offset: current_offset },
+            ));
+            current_offset += (HEADER_LEN + len) as u64;
+        }
 
         compact_file.flush()?;
         compact_file.get_mut().sync_all()?;
+        Ok(relocated)
+    }
 
-        let final_path = self.root_path.join(format!("wal-{:05}.log", new_wal_id));
-        fs::rename(&compact_path, &final_path)?;
-
-        let new_file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&final_path)?;
-
-        wal_guard.current_wal = new_file;
-        wal_guard.current_wal_id = new_wal_id;
-        wal_guard.current_wal_size = current_offset;
-
+    fn remove_wals_through(&self, frozen_through: u64) -> io::Result<()> {
         for entry in fs::read_dir(&self.root_path)? {
-             let entry = entry?;
-             let path = entry.path();
-             if let Some(name) = entry.file_name().to_str() {
-                 if name.starts_with("wal-") && name.ends_with(".log") {
-                     if name != format!("wal-{:05}.log", new_wal_id) {
-                         let _ = fs::remove_file(path);
-                     }
-                 }
-             }
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = match name.to_str() {
+                Some(n) => n,
+                None => continue,
+            };
+            if !name.starts_with("wal-") || !name.ends_with(".log") {
+                continue;
+            }
+            match name[4..name.len() - 4].parse::<u64>() {
+                Ok(id) if id <= frozen_through => {
+                    if let Err(e) = remove_file_with_retry(&entry.path()) {
+                        eprintln!("[{}] Could not remove obsolete {}: {}", self.name, name, e);
+                    }
+                },
+                _ => {}
+            }
         }
-
-        let _ = fs::remove_file(self.root_path.join(INDEX_FILENAME));
-
-        self.read_pool.lock().unwrap().clear();
-
-        *index_guard = new_index_map;
-
-        wal_guard.commit_paused = false;
-        wal_guard.write_paused = false;
-        self.wal_pause_cv.notify_all();
-        self.commit_signal.notify_one();
-
-        println!("[{}] Compaction complete.", self.name);
         Ok(())
     }
 
@@ -1301,11 +1382,8 @@ impl Collection {
                 .read(true)
                 .open(&tombstone)?;
             wal.current_wal_size = 0;
-            wal.commit_paused = false;
-            wal.write_paused = false;
         }
 
-        self.wal_pause_cv.notify_all();
         self.commit_signal.notify_one();
         self.read_pool.lock().unwrap().clear();
         self.index.write().unwrap().clear();
@@ -2643,11 +2721,13 @@ async fn local_write_batch(
         Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     };
 
-    let mut lock_order: Vec<usize> = (0..items.len()).collect();
-    lock_order.sort_by(|&a, &b| items[a].0.cmp(&items[b].0));
-    let mut _guards = Vec::with_capacity(lock_order.len());
-    for i in lock_order {
-        _guards.push(col.key_lock(&items[i].0).lock().await);
+    let mut stripes: Vec<usize> = items.iter().map(|(key, _)| col.key_stripe(key)).collect();
+    stripes.sort_unstable();
+    stripes.dedup();
+
+    let mut _guards = Vec::with_capacity(stripes.len());
+    for stripe in stripes {
+        _guards.push(col.key_locks[stripe].lock().await);
     }
 
     let pending = local_write_batch_inner(state, &col, items).await?;
@@ -3128,6 +3208,9 @@ async fn compact_collection(
                 "wal_size": wal.current_wal_size,
                 "documents": col.index.read().unwrap().len(),
             }))).into_response()
+        },
+        Ok(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => {
+            err_json(StatusCode::CONFLICT, e.to_string())
         },
         Ok(Err(e)) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -4962,6 +5045,191 @@ mod tests {
             "a stale handle to a released collection must refuse further writes");
 
         assert!(!db.drop_collection("users").unwrap(), "dropping a missing collection is a no-op");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn live_put(col: &Arc<Collection>, key: &str, v: i64) {
+        let (_, w, o, _) = col.put(key.into(), serde_json::json!({"v": v}), 1).unwrap();
+        col.index.write().unwrap().insert(key.into(), IndexEntry { wal_id: w, offset: o });
+    }
+
+    fn wal_ids_on_disk(root: &Path) -> Vec<u64> {
+        let mut ids: Vec<u64> = fs::read_dir(root).unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+            .filter(|n| n.starts_with("wal-") && n.ends_with(".log"))
+            .filter_map(|n| n[4..n.len() - 4].parse::<u64>().ok())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn a_bulk_batch_larger_than_the_stripe_count_does_not_self_deadlock() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        let keys: Vec<String> = (0..KEY_LOCK_STRIPES * 4).map(|i| format!("k{}", i)).collect();
+
+        let mut stripes: Vec<usize> = keys.iter().map(|k| col.key_stripe(k)).collect();
+        stripes.sort_unstable();
+        let distinct = { let mut d = stripes.clone(); d.dedup(); d.len() };
+        assert!(distinct < keys.len(), "this batch must contain stripe collisions for the test to be meaningful");
+
+        stripes.dedup();
+        let acquired = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut guards = Vec::new();
+            for stripe in stripes {
+                guards.push(col.key_locks[stripe].lock().await);
+            }
+            guards.len()
+        }).await;
+
+        assert!(acquired.is_ok(), "locking a batch must dedupe stripes; locking per key deadlocks on collision");
+        assert_eq!(acquired.unwrap(), distinct);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn compaction_writes_to_a_new_wal_and_leaves_the_active_one_writable() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        live_put(&col, "a", 1);
+        live_put(&col, "a", 2);
+        live_put(&col, "b", 9);
+
+        let frozen_through = col.wal_writer.lock().unwrap().current_wal_id;
+        col.compact().unwrap();
+
+        assert_eq!(col.wal_writer.lock().unwrap().current_wal_id, frozen_through + 2,
+            "writes must continue on a brand new WAL, not the compaction output");
+        assert_eq!(wal_ids_on_disk(&col.root_path), vec![frozen_through + 1, frozen_through + 2],
+            "only the compacted WAL and the new active WAL survive");
+
+        assert_eq!(col.index.read().unwrap().get("a").unwrap().wal_id, frozen_through + 1,
+            "live keys are relocated into the compaction output");
+
+        live_put(&col, "c", 7);
+        assert_eq!(col.index.read().unwrap().get("c").unwrap().wal_id, frozen_through + 2,
+            "post-compaction writes land on the active WAL");
+
+        assert_eq!(col.get("a").unwrap(), Some(serde_json::json!({"v": 2})));
+        assert_eq!(col.get("b").unwrap(), Some(serde_json::json!({"v": 9})));
+        assert_eq!(col.get("c").unwrap(), Some(serde_json::json!({"v": 7})));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn compaction_rejects_a_second_concurrent_run() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+        live_put(&col, "a", 1);
+
+        col.compacting.store(true, Ordering::SeqCst);
+        let err = col.compact().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock, "overlapping compactions must be refused, not interleaved");
+
+        col.compacting.store(false, Ordering::SeqCst);
+        col.compact().unwrap();
+        assert!(!col.compacting.load(Ordering::SeqCst), "the in-progress flag must clear when compaction finishes");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn concurrent_writes_during_compaction_are_never_lost() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        for i in 0..3000 {
+            live_put(&col, &format!("k{}", i), 0);
+        }
+
+        let writer_col = col.clone();
+        let writer = std::thread::spawn(move || {
+            while !writer_col.compacting.load(Ordering::SeqCst) {
+                std::hint::spin_loop();
+            }
+            for i in 0..200 {
+                let _guard = writer_col.key_lock(&format!("k{}", i)).blocking_lock();
+                live_put(&writer_col, &format!("k{}", i), 1);
+            }
+        });
+
+        col.compact().unwrap();
+        writer.join().unwrap();
+
+        for i in 0..200 {
+            assert_eq!(col.get(&format!("k{}", i)).unwrap(), Some(serde_json::json!({"v": 1})),
+                "a write racing compaction must survive it");
+        }
+        for i in 200..3000 {
+            assert_eq!(col.get(&format!("k{}", i)).unwrap(), Some(serde_json::json!({"v": 0})),
+                "untouched keys must survive relocation");
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn compacted_collection_replays_to_the_same_state_after_restart() {
+        let root = temp_root();
+
+        {
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("c").unwrap();
+            live_put(&col, "a", 1);
+            live_put(&col, "a", 2);
+            live_put(&col, "b", 9);
+            col.compact().unwrap();
+            live_put(&col, "b", 10);
+            live_put(&col, "c", 3);
+            col.enqueue_commit().await.unwrap().unwrap();
+        }
+
+        let db2 = Database::new(&root).unwrap();
+        let col2 = db2.get_collection("c").unwrap();
+
+        assert_eq!(col2.get("a").unwrap(), Some(serde_json::json!({"v": 2})));
+        assert_eq!(col2.get("b").unwrap(), Some(serde_json::json!({"v": 10})),
+            "a post-compaction overwrite must win over the relocated copy on replay");
+        assert_eq!(col2.get("c").unwrap(), Some(serde_json::json!({"v": 3})));
+        assert_eq!(col2.index.read().unwrap().len(), 3);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn compaction_drops_deleted_keys_and_keeps_them_deleted_after_restart() {
+        let root = temp_root();
+
+        {
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("c").unwrap();
+            live_put(&col, "keep", 1);
+            live_put(&col, "gone", 2);
+
+            col.delete("gone".into(), 1).unwrap();
+            col.index.write().unwrap().remove("gone");
+
+            col.compact().unwrap();
+            col.enqueue_commit().await.unwrap().unwrap();
+
+            assert!(col.get("gone").unwrap().is_none());
+        }
+
+        let db2 = Database::new(&root).unwrap();
+        let col2 = db2.get_collection("c").unwrap();
+        assert_eq!(col2.get("keep").unwrap(), Some(serde_json::json!({"v": 1})));
+        assert!(col2.get("gone").unwrap().is_none(), "a tombstoned key must not come back after compaction + replay");
 
         let _ = fs::remove_dir_all(&root);
     }
