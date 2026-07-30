@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 const WAL_ROTATION_LIMIT: u64 = 50 * 1024 * 1024;
@@ -136,10 +137,150 @@ struct NodeConfig {
     maintenance: MaintenanceConfig,
     #[serde(default)]
     read_cache: ReadCacheConfig,
+    #[serde(default)]
+    logging: LoggingConfig,
 }
 
 fn default_heartbeat_timeout() -> u64 { 6 }
 fn default_election_delay() -> u64 { 2000 }
+
+#[derive(Deserialize, Clone, Debug)]
+struct LoggingConfig {
+    #[serde(default = "default_log_level")]
+    level: String,
+    #[serde(default = "default_log_format")]
+    format: String,
+}
+
+fn default_log_level() -> String { "info".to_string() }
+fn default_log_format() -> String { "text".to_string() }
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self { level: default_log_level(), format: default_log_format() }
+    }
+}
+
+impl LoggingConfig {
+    fn validate(&self) -> Result<(), String> {
+        if self.level.parse::<tracing::Level>().is_err() {
+            return Err(format!("logging.level must be one of trace|debug|info|warn|error, got '{}'", self.level));
+        }
+        if self.format != "text" && self.format != "json" {
+            return Err(format!("logging.format must be 'text' or 'json', got '{}'", self.format));
+        }
+        Ok(())
+    }
+}
+
+struct EventFields {
+    message: Option<String>,
+    extra: Vec<(&'static str, serde_json::Value)>,
+}
+
+impl tracing::field::Visit for EventFields {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.push(field.name(), serde_json::Value::String(value.to_string()));
+    }
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.push(field.name(), serde_json::Value::from(value));
+    }
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        self.push(field.name(), serde_json::Value::from(value));
+    }
+    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+        self.push(field.name(), serde_json::Value::from(value));
+    }
+    fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+        self.push(field.name(), serde_json::Value::Bool(value));
+    }
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.push(field.name(), serde_json::Value::String(format!("{:?}", value)));
+    }
+}
+
+impl EventFields {
+    fn collect(event: &tracing::Event<'_>) -> Self {
+        let mut me = Self { message: None, extra: Vec::new() };
+        event.record(&mut me);
+        me
+    }
+
+    fn push(&mut self, name: &'static str, value: serde_json::Value) {
+        if name == "message" {
+            self.message = Some(match value {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            });
+        } else {
+            self.extra.push((name, value));
+        }
+    }
+}
+
+struct NodeFormat {
+    node_id: String,
+    json: bool,
+}
+
+impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for NodeFormat
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> tracing_subscriber::fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        _ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+        mut writer: tracing_subscriber::fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        let meta = event.metadata();
+        let fields = EventFields::collect(event);
+
+        if self.json {
+            let millis = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+            let mut map = serde_json::Map::new();
+            map.insert("ts_ms".into(), serde_json::Value::from(millis));
+            map.insert("level".into(), serde_json::Value::String(meta.level().to_string()));
+            map.insert("node_id".into(), serde_json::Value::String(self.node_id.clone()));
+            map.insert("target".into(), serde_json::Value::String(meta.target().to_string()));
+            if let Some(msg) = fields.message {
+                map.insert("message".into(), serde_json::Value::String(msg));
+            }
+            for (k, v) in fields.extra {
+                map.insert(k.to_string(), v);
+            }
+            return writeln!(writer, "{}", serde_json::Value::Object(map));
+        }
+
+        tracing_subscriber::fmt::time::FormatTime::format_time(
+            &tracing_subscriber::fmt::time::SystemTime, &mut writer)?;
+        write!(writer, " {:>5} node={} [{}]", meta.level(), self.node_id, meta.target())?;
+        if let Some(msg) = fields.message {
+            write!(writer, " {}", msg)?;
+        }
+        for (k, v) in fields.extra {
+            match v {
+                serde_json::Value::String(s) => write!(writer, " {}={}", k, s)?,
+                other => write!(writer, " {}={}", k, other)?,
+            }
+        }
+        writeln!(writer)
+    }
+}
+
+fn init_logging(cfg: &LoggingConfig, node_id: &str) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&cfg.level));
+
+    let layer = tracing_subscriber::fmt::layer()
+        .event_format(NodeFormat { node_id: node_id.to_string(), json: cfg.format == "json" });
+
+    tracing_subscriber::registry().with(filter).with(layer).init();
+}
 
 #[derive(Deserialize, Clone, Debug)]
 struct MaintenanceConfig {
@@ -364,6 +505,7 @@ impl NodeConfig {
             }
         }
         self.maintenance.validate()?;
+        self.logging.validate()?;
         Ok(())
     }
 
@@ -425,6 +567,7 @@ struct AppState {
     repair_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     resyncing: Arc<std::sync::Mutex<HashSet<String>>>,
     read_rr: Arc<AtomicUsize>,
+    metrics: Arc<Metrics>,
 }
 
 impl AppState {
@@ -558,7 +701,7 @@ impl Database {
         fs::create_dir_all(&root_path)?;
         let boot_lsn = LsnMeta::load(&root_path).map(|m| m.commit_lsn).unwrap_or(0);
         if boot_lsn > 0 {
-            println!("[db] Restored commit LSN {} from lsn.meta", boot_lsn);
+            info!(target: "db", "Restored commit LSN {} from lsn.meta", boot_lsn);
         }
         Ok(Self {
             root_path,
@@ -654,7 +797,7 @@ impl Database {
         for (name, col) in collections.iter() {
             let wal = col.wal_writer.lock().unwrap();
             if let Err(e) = wal.current_wal.sync_data() {
-                eprintln!("[{}] Failed to force sync WAL on shutdown: {}", name, e);
+                error!(target: "storage", collection = %name, error = %e, "Failed to force sync WAL on shutdown");
             }
             self.global_commit_index.fetch_max(wal.last_appended_lsn, Ordering::SeqCst);
             drop(wal);
@@ -666,11 +809,11 @@ impl Database {
             for tx in notifiers {
                 let _ = tx.send(Ok(()));
             }
-            println!("[{}] Flushed {} pending writes.", name, count);
+            info!(target: "storage", collection = %name, pending = count, "Flushed pending writes on shutdown");
         }
         let meta = LsnMeta { commit_lsn: self.global_commit_index.load(Ordering::SeqCst) };
         if let Err(e) = meta.save(&self.root_path) {
-            eprintln!("[db] Failed to persist lsn meta on shutdown: {}", e);
+            error!(target: "db", "Failed to persist lsn meta on shutdown: {}", e);
         }
     }
 }
@@ -703,8 +846,9 @@ impl Collection {
                 Ok(file) => {
                     match bincode::deserialize_from::<_, IndexSnapshot>(BufReader::new(file)) {
                         Ok(snapshot) => {
-                            println!("[{}] Loaded persisted snapshot (WAL ID: {}, Offset: {}, LSN: {}) with {} entries.",
-                                     name, snapshot.last_wal_id, snapshot.last_offset, snapshot.last_lsn, snapshot.map.len());
+                            info!(target: "storage", collection = %name, wal_id = snapshot.last_wal_id,
+                                offset = snapshot.last_offset, lsn = snapshot.last_lsn,
+                                entries = snapshot.map.len(), "Loaded persisted index snapshot");
                             inline_used = snapshot.map.values().map(|e| e.inline_bytes()).sum();
                             index = snapshot.map;
                             snapshot_wal_id = snapshot.last_wal_id;
@@ -713,10 +857,10 @@ impl Collection {
                             snapshot_term = snapshot.last_term;
                             snapshot_loaded = true;
                         }
-                        Err(e) => eprintln!("[{}] Failed to deserialize snapshot (likely legacy format): {}. Rebuilding from WAL.", name, e),
+                        Err(e) => warn!(target: "storage", collection = %name, error = %e, "Snapshot unreadable (likely legacy format); rebuilding from WAL"),
                     }
                 }
-                Err(e) => eprintln!("[{}] Failed to open index file: {}", name, e),
+                Err(e) => warn!(target: "storage", collection = %name, error = %e, "Failed to open index file"),
              }
         }
 
@@ -746,7 +890,7 @@ impl Collection {
         };
 
         if !snapshot_loaded {
-            println!("[{}] Replaying all WALs...", name);
+            info!(target: "storage", collection = %name, "Replaying all WALs");
              for (id, path) in &wal_files {
                 let r = Self::replay_file_from(*id, path, 0, &mut index, &cache, &mut inline_used)?;
                 fold(r, &mut max_lsn, &mut max_term);
@@ -756,7 +900,7 @@ impl Collection {
                  if *id < snapshot_wal_id {
                      continue;
                  } else if *id == snapshot_wal_id {
-                     println!("[{}] Resuming WAL {} from offset {}", name, id, snapshot_offset);
+                     info!(target: "storage", collection = %name, wal_id = id, offset = snapshot_offset, "Resuming WAL from snapshot offset");
                      let r = Self::replay_file_from(*id, path, snapshot_offset, &mut index, &cache, &mut inline_used)?;
                      fold(r, &mut max_lsn, &mut max_term);
                  } else {
@@ -880,20 +1024,20 @@ impl Collection {
             let lsn = u64::from_le_bytes(header[16..24].try_into().unwrap());
 
             if len == 0 || (len as u64) > MAX_RECORD_SIZE {
-                eprintln!("[{}] Invalid WAL frame length {}. Truncating.", path.display(), len);
+                warn!(target: "wal", file = %path.display(), frame_len = len, "Invalid WAL frame length; truncating");
                 break;
             }
 
             let mut payload = vec![0u8; len as usize];
             if let Err(_) = file.read_exact(&mut payload) {
-                eprintln!("[{}] Unexpected EOF while reading payload. Truncating.", path.display());
+                warn!(target: "wal", file = %path.display(), "Unexpected EOF while reading payload; truncating");
                 break;
             }
 
             let mut hasher = crc32fast::Hasher::new();
             hasher.update(&payload);
             if hasher.finalize() != crc {
-                eprintln!("[{}] CRC mismatch. Truncating file at chunk boundary.", path.display());
+                warn!(target: "wal", file = %path.display(), "CRC mismatch; truncating at chunk boundary");
                 break;
             }
 
@@ -929,7 +1073,7 @@ impl Collection {
 
         if valid_end_offset < file_len {
             file.set_len(valid_end_offset)?;
-            println!("[{}] Truncated corrupted WAL file down to size {}", path.display(), valid_end_offset);
+            warn!(target: "wal", file = %path.display(), size = valid_end_offset, "Truncated corrupted WAL file");
         }
 
         Ok((max_lsn, max_term))
@@ -1171,7 +1315,7 @@ impl Collection {
                     for tx in notifiers {
                         let _ = tx.send(Err(format!("Collection '{}' handle is no longer active", col.name)));
                     }
-                    println!("[{}] Commit task stopped; handle released.", col.name);
+                    debug!(target: "storage", collection = %col.name, "Commit task stopped; handle released");
                     return;
                 }
 
@@ -1213,7 +1357,7 @@ impl Collection {
                     let commit_lsn = col.db_global_commit_index.load(Ordering::SeqCst);
                     let meta = LsnMeta { commit_lsn };
                     if let Err(e) = meta.save(&col.data_root) {
-                        eprintln!("[{}] Failed to persist lsn meta: {}", col.name, e);
+                        error!(target: "storage", collection = %col.name, error = %e, "Failed to persist lsn meta");
                     }
                 }
             }
@@ -1407,7 +1551,7 @@ impl Collection {
         fs::rename(&temp_path, &path)?;
 
         let saved_lsn = snapshot.last_lsn;
-        println!("[{}] Index saved to disk at WAL {} offset {} lsn {}.", self.name, snapshot.last_wal_id, snapshot.last_offset, saved_lsn);
+        info!(target: "storage", collection = %self.name, wal_id = snapshot.last_wal_id, offset = snapshot.last_offset, lsn = saved_lsn, "Index snapshot saved");
         Ok(saved_lsn)
     }
 
@@ -1444,8 +1588,8 @@ impl Collection {
             (frozen, frozen_through, compact_id)
         };
 
-        println!("[{}] Compacting {} live keys from WAL <= {} into WAL {}; writes continue on WAL {}.",
-            self.name, frozen_index.len(), frozen_through, compact_id, frozen_through + 2);
+        info!(target: "compaction", collection = %self.name, live_keys = frozen_index.len(),
+            frozen_through, compact_wal = compact_id, active_wal = frozen_through + 2, "Compaction started");
 
         let compact_path = self.root_path.join("wal-compacted.tmp");
         let relocated = match self.write_compacted_wal(&compact_path, &frozen_index, compact_id) {
@@ -1485,8 +1629,8 @@ impl Collection {
 
         self.commit_signal.notify_one();
 
-        println!("[{}] Compaction complete: {} keys relocated, {} superseded by concurrent writes.",
-            self.name, remapped, superseded);
+        info!(target: "compaction", collection = %self.name, relocated = remapped, superseded,
+            "Compaction complete");
         Ok(())
     }
 
@@ -1561,7 +1705,7 @@ impl Collection {
             match name[4..name.len() - 4].parse::<u64>() {
                 Ok(id) if id <= frozen_through => {
                     if let Err(e) = remove_file_with_retry(&entry.path()) {
-                        eprintln!("[{}] Could not remove obsolete {}: {}", self.name, name, e);
+                        warn!(target: "compaction", collection = %self.name, file = %name, error = %e, "Could not remove obsolete WAL");
                     }
                 },
                 _ => {}
@@ -1935,7 +2079,7 @@ async fn maybe_follow_new_leader(state: &AppState, current_primary: &str) {
     };
 
     if changed {
-        println!("[failover] Following new leader {} (was {})", leader, current_primary);
+        info!(target: "failover", "Following new leader {} (was {})", leader, current_primary);
         let state2 = state.clone();
         let leader2 = leader.clone();
         tokio::spawn(async move {
@@ -1967,7 +2111,7 @@ async fn resync_all_from(state: &AppState, leader: &str) {
 
     for name in names {
         if let Err(e) = replica_sync_from_primary(&state.client, leader, &db, &name).await {
-            eprintln!("[demote] resync of '{}' from {} failed: {}", name, leader, e);
+            warn!(target: "demote", "resync of '{}' from {} failed: {}", name, leader, e);
         }
     }
 }
@@ -1986,7 +2130,7 @@ async fn demote(state: &AppState, new_term: u64) {
     };
 
     let _ = ReplicationMeta { term: new_term, is_leader: false, voted_for: None }.save("./data");
-    println!("[demote] Discovered higher term {}, stepping down to replica", new_term);
+    info!(target: "demote", "Discovered higher term {}, stepping down to replica", new_term);
 
     if restart {
         heartbeat_poll_task(state.clone());
@@ -1999,10 +2143,10 @@ async fn demote(state: &AppState, new_term: u64) {
                 let mut g = state2.replication.as_ref().unwrap().write().unwrap();
                 g.primary_addr = Some(leader.clone());
             }
-            println!("[demote] Following new leader {}; resyncing", leader);
+            info!(target: "demote", "Following new leader {}; resyncing", leader);
             resync_all_from(&state2, &leader).await;
         } else {
-            eprintln!("[demote] New leader not found yet; heartbeat poll will keep retrying");
+            warn!(target: "demote", "New leader not found yet; heartbeat poll will keep retrying");
         }
     });
 }
@@ -2063,16 +2207,18 @@ fn replicate_to_peers(
                     wal_frame: frame,
                 };
                 match client.post(&url).json(&req_body).send().await {
-                    Ok(r) if r.status().is_success() => {},
+                    Ok(r) if r.status().is_success() => {
+                        state.metrics.note_replica_ack(&replica_url, lsn);
+                    },
                     Ok(r) if r.status() == StatusCode::CONFLICT => {
                         let body = r.json::<serde_json::Value>().await.ok();
                         match classify_conflict(&body) {
                             ConflictKind::StaleTerm(t) => {
-                                eprintln!("[replication] Replica {} reports higher term {}; demoting", replica_url, t);
+                                warn!(target: "replication", "Replica {} reports higher term {}; demoting", replica_url, t);
                                 demote(&state, t).await;
                             },
                             ConflictKind::Gap(last_lsn) => {
-                                eprintln!("[replication] Replica {} gap at lsn {} (its last_lsn={}), starting repair", replica_url, lsn, last_lsn);
+                                warn!(target: "replication", "Replica {} gap at lsn {} (its last_lsn={}), starting repair", replica_url, lsn, last_lsn);
                                 let _ = repair_replica(state, replica_url.clone(), col, last_lsn).await;
                             }
                         }
@@ -2081,15 +2227,15 @@ fn replicate_to_peers(
                         let body = r.json::<serde_json::Value>().await.ok();
                         let their_term = forbidden_term(&body);
                         if their_term > term {
-                            eprintln!("[replication] Replica {} rejected us with higher term {}; demoting", replica_url, their_term);
+                            warn!(target: "replication", "Replica {} rejected us with higher term {}; demoting", replica_url, their_term);
                             demote(&state, their_term).await;
                         }
                     },
                     Ok(r) => {
-                        eprintln!("[replication] Replica {} returned {} (term={}, lsn={})", replica_url, r.status(), term, lsn);
+                        warn!(target: "replication", "Replica {} returned {} (term={}, lsn={})", replica_url, r.status(), term, lsn);
                     },
                     Err(e) => {
-                        eprintln!("[replication] Replica {} failed: {} (term={}, lsn={})", replica_url, e, term, lsn);
+                        warn!(target: "replication", "Replica {} failed: {} (term={}, lsn={})", replica_url, e, term, lsn);
                     }
                 }
             }));
@@ -2120,10 +2266,10 @@ async fn trigger_resync(state: &AppState, replica_url: &str, collection: &str) {
     let body = ResyncRequest { collection: collection.to_string() };
     match state.client.post(&url).json(&body).send().await {
         Ok(r) if r.status().is_success() => {
-            println!("[repair] Triggered snapshot resync on {} for '{}'", replica_url, collection);
+            info!(target: "repair", "Triggered snapshot resync on {} for '{}'", replica_url, collection);
         },
-        Ok(r) => eprintln!("[repair] Resync trigger on {} returned {}", replica_url, r.status()),
-        Err(e) => eprintln!("[repair] Resync trigger on {} failed: {}", replica_url, e),
+        Ok(r) => warn!(target: "repair", "Resync trigger on {} returned {}", replica_url, r.status()),
+        Err(e) => warn!(target: "repair", "Resync trigger on {} failed: {}", replica_url, e),
     }
 }
 
@@ -2175,7 +2321,7 @@ async fn repair_replica(state: AppState, replica_url: String, collection: String
     let reaches_target = contiguous.last().map_or(false, |(lsn, _)| *lsn >= target);
 
     if !reaches_target {
-        println!("[repair] Replica {} too far behind for '{}' (last_lsn={}, target={}), falling back to snapshot", replica_url, collection, replica_last_lsn, target);
+        info!(target: "repair", "Replica {} too far behind for '{}' (last_lsn={}, target={}), falling back to snapshot", replica_url, collection, replica_last_lsn, target);
         trigger_resync(&state, &replica_url, &collection).await;
         return false;
     }
@@ -2203,12 +2349,12 @@ async fn repair_replica(state: AppState, replica_url: String, collection: String
                 let body = r.json::<serde_json::Value>().await.ok();
                 match classify_conflict(&body) {
                     ConflictKind::StaleTerm(t) => {
-                        eprintln!("[repair] Replica {} reports higher term {} during backfill; demoting", replica_url, t);
+                        warn!(target: "repair", "Replica {} reports higher term {} during backfill; demoting", replica_url, t);
                         demote(&state, t).await;
                         return false;
                     },
                     ConflictKind::Gap(_) => {
-                        eprintln!("[repair] Replica {} still gapped during backfill at lsn {}, falling back to snapshot", replica_url, lsn);
+                        warn!(target: "repair", "Replica {} still gapped during backfill at lsn {}, falling back to snapshot", replica_url, lsn);
                         trigger_resync(&state, &replica_url, &collection).await;
                         return false;
                     }
@@ -2218,23 +2364,24 @@ async fn repair_replica(state: AppState, replica_url: String, collection: String
                 let body = r.json::<serde_json::Value>().await.ok();
                 let their_term = forbidden_term(&body);
                 if their_term > term {
-                    eprintln!("[repair] Replica {} rejected us with higher term {}; demoting", replica_url, their_term);
+                    warn!(target: "repair", "Replica {} rejected us with higher term {}; demoting", replica_url, their_term);
                     demote(&state, their_term).await;
                 }
                 return false;
             },
             Ok(r) => {
-                eprintln!("[repair] Replica {} returned {} during backfill", replica_url, r.status());
+                warn!(target: "repair", "Replica {} returned {} during backfill", replica_url, r.status());
                 return false;
             },
             Err(e) => {
-                eprintln!("[repair] Replica {} unreachable during backfill: {}", replica_url, e);
+                warn!(target: "repair", "Replica {} unreachable during backfill: {}", replica_url, e);
                 return false;
             }
         }
     }
 
-    println!("[repair] Streamed {} frames to {}; caught up to lsn {} for '{}'", sent, replica_url, prev, collection);
+    state.metrics.note_replica_ack(&replica_url, prev);
+    info!(target: "repair", "Streamed {} frames to {}; caught up to lsn {} for '{}'", sent, replica_url, prev, collection);
     prev >= target
 }
 
@@ -2299,7 +2446,10 @@ async fn replicate_one_await(
         wal_frame: frame.to_vec(),
     };
     match state.client.post(&url).json(&req).send().await {
-        Ok(r) if r.status().is_success() => true,
+        Ok(r) if r.status().is_success() => {
+            state.metrics.note_replica_ack(replica_url, lsn);
+            true
+        },
         Ok(r) if r.status() == StatusCode::CONFLICT => {
             let body = r.json::<serde_json::Value>().await.ok();
             match classify_conflict(&body) {
@@ -2446,7 +2596,7 @@ async fn router_forward_write(
         if let Ok(r) = build_forward(&state.client, &method, &fallback_url, body).send().await {
             if authoritative_write_status(r.status()) {
                 state.set_primary_override(&original_url, replica);
-                println!("[router] Cached new primary: {} -> {}", original_url, replica);
+                info!(target: "router", "Cached new primary: {} -> {}", original_url, replica);
                 return Ok(r);
             }
         }
@@ -2488,7 +2638,7 @@ async fn router_forward_bulk(
         if let Ok(r) = state.client.post(&fallback_url).json(body).send().await {
             if authoritative_write_status(r.status()) {
                 state.set_primary_override(original_url, replica);
-                println!("[router] Cached new primary: {} -> {}", original_url, replica);
+                info!(target: "router", "Cached new primary: {} -> {}", original_url, replica);
                 return Ok(r);
             }
         }
@@ -2605,10 +2755,11 @@ fn unique_shards(state: &AppState) -> Vec<(String, Vec<String>)> {
     out
 }
 
-fn maintenance_task(db: Arc<Database>, cfg: MaintenanceConfig, node_id: String) {
+fn maintenance_task(db: Arc<Database>, cfg: MaintenanceConfig) {
     tokio::spawn(async move {
-        println!("[maintenance] Scheduler active on {} (every {}s; compact at dead>={:.0}% of >={} bytes; snapshot every {}s)",
-            node_id, cfg.interval_secs, cfg.compaction_dead_ratio * 100.0, cfg.compaction_min_wal_bytes, cfg.snapshot_interval_secs);
+        info!(target: "maintenance", interval_secs = cfg.interval_secs,
+            dead_ratio = cfg.compaction_dead_ratio, min_wal_bytes = cfg.compaction_min_wal_bytes,
+            snapshot_interval_secs = cfg.snapshot_interval_secs, "Scheduler active");
 
         let mut last_snapshot: HashMap<String, (std::time::Instant, u64)> = HashMap::new();
 
@@ -2629,29 +2780,30 @@ fn maintenance_task(db: Arc<Database>, cfg: MaintenanceConfig, node_id: String) 
                 let usage = match tokio::task::spawn_blocking(move || probe.space_usage()).await {
                     Ok(Ok(u)) => u,
                     Ok(Err(e)) => {
-                        eprintln!("[maintenance] Could not measure '{}': {}", name, e);
+                        warn!(target: "maintenance", "Could not measure '{}': {}", name, e);
                         continue;
                     },
                     Err(e) => {
-                        eprintln!("[maintenance] Measurement task failed for '{}': {}", name, e);
+                        warn!(target: "maintenance", "Measurement task failed for '{}': {}", name, e);
                         continue;
                     }
                 };
 
                 let compacted = if should_compact(&usage, &cfg) {
-                    println!("[maintenance] '{}' is {:.1}% dead ({} of {} bytes across {} live keys); compacting",
-                        name, usage.dead_ratio() * 100.0, usage.dead_bytes(), usage.total_bytes, usage.live_keys);
+                    info!(target: "maintenance", collection = %name, dead_ratio = usage.dead_ratio(),
+                        dead_bytes = usage.dead_bytes(), total_bytes = usage.total_bytes,
+                        live_keys = usage.live_keys, "Dead-byte threshold reached; compacting");
 
                     let target = col.clone();
                     match tokio::task::spawn_blocking(move || target.compact()).await {
                         Ok(Ok(())) => true,
                         Ok(Err(ref e)) if e.kind() == io::ErrorKind::WouldBlock => false,
                         Ok(Err(e)) => {
-                            eprintln!("[maintenance] Compaction of '{}' failed: {}", name, e);
+                            warn!(target: "maintenance", "Compaction of '{}' failed: {}", name, e);
                             false
                         },
                         Err(e) => {
-                            eprintln!("[maintenance] Compaction task for '{}' panicked: {}", name, e);
+                            error!(target: "maintenance", "Compaction task for '{}' panicked: {}", name, e);
                             false
                         }
                     }
@@ -2679,8 +2831,8 @@ fn maintenance_task(db: Arc<Database>, cfg: MaintenanceConfig, node_id: String) 
                     Ok(Ok(saved_lsn)) => {
                         last_snapshot.insert(name, (std::time::Instant::now(), saved_lsn));
                     },
-                    Ok(Err(e)) => eprintln!("[maintenance] Snapshot of '{}' failed: {}", name, e),
-                    Err(e) => eprintln!("[maintenance] Snapshot task for '{}' panicked: {}", name, e),
+                    Ok(Err(e)) => warn!(target: "maintenance", "Snapshot of '{}' failed: {}", name, e),
+                    Err(e) => error!(target: "maintenance", "Snapshot task for '{}' panicked: {}", name, e),
                 }
             }
         }
@@ -2721,13 +2873,13 @@ fn router_probe_task(state: AppState) {
                             state.clear_primary_override(&original);
                         } else if winner != effective {
                             state.set_primary_override(&original, &winner);
-                            println!("[router-probe] Shard {} primary is now {}", original, winner);
+                            info!(target: "router_probe", "Shard {} primary is now {}", original, winner);
                         } else {
                             state.set_primary_override(&original, &winner);
                         }
                     },
                     None => {
-                        eprintln!("[router-probe] Shard {} has no reachable primary (election in progress?)", original);
+                        warn!(target: "router_probe", "Shard {} has no reachable primary (election in progress?)", original);
                     }
                 }
             }
@@ -3457,7 +3609,7 @@ async fn drop_collection(
     })).await;
 
     let replicated = acks.iter().filter(|ok| **ok).count();
-    println!("[{}] Collection dropped; {}/{} replicas acked", col_name, replicated, replicas.len());
+    info!(target: "admin", collection = %col_name, acked = replicated, replicas = replicas.len(), "Collection dropped");
 
     (StatusCode::OK, Json(serde_json::json!({
         "collection": col_name,
@@ -3563,7 +3715,7 @@ async fn internal_drop_handler(
     let name = req.collection.clone();
     match tokio::task::spawn_blocking(move || db.drop_collection(&name)).await {
         Ok(Ok(existed)) => {
-            println!("[replica] Dropped collection '{}' on primary's instruction", req.collection);
+            info!(target: "replica", "Dropped collection '{}' on primary's instruction", req.collection);
             (StatusCode::OK, Json(serde_json::json!({"status": "dropped", "existed": existed}))).into_response()
         },
         Ok(Err(e)) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -3772,7 +3924,7 @@ async fn replicate_handler(
             };
             if let Some(t) = new_term {
                 let _ = ReplicationMeta { term: t, is_leader: false, voted_for: None }.save("./data");
-                println!("[replicate] Adopted higher term {} from primary", t);
+                info!(target: "replicate", "Adopted higher term {} from primary", t);
             }
         }
     }
@@ -3848,7 +4000,7 @@ async fn replicate_handler(
             (StatusCode::OK, Json(serde_json::json!({"status": "duplicate", "last_lsn": last_lsn}))).into_response()
         },
         Ok(Ok(ReplicaApply::Gap { last_lsn })) => {
-            eprintln!("[replicate] Gap detected: got prev_lsn {} but replica is at lsn {}", req.prev_lsn, last_lsn);
+            warn!(target: "replicate", "Gap detected: got prev_lsn {} but replica is at lsn {}", req.prev_lsn, last_lsn);
             (StatusCode::CONFLICT, Json(serde_json::json!({"status": "gap", "last_lsn": last_lsn}))).into_response()
         },
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -3891,7 +4043,7 @@ async fn resync_handler(
 
     tokio::spawn(async move {
         if let Err(e) = replica_sync_from_primary(&client, &primary_addr, &db, &col).await {
-            eprintln!("[resync] Failed for '{}': {}", col, e);
+            warn!(target: "resync", "Failed for '{}': {}", col, e);
         } else if let Some(r) = repl {
             let mut g = r.write().unwrap();
             g.last_replication = Some(std::time::Instant::now());
@@ -3901,6 +4053,392 @@ async fn resync_handler(
     });
 
     (StatusCode::OK, "resync started").into_response()
+}
+
+const LATENCY_BUCKETS_MS: [f64; 11] = [0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0];
+
+#[derive(Clone, Default)]
+struct RouteStats {
+    count: u64,
+    errors: u64,
+    nanos_total: u64,
+    buckets: [u64; 12],
+}
+
+impl RouteStats {
+    fn observe(&mut self, nanos: u64, is_error: bool) {
+        self.count += 1;
+        self.nanos_total += nanos;
+        if is_error {
+            self.errors += 1;
+        }
+        let ms = nanos as f64 / 1_000_000.0;
+        let slot = LATENCY_BUCKETS_MS.iter().position(|b| ms <= *b).unwrap_or(LATENCY_BUCKETS_MS.len());
+        self.buckets[slot] += 1;
+    }
+
+    fn quantile_ms(&self, q: f64) -> f64 {
+        if self.count == 0 {
+            return 0.0;
+        }
+        let target = (self.count as f64 * q).ceil() as u64;
+        let mut seen = 0u64;
+        for (i, n) in self.buckets.iter().enumerate() {
+            seen += n;
+            if seen >= target {
+                return LATENCY_BUCKETS_MS.get(i).copied().unwrap_or(f64::INFINITY);
+            }
+        }
+        f64::INFINITY
+    }
+
+    fn avg_ms(&self) -> f64 {
+        if self.count == 0 {
+            return 0.0;
+        }
+        self.nanos_total as f64 / self.count as f64 / 1_000_000.0
+    }
+}
+
+struct Metrics {
+    started_at: std::time::Instant,
+    routes: std::sync::Mutex<BTreeMap<String, RouteStats>>,
+    replica_acked_lsn: std::sync::Mutex<BTreeMap<String, u64>>,
+}
+
+impl Metrics {
+    fn new() -> Self {
+        Self {
+            started_at: std::time::Instant::now(),
+            routes: std::sync::Mutex::new(BTreeMap::new()),
+            replica_acked_lsn: std::sync::Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn observe(&self, key: String, nanos: u64, is_error: bool) {
+        self.routes.lock().unwrap().entry(key).or_default().observe(nanos, is_error);
+    }
+
+    fn note_replica_ack(&self, replica_url: &str, lsn: u64) {
+        let mut acked = self.replica_acked_lsn.lock().unwrap();
+        let slot = acked.entry(replica_url.to_string()).or_insert(0);
+        if lsn > *slot {
+            *slot = lsn;
+        }
+    }
+
+    fn uptime_secs(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
+    }
+
+    fn routes_snapshot(&self) -> Vec<(String, RouteStats)> {
+        self.routes.lock().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+
+    fn replica_lag(&self, primary_lsn: u64, replicas: &[String]) -> Vec<(String, u64, u64)> {
+        let acked = self.replica_acked_lsn.lock().unwrap();
+        replicas.iter().map(|url| {
+            let seen = acked.get(url).copied().unwrap_or(0);
+            (url.clone(), seen, primary_lsn.saturating_sub(seen))
+        }).collect()
+    }
+}
+
+async fn metrics_middleware(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let path = req.extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_else(|| "<unmatched>".to_string());
+
+    if path == "/metrics" {
+        return next.run(req).await;
+    }
+
+    let key = format!("{} {}", req.method(), path);
+    let started = std::time::Instant::now();
+    let response = next.run(req).await;
+    let nanos = started.elapsed().as_nanos() as u64;
+
+    state.metrics.observe(key, nanos, response.status().is_server_error() || response.status().is_client_error());
+    response
+}
+
+fn collection_metrics(db: &Database) -> Vec<serde_json::Value> {
+    let collections: Vec<(String, Arc<Collection>)> = {
+        db.collections.read().unwrap().iter().map(|(n, c)| (n.clone(), c.clone())).collect()
+    };
+
+    collections.into_iter().map(|(name, col)| {
+        let usage = col.space_usage().ok();
+        let index = col.index.read().unwrap();
+        let cached = index.values().filter(|e| e.inline.is_some()).count();
+        let documents = index.len();
+        drop(index);
+
+        serde_json::json!({
+            "name": name,
+            "documents": documents,
+            "last_lsn": col.last_appended_lsn(),
+            "wal_bytes": usage.as_ref().map(|u| u.total_bytes),
+            "live_bytes": usage.as_ref().map(|u| u.live_bytes),
+            "dead_bytes": usage.as_ref().map(|u| u.dead_bytes()),
+            "dead_ratio": usage.as_ref().map(|u| u.dead_ratio()),
+            "cached_documents": cached,
+            "cache_bytes": col.inline_bytes.load(Ordering::Relaxed),
+            "compacting": col.compacting.load(Ordering::Relaxed),
+        })
+    }).collect()
+}
+
+fn replication_metrics(state: &AppState) -> serde_json::Value {
+    let db = match state.db.as_ref() {
+        Some(db) => db,
+        None => return serde_json::Value::Null,
+    };
+
+    let commit_index = db.global_commit_index.load(Ordering::SeqCst);
+    let leader = state.is_leader();
+    let term = state.current_term();
+
+    let (primary_addr, primary_position, last_replication_secs) = match state.replication.as_ref() {
+        Some(repl) => {
+            let r = repl.read().unwrap();
+            (
+                r.primary_addr.clone(),
+                r.last_known_primary_position,
+                r.last_replication.map(|t| t.elapsed().as_secs()),
+            )
+        },
+        None => (None, None, None),
+    };
+
+    if leader {
+        let replicas = state.get_replicas();
+        let lag = state.metrics.replica_lag(commit_index, &replicas);
+        let max_lag = lag.iter().map(|(_, _, l)| *l).max().unwrap_or(0);
+        serde_json::json!({
+            "role": "primary",
+            "term": term,
+            "commit_index": commit_index,
+            "last_log_term": db.last_log_term.load(Ordering::SeqCst),
+            "replica_count": replicas.len(),
+            "max_replica_lag": max_lag,
+            "replicas": lag.into_iter().map(|(url, acked, l)| serde_json::json!({
+                "url": url,
+                "acked_lsn": acked,
+                "lag": l,
+            })).collect::<Vec<_>>(),
+        })
+    } else {
+        serde_json::json!({
+            "role": "replica",
+            "term": term,
+            "commit_index": commit_index,
+            "last_log_term": db.last_log_term.load(Ordering::SeqCst),
+            "primary": primary_addr,
+            "primary_lsn": primary_position,
+            "lag": primary_position.map(|p| p.saturating_sub(commit_index)),
+            "seconds_since_replication": last_replication_secs,
+        })
+    }
+}
+
+fn prometheus_line(out: &mut String, name: &str, labels: &str, value: f64) {
+    use std::fmt::Write as _;
+    if labels.is_empty() {
+        let _ = writeln!(out, "{} {}", name, value);
+    } else {
+        let _ = writeln!(out, "{}{{{}}} {}", name, labels, value);
+    }
+}
+
+fn escape_label(v: &str) -> String {
+    v.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn render_prometheus(state: &AppState, collections: &[serde_json::Value], replication: &serde_json::Value) -> String {
+    let mut out = String::new();
+    let node = escape_label(&state.config.node_id);
+
+    out.push_str("# HELP dewdb_up Node is serving.\n# TYPE dewdb_up gauge\n");
+    prometheus_line(&mut out, "dewdb_up", &format!("node_id=\"{}\"", node), 1.0);
+
+    out.push_str("# HELP dewdb_uptime_seconds Seconds since process start.\n# TYPE dewdb_uptime_seconds counter\n");
+    prometheus_line(&mut out, "dewdb_uptime_seconds", &format!("node_id=\"{}\"", node), state.metrics.uptime_secs() as f64);
+
+    out.push_str("# HELP dewdb_leader Whether this node is the shard primary.\n# TYPE dewdb_leader gauge\n");
+    prometheus_line(&mut out, "dewdb_leader", &format!("node_id=\"{}\"", node), if state.is_leader() { 1.0 } else { 0.0 });
+
+    out.push_str("# HELP dewdb_term Current replication term.\n# TYPE dewdb_term gauge\n");
+    prometheus_line(&mut out, "dewdb_term", &format!("node_id=\"{}\"", node), state.current_term() as f64);
+
+    out.push_str("# HELP dewdb_collection_documents Live documents per collection.\n# TYPE dewdb_collection_documents gauge\n");
+    for c in collections {
+        let name = escape_label(c["name"].as_str().unwrap_or(""));
+        let labels = format!("node_id=\"{}\",collection=\"{}\"", node, name);
+        prometheus_line(&mut out, "dewdb_collection_documents", &labels, c["documents"].as_u64().unwrap_or(0) as f64);
+    }
+
+    out.push_str("# HELP dewdb_wal_bytes Total WAL bytes on disk per collection.\n# TYPE dewdb_wal_bytes gauge\n");
+    for c in collections {
+        let name = escape_label(c["name"].as_str().unwrap_or(""));
+        let labels = format!("node_id=\"{}\",collection=\"{}\"", node, name);
+        prometheus_line(&mut out, "dewdb_wal_bytes", &labels, c["wal_bytes"].as_u64().unwrap_or(0) as f64);
+        prometheus_line(&mut out, "dewdb_wal_dead_bytes", &labels, c["dead_bytes"].as_u64().unwrap_or(0) as f64);
+    }
+
+    if let Some(reps) = replication.get("replicas").and_then(|r| r.as_array()) {
+        out.push_str("# HELP dewdb_replication_lag_lsn Primary LSN minus replica acked LSN.\n# TYPE dewdb_replication_lag_lsn gauge\n");
+        for r in reps {
+            let url = escape_label(r["url"].as_str().unwrap_or(""));
+            let labels = format!("node_id=\"{}\",replica=\"{}\"", node, url);
+            prometheus_line(&mut out, "dewdb_replication_lag_lsn", &labels, r["lag"].as_u64().unwrap_or(0) as f64);
+        }
+    }
+    if let Some(lag) = replication.get("lag").and_then(|l| l.as_u64()) {
+        out.push_str("# HELP dewdb_replica_lag_lsn Known primary LSN minus this replica's LSN.\n# TYPE dewdb_replica_lag_lsn gauge\n");
+        prometheus_line(&mut out, "dewdb_replica_lag_lsn", &format!("node_id=\"{}\"", node), lag as f64);
+    }
+
+    out.push_str("# HELP dewdb_request_duration_ms Request latency histogram.\n# TYPE dewdb_request_duration_ms histogram\n");
+    for (key, stats) in state.metrics.routes_snapshot() {
+        let (method, route) = key.split_once(' ').unwrap_or(("", key.as_str()));
+        let base = format!("node_id=\"{}\",method=\"{}\",route=\"{}\"", node, escape_label(method), escape_label(route));
+        let mut cumulative = 0u64;
+        for (i, n) in stats.buckets.iter().enumerate() {
+            cumulative += n;
+            let le = LATENCY_BUCKETS_MS.get(i).map(|b| b.to_string()).unwrap_or_else(|| "+Inf".to_string());
+            prometheus_line(&mut out, "dewdb_request_duration_ms_bucket", &format!("{},le=\"{}\"", base, le), cumulative as f64);
+        }
+        prometheus_line(&mut out, "dewdb_request_duration_ms_sum", &base, stats.nanos_total as f64 / 1_000_000.0);
+        prometheus_line(&mut out, "dewdb_request_duration_ms_count", &base, stats.count as f64);
+        prometheus_line(&mut out, "dewdb_requests_total", &base, stats.count as f64);
+        prometheus_line(&mut out, "dewdb_request_errors_total", &base, stats.errors as f64);
+    }
+
+    out
+}
+
+#[derive(Deserialize)]
+struct MetricsParams {
+    format: Option<String>,
+}
+
+async fn metrics_handler(
+    State(state): State<AppState>,
+    Query(params): Query<MetricsParams>,
+) -> impl axum::response::IntoResponse {
+    let collections = match state.db.clone() {
+        Some(db) => tokio::task::spawn_blocking(move || collection_metrics(&db)).await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+
+    let replication = replication_metrics(&state);
+
+    if params.format.as_deref() == Some("prometheus") {
+        let body = render_prometheus(&state, &collections, &replication);
+        return ([(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")], body).into_response();
+    }
+
+    let requests: serde_json::Map<String, serde_json::Value> = state.metrics.routes_snapshot()
+        .into_iter()
+        .map(|(key, s)| (key, serde_json::json!({
+            "count": s.count,
+            "errors": s.errors,
+            "avg_ms": (s.avg_ms() * 1000.0).round() / 1000.0,
+            "p50_ms": s.quantile_ms(0.50),
+            "p95_ms": s.quantile_ms(0.95),
+            "p99_ms": s.quantile_ms(0.99),
+        })))
+        .collect();
+
+    let total_wal_bytes: u64 = collections.iter().filter_map(|c| c["wal_bytes"].as_u64()).sum();
+    let total_documents: u64 = collections.iter().filter_map(|c| c["documents"].as_u64()).sum();
+
+    let router = if state.config.role == "router" {
+        let shards: Vec<serde_json::Value> = unique_shards(&state).into_iter().map(|(original, replicas)| {
+            let effective = state.effective_primary(&original);
+            serde_json::json!({
+                "shard": original,
+                "effective_primary": effective,
+                "failed_over": effective != original,
+                "replicas": replicas,
+            })
+        }).collect();
+        serde_json::json!({ "shards": shards })
+    } else {
+        serde_json::Value::Null
+    };
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "node_id": state.config.node_id,
+        "role": state.config.role,
+        "leader": state.is_leader(),
+        "term": state.current_term(),
+        "uptime_secs": state.metrics.uptime_secs(),
+        "storage": {
+            "collections": collections,
+            "total_collections": collections.len(),
+            "total_documents": total_documents,
+            "total_wal_bytes": total_wal_bytes,
+        },
+        "replication": replication,
+        "router": router,
+        "requests": requests,
+    }))).into_response()
+}
+
+async fn health_handler(
+    State(state): State<AppState>,
+) -> impl axum::response::IntoResponse {
+    let mut reasons: Vec<String> = Vec::new();
+
+    if state.is_shard() {
+        if state.db.is_none() {
+            reasons.push("shard has no open database".to_string());
+        }
+        if !state.is_leader() {
+            let (primary, since) = match state.replication.as_ref() {
+                Some(repl) => {
+                    let r = repl.read().unwrap();
+                    (r.primary_addr.clone(), r.last_heartbeat.map(|t| t.elapsed().as_secs()))
+                },
+                None => (None, None),
+            };
+            match primary {
+                None => reasons.push("replica has no known primary".to_string()),
+                Some(_) => {
+                    let stale_for = since.unwrap_or_else(|| state.metrics.uptime_secs());
+                    if stale_for > state.config.heartbeat_timeout_secs {
+                        let detail = if since.is_some() { "no primary heartbeat for" } else { "never reached primary in" };
+                        reasons.push(format!("{} {}s", detail, stale_for));
+                    }
+                },
+            }
+        }
+    }
+
+    if state.config.role == "router" && state.config.shard_map.is_empty() {
+        reasons.push("router has no shards configured".to_string());
+    }
+
+    let healthy = reasons.is_empty();
+    let status = if healthy { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+
+    (status, Json(serde_json::json!({
+        "status": if healthy { "ok" } else { "degraded" },
+        "node_id": state.config.node_id,
+        "role": state.config.role,
+        "leader": state.is_leader(),
+        "term": state.current_term(),
+        "uptime_secs": state.metrics.uptime_secs(),
+        "collections": state.db.as_ref().map_or(0, |db| db.collections.read().unwrap().len()),
+        "reasons": reasons,
+    }))).into_response()
 }
 
 async fn heartbeat_handler(
@@ -3925,7 +4463,7 @@ fn heartbeat_poll_task(state: AppState) {
             tokio::time::sleep(Duration::from_secs(2)).await;
 
             if state.is_leader() {
-                println!("[heartbeat] This node is now leader, stopping heartbeat poll");
+                info!(target: "heartbeat", "This node is now leader, stopping heartbeat poll");
                 break;
             }
 
@@ -3961,16 +4499,16 @@ fn heartbeat_poll_task(state: AppState) {
                         }
                         if let Some(t) = adopted {
                             let _ = ReplicationMeta { term: t, is_leader: false, voted_for: None }.save("./data");
-                            println!("[heartbeat] Adopted higher term {} from primary {}", t, primary_addr);
+                            info!(target: "heartbeat", "Adopted higher term {} from primary {}", t, primary_addr);
                         }
                     }
                 },
                 Ok(r) => {
-                    eprintln!("[heartbeat] Primary {} returned {}", primary_addr, r.status());
+                    warn!(target: "heartbeat", "Primary {} returned {}", primary_addr, r.status());
                     maybe_follow_new_leader(&state, &primary_addr).await;
                 },
                 Err(e) => {
-                    eprintln!("[heartbeat] Primary {} unreachable: {}", primary_addr, e);
+                    warn!(target: "heartbeat", "Primary {} unreachable: {}", primary_addr, e);
                     maybe_follow_new_leader(&state, &primary_addr).await;
                 }
             }
@@ -3992,7 +4530,7 @@ fn heartbeat_poll_task(state: AppState) {
             };
 
             if should_elect {
-                println!("[election] Heartbeat timeout detected, initiating election...");
+                info!(target: "election", "Heartbeat timeout detected, initiating election...");
                 run_election(&state, election_delay).await;
                 if state.is_leader() {
                     break;
@@ -4115,7 +4653,7 @@ async fn vote_handler(
         heartbeat_poll_task(state.clone());
     }
     if granted {
-        println!("[vote] Granted vote to {} for term {}", req.candidate_id, req.term);
+        info!(target: "vote", "Granted vote to {} for term {}", req.candidate_id, req.term);
     }
 
     (StatusCode::OK, Json(VoteResponse { term: resp_term, vote_granted: granted })).into_response()
@@ -4123,7 +4661,7 @@ async fn vote_handler(
 
 async fn run_election(state: &AppState, max_delay_ms: u64) {
     let delay_ms = election_jitter(&state.config.node_id, max_delay_ms);
-    println!("[election] Waiting {}ms before requesting votes...", delay_ms);
+    info!(target: "election", "Waiting {}ms before requesting votes...", delay_ms);
     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 
     if state.is_leader() {
@@ -4136,7 +4674,7 @@ async fn run_election(state: &AppState, max_delay_ms: u64) {
             let url = format!("{}/internal/heartbeat", addr);
             if let Ok(r) = state.client.get(&url).send().await {
                 if r.status().is_success() {
-                    println!("[election] Primary recovered during delay, aborting election");
+                    info!(target: "election", "Primary recovered during delay, aborting election");
                     let mut repl = state.replication.as_ref().unwrap().write().unwrap();
                     repl.last_heartbeat = Some(std::time::Instant::now());
                     return;
@@ -4160,13 +4698,13 @@ async fn run_election(state: &AppState, max_delay_ms: u64) {
     let peers = state.config.peers.clone();
     let cluster_size = peers.len() + 1;
     let needed = majority(cluster_size);
-    println!("[election] Node {} standing for term {} ({} peers, need {} votes)", candidate_id, new_term, peers.len(), needed);
+    info!(target: "election", "Node {} standing for term {} ({} peers, need {} votes)", candidate_id, new_term, peers.len(), needed);
 
     if peers.is_empty() {
         if needed <= 1 {
             become_leader(state, new_term, &candidate_id).await;
         } else {
-            eprintln!("[election] No peers configured; cannot form a majority. Set 'peers' in config for automatic failover.");
+            warn!(target: "election", "No peers configured; cannot form a majority. Set 'peers' in config for automatic failover.");
         }
         return;
     }
@@ -4220,7 +4758,7 @@ async fn run_election(state: &AppState, max_delay_ms: u64) {
 
     let seen_term = highest_term.load(Ordering::Relaxed);
     if seen_term > new_term {
-        println!("[election] Saw higher term {} during election; stepping down", seen_term);
+        info!(target: "election", "Saw higher term {} during election; stepping down", seen_term);
         demote(state, seen_term).await;
         return;
     }
@@ -4229,7 +4767,7 @@ async fn run_election(state: &AppState, max_delay_ms: u64) {
     if tally >= needed {
         become_leader(state, new_term, &candidate_id).await;
     } else {
-        println!("[election] Only {}/{} votes for term {}; election failed, will retry", tally, needed, new_term);
+        info!(target: "election", "Only {}/{} votes for term {}; election failed, will retry", tally, needed, new_term);
     }
 }
 
@@ -4237,7 +4775,7 @@ async fn become_leader(state: &AppState, term: u64, candidate_id: &str) {
     {
         let mut repl = state.replication.as_ref().unwrap().write().unwrap();
         if repl.term != term || repl.voted_for.as_deref() != Some(candidate_id) {
-            println!("[election] State changed during election (term now {}); not assuming leadership", repl.term);
+            info!(target: "election", "State changed during election (term now {}); not assuming leadership", repl.term);
             return;
         }
         repl.is_leader = true;
@@ -4245,8 +4783,8 @@ async fn become_leader(state: &AppState, term: u64, candidate_id: &str) {
         repl.primary_addr = None;
     }
     let _ = ReplicationMeta { term, is_leader: true, voted_for: Some(candidate_id.to_string()) }.save("./data");
-    println!("[election] *** WON election: PROMOTED to primary at term {} ***", term);
-    println!("[election] Node {} is now accepting writes", candidate_id);
+    info!(target: "election", "*** WON election: PROMOTED to primary at term {} ***", term);
+    info!(target: "election", "Node {} is now accepting writes", candidate_id);
 }
 
 #[derive(Deserialize)]
@@ -4303,7 +4841,7 @@ async fn replica_sync_from_primary(
     db: &Database,
     collection_name: &str,
 ) -> Result<(), String> {
-    println!("[replica-sync] Syncing collection '{}' from primary {}", collection_name, primary_addr);
+    info!(target: "replica_sync", "Syncing collection '{}' from primary {}", collection_name, primary_addr);
 
     let url = format!("{}/internal/snapshot?collection={}", primary_addr, collection_name);
     let resp = client.get(&url)
@@ -4319,7 +4857,7 @@ async fn replica_sync_from_primary(
         .map_err(|e| format!("Failed to parse snapshot response: {}", e))?;
 
     if files.is_empty() {
-        println!("[replica-sync] No files received for collection '{}', it may not exist on primary yet", collection_name);
+        info!(target: "replica_sync", "No files received for collection '{}', it may not exist on primary yet", collection_name);
         return Ok(());
     }
 
@@ -4354,12 +4892,12 @@ async fn replica_sync_from_primary(
         let _ = fs::remove_file(path);
     }
 
-    println!("[replica-sync] Restored {} files for collection '{}'", files.len(), collection_name);
+    info!(target: "replica_sync", "Restored {} files for collection '{}'", files.len(), collection_name);
 
     let _ = db.get_collection(collection_name)
         .map_err(|e| format!("Failed to reopen collection after sync: {}", e))?;
 
-    println!("[replica-sync] Collection '{}' ready", collection_name);
+    info!(target: "replica_sync", "Collection '{}' ready", collection_name);
     Ok(())
 }
 
@@ -4382,10 +4920,12 @@ async fn main() -> io::Result<()> {
     let config: NodeConfig = serde_json::from_str(&config_content).expect("Invalid config JSON format");
     config.validate().expect("Invalid config map constraints");
 
-    println!("Booting Node: {} | Role: {} | Shard Role: {:?}", config.node_id, config.role, config.shard_role);
+    init_logging(&config.logging, &config.node_id);
+
+    info!(target: "boot", role = %config.role, shard_role = ?config.shard_role, "Booting node");
 
     if config.role == "router" && Path::new("./data").exists() {
-        println!("Warning: router node should not use local storage");
+        warn!(target: "boot", "Router node should not use local storage");
     }
 
     let db = if config.role == "shard" {
@@ -4397,7 +4937,7 @@ async fn main() -> io::Result<()> {
     let db_clone = db.clone();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
-        println!("\nReceived Ctrl-C. Shutting down and forcing WAL commits...");
+        info!(target: "boot", "Received Ctrl-C; shutting down and forcing WAL commits");
         if let Some(d) = db_clone {
             d.force_commit_all();
         }
@@ -4407,7 +4947,7 @@ async fn main() -> io::Result<()> {
     let replication = if config.role == "shard" {
         let meta = ReplicationMeta::load("./data");
         let (term, is_leader, voted_for) = if let Some(ref m) = meta {
-            println!("[boot] Restored replication state: term={}, is_leader={}", m.term, m.is_leader);
+            info!(target: "boot", "Restored replication state: term={}, is_leader={}", m.term, m.is_leader);
             let mut boot_term = m.term;
             let mut boot_voted = m.voted_for.clone();
             if m.is_leader {
@@ -4415,7 +4955,7 @@ async fn main() -> io::Result<()> {
                 boot_voted = Some(config.node_id.clone());
                 let new_meta = ReplicationMeta { term: boot_term, is_leader: true, voted_for: boot_voted.clone() };
                 let _ = new_meta.save("./data");
-                println!("[boot] Escalated leader term to {} to prevent split brain.", boot_term);
+                info!(target: "boot", "Escalated leader term to {} to prevent split brain.", boot_term);
             }
             (boot_term, m.is_leader, boot_voted)
         } else {
@@ -4454,18 +4994,19 @@ async fn main() -> io::Result<()> {
         repair_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         resyncing: Arc::new(std::sync::Mutex::new(HashSet::new())),
         read_rr: Arc::new(AtomicUsize::new(0)),
+        metrics: Arc::new(Metrics::new()),
     };
 
     if config.shard_role.as_deref() == Some("replica") {
         if let (Some(primary_addr), Some(db)) = (&config.primary_addr, &db) {
-            println!("[replica] Performing full sync from primary: {}", primary_addr);
+            info!(target: "replica", "Performing full sync from primary: {}", primary_addr);
 
             if let Ok(entries) = fs::read_dir("./data") {
                 for entry in entries.flatten() {
                     if entry.path().is_dir() {
                         if let Some(name) = entry.file_name().to_str() {
                             if let Err(e) = replica_sync_from_primary(&client, primary_addr, db, name).await {
-                                eprintln!("[replica] Sync failed for '{}': {}", name, e);
+                                warn!(target: "replica", "Sync failed for '{}': {}", name, e);
                             }
                         }
                     }
@@ -4475,6 +5016,8 @@ async fn main() -> io::Result<()> {
     }
 
     let mut app = Router::new()
+        .route("/health", get(health_handler))
+        .route("/metrics", get(metrics_handler))
         .route("/collections", get(list_collections))
         .route("/collections/:name", delete(drop_collection))
         .route("/collections/:name/compact", post(compact_collection))
@@ -4494,29 +5037,31 @@ async fn main() -> io::Result<()> {
             .route("/internal/heartbeat", get(heartbeat_handler));
     }
 
-    let app = app.with_state(state.clone());
+    let app = app
+        .layer(axum::middleware::from_fn_with_state(state.clone(), metrics_middleware))
+        .with_state(state.clone());
 
     if config.role == "shard" && !state.is_leader() {
-        println!("[boot] Starting heartbeat poll task (timeout={}s, delay={}ms)",
+        info!(target: "boot", "Starting heartbeat poll task (timeout={}s, delay={}ms)",
             config.heartbeat_timeout_secs, config.election_delay_ms);
         heartbeat_poll_task(state.clone());
     }
 
     if config.role == "router" {
-        println!("[boot] Starting router primary-probe task (interval={}s)", ROUTER_PROBE_INTERVAL_SECS);
+        info!(target: "boot", "Starting router primary-probe task (interval={}s)", ROUTER_PROBE_INTERVAL_SECS);
         router_probe_task(state.clone());
     }
 
     if let Some(ref database) = state.db {
         if config.maintenance.enabled {
-            maintenance_task(database.clone(), config.maintenance.clone(), config.node_id.clone());
+            maintenance_task(database.clone(), config.maintenance.clone());
         } else {
-            println!("[boot] Maintenance scheduler disabled by config");
+            info!(target: "boot", "Maintenance scheduler disabled by config");
         }
     }
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
-    println!("Server starting on http://{}", config.listen_addr);
+    info!(target: "boot", addr = %config.listen_addr, "Server listening");
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -5436,6 +5981,71 @@ mod tests {
 
     fn inline_count(col: &Arc<Collection>) -> usize {
         col.index.read().unwrap().values().filter(|e| e.inline.is_some()).count()
+    }
+
+    #[test]
+    fn latency_histogram_buckets_and_quantiles() {
+        let mut st = RouteStats::default();
+        for _ in 0..90 { st.observe(400_000, false); }
+        for _ in 0..9 { st.observe(30_000_000, false); }
+        st.observe(900_000_000, true);
+
+        assert_eq!(st.count, 100);
+        assert_eq!(st.errors, 1);
+        assert_eq!(st.buckets[0], 90, "0.4ms lands in the 0.5ms bucket");
+        assert_eq!(st.quantile_ms(0.50), 0.5, "p50 sits in the fast bucket");
+        assert_eq!(st.quantile_ms(0.95), 50.0, "p95 reflects the slow tail");
+        assert_eq!(st.quantile_ms(0.99), 50.0);
+        assert!((st.avg_ms() - 12.06).abs() < 0.01, "mean of 90x0.4ms + 9x30ms + 900ms, got {}", st.avg_ms());
+
+        let empty = RouteStats::default();
+        assert_eq!(empty.quantile_ms(0.99), 0.0, "an unused route must not divide by zero");
+        assert_eq!(empty.avg_ms(), 0.0);
+    }
+
+    #[test]
+    fn slow_requests_fall_into_the_overflow_bucket() {
+        let mut st = RouteStats::default();
+        st.observe(5_000_000_000, false);
+        assert_eq!(*st.buckets.last().unwrap(), 1, "5s must land in +Inf, not be dropped");
+        assert_eq!(st.quantile_ms(0.99), f64::INFINITY);
+    }
+
+    #[test]
+    fn replica_lag_is_primary_lsn_minus_acked() {
+        let m = Metrics::new();
+        let replicas = vec!["http://a".to_string(), "http://b".to_string()];
+
+        let lag = m.replica_lag(100, &replicas);
+        assert_eq!(lag[0].2, 100, "a replica that never acked is fully behind");
+
+        m.note_replica_ack("http://a", 100);
+        m.note_replica_ack("http://b", 60);
+        let lag = m.replica_lag(100, &replicas);
+        assert_eq!(lag[0].1, 100);
+        assert_eq!(lag[0].2, 0, "a caught-up replica has zero lag");
+        assert_eq!(lag[1].2, 40, "a trailing replica reports the gap");
+
+        m.note_replica_ack("http://b", 50);
+        assert_eq!(m.replica_lag(100, &replicas)[1].1, 60,
+            "an out-of-order ack must not move the watermark backwards");
+
+        assert_eq!(m.replica_lag(10, &replicas)[0].2, 0,
+            "an acked lsn ahead of the primary must not underflow");
+    }
+
+    #[test]
+    fn metrics_records_errors_separately_from_traffic() {
+        let m = Metrics::new();
+        m.observe("GET /x".to_string(), 1_000_000, false);
+        m.observe("GET /x".to_string(), 1_000_000, true);
+        m.observe("POST /y".to_string(), 1_000_000, false);
+
+        let snap = m.routes_snapshot();
+        assert_eq!(snap.len(), 2, "routes are tracked by template, not by URL");
+        let x = &snap.iter().find(|(k, _)| k == "GET /x").unwrap().1;
+        assert_eq!(x.count, 2);
+        assert_eq!(x.errors, 1);
     }
 
     #[tokio::test]
