@@ -141,7 +141,11 @@ struct NodeConfig {
     logging: LoggingConfig,
     #[serde(default)]
     auth: AuthConfig,
+    #[serde(default = "default_data_dir")]
+    data_dir: String,
 }
+
+fn default_data_dir() -> String { "./data".to_string() }
 
 fn default_heartbeat_timeout() -> u64 { 6 }
 fn default_election_delay() -> u64 { 2000 }
@@ -480,24 +484,177 @@ fn hash_key(col: &str, key: &str) -> u64 {
     xxhash_rust::xxh64::xxh64(format!("{}:{}", col, key).as_bytes(), 0)
 }
 
-impl NodeConfig {
-    fn validate(&self) -> Result<(), String> {
-        if self.role == "router" && self.shard_map.is_empty() {
-            return Err("Router requires at least one shard".into());
+fn shard_owns(shard: &ShardInfo, hash: u64) -> bool {
+    if shard.start_hash == shard.end_hash {
+        true
+    } else if shard.start_hash < shard.end_hash {
+        hash >= shard.start_hash && hash < shard.end_hash
+    } else {
+        hash >= shard.start_hash || hash < shard.end_hash
+    }
+}
+
+const RING_SIZE: u128 = 1u128 << 64;
+
+fn ring_segments(shard: &ShardInfo) -> Vec<(u128, u128)> {
+    if shard.start_hash == shard.end_hash {
+        vec![(0, RING_SIZE)]
+    } else if shard.start_hash < shard.end_hash {
+        vec![(shard.start_hash as u128, shard.end_hash as u128)]
+    } else {
+        vec![(shard.start_hash as u128, RING_SIZE), (0, shard.end_hash as u128)]
+    }
+}
+
+fn validate_shard_ring(shards: &[ShardInfo]) -> Result<(), String> {
+    if shards.is_empty() {
+        return Err("Router requires at least one shard".to_string());
+    }
+
+    let full: Vec<&ShardInfo> = shards.iter().filter(|s| s.start_hash == s.end_hash).collect();
+    if !full.is_empty() && shards.len() > 1 {
+        return Err(format!(
+            "Shard {} claims the whole ring (start_hash == end_hash) but {} other shard(s) are configured; ranges overlap",
+            full[0].node_url, shards.len() - 1));
+    }
+
+    let mut segments: Vec<(u128, u128, &str)> = Vec::new();
+    for shard in shards {
+        for (lo, hi) in ring_segments(shard) {
+            if lo < hi {
+                segments.push((lo, hi, shard.node_url.as_str()));
+            }
         }
-        if self.role == "router" {
-            let mut sorted = self.shard_map.clone();
-            sorted.sort_by_key(|s| s.start_hash);
-            for i in 1..sorted.len() {
-                if sorted[i].start_hash != sorted[i - 1].end_hash {
-                    return Err("Shard map has uncovered hash ranges".into());
+    }
+    segments.sort_by_key(|(lo, _, _)| *lo);
+
+    let mut cursor: u128 = 0;
+    let mut previous_owner = "";
+    for (lo, hi, owner) in &segments {
+        if *lo < cursor {
+            return Err(format!(
+                "Shard ranges overlap: {} covers [{}, {}) which re-enters territory already owned by {}",
+                owner, lo, hi, previous_owner));
+        }
+        if *lo > cursor {
+            return Err(format!(
+                "Shard map has an uncovered hash range [{}, {}) before {}", cursor, lo, owner));
+        }
+        cursor = *hi;
+        previous_owner = owner;
+    }
+
+    if cursor != RING_SIZE {
+        return Err(format!("Shard map has an uncovered hash range [{}, {})", cursor, RING_SIZE));
+    }
+
+    Ok(())
+}
+
+fn endpoint_of(url: &str) -> &str {
+    url.trim_end_matches('/')
+        .rsplit("//")
+        .next()
+        .unwrap_or(url)
+}
+
+fn same_endpoint(a: &str, b: &str) -> bool {
+    endpoint_of(a) == endpoint_of(b)
+}
+
+fn config_warnings(cfg: &NodeConfig) -> Vec<String> {
+    let mut out = Vec::new();
+
+    if cfg.role == "router" {
+        let mut replica_lists: BTreeMap<&str, &Vec<String>> = BTreeMap::new();
+        for shard in &cfg.shard_map {
+            if let Some(previous) = replica_lists.get(shard.node_url.as_str()) {
+                if **previous != shard.replica_urls {
+                    out.push(format!(
+                        "shard {} appears in multiple ranges with different replica_urls; \
+                         router failover will use whichever range matched the key",
+                        shard.node_url));
+                }
+            } else {
+                replica_lists.insert(shard.node_url.as_str(), &shard.replica_urls);
+            }
+
+            let mut seen = HashSet::new();
+            for replica in &shard.replica_urls {
+                if !seen.insert(replica.as_str()) {
+                    out.push(format!("shard {} lists replica {} more than once", shard.node_url, replica));
+                }
+                if same_endpoint(replica, &shard.node_url) {
+                    out.push(format!("shard {} lists itself as its own replica", shard.node_url));
                 }
             }
-            if sorted.first().unwrap().start_hash == 0 && sorted.last().unwrap().end_hash == 0 {
-            } else if sorted.last().unwrap().end_hash == sorted.first().unwrap().start_hash {
-            } else {
-                return Err("Shard map has uncovered hash ranges".into());
+
+            if shard.replica_urls.is_empty() {
+                out.push(format!("shard {} has no replica_urls; reads and writes cannot fail over", shard.node_url));
             }
+        }
+
+        for shard in &cfg.shard_map {
+            for other in &cfg.shard_map {
+                if other.node_url == shard.node_url {
+                    continue;
+                }
+                if other.replica_urls.iter().any(|r| same_endpoint(r, &shard.node_url)) {
+                    out.push(format!(
+                        "{} is a primary for one range and a replica of {} for another; \
+                         a failover there would promote a node that already serves writes",
+                        shard.node_url, other.node_url));
+                }
+            }
+        }
+    }
+
+    if cfg.role == "shard" {
+        if cfg.peers.iter().any(|p| same_endpoint(p, &cfg.listen_addr)) {
+            out.push(format!(
+                "peers contains this node's own address ({}); peers must list only the other nodes, \
+                 otherwise the majority threshold is computed against an inflated cluster size",
+                cfg.listen_addr));
+        }
+        if cfg.replicas.iter().any(|r| same_endpoint(r, &cfg.listen_addr)) {
+            out.push(format!("replicas contains this node's own address ({})", cfg.listen_addr));
+        }
+
+        let mut seen = HashSet::new();
+        for replica in &cfg.replicas {
+            if !seen.insert(endpoint_of(replica)) {
+                out.push(format!("replicas lists {} more than once", replica));
+            }
+        }
+
+        if let Some(primary) = &cfg.primary_addr {
+            if !cfg.peers.is_empty() && !cfg.peers.iter().any(|p| same_endpoint(p, primary)) {
+                out.push(format!("primary_addr {} is not listed in peers; it cannot be voted for", primary));
+            }
+        }
+
+        if !cfg.replicas.is_empty() {
+            for replica in &cfg.replicas {
+                if !cfg.peers.is_empty() && !cfg.peers.iter().any(|p| same_endpoint(p, replica)) {
+                    out.push(format!("replica {} is not listed in peers; it cannot vote in an election", replica));
+                }
+            }
+            if cfg.peers.is_empty() {
+                out.push("replicas are configured but peers is empty; this node can never be replaced by an election".to_string());
+            }
+        }
+    }
+
+    out
+}
+
+impl NodeConfig {
+    fn validate(&self) -> Result<(), String> {
+        if self.role == "router" {
+            validate_shard_ring(&self.shard_map)?;
+        }
+        if self.data_dir.trim().is_empty() {
+            return Err("data_dir must not be empty".into());
         }
         if self.role == "shard" {
             if let Some(ref sr) = self.shard_role {
@@ -512,20 +669,6 @@ impl NodeConfig {
         Ok(())
     }
 
-    fn get_shard_url(&self, hash: u64) -> Option<String> {
-        for shard in &self.shard_map {
-            if shard.start_hash <= shard.end_hash {
-                if hash >= shard.start_hash && hash < shard.end_hash {
-                    return Some(shard.node_url.clone());
-                }
-            } else {
-                if hash >= shard.start_hash || hash < shard.end_hash {
-                    return Some(shard.node_url.clone());
-                }
-            }
-        }
-        None
-    }
 }
 
 struct Collection {
@@ -601,12 +744,7 @@ impl AppState {
 
     fn get_effective_shard_url(&self, hash: u64) -> Option<(String, String, Vec<String>)> {
         for shard in &self.config.shard_map {
-            let matches = if shard.start_hash <= shard.end_hash {
-                hash >= shard.start_hash && hash < shard.end_hash
-            } else {
-                hash >= shard.start_hash || hash < shard.end_hash
-            };
-            if matches {
+            if shard_owns(shard, hash) {
                 let mut overrides = self.primary_overrides.lock().unwrap();
                 if let Some(ov) = overrides.get(&shard.node_url) {
                     if ov.cached_at.elapsed().as_secs() < OVERRIDE_TTL_SECS {
@@ -2132,7 +2270,7 @@ async fn demote(state: &AppState, new_term: u64) {
         }
     };
 
-    let _ = ReplicationMeta { term: new_term, is_leader: false, voted_for: None }.save("./data");
+    let _ = ReplicationMeta { term: new_term, is_leader: false, voted_for: None }.save(&state.config.data_dir);
     info!(target: "demote", "Discovered higher term {}, stepping down to replica", new_term);
 
     if restart {
@@ -3926,7 +4064,7 @@ async fn replicate_handler(
                 }
             };
             if let Some(t) = new_term {
-                let _ = ReplicationMeta { term: t, is_leader: false, voted_for: None }.save("./data");
+                let _ = ReplicationMeta { term: t, is_leader: false, voted_for: None }.save(&state.config.data_dir);
                 info!(target: "replicate", "Adopted higher term {} from primary", t);
             }
         }
@@ -4653,7 +4791,7 @@ fn heartbeat_poll_task(state: AppState) {
                             }
                         }
                         if let Some(t) = adopted {
-                            let _ = ReplicationMeta { term: t, is_leader: false, voted_for: None }.save("./data");
+                            let _ = ReplicationMeta { term: t, is_leader: false, voted_for: None }.save(&state.config.data_dir);
                             info!(target: "heartbeat", "Adopted higher term {} from primary {}", t, primary_addr);
                         }
                     }
@@ -4803,7 +4941,7 @@ async fn vote_handler(
         (d.granted, d.term, restart, persist)
     };
 
-    let _ = persist.save("./data");
+    let _ = persist.save(&state.config.data_dir);
     if restart_poll {
         heartbeat_poll_task(state.clone());
     }
@@ -4848,7 +4986,7 @@ async fn run_election(state: &AppState, max_delay_ms: u64) {
         repl.voted_for = Some(candidate_id.clone());
         repl.term
     };
-    let _ = ReplicationMeta { term: new_term, is_leader: false, voted_for: Some(candidate_id.clone()) }.save("./data");
+    let _ = ReplicationMeta { term: new_term, is_leader: false, voted_for: Some(candidate_id.clone()) }.save(&state.config.data_dir);
 
     let peers = state.config.peers.clone();
     let cluster_size = peers.len() + 1;
@@ -4937,7 +5075,7 @@ async fn become_leader(state: &AppState, term: u64, candidate_id: &str) {
         repl.heartbeat_running = false;
         repl.primary_addr = None;
     }
-    let _ = ReplicationMeta { term, is_leader: true, voted_for: Some(candidate_id.to_string()) }.save("./data");
+    let _ = ReplicationMeta { term, is_leader: true, voted_for: Some(candidate_id.to_string()) }.save(&state.config.data_dir);
     info!(target: "election", "*** WON election: PROMOTED to primary at term {} ***", term);
     info!(target: "election", "Node {} is now accepting writes", candidate_id);
 }
@@ -5077,14 +5215,18 @@ async fn main() -> io::Result<()> {
 
     init_logging(&config.logging, &config.node_id);
 
+    for warning in config_warnings(&config) {
+        warn!(target: "config", "{}", warning);
+    }
+
     info!(target: "boot", role = %config.role, shard_role = ?config.shard_role, "Booting node");
 
-    if config.role == "router" && Path::new("./data").exists() {
+    if config.role == "router" && Path::new(&config.data_dir).exists() {
         warn!(target: "boot", "Router node should not use local storage");
     }
 
     let db = if config.role == "shard" {
-        Some(Arc::new(Database::with_cache("./data", config.read_cache.clone())?))
+        Some(Arc::new(Database::with_cache(&config.data_dir, config.read_cache.clone())?))
     } else {
         None
     };
@@ -5100,7 +5242,7 @@ async fn main() -> io::Result<()> {
     });
 
     let replication = if config.role == "shard" {
-        let meta = ReplicationMeta::load("./data");
+        let meta = ReplicationMeta::load(&config.data_dir);
         let (term, is_leader, voted_for) = if let Some(ref m) = meta {
             info!(target: "boot", "Restored replication state: term={}, is_leader={}", m.term, m.is_leader);
             let mut boot_term = m.term;
@@ -5109,7 +5251,7 @@ async fn main() -> io::Result<()> {
                 boot_term += 1;
                 boot_voted = Some(config.node_id.clone());
                 let new_meta = ReplicationMeta { term: boot_term, is_leader: true, voted_for: boot_voted.clone() };
-                let _ = new_meta.save("./data");
+                let _ = new_meta.save(&config.data_dir);
                 info!(target: "boot", "Escalated leader term to {} to prevent split brain.", boot_term);
             }
             (boot_term, m.is_leader, boot_voted)
@@ -5160,7 +5302,7 @@ async fn main() -> io::Result<()> {
         if let (Some(primary_addr), Some(db)) = (&config.primary_addr, &db) {
             info!(target: "replica", "Performing full sync from primary: {}", primary_addr);
 
-            if let Ok(entries) = fs::read_dir("./data") {
+            if let Ok(entries) = fs::read_dir(&config.data_dir) {
                 for entry in entries.flatten() {
                     if entry.path().is_dir() {
                         if let Some(name) = entry.file_name().to_str() {
@@ -6149,6 +6291,184 @@ mod tests {
             api_keys: keys.iter().map(|k| k.to_string()).collect(),
             upstream_api_key: None,
         }
+    }
+
+    const HALF: u64 = 9223372036854775808;
+
+    fn sh(start: u64, end: u64, url: &str, replicas: &[&str]) -> ShardInfo {
+        ShardInfo {
+            start_hash: start,
+            end_hash: end,
+            node_url: url.to_string(),
+            replica_urls: replicas.iter().map(|r| r.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_single_shard_owning_the_whole_ring_validates_and_routes() {
+        let one = vec![sh(0, 0, "http://a", &[])];
+        assert!(validate_shard_ring(&one).is_ok(), "one shard with start == end owns the entire ring");
+
+        assert!(shard_owns(&one[0], 0));
+        assert!(shard_owns(&one[0], u64::MAX));
+        assert!(shard_owns(&one[0], 123456789));
+    }
+
+    #[test]
+    fn shard_ring_rejects_overlaps() {
+        let overlap = vec![
+            sh(0, HALF + 100, "http://a", &[]),
+            sh(HALF, 0, "http://b", &[]),
+        ];
+        let err = validate_shard_ring(&overlap).unwrap_err();
+        assert!(err.contains("overlap"), "got: {}", err);
+
+        let duplicated = vec![
+            sh(0, HALF, "http://a", &[]),
+            sh(0, HALF, "http://b", &[]),
+            sh(HALF, 0, "http://c", &[]),
+        ];
+        assert!(validate_shard_ring(&duplicated).unwrap_err().contains("overlap"));
+
+        let two_full = vec![sh(0, 0, "http://a", &[]), sh(0, 0, "http://b", &[])];
+        assert!(validate_shard_ring(&two_full).unwrap_err().contains("whole ring"));
+
+        let full_plus_one = vec![sh(0, 0, "http://a", &[]), sh(0, HALF, "http://b", &[])];
+        assert!(validate_shard_ring(&full_plus_one).unwrap_err().contains("whole ring"));
+    }
+
+    #[test]
+    fn shard_ring_rejects_gaps() {
+        let gap_in_middle = vec![
+            sh(0, 100, "http://a", &[]),
+            sh(200, 0, "http://b", &[]),
+        ];
+        assert!(validate_shard_ring(&gap_in_middle).unwrap_err().contains("uncovered"));
+
+        let gap_at_start = vec![sh(100, 0, "http://a", &[])];
+        assert!(validate_shard_ring(&gap_at_start).unwrap_err().contains("uncovered"));
+
+        let gap_at_end = vec![sh(0, HALF, "http://a", &[])];
+        assert!(validate_shard_ring(&gap_at_end).unwrap_err().contains("uncovered"));
+
+        assert!(validate_shard_ring(&[]).is_err());
+    }
+
+    #[test]
+    fn shard_ring_accepts_a_correctly_covered_wrap_around_map() {
+        let two = vec![
+            sh(0, HALF, "http://a", &[]),
+            sh(HALF, 0, "http://b", &[]),
+        ];
+        assert!(validate_shard_ring(&two).is_ok());
+
+        let three = vec![
+            sh(0, 1000, "http://a", &[]),
+            sh(1000, HALF, "http://b", &[]),
+            sh(HALF, 0, "http://c", &[]),
+        ];
+        assert!(validate_shard_ring(&three).is_ok(), "order in the file must not matter");
+
+        let shuffled = vec![
+            sh(HALF, 0, "http://c", &[]),
+            sh(0, 1000, "http://a", &[]),
+            sh(1000, HALF, "http://b", &[]),
+        ];
+        assert!(validate_shard_ring(&shuffled).is_ok());
+    }
+
+    #[test]
+    fn every_hash_routes_to_exactly_one_shard() {
+        let shards = vec![
+            sh(0, 1000, "http://a", &[]),
+            sh(1000, HALF, "http://b", &[]),
+            sh(HALF, 0, "http://c", &[]),
+        ];
+        validate_shard_ring(&shards).unwrap();
+
+        for hash in [0u64, 1, 999, 1000, 1001, HALF - 1, HALF, HALF + 1, u64::MAX] {
+            let owners: Vec<&str> = shards.iter()
+                .filter(|s| shard_owns(s, hash))
+                .map(|s| s.node_url.as_str())
+                .collect();
+            assert_eq!(owners.len(), 1, "hash {} had owners {:?}", hash, owners);
+        }
+    }
+
+    fn warn_cfg(json: &str) -> Vec<String> {
+        let cfg: NodeConfig = serde_json::from_str(json).unwrap();
+        config_warnings(&cfg)
+    }
+
+    #[test]
+    fn warns_when_peers_includes_this_node() {
+        let w = warn_cfg(r#"{"node_id":"n1","role":"shard","listen_addr":"127.0.0.1:9501",
+            "peers":["http://127.0.0.1:9501","http://127.0.0.1:9502"]}"#);
+        assert!(w.iter().any(|m| m.contains("own address")), "got {:?}", w);
+
+        let clean = warn_cfg(r#"{"node_id":"n1","role":"shard","listen_addr":"127.0.0.1:9501",
+            "peers":["http://127.0.0.1:9502"]}"#);
+        assert!(!clean.iter().any(|m| m.contains("own address")), "got {:?}", clean);
+    }
+
+    #[test]
+    fn warns_when_replicas_and_peers_disagree() {
+        let w = warn_cfg(r#"{"node_id":"n1","role":"shard","listen_addr":"127.0.0.1:9501",
+            "replicas":["http://127.0.0.1:9502"],"peers":["http://127.0.0.1:9503"]}"#);
+        assert!(w.iter().any(|m| m.contains("9502") && m.contains("cannot vote")), "got {:?}", w);
+
+        let orphaned = warn_cfg(r#"{"node_id":"n1","role":"shard","listen_addr":"127.0.0.1:9501",
+            "replicas":["http://127.0.0.1:9502"]}"#);
+        assert!(orphaned.iter().any(|m| m.contains("peers is empty")), "got {:?}", orphaned);
+
+        let dup = warn_cfg(r#"{"node_id":"n1","role":"shard","listen_addr":"127.0.0.1:9501",
+            "replicas":["http://127.0.0.1:9502","http://127.0.0.1:9502"],
+            "peers":["http://127.0.0.1:9502"]}"#);
+        assert!(dup.iter().any(|m| m.contains("more than once")), "got {:?}", dup);
+    }
+
+    #[test]
+    fn warns_when_a_replica_never_appears_in_the_shard_map_consistently() {
+        let w = warn_cfg(r#"{"node_id":"r","role":"router","listen_addr":"127.0.0.1:9500",
+            "shard_map":[
+              {"start_hash":0,"end_hash":9223372036854775808,"node_url":"http://a","replica_urls":["http://x"]},
+              {"start_hash":9223372036854775808,"end_hash":0,"node_url":"http://a","replica_urls":["http://y"]}]}"#);
+        assert!(w.iter().any(|m| m.contains("different replica_urls")), "got {:?}", w);
+
+        let cross = warn_cfg(r#"{"node_id":"r","role":"router","listen_addr":"127.0.0.1:9500",
+            "shard_map":[
+              {"start_hash":0,"end_hash":9223372036854775808,"node_url":"http://a","replica_urls":["http://b"]},
+              {"start_hash":9223372036854775808,"end_hash":0,"node_url":"http://b","replica_urls":["http://a"]}]}"#);
+        assert!(cross.iter().any(|m| m.contains("already serves writes")), "got {:?}", cross);
+
+        let bare = warn_cfg(r#"{"node_id":"r","role":"router","listen_addr":"127.0.0.1:9500",
+            "shard_map":[{"start_hash":0,"end_hash":0,"node_url":"http://a"}]}"#);
+        assert!(bare.iter().any(|m| m.contains("cannot fail over")), "got {:?}", bare);
+    }
+
+    #[test]
+    fn endpoints_compare_across_scheme_and_trailing_slash() {
+        assert!(same_endpoint("http://127.0.0.1:9501", "127.0.0.1:9501"));
+        assert!(same_endpoint("http://127.0.0.1:9501/", "127.0.0.1:9501"));
+        assert!(same_endpoint("https://127.0.0.1:9501", "http://127.0.0.1:9501"));
+        assert!(!same_endpoint("http://127.0.0.1:9501", "127.0.0.1:9502"));
+    }
+
+    #[test]
+    fn data_dir_defaults_and_is_configurable() {
+        let default: NodeConfig = serde_json::from_str(
+            r#"{"node_id":"n","role":"shard","listen_addr":"127.0.0.1:1"}"#).unwrap();
+        assert_eq!(default.data_dir, "./data");
+        assert!(default.validate().is_ok());
+
+        let custom: NodeConfig = serde_json::from_str(
+            r#"{"node_id":"n","role":"shard","listen_addr":"127.0.0.1:1","data_dir":"/var/lib/dewdb"}"#).unwrap();
+        assert_eq!(custom.data_dir, "/var/lib/dewdb");
+        assert!(custom.validate().is_ok());
+
+        let blank: NodeConfig = serde_json::from_str(
+            r#"{"node_id":"n","role":"shard","listen_addr":"127.0.0.1:1","data_dir":"  "}"#).unwrap();
+        assert!(blank.validate().is_err(), "a blank data_dir would write into the process cwd");
     }
 
     #[test]
