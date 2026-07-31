@@ -19,10 +19,61 @@ use uuid::Uuid;
 const WAL_ROTATION_LIMIT: u64 = 50 * 1024 * 1024;
 const MAX_RECORD_SIZE: u64 = 10 * 1024 * 1024;
 const INDEX_FILENAME: &str = "index-current.bin";
-const HEADER_LEN: usize = 24;
+const HEADER_LEN: usize = 40;
 const KEY_LOCK_STRIPES: usize = 64;
 const READ_POOL_HANDLES: usize = 4;
 const DIR_REMOVE_ATTEMPTS: usize = 5;
+
+/// Frame header: len | crc | term | lsn | prev_lsn | prev_term.
+///
+/// `prev_lsn`/`prev_term` point at the frame that precedes this one *in this
+/// collection*, not in the global LSN space. LSNs are handed out from one
+/// database-wide counter, so a collection's frames are sparse in that space
+/// (writes to other collections consume numbers in between). Chaining on the
+/// collection's own predecessor is what lets a replica tell "I am missing
+/// frames" apart from "the primary also wrote somewhere else".
+#[derive(Debug, Clone, Copy)]
+struct FrameHeader {
+    len: u32,
+    crc: u32,
+    term: u64,
+    lsn: u64,
+    prev_lsn: u64,
+    prev_term: u64,
+}
+
+impl FrameHeader {
+    fn parse(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < HEADER_LEN {
+            return None;
+        }
+        Some(Self {
+            len: u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            crc: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            term: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            lsn: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+            prev_lsn: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+            prev_term: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
+        })
+    }
+
+    fn encode(&self) -> [u8; HEADER_LEN] {
+        let mut out = [0u8; HEADER_LEN];
+        out[0..4].copy_from_slice(&self.len.to_le_bytes());
+        out[4..8].copy_from_slice(&self.crc.to_le_bytes());
+        out[8..16].copy_from_slice(&self.term.to_le_bytes());
+        out[16..24].copy_from_slice(&self.lsn.to_le_bytes());
+        out[24..32].copy_from_slice(&self.prev_lsn.to_le_bytes());
+        out[32..40].copy_from_slice(&self.prev_term.to_le_bytes());
+        out
+    }
+
+    fn payload_valid(&self, payload: &[u8]) -> bool {
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(payload);
+        hasher.finalize() == self.crc
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "op", rename_all = "lowercase")]
@@ -370,7 +421,10 @@ struct ReplicateRequest {
 enum ReplicaApply {
     Applied { wal_id: u64, offset: u64, lsn: u64 },
     Duplicate { last_lsn: u64 },
-    Gap { last_lsn: u64 },
+    Gap { last_lsn: u64, last_term: u64 },
+    /// Our log conflicts with the leader's at this position; streaming more
+    /// frames cannot fix it, only replacing our copy wholesale can.
+    Divergent { last_lsn: u64, last_term: u64 },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -933,6 +987,28 @@ impl Database {
         Ok(existed)
     }
 
+    /// Re-derive the commit watermark from what is actually on disk.
+    ///
+    /// `global_commit_index` only ever ratchets up, so a node whose log was
+    /// replaced by a snapshot (or truncated back to the leader's history) would
+    /// keep advertising the LSN it used to hold. That number is what elections
+    /// compare, so leaving it inflated lets a node win a vote on data it no
+    /// longer has.
+    fn recompute_commit_index(&self) -> io::Result<u64> {
+        let mut highest = 0u64;
+        for name in self.list_collections()? {
+            highest = highest.max(self.get_collection(&name)?.last_appended_lsn());
+        }
+
+        let previous = self.global_commit_index.swap(highest, Ordering::SeqCst);
+        if highest < previous {
+            info!(target: "db", from = previous, to = highest,
+                "Lowered commit index to match on-disk log after resync");
+            let _ = LsnMeta { commit_lsn: highest }.save(&self.root_path);
+        }
+        Ok(highest)
+    }
+
     fn force_commit_all(&self) {
         let collections = self.collections.read().unwrap();
         for (name, col) in collections.iter() {
@@ -1159,10 +1235,11 @@ impl Collection {
                 Err(e) => return Err(e),
             }
 
-            let len = u32::from_le_bytes(header[0..4].try_into().unwrap());
-            let crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
-            let term = u64::from_le_bytes(header[8..16].try_into().unwrap());
-            let lsn = u64::from_le_bytes(header[16..24].try_into().unwrap());
+            let parsed = match FrameHeader::parse(&header) {
+                Some(h) => h,
+                None => break,
+            };
+            let (len, term, lsn) = (parsed.len, parsed.term, parsed.lsn);
 
             if len == 0 || (len as u64) > MAX_RECORD_SIZE {
                 warn!(target: "wal", file = %path.display(), frame_len = len, "Invalid WAL frame length; truncating");
@@ -1175,9 +1252,7 @@ impl Collection {
                 break;
             }
 
-            let mut hasher = crc32fast::Hasher::new();
-            hasher.update(&payload);
-            if hasher.finalize() != crc {
+            if !parsed.payload_valid(&payload) {
                 warn!(target: "wal", file = %path.display(), "CRC mismatch; truncating at chunk boundary");
                 break;
             }
@@ -1275,11 +1350,14 @@ impl Collection {
 
         let lsn = self.db_next_lsn.fetch_add(1, Ordering::SeqCst) + 1;
 
-        let mut header = [0u8; HEADER_LEN];
-        header[0..4].copy_from_slice(&(len as u32).to_le_bytes());
-        header[4..8].copy_from_slice(&crc.to_le_bytes());
-        header[8..16].copy_from_slice(&term.to_le_bytes());
-        header[16..24].copy_from_slice(&lsn.to_le_bytes());
+        let header = FrameHeader {
+            len: len as u32,
+            crc,
+            term,
+            lsn,
+            prev_lsn: wal.last_appended_lsn,
+            prev_term: wal.last_appended_term,
+        }.encode();
 
         let mut frame = Vec::with_capacity(frame_len as usize);
         frame.extend_from_slice(&header);
@@ -1301,15 +1379,10 @@ impl Collection {
         Ok((frame, wal_id, offset, lsn))
     }
 
-    fn append_raw_frame(&self, frame_bytes: &[u8], prev_lsn: u64) -> io::Result<ReplicaApply> {
-        if frame_bytes.len() < HEADER_LEN {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Frame too short"));
-        }
-
-        let len = u32::from_le_bytes(frame_bytes[0..4].try_into().unwrap()) as usize;
-        let crc = u32::from_le_bytes(frame_bytes[4..8].try_into().unwrap());
-        let frame_term = u64::from_le_bytes(frame_bytes[8..16].try_into().unwrap());
-        let frame_lsn = u64::from_le_bytes(frame_bytes[16..24].try_into().unwrap());
+    fn append_raw_frame(&self, frame_bytes: &[u8]) -> io::Result<ReplicaApply> {
+        let header = FrameHeader::parse(frame_bytes)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Frame too short"))?;
+        let len = header.len as usize;
 
         if frame_bytes.len() < HEADER_LEN + len {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Frame payload incomplete"));
@@ -1317,9 +1390,7 @@ impl Collection {
 
         let payload = &frame_bytes[HEADER_LEN..HEADER_LEN + len];
 
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(payload);
-        if hasher.finalize() != crc {
+        if !header.payload_valid(payload) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "CRC mismatch on replicated frame"));
         }
 
@@ -1335,13 +1406,28 @@ impl Collection {
         }
 
         let last = wal.last_appended_lsn;
+        let last_term = wal.last_appended_term;
 
-        if frame_lsn <= last {
+        // A leader from a newer term re-using an LSN we already hold means our
+        // tail came from a leader that lost the election. Terms only ever rise
+        // along a log, so our entry at that LSN carries a lower term than this
+        // frame does: the two logs have diverged and ours is the wrong one.
+        if header.lsn <= last && header.term > last_term {
+            return Ok(ReplicaApply::Divergent { last_lsn: last, last_term });
+        }
+
+        if header.lsn <= last {
             return Ok(ReplicaApply::Duplicate { last_lsn: last });
         }
 
-        if prev_lsn != last {
-            return Ok(ReplicaApply::Gap { last_lsn: last });
+        if header.prev_lsn != last {
+            return Ok(ReplicaApply::Gap { last_lsn: last, last_term });
+        }
+
+        // Same position, different history: the leader's predecessor was written
+        // in another term than ours. Raft's log-matching check.
+        if header.prev_term != last_term {
+            return Ok(ReplicaApply::Divergent { last_lsn: last, last_term });
         }
 
         if wal.current_wal_size >= WAL_ROTATION_LIMIT {
@@ -1362,12 +1448,12 @@ impl Collection {
         let wal_id = wal.current_wal_id;
 
         wal.current_wal_size += frame_len;
-        wal.last_appended_lsn = frame_lsn;
-        wal.last_appended_term = frame_term;
-        self.db_next_lsn.fetch_max(frame_lsn, Ordering::SeqCst);
-        self.db_last_log_term.store(frame_term, Ordering::SeqCst);
+        wal.last_appended_lsn = header.lsn;
+        wal.last_appended_term = header.term;
+        self.db_next_lsn.fetch_max(header.lsn, Ordering::SeqCst);
+        self.db_last_log_term.store(header.term, Ordering::SeqCst);
 
-        Ok(ReplicaApply::Applied { wal_id, offset, lsn: frame_lsn })
+        Ok(ReplicaApply::Applied { wal_id, offset, lsn: header.lsn })
     }
 
     fn read_frames_after(&self, after_lsn: u64, up_to_lsn: u64) -> io::Result<Vec<(u64, Vec<u8>)>> {
@@ -1397,9 +1483,12 @@ impl Collection {
                 if file.read_exact(&mut header).is_err() {
                     break;
                 }
-                let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
-                let crc = u32::from_le_bytes(header[4..8].try_into().unwrap());
-                let lsn = u64::from_le_bytes(header[16..24].try_into().unwrap());
+                let parsed = match FrameHeader::parse(&header) {
+                    Some(h) => h,
+                    None => break,
+                };
+                let len = parsed.len as usize;
+                let lsn = parsed.lsn;
 
                 if len == 0 || len as u64 > MAX_RECORD_SIZE {
                     break;
@@ -1410,9 +1499,7 @@ impl Collection {
                     break;
                 }
 
-                let mut hasher = crc32fast::Hasher::new();
-                hasher.update(&payload);
-                if hasher.finalize() != crc {
+                if !parsed.payload_valid(&payload) {
                     break;
                 }
 
@@ -2260,6 +2347,10 @@ async fn resync_all_from(state: &AppState, leader: &str) {
             warn!(target: "demote", "resync of '{}' from {} failed: {}", name, leader, e);
         }
     }
+
+    if let Err(e) = db.recompute_commit_index() {
+        warn!(target: "demote", "could not recompute commit index after resync: {}", e);
+    }
 }
 
 async fn demote(state: &AppState, new_term: u64) {
@@ -2299,17 +2390,26 @@ async fn demote(state: &AppState, new_term: u64) {
 
 enum ConflictKind {
     StaleTerm(u64),
-    Gap(u64),
+    /// Replica is behind at (last_lsn, last_term) and can be streamed forward.
+    Gap(u64, u64),
+    /// Replica holds entries we do not; only a snapshot can reconcile it.
+    Divergent(u64),
 }
 
 fn classify_conflict(body: &Option<serde_json::Value>) -> ConflictKind {
-    if let Some(b) = body {
-        if b.get("status").and_then(|s| s.as_str()) == Some("stale_term") {
-            return ConflictKind::StaleTerm(b.get("term").and_then(|v| v.as_u64()).unwrap_or(0));
-        }
-        return ConflictKind::Gap(b.get("last_lsn").and_then(|v| v.as_u64()).unwrap_or(0));
+    let b = match body {
+        Some(b) => b,
+        None => return ConflictKind::Gap(0, 0),
+    };
+
+    let last_lsn = b.get("last_lsn").and_then(|v| v.as_u64()).unwrap_or(0);
+    let last_term = b.get("last_term").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    match b.get("status").and_then(|s| s.as_str()) {
+        Some("stale_term") => ConflictKind::StaleTerm(b.get("term").and_then(|v| v.as_u64()).unwrap_or(0)),
+        Some("divergent") => ConflictKind::Divergent(last_lsn),
+        _ => ConflictKind::Gap(last_lsn, last_term),
     }
-    ConflictKind::Gap(0)
 }
 
 fn forbidden_term(body: &Option<serde_json::Value>) -> u64 {
@@ -2363,9 +2463,15 @@ fn replicate_to_peers(
                                 warn!(target: "replication", "Replica {} reports higher term {}; demoting", replica_url, t);
                                 demote(&state, t).await;
                             },
-                            ConflictKind::Gap(last_lsn) => {
+                            ConflictKind::Divergent(last_lsn) => {
+                                state.metrics.note_divergence();
+                                warn!(target: "replication", "Replica {} diverges from us at lsn {} (its last_lsn={}); snapshotting it", replica_url, lsn, last_lsn);
+                                trigger_resync(&state, &replica_url, &col).await;
+                            },
+                            ConflictKind::Gap(last_lsn, last_term) => {
+                                state.metrics.note_gap();
                                 warn!(target: "replication", "Replica {} gap at lsn {} (its last_lsn={}), starting repair", replica_url, lsn, last_lsn);
-                                let _ = repair_replica(state, replica_url.clone(), col, last_lsn).await;
+                                let _ = repair_replica(state, replica_url.clone(), col, last_lsn, last_term).await;
                             }
                         }
                     },
@@ -2392,17 +2498,30 @@ fn replicate_to_peers(
     });
 }
 
-fn contiguous_prefix(after_lsn: u64, mut frames: Vec<(u64, Vec<u8>)>) -> Vec<(u64, Vec<u8>)> {
+/// Longest run of frames that chains onto `(after_lsn, after_term)`.
+///
+/// A collection's LSNs are sparse in the global space, so "the next frame" is
+/// not `after_lsn + 1`; it is whichever frame names its predecessor as ours.
+/// Compaction drops superseded frames, which breaks the chain — that shows up
+/// here as a short (or empty) run, and the caller falls back to a snapshot.
+fn chain_prefix(after_lsn: u64, after_term: u64, mut frames: Vec<(u64, Vec<u8>)>) -> Vec<(u64, Vec<u8>)> {
     frames.sort_by_key(|(lsn, _)| *lsn);
-    let mut expected = after_lsn + 1;
+
+    let mut prev_lsn = after_lsn;
+    let mut prev_term = after_term;
     let mut out = Vec::new();
+
     for (lsn, frame) in frames {
-        if lsn == expected {
-            out.push((lsn, frame));
-            expected += 1;
-        } else if lsn > expected {
+        let header = match FrameHeader::parse(&frame) {
+            Some(h) => h,
+            None => break,
+        };
+        if header.prev_lsn != prev_lsn || header.prev_term != prev_term {
             break;
         }
+        prev_lsn = lsn;
+        prev_term = header.term;
+        out.push((lsn, frame));
     }
     out
 }
@@ -2412,6 +2531,7 @@ async fn trigger_resync(state: &AppState, replica_url: &str, collection: &str) {
     let body = ResyncRequest { collection: collection.to_string() };
     match state.client.post(&url).json(&body).send().await {
         Ok(r) if r.status().is_success() => {
+            state.metrics.note_resync();
             info!(target: "repair", "Triggered snapshot resync on {} for '{}'", replica_url, collection);
         },
         Ok(r) => warn!(target: "repair", "Resync trigger on {} returned {}", replica_url, r.status()),
@@ -2419,17 +2539,13 @@ async fn trigger_resync(state: &AppState, replica_url: &str, collection: &str) {
     }
 }
 
-async fn probe_replica_lsn(state: &AppState, replica_url: &str) -> Option<u64> {
-    let url = format!("{}/internal/heartbeat", replica_url);
-    let r = state.client.get(&url).send().await.ok()?;
-    if !r.status().is_success() {
-        return None;
-    }
-    let v = r.json::<serde_json::Value>().await.ok()?;
-    v.get("commit_index").and_then(|x| x.as_u64())
-}
-
-async fn repair_replica(state: AppState, replica_url: String, collection: String, reported_last_lsn: u64) -> bool {
+async fn repair_replica(
+    state: AppState,
+    replica_url: String,
+    collection: String,
+    reported_last_lsn: u64,
+    reported_last_term: u64,
+) -> bool {
     let lock = {
         let mut locks = state.repair_locks.lock().unwrap();
         locks.entry(replica_url.clone())
@@ -2447,42 +2563,43 @@ async fn repair_replica(state: AppState, replica_url: String, collection: String
         Err(_) => return false,
     };
 
-    let target = db.global_commit_index.load(Ordering::SeqCst);
+    // Catch the replica up to where *this collection* ends, not to the global
+    // commit index: another collection may hold the highest LSN in the cluster,
+    // and this one can never reach it.
+    let target = col.last_appended_lsn();
 
-    let probed = probe_replica_lsn(&state, &replica_url).await.unwrap_or(0);
-    let replica_last_lsn = reported_last_lsn.max(probed);
-
-    if replica_last_lsn >= target {
+    if reported_last_lsn >= target {
         return true;
     }
 
     let col_scan = col.clone();
-    let after = replica_last_lsn;
+    let after = reported_last_lsn;
     let frames = match tokio::task::spawn_blocking(move || col_scan.read_frames_after(after, target)).await {
         Ok(Ok(f)) => f,
         _ => return false,
     };
 
-    let contiguous = contiguous_prefix(replica_last_lsn, frames);
-    let reaches_target = contiguous.last().map_or(false, |(lsn, _)| *lsn >= target);
+    let chained = chain_prefix(reported_last_lsn, reported_last_term, frames);
+    let reaches_target = chained.last().map_or(false, |(lsn, _)| *lsn >= target);
 
     if !reaches_target {
-        info!(target: "repair", "Replica {} too far behind for '{}' (last_lsn={}, target={}), falling back to snapshot", replica_url, collection, replica_last_lsn, target);
+        info!(target: "repair", "Replica {} too far behind for '{}' (last_lsn={}, target={}), falling back to snapshot", replica_url, collection, reported_last_lsn, target);
         trigger_resync(&state, &replica_url, &collection).await;
         return false;
     }
 
     let term = state.current_term();
     let commit_index = db.global_commit_index.load(Ordering::SeqCst);
-    let sent = contiguous.len();
-    let mut prev = replica_last_lsn;
+    let sent = chained.len();
+    let mut prev = reported_last_lsn;
 
-    for (lsn, frame) in contiguous {
+    for (lsn, frame) in chained {
+        let prev_lsn = FrameHeader::parse(&frame).map_or(prev, |h| h.prev_lsn);
         let req = ReplicateRequest {
             collection: collection.clone(),
             term,
             lsn,
-            prev_lsn: prev,
+            prev_lsn,
             commit_index: Some(commit_index),
             wal_frame: frame,
         };
@@ -2499,7 +2616,12 @@ async fn repair_replica(state: AppState, replica_url: String, collection: String
                         demote(&state, t).await;
                         return false;
                     },
-                    ConflictKind::Gap(_) => {
+                    ConflictKind::Divergent(last_lsn) => {
+                        warn!(target: "repair", "Replica {} diverges from us at lsn {} (its last_lsn={}); snapshotting it", replica_url, lsn, last_lsn);
+                        trigger_resync(&state, &replica_url, &collection).await;
+                        return false;
+                    },
+                    ConflictKind::Gap(..) => {
                         warn!(target: "repair", "Replica {} still gapped during backfill at lsn {}, falling back to snapshot", replica_url, lsn);
                         trigger_resync(&state, &replica_url, &collection).await;
                         return false;
@@ -2603,8 +2725,15 @@ async fn replicate_one_await(
                     demote(state, t).await;
                     false
                 },
-                ConflictKind::Gap(last_lsn) => {
-                    repair_replica(state.clone(), replica_url.to_string(), collection.to_string(), last_lsn).await
+                ConflictKind::Divergent(last_lsn) => {
+                    state.metrics.note_divergence();
+                    warn!(target: "replication", "Replica {} diverges from us at lsn {} (its last_lsn={}); snapshotting it", replica_url, lsn, last_lsn);
+                    trigger_resync(state, replica_url, collection).await;
+                    false
+                },
+                ConflictKind::Gap(last_lsn, last_term) => {
+                    state.metrics.note_gap();
+                    repair_replica(state.clone(), replica_url.to_string(), collection.to_string(), last_lsn, last_term).await
                 }
             }
         },
@@ -3160,7 +3289,9 @@ async fn finish_write(
     let commit_index = db.global_commit_index.load(Ordering::SeqCst);
     let replicas = state.get_replicas();
     let required = required_acks(&wc, replicas.len());
-    let prev_lsn = pending.lsn.saturating_sub(1);
+    // Not lsn - 1: that number belongs to whichever collection was written to
+    // last, which is often a different one.
+    let prev_lsn = FrameHeader::parse(&pending.frame).map_or(0, |h| h.prev_lsn);
 
     let acks = if required <= 1 {
         replicate_to_peers(
@@ -4095,15 +4226,18 @@ async fn replicate_handler(
         Vec::new()
     };
 
-    if frame.len() >= HEADER_LEN {
-        let frame_lsn = u64::from_le_bytes(frame[16..24].try_into().unwrap());
-        if frame_lsn != req.lsn {
+    // The header is authoritative; the request fields are cross-checked so a
+    // mismatched sender is rejected rather than silently ignored.
+    if let Some(header) = FrameHeader::parse(&frame) {
+        if header.lsn != req.lsn {
             return (StatusCode::BAD_REQUEST, "Frame lsn does not match request lsn").into_response();
+        }
+        if header.prev_lsn != req.prev_lsn {
+            return (StatusCode::BAD_REQUEST, "Frame prev_lsn does not match request prev_lsn").into_response();
         }
     }
 
     let col_clone = col.clone();
-    let prev_lsn = req.prev_lsn;
 
     let entry_opt = if frame.len() >= HEADER_LEN {
         serde_json::from_slice::<LogEntry>(&frame[HEADER_LEN..]).ok()
@@ -4111,7 +4245,7 @@ async fn replicate_handler(
         None
     };
 
-    match tokio::task::spawn_blocking(move || col_clone.append_raw_frame(&frame, prev_lsn)).await {
+    match tokio::task::spawn_blocking(move || col_clone.append_raw_frame(&frame)).await {
         Ok(Ok(ReplicaApply::Applied { wal_id, offset, lsn })) => {
             let commit_rx = col.enqueue_commit();
             match commit_rx.await {
@@ -4148,9 +4282,23 @@ async fn replicate_handler(
             }
             (StatusCode::OK, Json(serde_json::json!({"status": "duplicate", "last_lsn": last_lsn}))).into_response()
         },
-        Ok(Ok(ReplicaApply::Gap { last_lsn })) => {
+        Ok(Ok(ReplicaApply::Gap { last_lsn, last_term })) => {
             warn!(target: "replicate", "Gap detected: got prev_lsn {} but replica is at lsn {}", req.prev_lsn, last_lsn);
-            (StatusCode::CONFLICT, Json(serde_json::json!({"status": "gap", "last_lsn": last_lsn}))).into_response()
+            (StatusCode::CONFLICT, Json(serde_json::json!({
+                "status": "gap",
+                "last_lsn": last_lsn,
+                "last_term": last_term,
+            }))).into_response()
+        },
+        Ok(Ok(ReplicaApply::Divergent { last_lsn, last_term })) => {
+            warn!(target: "replicate", collection = %req.collection, lsn = req.lsn, term = req.term,
+                last_lsn, last_term,
+                "Log divergence: our tail came from a superseded leader, awaiting snapshot");
+            (StatusCode::CONFLICT, Json(serde_json::json!({
+                "status": "divergent",
+                "last_lsn": last_lsn,
+                "last_term": last_term,
+            }))).into_response()
         },
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
@@ -4193,10 +4341,15 @@ async fn resync_handler(
     tokio::spawn(async move {
         if let Err(e) = replica_sync_from_primary(&client, &primary_addr, &db, &col).await {
             warn!(target: "resync", "Failed for '{}': {}", col, e);
-        } else if let Some(r) = repl {
-            let mut g = r.write().unwrap();
-            g.last_replication = Some(std::time::Instant::now());
-            g.was_receiving_replication = true;
+        } else {
+            if let Some(r) = repl {
+                let mut g = r.write().unwrap();
+                g.last_replication = Some(std::time::Instant::now());
+                g.was_receiving_replication = true;
+            }
+            if let Err(e) = db.recompute_commit_index() {
+                warn!(target: "resync", "could not recompute commit index for '{}': {}", col, e);
+            }
         }
         resyncing.lock().unwrap().remove(&col);
     });
@@ -4253,6 +4406,12 @@ struct Metrics {
     started_at: std::time::Instant,
     routes: std::sync::Mutex<BTreeMap<String, RouteStats>>,
     replica_acked_lsn: std::sync::Mutex<BTreeMap<String, u64>>,
+    /// Repair events seen from the primary side. A healthy cluster holds these
+    /// near zero; a rising gap count means replication is arriving out of order,
+    /// and any divergence at all means a leader change left a replica behind.
+    gaps: AtomicU64,
+    divergences: AtomicU64,
+    resyncs: AtomicU64,
 }
 
 impl Metrics {
@@ -4261,7 +4420,30 @@ impl Metrics {
             started_at: std::time::Instant::now(),
             routes: std::sync::Mutex::new(BTreeMap::new()),
             replica_acked_lsn: std::sync::Mutex::new(BTreeMap::new()),
+            gaps: AtomicU64::new(0),
+            divergences: AtomicU64::new(0),
+            resyncs: AtomicU64::new(0),
         }
+    }
+
+    fn note_gap(&self) {
+        self.gaps.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_divergence(&self) {
+        self.divergences.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_resync(&self) {
+        self.resyncs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn repair_counts(&self) -> (u64, u64, u64) {
+        (
+            self.gaps.load(Ordering::Relaxed),
+            self.divergences.load(Ordering::Relaxed),
+            self.resyncs.load(Ordering::Relaxed),
+        )
     }
 
     fn observe(&self, key: String, nanos: u64, is_error: bool) {
@@ -4365,6 +4547,8 @@ fn replication_metrics(state: &AppState) -> serde_json::Value {
         None => (None, None, None),
     };
 
+    let (gaps, divergences, resyncs) = state.metrics.repair_counts();
+
     if leader {
         let replicas = state.get_replicas();
         let lag = state.metrics.replica_lag(commit_index, &replicas);
@@ -4376,6 +4560,11 @@ fn replication_metrics(state: &AppState) -> serde_json::Value {
             "last_log_term": db.last_log_term.load(Ordering::SeqCst),
             "replica_count": replicas.len(),
             "max_replica_lag": max_lag,
+            "repairs": {
+                "gaps": gaps,
+                "divergences": divergences,
+                "resyncs_triggered": resyncs,
+            },
             "replicas": lag.into_iter().map(|(url, acked, l)| serde_json::json!({
                 "url": url,
                 "acked_lsn": acked,
@@ -4452,6 +4641,15 @@ fn render_prometheus(state: &AppState, collections: &[serde_json::Value], replic
         out.push_str("# HELP dewdb_replica_lag_lsn Known primary LSN minus this replica's LSN.\n# TYPE dewdb_replica_lag_lsn gauge\n");
         prometheus_line(&mut out, "dewdb_replica_lag_lsn", &format!("node_id=\"{}\"", node), lag as f64);
     }
+
+    let (gaps, divergences, resyncs) = state.metrics.repair_counts();
+    let node_label = format!("node_id=\"{}\"", node);
+    out.push_str("# HELP dewdb_replication_gaps_total Replicas that reported missing frames.\n# TYPE dewdb_replication_gaps_total counter\n");
+    prometheus_line(&mut out, "dewdb_replication_gaps_total", &node_label, gaps as f64);
+    out.push_str("# HELP dewdb_replication_divergences_total Replicas whose log conflicted with ours.\n# TYPE dewdb_replication_divergences_total counter\n");
+    prometheus_line(&mut out, "dewdb_replication_divergences_total", &node_label, divergences as f64);
+    out.push_str("# HELP dewdb_replication_resyncs_total Snapshot resyncs this node triggered.\n# TYPE dewdb_replication_resyncs_total counter\n");
+    prometheus_line(&mut out, "dewdb_replication_resyncs_total", &node_label, resyncs as f64);
 
     out.push_str("# HELP dewdb_request_duration_ms Request latency histogram.\n# TYPE dewdb_request_duration_ms histogram\n");
     for (key, stats) in state.metrics.routes_snapshot() {
@@ -5396,6 +5594,10 @@ async fn main() -> io::Result<()> {
                     }
                 }
             }
+
+            if let Err(e) = db.recompute_commit_index() {
+                warn!(target: "replica", "Could not recompute commit index after boot sync: {}", e);
+            }
         }
     }
 
@@ -5572,27 +5774,27 @@ mod tests {
         let (f3, _, _, l3) = pcol.put("k3".into(), serde_json::json!({"v": 3}), 1).unwrap();
         assert_eq!((l1, l2, l3), (1, 2, 3));
 
-        match rcol.append_raw_frame(&f1, 0).unwrap() {
+        match rcol.append_raw_frame(&f1).unwrap() {
             ReplicaApply::Applied { lsn, .. } => assert_eq!(lsn, 1),
             other => panic!("expected Applied, got {:?}", other),
         }
 
-        match rcol.append_raw_frame(&f3, 2).unwrap() {
-            ReplicaApply::Gap { last_lsn } => assert_eq!(last_lsn, 1),
+        match rcol.append_raw_frame(&f3).unwrap() {
+            ReplicaApply::Gap { last_lsn, .. } => assert_eq!(last_lsn, 1),
             other => panic!("expected Gap, got {:?}", other),
         }
 
-        match rcol.append_raw_frame(&f2, 1).unwrap() {
+        match rcol.append_raw_frame(&f2).unwrap() {
             ReplicaApply::Applied { lsn, .. } => assert_eq!(lsn, 2),
             other => panic!("expected Applied, got {:?}", other),
         }
 
-        match rcol.append_raw_frame(&f3, 2).unwrap() {
+        match rcol.append_raw_frame(&f3).unwrap() {
             ReplicaApply::Applied { lsn, .. } => assert_eq!(lsn, 3),
             other => panic!("expected Applied, got {:?}", other),
         }
 
-        match rcol.append_raw_frame(&f2, 1).unwrap() {
+        match rcol.append_raw_frame(&f2).unwrap() {
             ReplicaApply::Duplicate { last_lsn } => assert_eq!(last_lsn, 3),
             other => panic!("expected Duplicate, got {:?}", other),
         }
@@ -5625,32 +5827,29 @@ mod tests {
         pcol.enqueue_commit().await.unwrap().unwrap();
         assert_eq!(pdb.global_commit_index.load(Ordering::SeqCst), 5);
 
-        let all = contiguous_prefix(0, pcol.read_frames_after(0, 5).unwrap());
+        let all = chain_prefix(0, 0, pcol.read_frames_after(0, 5).unwrap());
         let lsns: Vec<u64> = all.iter().map(|(l, _)| *l).collect();
         assert_eq!(lsns, vec![1, 2, 3, 4, 5]);
 
         let rdb = Database::new(&rroot).unwrap();
         let rcol = rdb.get_collection("c").unwrap();
 
-        let mut prev = 0;
         for (lsn, fr) in &all[..2] {
-            match rcol.append_raw_frame(fr, prev).unwrap() {
+            match rcol.append_raw_frame(fr).unwrap() {
                 ReplicaApply::Applied { lsn: a, .. } => assert_eq!(a, *lsn),
                 other => panic!("expected Applied, got {:?}", other),
             }
-            prev = *lsn;
         }
 
-        let backfill = contiguous_prefix(2, pcol.read_frames_after(2, 5).unwrap());
+        let backfill = chain_prefix(2, 1, pcol.read_frames_after(2, 5).unwrap());
         let bf_lsns: Vec<u64> = backfill.iter().map(|(l, _)| *l).collect();
         assert_eq!(bf_lsns, vec![3, 4, 5]);
 
         for (lsn, fr) in &backfill {
-            match rcol.append_raw_frame(fr, prev).unwrap() {
+            match rcol.append_raw_frame(fr).unwrap() {
                 ReplicaApply::Applied { lsn: a, .. } => assert_eq!(a, *lsn),
                 other => panic!("expected Applied during backfill, got {:?}", other),
             }
-            prev = *lsn;
         }
 
         rcol.enqueue_commit().await.unwrap().unwrap();
@@ -5690,12 +5889,205 @@ mod tests {
         lsns.sort();
         assert_eq!(lsns, vec![3, 4], "compaction should drop overwritten lsns 1 and 2");
 
-        let from_zero = contiguous_prefix(0, col.read_frames_after(0, 4).unwrap());
-        assert!(from_zero.is_empty(), "no contiguous run from lsn 1 exists -> repair must snapshot");
+        let from_zero = chain_prefix(0, 0, col.read_frames_after(0, 4).unwrap());
+        assert!(from_zero.is_empty(), "the surviving frames no longer chain onto an empty log -> repair must snapshot");
 
-        let from_two = contiguous_prefix(2, col.read_frames_after(2, 4).unwrap());
+        let from_two = chain_prefix(2, 1, col.read_frames_after(2, 4).unwrap());
         let two_lsns: Vec<u64> = from_two.iter().map(|(l, _)| *l).collect();
         assert_eq!(two_lsns, vec![3, 4], "a replica already at lsn 2 can still backfill");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Hand-builds a valid frame so a test can pose as a leader at any term.
+    fn make_frame(term: u64, lsn: u64, prev_lsn: u64, prev_term: u64, key: &str, v: i64) -> Vec<u8> {
+        let entry = LogEntry::Put {
+            key: key.to_string(),
+            value: serde_json::json!({"v": v}),
+            ts: 0,
+        };
+        let payload = serde_json::to_vec(&entry).unwrap();
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&payload);
+
+        let header = FrameHeader {
+            len: payload.len() as u32,
+            crc: hasher.finalize(),
+            term,
+            lsn,
+            prev_lsn,
+            prev_term,
+        };
+
+        let mut frame = header.encode().to_vec();
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    #[tokio::test]
+    async fn frames_chain_to_their_collection_predecessor_not_to_lsn_minus_one() {
+        let proot = temp_root();
+        let rroot = temp_root();
+
+        let pdb = Database::new(&proot).unwrap();
+        let pa = pdb.get_collection("alpha").unwrap();
+        let pb = pdb.get_collection("beta").unwrap();
+
+        let (fa1, _, _, la1) = pa.put("k1".into(), serde_json::json!({"v": 1}), 1).unwrap();
+        let (fb1, _, _, lb1) = pb.put("k1".into(), serde_json::json!({"v": 2}), 1).unwrap();
+        let (fa2, _, _, la2) = pa.put("k2".into(), serde_json::json!({"v": 3}), 1).unwrap();
+        let (fb2, _, _, lb2) = pb.put("k2".into(), serde_json::json!({"v": 4}), 1).unwrap();
+
+        assert_eq!((la1, lb1, la2, lb2), (1, 2, 3, 4),
+            "LSNs are handed out by one database-wide counter, so collections interleave");
+
+        assert_eq!(FrameHeader::parse(&fa1).unwrap().prev_lsn, 0);
+        assert_eq!(FrameHeader::parse(&fb1).unwrap().prev_lsn, 0,
+            "beta's first frame has no predecessor in beta, even though alpha already used lsn 1");
+        assert_eq!(FrameHeader::parse(&fa2).unwrap().prev_lsn, 1,
+            "alpha's second frame follows alpha's first, not the globally previous lsn 2");
+        assert_eq!(FrameHeader::parse(&fb2).unwrap().prev_lsn, 2);
+
+        let rdb = Database::new(&rroot).unwrap();
+        let ra = rdb.get_collection("alpha").unwrap();
+        let rb = rdb.get_collection("beta").unwrap();
+
+        for (col, frame, expected) in [(&ra, &fa1, 1u64), (&rb, &fb1, 2), (&ra, &fa2, 3), (&rb, &fb2, 4)] {
+            match col.append_raw_frame(frame).unwrap() {
+                ReplicaApply::Applied { lsn, .. } => assert_eq!(lsn, expected),
+                other => panic!(
+                    "a write to a second collection must not look like a gap (lsn {}), got {:?}",
+                    expected, other),
+            }
+        }
+
+        ra.enqueue_commit().await.unwrap().unwrap();
+        rb.enqueue_commit().await.unwrap().unwrap();
+        drop(ra);
+        drop(rb);
+        drop(rdb);
+
+        let rdb2 = Database::new(&rroot).unwrap();
+        assert_eq!(rdb2.get_collection("alpha").unwrap().get("k2").unwrap(), Some(serde_json::json!({"v": 3})));
+        assert_eq!(rdb2.get_collection("beta").unwrap().get("k2").unwrap(), Some(serde_json::json!({"v": 4})));
+
+        let _ = fs::remove_dir_all(&proot);
+        let _ = fs::remove_dir_all(&rroot);
+    }
+
+    #[tokio::test]
+    async fn a_replica_holding_a_superseded_leaders_tail_reports_divergence() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        let mut prev = (0u64, 0u64);
+        for lsn in 1..=3u64 {
+            let frame = make_frame(1, lsn, prev.0, prev.1, &format!("k{}", lsn), lsn as i64);
+            match col.append_raw_frame(&frame).unwrap() {
+                ReplicaApply::Applied { .. } => {},
+                other => panic!("term-1 replication should apply cleanly, got {:?}", other),
+            }
+            prev = (lsn, 1);
+        }
+
+        // The term-1 leader died before lsn 3 was acked by a majority. The winner
+        // of the next election only had lsn 2, so it re-uses lsn 3 for its own entry.
+        let contested = make_frame(2, 3, 2, 1, "k3", 99);
+        match col.append_raw_frame(&contested).unwrap() {
+            ReplicaApply::Divergent { last_lsn, last_term } => assert_eq!((last_lsn, last_term), (3, 1),
+                "the replica must report where its own log ends so the primary can replace it"),
+            other => panic!("a newer term re-using an occupied lsn is divergence, not a duplicate: {:?}", other),
+        }
+
+        // A plain retransmit from the same term is still just a duplicate.
+        let retransmit = make_frame(1, 2, 1, 1, "k2", 2);
+        match col.append_raw_frame(&retransmit).unwrap() {
+            ReplicaApply::Duplicate { last_lsn } => assert_eq!(last_lsn, 3),
+            other => panic!("expected Duplicate, got {:?}", other),
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_frame_whose_predecessor_sits_in_another_term_is_refused() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        let first = make_frame(1, 1, 0, 0, "k1", 1);
+        assert!(matches!(col.append_raw_frame(&first).unwrap(), ReplicaApply::Applied { .. }));
+
+        // Same predecessor position, but the leader believes lsn 1 was written in
+        // term 2. One of us has the wrong entry there.
+        let mismatched = make_frame(2, 2, 1, 2, "k2", 2);
+        match col.append_raw_frame(&mismatched).unwrap() {
+            ReplicaApply::Divergent { last_lsn, last_term } => assert_eq!((last_lsn, last_term), (1, 1)),
+            other => panic!("log matching must reject a predecessor from another term, got {:?}", other),
+        }
+
+        let agreed = make_frame(2, 2, 1, 1, "k2", 2);
+        match col.append_raw_frame(&agreed).unwrap() {
+            ReplicaApply::Applied { lsn, .. } => assert_eq!(lsn, 2),
+            other => panic!("a new term appending onto agreed history must apply, got {:?}", other),
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn chain_prefix_stops_where_the_chain_breaks() {
+        let f1 = make_frame(1, 1, 0, 0, "k1", 1);
+        let f2 = make_frame(1, 4, 1, 1, "k2", 2);
+        let f3 = make_frame(1, 9, 4, 1, "k3", 3);
+
+        let sparse = vec![(1u64, f1.clone()), (4, f2.clone()), (9, f3.clone())];
+        let all = chain_prefix(0, 0, sparse.clone());
+        assert_eq!(all.iter().map(|(l, _)| *l).collect::<Vec<_>>(), vec![1, 4, 9],
+            "sparse LSNs still chain; only the predecessor links matter");
+
+        let from_middle = chain_prefix(4, 1, vec![(9, f3.clone())]);
+        assert_eq!(from_middle.len(), 1, "a replica sitting at lsn 4 can be streamed lsn 9");
+
+        let hole = chain_prefix(0, 0, vec![(4, f2.clone()), (9, f3.clone())]);
+        assert!(hole.is_empty(), "lsn 4 names lsn 1 as its predecessor, which an empty log does not have");
+
+        let wrong_term = chain_prefix(4, 2, vec![(9, f3)]);
+        assert!(wrong_term.is_empty(), "matching lsn but mismatched term must not chain");
+
+        let truncated = chain_prefix(0, 0, vec![(1, f1), (9, make_frame(1, 9, 5, 1, "k3", 3))]);
+        assert_eq!(truncated.iter().map(|(l, _)| *l).collect::<Vec<_>>(), vec![1],
+            "the run stops at the first frame whose predecessor is missing");
+    }
+
+    #[tokio::test]
+    async fn recompute_commit_index_follows_the_log_back_down() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+
+        let a = db.get_collection("a").unwrap();
+        for i in 0..3 {
+            live_put(&a, &format!("k{}", i), i);
+        }
+        let b = db.get_collection("b").unwrap();
+        live_put(&b, "k", 1);
+        a.enqueue_commit().await.unwrap().unwrap();
+        b.enqueue_commit().await.unwrap().unwrap();
+
+        let real_end = db.global_commit_index.load(Ordering::SeqCst);
+        assert_eq!(real_end, 4);
+
+        // A snapshot resync can leave the watermark above what the log holds,
+        // and elections compare that number.
+        db.global_commit_index.store(999, Ordering::SeqCst);
+        assert_eq!(db.recompute_commit_index().unwrap(), real_end);
+        assert_eq!(db.global_commit_index.load(Ordering::SeqCst), real_end,
+            "an inflated watermark must come back down to the real end of the log");
+        assert_eq!(LsnMeta::load(&root).map(|m| m.commit_lsn), Some(real_end),
+            "the persisted watermark must be corrected too, or a restart re-inflates it");
+
+        assert_eq!(db.recompute_commit_index().unwrap(), real_end, "recomputing is idempotent");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -5838,14 +6230,20 @@ mod tests {
             _ => panic!("expected StaleTerm"),
         }
 
-        let gap = Some(serde_json::json!({"status": "gap", "last_lsn": 42}));
+        let gap = Some(serde_json::json!({"status": "gap", "last_lsn": 42, "last_term": 7}));
         match classify_conflict(&gap) {
-            ConflictKind::Gap(l) => assert_eq!(l, 42),
+            ConflictKind::Gap(l, t) => assert_eq!((l, t), (42, 7)),
             _ => panic!("expected Gap"),
         }
 
+        let divergent = Some(serde_json::json!({"status": "divergent", "last_lsn": 11, "last_term": 3}));
+        match classify_conflict(&divergent) {
+            ConflictKind::Divergent(l) => assert_eq!(l, 11),
+            _ => panic!("expected Divergent"),
+        }
+
         match classify_conflict(&None) {
-            ConflictKind::Gap(l) => assert_eq!(l, 0),
+            ConflictKind::Gap(l, t) => assert_eq!((l, t), (0, 0)),
             _ => panic!("expected Gap default"),
         }
 
@@ -6707,21 +7105,40 @@ mod tests {
         panic!("could not bind {}", addr);
     }
 
-    async fn put_doc_http(client: &reqwest::Client, base: &str, key: &str, v: i64) -> StatusCode {
-        let url = format!("{}/collections/t/docs/{}", base, key);
+    async fn put_doc_at(client: &reqwest::Client, base: &str, col: &str, key: &str, v: i64, query: &str) -> StatusCode {
+        let url = format!("{}/collections/{}/docs/{}{}", base, col, key, query);
         match client.put(&url).json(&serde_json::json!({"value": {"v": v}})).send().await {
             Ok(r) => r.status(),
             Err(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
-    async fn read_doc_http(client: &reqwest::Client, base: &str, key: &str) -> Option<i64> {
-        let url = format!("{}/collections/t/docs/{}", base, key);
+    async fn read_doc_at(client: &reqwest::Client, base: &str, col: &str, key: &str) -> Option<i64> {
+        let url = format!("{}/collections/{}/docs/{}", base, col, key);
         let r = client.get(&url).send().await.ok()?;
         if !r.status().is_success() {
             return None;
         }
         r.json::<serde_json::Value>().await.ok()?.get("v")?.as_i64()
+    }
+
+    async fn put_doc_http(client: &reqwest::Client, base: &str, key: &str, v: i64) -> StatusCode {
+        put_doc_at(client, base, "t", key, v, "").await
+    }
+
+    async fn read_doc_http(client: &reqwest::Client, base: &str, key: &str) -> Option<i64> {
+        read_doc_at(client, base, "t", key).await
+    }
+
+    async fn wait_for_doc(client: &reqwest::Client, base: &str, col: &str, key: &str, want: i64, deadline: Duration) -> bool {
+        let start = std::time::Instant::now();
+        while start.elapsed() < deadline {
+            if read_doc_at(client, base, col, key).await == Some(want) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
     }
 
     async fn wait_for<F>(deadline: Duration, mut check: F) -> bool
@@ -6825,6 +7242,43 @@ mod tests {
         assert_eq!(read_doc_http(&client, &new_leader.url(), "k2").await, Some(2));
         assert_eq!(read_doc_http(&client, &new_leader.url(), "k1").await, Some(1),
             "data written before the failover must survive it");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn interleaved_collection_writes_replicate_without_repair_traffic() {
+        let root = temp_root();
+        let (n1, n2, n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+
+        // w=all keeps each write ordered against the next, so any gap reported
+        // here is a real chaining bug and not just an out-of-order arrival.
+        let sync = "?w=all&wtimeout=4000";
+
+        for i in 0..5 {
+            let k = format!("k{}", i);
+            assert!(put_doc_at(&client, &n1.url(), "alpha", &k, i, sync).await.is_success(),
+                "write {} to alpha must be accepted", i);
+            assert!(put_doc_at(&client, &n1.url(), "beta", &k, 100 + i, sync).await.is_success(),
+                "write {} to beta must be accepted", i);
+        }
+
+        for replica in [&n2, &n3] {
+            for i in 0..5 {
+                let k = format!("k{}", i);
+                assert!(wait_for_doc(&client, &replica.url(), "alpha", &k, i, Duration::from_secs(10)).await,
+                    "{} never received alpha/{}", replica.node_id, k);
+                assert!(wait_for_doc(&client, &replica.url(), "beta", &k, 100 + i, Duration::from_secs(10)).await,
+                    "{} never received beta/{}", replica.node_id, k);
+            }
+        }
+
+        let (gaps, divergences, resyncs) = n1.state.as_ref().unwrap().metrics.repair_counts();
+        assert_eq!((gaps, divergences, resyncs), (0, 0, 0),
+            "alternating writes between two collections must replicate directly; \
+             chaining on lsn-1 instead of the collection's own predecessor makes \
+             every second write look like a gap and drags in a full snapshot resync");
 
         let _ = fs::remove_dir_all(&root);
     }
