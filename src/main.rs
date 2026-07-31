@@ -2172,28 +2172,33 @@ fn apply_demotion(repl: &mut ReplicationState, new_term: u64) -> Option<bool> {
 
 async fn discover_leader(state: &AppState) -> Option<String> {
     let mut peers: Vec<String> = state.config.replicas.clone();
+    peers.extend(state.config.peers.iter().cloned());
     if let Some(r) = state.replication.as_ref() {
-        if let Some(p) = r.read().unwrap().primary_addr.clone() {
+        let g = r.read().unwrap();
+        if let Some(p) = g.primary_addr.clone() {
             peers.push(p);
         }
+        peers.extend(g.replicas.iter().cloned());
     }
+    peers.retain(|p| !same_endpoint(p, &state.config.listen_addr));
     peers.sort();
     peers.dedup();
 
-    let mut best: Option<(u64, String)> = None;
-    for peer in peers {
-        let url = format!("{}/internal/heartbeat", peer);
-        if let Ok(resp) = state.client.get(&url).send().await {
-            if let Ok(hb) = resp.json::<serde_json::Value>().await {
-                let role = hb.get("role").and_then(|v| v.as_str()).unwrap_or("");
-                let term = hb.get("term").and_then(|v| v.as_u64()).unwrap_or(0);
-                if role == "primary" && best.as_ref().map_or(true, |(t, _)| term > *t) {
-                    best = Some((term, peer.clone()));
-                }
-            }
+    let probes = futures::future::join_all(peers.into_iter().map(|peer| {
+        let client = state.client.clone();
+        async move {
+            let url = format!("{}/internal/heartbeat", peer);
+            let resp = client.get(&url)
+                .timeout(Duration::from_millis(PEER_PROBE_TIMEOUT_MS))
+                .send().await.ok()?;
+            let hb = resp.json::<serde_json::Value>().await.ok()?;
+            let role = hb.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            let term = hb.get("term").and_then(|v| v.as_u64()).unwrap_or(0);
+            if role == "primary" { Some((term, peer)) } else { None }
         }
-    }
-    best.map(|(_, url)| url)
+    })).await;
+
+    probes.into_iter().flatten().max_by_key(|(term, _)| *term).map(|(_, url)| url)
 }
 
 async fn maybe_follow_new_leader(state: &AppState, current_primary: &str) {
@@ -2860,6 +2865,9 @@ async fn passthrough_json(r: reqwest::Response) -> axum::response::Response {
 }
 
 const ROUTER_PROBE_INTERVAL_SECS: u64 = 3;
+const HEARTBEAT_POLL_INTERVAL_MS: u64 = 500;
+const PEER_PROBE_TIMEOUT_MS: u64 = 400;
+const VOTE_REQUEST_TIMEOUT_MS: u64 = 1500;
 
 async fn probe_node(client: &reqwest::Client, url: &str) -> Option<(String, u64)> {
     let hb = format!("{}/internal/heartbeat", url);
@@ -4747,13 +4755,42 @@ async fn heartbeat_handler(
     }))).into_response()
 }
 
+async fn adopt_existing_leader(state: &AppState) -> bool {
+    let leader = match discover_leader(state).await {
+        Some(l) => l,
+        None => return false,
+    };
+
+    let changed = {
+        let mut repl = match state.replication.as_ref() {
+            Some(r) => r.write().unwrap(),
+            None => return false,
+        };
+        let changed = repl.primary_addr.as_deref() != Some(leader.as_str());
+        repl.primary_addr = Some(leader.clone());
+        repl.last_heartbeat = Some(std::time::Instant::now());
+        changed
+    };
+
+    if changed {
+        info!(target: "failover", "Found active leader {}; following it instead of standing for election", leader);
+        let state2 = state.clone();
+        let leader2 = leader.clone();
+        tokio::spawn(async move {
+            resync_all_from(&state2, &leader2).await;
+        });
+    }
+    true
+}
+
 fn heartbeat_poll_task(state: AppState) {
     tokio::spawn(async move {
-        let timeout_secs = state.config.heartbeat_timeout_secs;
+        let timeout = Duration::from_secs(state.config.heartbeat_timeout_secs);
         let election_delay = state.config.election_delay_ms;
+        let task_started = std::time::Instant::now();
 
         loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(Duration::from_millis(HEARTBEAT_POLL_INTERVAL_MS)).await;
 
             if state.is_leader() {
                 info!(target: "heartbeat", "This node is now leader, stopping heartbeat poll");
@@ -4765,69 +4802,64 @@ fn heartbeat_poll_task(state: AppState) {
                 if !repl.heartbeat_running {
                     break;
                 }
-                match repl.primary_addr.clone() {
-                    Some(addr) => addr,
-                    None => continue,
-                }
+                repl.primary_addr.clone()
             };
 
-            let url = format!("{}/internal/heartbeat", primary_addr);
-            match state.client.get(&url).send().await {
-                Ok(r) if r.status().is_success() => {
-                    if let Ok(hb) = r.json::<serde_json::Value>().await {
-                        let mut adopted = None;
-                        {
-                            let mut repl = state.replication.as_ref().unwrap().write().unwrap();
-                            repl.last_heartbeat = Some(std::time::Instant::now());
-                            if let Some(idx) = hb.get("commit_index").and_then(|v| v.as_u64()) {
-                                repl.last_known_primary_position = Some(idx);
-                            }
-                            if let Some(t) = hb.get("term").and_then(|v| v.as_u64()) {
-                                if t > repl.term {
-                                    repl.term = t;
-                                    repl.voted_for = None;
-                                    adopted = Some(t);
+            if let Some(primary_addr) = primary_addr {
+                let url = format!("{}/internal/heartbeat", primary_addr);
+                match state.client.get(&url).send().await {
+                    Ok(r) if r.status().is_success() => {
+                        if let Ok(hb) = r.json::<serde_json::Value>().await {
+                            let mut adopted = None;
+                            {
+                                let mut repl = state.replication.as_ref().unwrap().write().unwrap();
+                                repl.last_heartbeat = Some(std::time::Instant::now());
+                                if let Some(idx) = hb.get("commit_index").and_then(|v| v.as_u64()) {
+                                    repl.last_known_primary_position = Some(idx);
+                                }
+                                if let Some(t) = hb.get("term").and_then(|v| v.as_u64()) {
+                                    if t > repl.term {
+                                        repl.term = t;
+                                        repl.voted_for = None;
+                                        adopted = Some(t);
+                                    }
                                 }
                             }
+                            if let Some(t) = adopted {
+                                let _ = ReplicationMeta { term: t, is_leader: false, voted_for: None }
+                                    .save(&state.config.data_dir);
+                                info!(target: "heartbeat", "Adopted higher term {} from primary {}", t, primary_addr);
+                            }
                         }
-                        if let Some(t) = adopted {
-                            let _ = ReplicationMeta { term: t, is_leader: false, voted_for: None }.save(&state.config.data_dir);
-                            info!(target: "heartbeat", "Adopted higher term {} from primary {}", t, primary_addr);
-                        }
+                    },
+                    Ok(r) => {
+                        warn!(target: "heartbeat", "Primary {} returned {}", primary_addr, r.status());
+                        maybe_follow_new_leader(&state, &primary_addr).await;
+                    },
+                    Err(e) => {
+                        warn!(target: "heartbeat", "Primary {} unreachable: {}", primary_addr, e);
                     }
-                },
-                Ok(r) => {
-                    warn!(target: "heartbeat", "Primary {} returned {}", primary_addr, r.status());
-                    maybe_follow_new_leader(&state, &primary_addr).await;
-                },
-                Err(e) => {
-                    warn!(target: "heartbeat", "Primary {} unreachable: {}", primary_addr, e);
-                    maybe_follow_new_leader(&state, &primary_addr).await;
                 }
             }
 
-            let should_elect = {
+            let quiet = {
                 let repl = state.replication.as_ref().unwrap().read().unwrap();
-                let my_idx = state.db.as_ref().map_or(0, |db| db.global_commit_index.load(Ordering::SeqCst));
-                let caught_up = repl.last_known_primary_position.map_or(false, |p| my_idx >= p);
-
-                if let Some(last_hb) = repl.last_heartbeat {
-                    let elapsed = last_hb.elapsed().as_secs();
-                    let repl_eligible = repl.was_receiving_replication && caught_up &&
-                        repl.last_replication.map_or(false, |lr| lr.elapsed().as_secs() < timeout_secs);
-                    elapsed > timeout_secs && repl_eligible
-                } else {
-                    repl.was_receiving_replication && caught_up &&
-                        repl.last_replication.map_or(false, |lr| lr.elapsed().as_secs() < timeout_secs)
-                }
+                contact_lost(repl.last_heartbeat, repl.last_replication, task_started.elapsed(), timeout)
             };
 
-            if should_elect {
-                info!(target: "election", "Heartbeat timeout detected, initiating election...");
-                run_election(&state, election_delay).await;
-                if state.is_leader() {
-                    break;
-                }
+            if !quiet {
+                continue;
+            }
+
+            if adopt_existing_leader(&state).await {
+                continue;
+            }
+
+            info!(target: "election", "No leader contact for {}s; standing for election", timeout.as_secs());
+            run_election(&state, election_delay).await;
+
+            if state.is_leader() {
+                break;
             }
         }
     });
@@ -4851,6 +4883,31 @@ struct VoteDecision {
     granted: bool,
     term: u64,
     voted_for: Option<String>,
+}
+
+fn leader_replica_set(configured: &[String], peers: &[String], listen_addr: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for candidate in configured.iter().chain(peers.iter()) {
+        if same_endpoint(candidate, listen_addr) {
+            continue;
+        }
+        if !out.iter().any(|existing| same_endpoint(existing, candidate)) {
+            out.push(candidate.clone());
+        }
+    }
+    out
+}
+
+fn contact_lost(
+    last_heartbeat: Option<std::time::Instant>,
+    last_replication: Option<std::time::Instant>,
+    since_start: Duration,
+    timeout: Duration,
+) -> bool {
+    match [last_heartbeat, last_replication].into_iter().flatten().max() {
+        Some(latest) => latest.elapsed() >= timeout,
+        None => since_start >= timeout,
+    }
 }
 
 fn majority(cluster_size: usize) -> usize {
@@ -4961,19 +5018,9 @@ async fn run_election(state: &AppState, max_delay_ms: u64) {
         return;
     }
 
-    {
-        let primary_addr = state.replication.as_ref().unwrap().read().unwrap().primary_addr.clone();
-        if let Some(addr) = primary_addr {
-            let url = format!("{}/internal/heartbeat", addr);
-            if let Ok(r) = state.client.get(&url).send().await {
-                if r.status().is_success() {
-                    info!(target: "election", "Primary recovered during delay, aborting election");
-                    let mut repl = state.replication.as_ref().unwrap().write().unwrap();
-                    repl.last_heartbeat = Some(std::time::Instant::now());
-                    return;
-                }
-            }
-        }
+    if adopt_existing_leader(state).await {
+        info!(target: "election", "A leader is already serving; aborting election and following it");
+        return;
     }
 
     let my_lsn = state.db.as_ref().map_or(0, |db| db.global_commit_index.load(Ordering::SeqCst));
@@ -5014,7 +5061,10 @@ async fn run_election(state: &AppState, max_delay_ms: u64) {
         let tx = tx.clone();
         tokio::spawn(async move {
             let url = format!("{}/internal/vote", peer);
-            let result = match client.post(&url).json(&req).send().await {
+            let sent = client.post(&url)
+                .timeout(Duration::from_millis(VOTE_REQUEST_TIMEOUT_MS))
+                .json(&req).send().await;
+            let result = match sent {
                 Ok(r) if r.status().is_success() => {
                     match r.json::<VoteResponse>().await {
                         Ok(v) => (v.vote_granted, v.term),
@@ -5074,6 +5124,11 @@ async fn become_leader(state: &AppState, term: u64, candidate_id: &str) {
         repl.is_leader = true;
         repl.heartbeat_running = false;
         repl.primary_addr = None;
+        repl.replicas = leader_replica_set(
+            &state.config.replicas,
+            &state.config.peers,
+            &state.config.listen_addr,
+        );
     }
     let _ = ReplicationMeta { term, is_leader: true, voted_for: Some(candidate_id.to_string()) }.save(&state.config.data_dir);
     info!(target: "election", "*** WON election: PROMOTED to primary at term {} ***", term);
@@ -5194,6 +5249,34 @@ async fn replica_sync_from_primary(
     Ok(())
 }
 
+fn build_app(state: &AppState) -> Router {
+    let mut app = Router::new()
+        .route("/health", get(health_handler))
+        .route("/metrics", get(metrics_handler))
+        .route("/collections", get(list_collections))
+        .route("/collections/:name", delete(drop_collection))
+        .route("/collections/:name/compact", post(compact_collection))
+        .route("/collections/:name/snapshot", post(snapshot_collection))
+        .route("/collections/:name/docs", post(create_doc).get(list_docs))
+        .route("/collections/:name/docs/bulk", post(bulk_create_docs))
+        .route("/collections/:name/query", get(query_docs))
+        .route("/collections/:name/docs/:id", get(get_doc).put(put_doc).patch(update_doc).delete(delete_doc));
+
+    if state.config.role == "shard" {
+        app = app
+            .route("/internal/replicate", post(replicate_handler))
+            .route("/internal/snapshot", get(snapshot_handler))
+            .route("/internal/resync", post(resync_handler))
+            .route("/internal/vote", post(vote_handler))
+            .route("/internal/drop", post(internal_drop_handler))
+            .route("/internal/heartbeat", get(heartbeat_handler));
+    }
+
+    app.layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), metrics_middleware))
+        .with_state(state.clone())
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -5243,22 +5326,22 @@ async fn main() -> io::Result<()> {
 
     let replication = if config.role == "shard" {
         let meta = ReplicationMeta::load(&config.data_dir);
+        let solo_primary = config.peers.is_empty() && config.shard_role.as_deref() == Some("primary");
+
         let (term, is_leader, voted_for) = if let Some(ref m) = meta {
-            info!(target: "boot", "Restored replication state: term={}, is_leader={}", m.term, m.is_leader);
-            let mut boot_term = m.term;
-            let mut boot_voted = m.voted_for.clone();
-            if m.is_leader {
-                boot_term += 1;
-                boot_voted = Some(config.node_id.clone());
-                let new_meta = ReplicationMeta { term: boot_term, is_leader: true, voted_for: boot_voted.clone() };
-                let _ = new_meta.save(&config.data_dir);
-                info!(target: "boot", "Escalated leader term to {} to prevent split brain.", boot_term);
+            info!(target: "boot", "Restored replication state: term={}, was_leader={}", m.term, m.is_leader);
+            if m.is_leader && !solo_primary {
+                info!(target: "boot", "Rejoining as follower at term {}; the cluster may have elected a new leader", m.term);
             }
-            (boot_term, m.is_leader, boot_voted)
+            (m.term, solo_primary, m.voted_for.clone())
         } else {
             let is_primary = config.shard_role.as_deref() == Some("primary");
+            info!(target: "boot", "No prior replication state; bootstrapping as {}",
+                if is_primary { "primary" } else { "replica" });
             (0, is_primary, None)
         };
+
+        let _ = ReplicationMeta { term, is_leader, voted_for: voted_for.clone() }.save(&config.data_dir);
 
         Some(Arc::new(RwLock::new(ReplicationState {
             term,
@@ -5316,32 +5399,7 @@ async fn main() -> io::Result<()> {
         }
     }
 
-    let mut app = Router::new()
-        .route("/health", get(health_handler))
-        .route("/metrics", get(metrics_handler))
-        .route("/collections", get(list_collections))
-        .route("/collections/:name", delete(drop_collection))
-        .route("/collections/:name/compact", post(compact_collection))
-        .route("/collections/:name/snapshot", post(snapshot_collection))
-        .route("/collections/:name/docs", post(create_doc).get(list_docs))
-        .route("/collections/:name/docs/bulk", post(bulk_create_docs))
-        .route("/collections/:name/query", get(query_docs))
-        .route("/collections/:name/docs/:id", get(get_doc).put(put_doc).patch(update_doc).delete(delete_doc));
-
-    if config.role == "shard" {
-        app = app
-            .route("/internal/replicate", post(replicate_handler))
-            .route("/internal/snapshot", get(snapshot_handler))
-            .route("/internal/resync", post(resync_handler))
-            .route("/internal/vote", post(vote_handler))
-            .route("/internal/drop", post(internal_drop_handler))
-            .route("/internal/heartbeat", get(heartbeat_handler));
-    }
-
-    let app = app
-        .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
-        .layer(axum::middleware::from_fn_with_state(state.clone(), metrics_middleware))
-        .with_state(state.clone());
+    let app = build_app(&state);
 
     if config.role == "shard" && !state.is_leader() {
         info!(target: "boot", "Starting heartbeat poll task (timeout={}s, delay={}ms)",
@@ -6469,6 +6527,516 @@ mod tests {
         let blank: NodeConfig = serde_json::from_str(
             r#"{"node_id":"n","role":"shard","listen_addr":"127.0.0.1:1","data_dir":"  "}"#).unwrap();
         assert!(blank.validate().is_err(), "a blank data_dir would write into the process cwd");
+    }
+
+    fn ago(ms: u64) -> std::time::Instant {
+        std::time::Instant::now() - Duration::from_millis(ms)
+    }
+
+    struct TestNode {
+        node_id: String,
+        addr: String,
+        data_dir: PathBuf,
+        peers: Vec<String>,
+        replicas: Vec<String>,
+        primary_addr: Option<String>,
+        shard_role: String,
+        state: Option<AppState>,
+        stop: Option<Arc<tokio::sync::Notify>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    fn free_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        drop(l);
+        port
+    }
+
+    fn node_config(n: &TestNode) -> NodeConfig {
+        let json = serde_json::json!({
+            "node_id": n.node_id,
+            "role": "shard",
+            "shard_role": n.shard_role,
+            "listen_addr": n.addr,
+            "peers": n.peers,
+            "replicas": n.replicas,
+            "primary_addr": n.primary_addr,
+            "data_dir": n.data_dir.to_string_lossy(),
+            "heartbeat_timeout_secs": 1,
+            "election_delay_ms": 200,
+            "maintenance": { "enabled": false },
+        });
+        serde_json::from_value(json).unwrap()
+    }
+
+    impl TestNode {
+        fn new(node_id: &str, port: u16, root: &Path, shard_role: &str) -> Self {
+            let data_dir = root.join(node_id);
+            fs::create_dir_all(&data_dir).unwrap();
+            Self {
+                node_id: node_id.to_string(),
+                addr: format!("127.0.0.1:{}", port),
+                data_dir,
+                peers: Vec::new(),
+                replicas: Vec::new(),
+                primary_addr: None,
+                shard_role: shard_role.to_string(),
+                state: None,
+                stop: None,
+                thread: None,
+            }
+        }
+
+        fn url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+
+        fn start(&mut self) {
+            let config = node_config(self);
+            config.validate().unwrap();
+
+            let addr = self.addr.clone();
+            let stop = Arc::new(tokio::sync::Notify::new());
+            let stop_in_node = stop.clone();
+            let (tx, rx) = std::sync::mpsc::channel::<AppState>();
+
+            let thread = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .unwrap();
+
+                rt.block_on(async move {
+                    let db = Arc::new(
+                        Database::with_cache(&config.data_dir, ReadCacheConfig::default()).unwrap());
+
+                    let meta = ReplicationMeta::load(&config.data_dir);
+                    let solo = config.peers.is_empty() && config.shard_role.as_deref() == Some("primary");
+                    let (term, is_leader, voted_for) = match &meta {
+                        Some(m) => (m.term, solo, m.voted_for.clone()),
+                        None => (0, config.shard_role.as_deref() == Some("primary"), None),
+                    };
+                    let _ = ReplicationMeta { term, is_leader, voted_for: voted_for.clone() }
+                        .save(&config.data_dir);
+
+                    let replication = Arc::new(RwLock::new(ReplicationState {
+                        term,
+                        is_leader,
+                        voted_for,
+                        last_heartbeat: None,
+                        last_replication: None,
+                        was_receiving_replication: false,
+                        heartbeat_running: !is_leader,
+                        replicas: config.replicas.clone(),
+                        primary_addr: config.primary_addr.clone(),
+                        last_known_primary_position: None,
+                    }));
+
+                    let state = AppState {
+                        db: Some(db),
+                        config: Arc::new(config.clone()),
+                        client: build_client(&config.auth),
+                        replication: Some(replication),
+                        primary_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                        shard_failover_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                        repair_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                        resyncing: Arc::new(std::sync::Mutex::new(HashSet::new())),
+                        read_rr: Arc::new(AtomicUsize::new(0)),
+                        metrics: Arc::new(Metrics::new()),
+                    };
+
+                    let app = build_app(&state);
+                    if !state.is_leader() {
+                        heartbeat_poll_task(state.clone());
+                    }
+
+                    let listener = bind_with_retry(&addr).await;
+                    tokio::spawn(async move {
+                        let _ = axum::serve(listener, app).await;
+                    });
+
+                    tx.send(state).unwrap();
+                    stop_in_node.notified().await;
+                });
+
+                rt.shutdown_background();
+            });
+
+            let state = rx.recv_timeout(Duration::from_secs(10)).expect("node failed to start");
+            self.state = Some(state);
+            self.stop = Some(stop);
+            self.thread = Some(thread);
+        }
+
+        fn kill(&mut self) {
+            self.state = None;
+            if let Some(stop) = self.stop.take() {
+                stop.notify_one();
+            }
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+
+        fn is_leader(&self) -> bool {
+            self.state.as_ref().map_or(false, |s| s.is_leader())
+        }
+
+        fn term(&self) -> u64 {
+            self.state.as_ref().map_or(0, |s| s.current_term())
+        }
+    }
+
+    impl Drop for TestNode {
+        fn drop(&mut self) {
+            if let Some(stop) = self.stop.take() {
+                stop.notify_one();
+            }
+        }
+    }
+
+    async fn bind_with_retry(addr: &str) -> tokio::net::TcpListener {
+        for _ in 0..50 {
+            match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => return l,
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        }
+        panic!("could not bind {}", addr);
+    }
+
+    async fn put_doc_http(client: &reqwest::Client, base: &str, key: &str, v: i64) -> StatusCode {
+        let url = format!("{}/collections/t/docs/{}", base, key);
+        match client.put(&url).json(&serde_json::json!({"value": {"v": v}})).send().await {
+            Ok(r) => r.status(),
+            Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
+    async fn read_doc_http(client: &reqwest::Client, base: &str, key: &str) -> Option<i64> {
+        let url = format!("{}/collections/t/docs/{}", base, key);
+        let r = client.get(&url).send().await.ok()?;
+        if !r.status().is_success() {
+            return None;
+        }
+        r.json::<serde_json::Value>().await.ok()?.get("v")?.as_i64()
+    }
+
+    async fn wait_for<F>(deadline: Duration, mut check: F) -> bool
+    where
+        F: FnMut() -> bool,
+    {
+        let start = std::time::Instant::now();
+        while start.elapsed() < deadline {
+            if check() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    fn leaders(nodes: &[&TestNode]) -> Vec<String> {
+        nodes.iter().filter(|n| n.is_leader()).map(|n| n.node_id.clone()).collect()
+    }
+
+    async fn settle_leader(nodes: &[&TestNode], deadline: Duration) -> Option<String> {
+        let start = std::time::Instant::now();
+        let mut candidate: Option<(String, std::time::Instant)> = None;
+
+        while start.elapsed() < deadline {
+            let current = leaders(nodes);
+            if current.len() == 1 {
+                let holder = current[0].clone();
+                match &candidate {
+                    Some((id, since)) if *id == holder => {
+                        if since.elapsed() >= Duration::from_millis(1200) {
+                            return Some(holder);
+                        }
+                    },
+                    _ => candidate = Some((holder, std::time::Instant::now())),
+                }
+            } else {
+                candidate = None;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        None
+    }
+
+    fn node_by_id<'a>(nodes: &[&'a TestNode], id: &str) -> &'a TestNode {
+        nodes.iter().find(|n| n.node_id == id).expect("leader vanished")
+    }
+
+    async fn three_node_cluster(root: &Path) -> (TestNode, TestNode, TestNode) {
+        let (p1, p2, p3) = (free_port(), free_port(), free_port());
+        let (u1, u2, u3) = (
+            format!("http://127.0.0.1:{}", p1),
+            format!("http://127.0.0.1:{}", p2),
+            format!("http://127.0.0.1:{}", p3),
+        );
+
+        let mut n1 = TestNode::new("n1", p1, root, "primary");
+        n1.peers = vec![u2.clone(), u3.clone()];
+        n1.replicas = vec![u2.clone(), u3.clone()];
+
+        let mut n2 = TestNode::new("n2", p2, root, "replica");
+        n2.peers = vec![u1.clone(), u3.clone()];
+        n2.primary_addr = Some(u1.clone());
+
+        let mut n3 = TestNode::new("n3", p3, root, "replica");
+        n3.peers = vec![u1.clone(), u2.clone()];
+        n3.primary_addr = Some(u1.clone());
+
+        n1.start();
+        n2.start();
+        n3.start();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        (n1, n2, n3)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_follower_takes_over_when_the_leader_stops_heartbeating() {
+        let root = temp_root();
+        let (mut n1, n2, n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().unwrap();
+
+        assert_eq!(leaders(&[&n1, &n2, &n3]), vec!["n1".to_string()], "n1 starts as the only leader");
+
+        assert_eq!(put_doc_http(&client, &n1.url(), "k1", 1).await, StatusCode::CREATED);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(read_doc_http(&client, &n2.url(), "k1").await, Some(1), "write replicated to n2");
+        assert_eq!(read_doc_http(&client, &n3.url(), "k1").await, Some(1), "write replicated to n3");
+
+        let term_before = n1.term();
+        n1.kill();
+
+        let winner = settle_leader(&[&n2, &n3], Duration::from_secs(20)).await
+            .expect("a follower must stand for election once the leader stops heartbeating");
+
+        let new_leader = node_by_id(&[&n2, &n3], &winner);
+        assert!(new_leader.term() > term_before,
+            "the new leader must run at a higher term ({} vs {})", new_leader.term(), term_before);
+
+        assert_eq!(put_doc_http(&client, &new_leader.url(), "k2", 2).await, StatusCode::CREATED,
+            "the new leader must accept writes");
+        assert_eq!(read_doc_http(&client, &new_leader.url(), "k2").await, Some(2));
+        assert_eq!(read_doc_http(&client, &new_leader.url(), "k1").await, Some(1),
+            "data written before the failover must survive it");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn failover_elects_a_single_leader_every_time() {
+        for attempt in 0..3 {
+            let root = temp_root();
+            let (mut n1, n2, n3) = three_node_cluster(&root).await;
+            let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().unwrap();
+
+            assert_eq!(put_doc_http(&client, &n1.url(), "k1", 1).await, StatusCode::CREATED);
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            n1.kill();
+
+            let winner = settle_leader(&[&n2, &n3], Duration::from_secs(20)).await;
+            assert!(winner.is_some(), "attempt {}: failover must be repeatable, not a fluke", attempt);
+
+            let holder = node_by_id(&[&n2, &n3], winner.as_ref().unwrap());
+            assert_eq!(put_doc_http(&client, &holder.url(), "k2", 2).await, StatusCode::CREATED,
+                "attempt {}: the settled leader must accept writes", attempt);
+
+            drop(n2);
+            drop(n3);
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_surviving_follower_follows_the_new_leader() {
+        let root = temp_root();
+        let (mut n1, n2, n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().unwrap();
+
+        assert_eq!(put_doc_http(&client, &n1.url(), "k1", 1).await, StatusCode::CREATED);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        n1.kill();
+
+        let winner = settle_leader(&[&n2, &n3], Duration::from_secs(20)).await
+            .expect("no leader was elected");
+
+        let leader = node_by_id(&[&n2, &n3], &winner);
+        let follower = if winner == "n2" { &n3 } else { &n2 };
+
+        assert_eq!(put_doc_http(&client, &leader.url(), "k2", 2).await, StatusCode::CREATED);
+
+        let follower_url = follower.url();
+        let start = std::time::Instant::now();
+        let mut converged = false;
+        while start.elapsed() < Duration::from_secs(20) {
+            if read_doc_http(&client, &follower_url, "k2").await == Some(2) {
+                converged = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        assert!(converged, "the surviving follower must discover the new leader and receive its writes");
+        assert!(!follower.is_leader(), "the follower must not also claim leadership");
+        assert_eq!(leaders(&[&n2, &n3]).len(), 1, "exactly one leader must remain");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_recovered_leader_rejoins_as_a_follower_without_stealing_back() {
+        let root = temp_root();
+        let (mut n1, n2, n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().unwrap();
+
+        assert_eq!(put_doc_http(&client, &n1.url(), "k1", 1).await, StatusCode::CREATED);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        n1.kill();
+        let winner = settle_leader(&[&n2, &n3], Duration::from_secs(20)).await
+            .expect("no leader was elected");
+        let new_leader_term = node_by_id(&[&n2, &n3], &winner).term();
+
+        let leader_url = node_by_id(&[&n2, &n3], &winner).url();
+        assert_eq!(put_doc_http(&client, &leader_url, "k2", 2).await, StatusCode::CREATED);
+
+        n1.start();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        assert!(!n1.is_leader(),
+            "a restarted leader must rejoin as a follower; resuming leadership from disk causes split brain");
+        assert_eq!(leaders(&[&n1, &n2, &n3]), vec![winner.clone()],
+            "the cluster must still have exactly the leader it elected");
+        assert!(n1.term() >= new_leader_term,
+            "the rejoining node must adopt the cluster's term, got {} vs {}", n1.term(), new_leader_term);
+
+        assert_eq!(put_doc_http(&client, &n1.url(), "k3", 3).await, StatusCode::FORBIDDEN,
+            "the rejoined node must refuse direct writes now that it is a follower");
+
+        let start = std::time::Instant::now();
+        let mut caught_up = false;
+        while start.elapsed() < Duration::from_secs(20) {
+            if read_doc_http(&client, &n1.url(), "k2").await == Some(2) {
+                caught_up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(caught_up, "the rejoined node must receive the writes it missed while down");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_healthy_leader_is_never_displaced() {
+        let root = temp_root();
+        let (n1, n2, n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().unwrap();
+
+        let term_before = n1.term();
+        for i in 0..3 {
+            assert_eq!(put_doc_http(&client, &n1.url(), &format!("k{}", i), i).await, StatusCode::CREATED);
+            tokio::time::sleep(Duration::from_millis(400)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        assert_eq!(leaders(&[&n1, &n2, &n3]), vec!["n1".to_string()],
+            "followers must not depose a leader that is still answering heartbeats");
+        assert_eq!(n1.term(), term_before, "a stable cluster must not churn terms");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_minority_cannot_elect_itself() {
+        let root = temp_root();
+        let (mut n1, n2, mut n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().unwrap();
+
+        assert_eq!(put_doc_http(&client, &n1.url(), "k1", 1).await, StatusCode::CREATED);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        n1.kill();
+        n3.kill();
+
+        tokio::time::sleep(Duration::from_secs(8)).await;
+
+        assert!(!n2.is_leader(),
+            "a single survivor out of three must not promote itself; that would allow split brain");
+        assert_eq!(put_doc_http(&client, &n2.url(), "k2", 2).await, StatusCode::FORBIDDEN,
+            "a node that lost quorum must keep refusing writes");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn contact_lost_fires_once_the_leader_goes_quiet() {
+        let timeout = Duration::from_secs(3);
+
+        assert!(!contact_lost(Some(ago(500)), None, Duration::from_secs(60), timeout),
+            "a fresh heartbeat means the leader is alive");
+        assert!(contact_lost(Some(ago(4000)), None, Duration::from_secs(60), timeout),
+            "a stale heartbeat must trigger an election");
+
+        assert!(!contact_lost(None, Some(ago(500)), Duration::from_secs(60), timeout),
+            "recent replication counts as leader contact even with no heartbeat");
+        assert!(contact_lost(None, Some(ago(4000)), Duration::from_secs(60), timeout),
+            "stale replication must not hold off an election");
+    }
+
+    #[test]
+    fn a_dead_leader_silences_heartbeat_and_replication_together() {
+        let timeout = Duration::from_secs(3);
+
+        assert!(contact_lost(Some(ago(4000)), Some(ago(4000)), Duration::from_secs(60), timeout),
+            "when a leader dies both signals go stale at once; this must still elect. \
+             The original bug required replication to be FRESH while the heartbeat was STALE, \
+             which can never hold, so failover never happened.");
+
+        assert!(!contact_lost(Some(ago(4000)), Some(ago(100)), Duration::from_secs(60), timeout),
+            "replication still arriving means the leader lives, whatever the heartbeat poll saw");
+        assert!(!contact_lost(Some(ago(100)), Some(ago(4000)), Duration::from_secs(60), timeout),
+            "the most recent of the two signals wins");
+    }
+
+    #[test]
+    fn a_node_that_never_heard_from_anyone_still_elects() {
+        let timeout = Duration::from_secs(3);
+
+        assert!(!contact_lost(None, None, Duration::from_millis(500), timeout),
+            "a freshly started node waits out the timeout before standing");
+        assert!(contact_lost(None, None, Duration::from_secs(4), timeout),
+            "a node with no contact at all must eventually stand, or a cluster that \
+             never replicated could never elect a leader");
+    }
+
+    #[test]
+    fn a_promoted_follower_inherits_the_rest_of_the_cluster_as_replicas() {
+        let peers = vec!["http://127.0.0.1:2".to_string(), "http://127.0.0.1:3".to_string()];
+
+        let promoted = leader_replica_set(&[], &peers, "127.0.0.1:2");
+        assert_eq!(promoted, vec!["http://127.0.0.1:3".to_string()],
+            "a follower with no configured replicas must adopt its peers, minus itself, \
+             or it would accept writes and replicate them nowhere");
+
+        let configured = vec!["http://127.0.0.1:9".to_string()];
+        let merged = leader_replica_set(&configured, &peers, "127.0.0.1:1");
+        assert_eq!(merged, vec![
+            "http://127.0.0.1:9".to_string(),
+            "http://127.0.0.1:2".to_string(),
+            "http://127.0.0.1:3".to_string(),
+        ], "configured replicas come first, peers fill in the rest");
+
+        let deduped = leader_replica_set(&["http://127.0.0.1:2/".to_string()], &peers, "127.0.0.1:1");
+        assert_eq!(deduped.len(), 2, "the same endpoint written differently must not be duplicated");
+
+        assert!(leader_replica_set(&[], &[], "127.0.0.1:1").is_empty());
     }
 
     #[test]
