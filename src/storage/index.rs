@@ -65,6 +65,26 @@ pub struct LsnMeta {
     pub commit_lsn: u64,
 }
 
+// How far this collection's index reflects its log. Boot replays the whole WAL but
+// may only publish up to here; anything above was never committed and has to stay
+// staged, or a restart would expose entries a leader change can still revoke.
+#[derive(Serialize, Deserialize)]
+pub struct AppliedMeta {
+    pub applied_lsn: u64,
+}
+
+impl AppliedMeta {
+    pub fn load(col_dir: &Path) -> Option<Self> {
+        serde_json::from_str(&fs::read_to_string(col_dir.join("applied.meta")).ok()?).ok()
+    }
+
+    pub fn save(&self, col_dir: &Path) -> io::Result<()> {
+        let content = serde_json::to_string(self)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        fs::write(col_dir.join("applied.meta"), content)
+    }
+}
+
 impl LsnMeta {
     pub fn load(dir: &Path) -> Option<Self> {
         let content = fs::read_to_string(dir.join("lsn.meta")).ok()?;

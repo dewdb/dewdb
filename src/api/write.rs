@@ -59,16 +59,13 @@ async fn local_write_inner(
         Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
 
-    {
-        // Ordering: the index is published only after the frame is fsynced, so a reader
-        // can never observe a write that a crash would lose.
-        let mut index = col.index.write().unwrap();
-        if is_delete {
-            index.remove(&key);
-        } else {
-            col.apply_index_put(&mut index, key.clone(), col.build_entry(wal_id, offset, &frame[HEADER_LEN..]));
-        }
-    }
+    // Durable, but not yet readable: the index only publishes committed entries.
+    let staged = if is_delete {
+        None
+    } else {
+        Some(col.build_entry(wal_id, offset, &frame[HEADER_LEN..]))
+    };
+    col.stage(lsn, key.clone(), wal_id, offset, staged);
 
     Ok(PendingWrite { frame, term, lsn, existed })
 }
@@ -167,7 +164,7 @@ pub async fn local_patch(
 
         let col_read = col.clone();
         let key_read = key.clone();
-        let current = match tokio::task::spawn_blocking(move || col_read.get(&key_read)).await {
+        let current = match tokio::task::spawn_blocking(move || col_read.get_including_staged(&key_read)).await {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
             Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
@@ -216,12 +213,9 @@ async fn local_write_batch_inner(
         Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
 
-    {
-        let mut index = col.index.write().unwrap();
-        for (key, frame, wal_id, offset, _) in &frames {
-            let entry = col.build_entry(*wal_id, *offset, &frame[HEADER_LEN..]);
-            col.apply_index_put(&mut index, key.clone(), entry);
-        }
+    for (key, frame, wal_id, offset, lsn) in &frames {
+        let entry = col.build_entry(*wal_id, *offset, &frame[HEADER_LEN..]);
+        col.stage(*lsn, key.clone(), *wal_id, *offset, Some(entry));
     }
 
     Ok(frames.into_iter().zip(existed.into_iter())

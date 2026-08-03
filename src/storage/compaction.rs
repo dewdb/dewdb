@@ -69,6 +69,12 @@ impl Collection {
         if self.compacting.swap(true, Ordering::SeqCst) {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "Compaction already in progress"));
         }
+        // Uncommitted frames are absent from the index, so relocation would not copy
+        // them and retiring their WAL would lose them. Wait for the commit to land.
+        if self.pending_len() > 0 {
+            self.compacting.store(false, Ordering::SeqCst);
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "Uncommitted frames pending"));
+        }
         let _guard = CompactionGuard { flag: &self.compacting };
 
         let (frozen_index, frozen_through, compact_id) = {

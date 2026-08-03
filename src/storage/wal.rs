@@ -1,6 +1,6 @@
 //! WAL append, replicated-frame apply, boot replay, and frame read-back.
 
-use super::collection::{Collection, READ_POOL_HANDLES};
+use super::collection::{Collection, StagedApply, READ_POOL_HANDLES};
 use super::frame::{FrameHeader, LogEntry, ReplicaApply, HEADER_LEN, MAX_RECORD_SIZE};
 use super::index::{IndexEntry, ReadCacheConfig};
 use std::collections::BTreeMap;
@@ -22,7 +22,16 @@ pub struct WalsState {
 }
 
 impl Collection {
-    pub fn replay_file_from(wal_id: u64, path: &PathBuf, mut start_offset: u64, index: &mut BTreeMap<String, IndexEntry>, cache: &ReadCacheConfig, inline_used: &mut u64) -> io::Result<(u64, u64)> {
+    pub fn replay_file_from(
+        wal_id: u64,
+        path: &PathBuf,
+        mut start_offset: u64,
+        index: &mut BTreeMap<String, IndexEntry>,
+        pending: &mut BTreeMap<u64, StagedApply>,
+        applied_through: u64,
+        cache: &ReadCacheConfig,
+        inline_used: &mut u64,
+    ) -> io::Result<(u64, u64)> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         let file_len = file.metadata()?.len();
 
@@ -68,6 +77,33 @@ impl Collection {
             }
 
             if let Ok(entry) = serde_json::from_slice::<LogEntry>(&payload) {
+                if lsn > applied_through {
+                    // Uncommitted at the last shutdown: keep it durable but unpublished.
+                    let staged = match entry {
+                        LogEntry::Put { key, .. } => {
+                            let inline = if len <= cache.inline_max_value_bytes {
+                                Some(payload.clone().into_boxed_slice())
+                            } else {
+                                None
+                            };
+                            StagedApply {
+                                key,
+                                wal_id,
+                                offset,
+                                entry: Some(IndexEntry { wal_id, offset, len, inline }),
+                            }
+                        },
+                        LogEntry::Del { key, .. } => StagedApply { key, wal_id, offset, entry: None },
+                    };
+                    pending.insert(lsn, staged);
+                    if lsn > max_lsn {
+                        max_lsn = lsn;
+                        max_term = term;
+                    }
+                    offset += HEADER_LEN as u64 + len as u64;
+                    valid_end_offset = offset;
+                    continue;
+                }
                 match entry {
                     LogEntry::Put { key, .. } => {
                         let inline = if len as u32 <= cache.inline_max_value_bytes

@@ -1,7 +1,7 @@
 //! A collection's index, key locks, group commit, and read path.
 
 use super::frame::LogEntry;
-use super::index::{IndexEntry, IndexSnapshot, LsnMeta, ReadCacheConfig, INDEX_FILENAME};
+use super::index::{AppliedMeta, IndexEntry, IndexSnapshot, LsnMeta, ReadCacheConfig, INDEX_FILENAME};
 use super::wal::WalsState;
 use crate::query::{matches_filter, Filter};
 use std::collections::{BTreeMap, HashMap};
@@ -35,9 +35,21 @@ pub struct Collection {
     pub inline_bytes: AtomicU64,
     // Highest LSN of this collection that has been fsynced.
     pub durable_lsn: AtomicU64,
+    // Frames that are durable but not yet committed. The index holds committed
+    // state only, so readers never see an entry a leader change could revoke.
+    pub pending: std::sync::Mutex<BTreeMap<u64, StagedApply>>,
+    pub applied_lsn: AtomicU64,
+    watermark_recorded: AtomicBool,
     pub db_durable_lsn: Arc<AtomicU64>,
     pub db_next_lsn: Arc<AtomicU64>,
     pub db_last_log_term: Arc<AtomicU64>,
+}
+
+pub struct StagedApply {
+    pub key: String,
+    pub wal_id: u64,
+    pub offset: u64,
+    pub entry: Option<IndexEntry>,
 }
 
 impl Collection {
@@ -54,7 +66,14 @@ impl Collection {
         fs::create_dir_all(&root_path)?;
         let data_root = root_path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
+        // Absent means this collection has no consensus history (a fresh node, or the
+        // storage engine used on its own), so its whole log is its state.
+        let applied_through = AppliedMeta::load(&root_path)
+            .map(|m| m.applied_lsn)
+            .unwrap_or(u64::MAX);
+
         let mut index = BTreeMap::new();
+        let mut pending: BTreeMap<u64, StagedApply> = BTreeMap::new();
         let mut inline_used: u64 = 0;
         let mut wal_files = Vec::new();
 
@@ -116,7 +135,7 @@ impl Collection {
         if !snapshot_loaded {
             info!(target: "storage", collection = %name, "Replaying all WALs");
              for (id, path) in &wal_files {
-                let r = Self::replay_file_from(*id, path, 0, &mut index, &cache, &mut inline_used)?;
+                let r = Self::replay_file_from(*id, path, 0, &mut index, &mut pending, applied_through, &cache, &mut inline_used)?;
                 fold(r, &mut max_lsn, &mut max_term);
             }
         } else {
@@ -125,10 +144,10 @@ impl Collection {
                      continue;
                  } else if *id == snapshot_wal_id {
                      info!(target: "storage", collection = %name, wal_id = id, offset = snapshot_offset, "Resuming WAL from snapshot offset");
-                     let r = Self::replay_file_from(*id, path, snapshot_offset, &mut index, &cache, &mut inline_used)?;
+                     let r = Self::replay_file_from(*id, path, snapshot_offset, &mut index, &mut pending, applied_through, &cache, &mut inline_used)?;
                      fold(r, &mut max_lsn, &mut max_term);
                  } else {
-                     let r = Self::replay_file_from(*id, path, 0, &mut index, &cache, &mut inline_used)?;
+                     let r = Self::replay_file_from(*id, path, 0, &mut index, &mut pending, applied_through, &cache, &mut inline_used)?;
                      fold(r, &mut max_lsn, &mut max_term);
                  }
              }
@@ -174,6 +193,9 @@ impl Collection {
             cache,
             inline_bytes: AtomicU64::new(inline_total),
             durable_lsn: AtomicU64::new(boot_lsn),
+            pending: std::sync::Mutex::new(pending),
+            applied_lsn: AtomicU64::new(if applied_through == u64::MAX { boot_lsn } else { applied_through }),
+            watermark_recorded: AtomicBool::new(applied_through != u64::MAX),
             db_durable_lsn,
             db_next_lsn,
             db_last_log_term,
@@ -387,6 +409,16 @@ impl Collection {
         }
     }
 
+    fn read_entry(&self, entry: &IndexEntry) -> io::Result<Option<serde_json::Value>> {
+        match &entry.inline {
+            Some(payload) => Ok(Self::value_from_payload(payload)),
+            None => {
+                let payload = self.read_frame_payload(entry.wal_id, entry.offset)?;
+                Ok(Self::value_from_payload(&payload))
+            }
+        }
+    }
+
     pub fn get(&self, key: &str) -> io::Result<Option<serde_json::Value>> {
         let located = {
             let index = self.index.read().unwrap();
@@ -435,6 +467,88 @@ impl Collection {
         self.durable_lsn.load(Ordering::SeqCst)
     }
 
+    pub fn applied_lsn(&self) -> u64 {
+        self.applied_lsn.load(Ordering::SeqCst)
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.pending.lock().unwrap().len()
+    }
+
+    /// Holds a durable frame back until it is committed.
+    ///
+    /// `entry` is None for a delete. Keyed by LSN so draining is in log order.
+    pub fn stage(&self, lsn: u64, key: String, wal_id: u64, offset: u64, entry: Option<IndexEntry>) {
+        // First staged frame means this collection is consensus-managed. Record the
+        // watermark now, or a restart before the first commit would apply-all and
+        // publish entries nobody ever acknowledged.
+        if !self.watermark_recorded.swap(true, Ordering::SeqCst) {
+            let applied_lsn = self.applied_lsn();
+            if let Err(e) = (AppliedMeta { applied_lsn }).save(&self.root_path) {
+                error!(target: "storage", collection = %self.name, error = %e,
+                    "Failed to record applied watermark");
+                self.watermark_recorded.store(false, Ordering::SeqCst);
+            }
+        }
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(lsn, StagedApply { key, wal_id, offset, entry });
+    }
+
+    /// Position of the oldest frame the index does not yet reflect.
+    pub fn pending_floor(&self) -> Option<(u64, u64)> {
+        let pending = self.pending.lock().unwrap();
+        pending.values().next().map(|s| (s.wal_id, s.offset))
+    }
+
+    /// Publishes every staged frame at or below `committed_lsn`, in log order.
+    pub fn apply_committed(&self, committed_lsn: u64) -> usize {
+        let ready = {
+            let mut pending = self.pending.lock().unwrap();
+            let mut ready = std::mem::take(&mut *pending);
+            *pending = ready.split_off(&(committed_lsn + 1));
+            ready
+        };
+
+        if !ready.is_empty() {
+            let mut index = self.index.write().unwrap();
+            for (_lsn, staged) in ready.iter() {
+                match &staged.entry {
+                    Some(entry) => self.apply_index_put(&mut index, staged.key.clone(), entry.clone()),
+                    None => self.apply_index_remove(&mut index, &staged.key),
+                }
+            }
+        }
+
+        let previous = self.applied_lsn.fetch_max(committed_lsn, Ordering::SeqCst);
+        if committed_lsn > previous {
+            if let Err(e) = (AppliedMeta { applied_lsn: committed_lsn }).save(&self.root_path) {
+                error!(target: "storage", collection = %self.name, error = %e,
+                    "Failed to persist applied watermark; a restart will re-stage these entries");
+            }
+        }
+        ready.len()
+    }
+
+    /// Read-modify-write must see the newest durable value, not the newest
+    /// committed one, or a patch racing an uncommitted write silently drops it.
+    pub fn get_including_staged(&self, key: &str) -> io::Result<Option<serde_json::Value>> {
+        let staged = {
+            let pending = self.pending.lock().unwrap();
+            pending
+                .values()
+                .rev()
+                .find(|s| s.key == key)
+                .map(|s| s.entry.clone())
+        };
+        match staged {
+            Some(None) => Ok(None),
+            Some(Some(entry)) => self.read_entry(&entry),
+            None => self.get(key),
+        }
+    }
+
     pub fn last_appended_lsn(&self) -> u64 {
         self.wal_writer.lock().unwrap().last_appended_lsn
     }
@@ -443,11 +557,17 @@ impl Collection {
     // snapshot intact.
     pub fn save_index(&self) -> io::Result<u64> {
         let wal_writer = self.wal_writer.lock().unwrap();
+        // Uncommitted frames are not in the index, so replay has to start at the
+        // oldest of them or their keys would be skipped on the next boot.
+        let floor = self.pending_floor();
         let index = self.index.read().unwrap();
 
+        let (resume_wal, resume_offset) = floor
+            .unwrap_or((wal_writer.current_wal_id, wal_writer.current_wal_size));
+
         let snapshot = IndexSnapshot {
-            last_wal_id: wal_writer.current_wal_id,
-            last_offset: wal_writer.current_wal_size,
+            last_wal_id: resume_wal,
+            last_offset: resume_offset,
             last_lsn: wal_writer.last_appended_lsn,
             last_term: wal_writer.last_appended_term,
             map: index.clone(),
@@ -491,6 +611,7 @@ impl Collection {
 
         self.commit_signal.notify_one();
         self.read_pool.lock().unwrap().clear();
+        self.pending.lock().unwrap().clear();
         self.index.write().unwrap().clear();
 
         Ok(tombstone)
@@ -504,7 +625,7 @@ mod tests {
     use crate::json::merge_patch;
     use crate::storage::Database;
     use crate::storage::HEADER_LEN;
-    use crate::test_support::{idx, live_put, temp_root};
+    use crate::test_support::{idx, live_put, stage_delete, stage_put, temp_root};
     use crate::util::remove_file_with_retry;
     use std::collections::HashSet;
 
@@ -817,6 +938,190 @@ mod tests {
 
         assert!(acquired.is_ok(), "locking a batch must dedupe stripes; locking per key deadlocks on collision");
         assert_eq!(acquired.unwrap(), distinct);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_staged_write_is_invisible_until_it_is_committed() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        let first = stage_put(&col, "a", 1);
+        let second = stage_put(&col, "b", 2);
+        assert_eq!(col.pending_len(), 2);
+        assert!(col.get("a").unwrap().is_none(), "a durable but uncommitted write must not be readable");
+        assert!(col.get("b").unwrap().is_none());
+
+        assert_eq!(col.apply_committed(first), 1, "only the committed prefix is published");
+        assert_eq!(col.get("a").unwrap(), Some(serde_json::json!({"v": 1})));
+        assert!(col.get("b").unwrap().is_none(), "the entry above the watermark stays hidden");
+        assert_eq!(col.pending_len(), 1);
+
+        assert_eq!(col.apply_committed(second), 1);
+        assert_eq!(col.get("b").unwrap(), Some(serde_json::json!({"v": 2})));
+        assert_eq!(col.pending_len(), 0);
+        assert_eq!(col.applied_lsn(), second);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn staged_frames_apply_in_log_order_not_arrival_order() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        stage_put(&col, "k", 1);
+        let newer = stage_put(&col, "k", 2);
+        col.apply_committed(newer);
+
+        assert_eq!(col.get("k").unwrap(), Some(serde_json::json!({"v": 2})),
+            "the later LSN must win regardless of how the staging map was walked");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn an_uncommitted_delete_does_not_hide_the_committed_value() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        let put = stage_put(&col, "k", 1);
+        col.apply_committed(put);
+
+        let del = stage_delete(&col, "k");
+        assert_eq!(col.get("k").unwrap(), Some(serde_json::json!({"v": 1})),
+            "the delete is durable but not committed, so the old value is still the truth");
+
+        col.apply_committed(del);
+        assert!(col.get("k").unwrap().is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn read_modify_write_sees_the_staged_value() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        let put = stage_put(&col, "k", 1);
+        col.apply_committed(put);
+        stage_put(&col, "k", 2);
+
+        assert_eq!(col.get("k").unwrap(), Some(serde_json::json!({"v": 1})),
+            "readers see committed state");
+        assert_eq!(col.get_including_staged("k").unwrap(), Some(serde_json::json!({"v": 2})),
+            "a patch must merge onto the newest durable value or it silently drops it");
+
+        stage_delete(&col, "k");
+        assert!(col.get_including_staged("k").unwrap().is_none(),
+            "a staged delete is the newest durable state");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn compaction_waits_for_uncommitted_frames() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        live_put(&col, "a", 1);
+        let staged = stage_put(&col, "b", 2);
+
+        let err = col.compact().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock,
+            "relocation skips entries missing from the index, so retiring their WAL would lose them");
+
+        col.apply_committed(staged);
+        col.compact().unwrap();
+        assert_eq!(col.get("b").unwrap(), Some(serde_json::json!({"v": 2})));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_keeps_the_applied_prefix_and_restages_the_rest() {
+        let root = temp_root();
+
+        {
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("c").unwrap();
+            live_put(&col, "applied", 1);
+            stage_put(&col, "staged", 2);
+            col.save_index().unwrap();
+            col.enqueue_commit().await.unwrap().unwrap();
+        }
+
+        let db2 = Database::new(&root).unwrap();
+        let col2 = db2.get_collection("c").unwrap();
+        assert_eq!(col2.get("applied").unwrap(), Some(serde_json::json!({"v": 1})),
+            "the snapshot resumed replay at the oldest pending frame, so nothing before it was lost");
+        assert!(col2.get("staged").unwrap().is_none(),
+            "the uncommitted frame is back in the staging buffer, not published");
+        assert_eq!(col2.pending_len(), 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn an_uncommitted_tail_stays_hidden_across_a_restart() {
+        let root = temp_root();
+        let committed;
+
+        {
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("c").unwrap();
+            committed = stage_put(&col, "safe", 1);
+            stage_put(&col, "risky", 2);
+            col.apply_committed(committed);
+            col.enqueue_commit().await.unwrap().unwrap();
+
+            assert_eq!(col.get("safe").unwrap(), Some(serde_json::json!({"v": 1})));
+            assert!(col.get("risky").unwrap().is_none());
+        }
+
+        let db2 = Database::new(&root).unwrap();
+        let col2 = db2.get_collection("c").unwrap();
+
+        assert_eq!(col2.get("safe").unwrap(), Some(serde_json::json!({"v": 1})),
+            "a committed entry survives the restart");
+        assert!(col2.get("risky").unwrap().is_none(),
+            "replaying the whole log at boot would publish an entry no quorum ever held,              and a new leader could still revoke it");
+        assert_eq!(col2.applied_lsn(), committed);
+        assert_eq!(col2.pending_len(), 1, "it is still durable, just not visible");
+
+        // once the cluster commits it, the restored node publishes it like any other
+        col2.apply_committed(committed + 1);
+        assert_eq!(col2.get("risky").unwrap(), Some(serde_json::json!({"v": 2})));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_collection_with_no_consensus_history_replays_its_whole_log() {
+        let root = temp_root();
+
+        {
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("c").unwrap();
+            for i in 0..5 {
+                live_put(&col, &format!("k{}", i), i);
+            }
+            col.enqueue_commit().await.unwrap().unwrap();
+        }
+
+        let db2 = Database::new(&root).unwrap();
+        let col2 = db2.get_collection("c").unwrap();
+        for i in 0..5 {
+            assert_eq!(col2.get(&format!("k{}", i)).unwrap(), Some(serde_json::json!({"v": i})),
+                "with no watermark on disk the log is the state, so the storage engine                  stays usable on its own");
+        }
+        assert_eq!(col2.pending_len(), 0);
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -65,13 +65,18 @@ impl AppState {
             .and_then(|db| db.get_collection(collection).ok())
             .map_or(0, |col| col.durable_lsn());
 
-        let mut g = repl.write().unwrap();
-        g.progress.observe_ack(replica, collection, lsn);
-        if !g.is_leader || ack_term != g.term {
-            return g.progress.committed(collection);
-        }
-        let replicas = g.replicas.clone();
-        g.progress.advance(collection, leader_durable, &replicas)
+        let committed = {
+            let mut g = repl.write().unwrap();
+            g.progress.observe_ack(replica, collection, lsn);
+            if !g.is_leader || ack_term != g.term {
+                g.progress.committed(collection)
+            } else {
+                let replicas = g.replicas.clone();
+                g.progress.advance(collection, leader_durable, &replicas)
+            }
+        };
+        self.apply_committed(collection, committed);
+        committed
     }
 
     pub fn committed_lsn(&self, collection: &str) -> u64 {
@@ -85,6 +90,13 @@ impl AppState {
         match self.replication.as_ref() {
             Some(r) => r.read().unwrap().progress.matched(replica, collection),
             None => 0,
+        }
+    }
+
+    pub fn all_committed(&self) -> Vec<(String, u64)> {
+        match self.replication.as_ref() {
+            Some(r) => r.read().unwrap().progress.all_committed(),
+            None => Vec::new(),
         }
     }
 
@@ -102,12 +114,17 @@ impl AppState {
             Some(r) => r,
             None => return 0,
         };
-        let mut g = repl.write().unwrap();
-        if !g.is_leader {
-            return g.progress.committed(collection);
-        }
-        let replicas = g.replicas.clone();
-        g.progress.advance(collection, durable_lsn, &replicas)
+        let committed = {
+            let mut g = repl.write().unwrap();
+            if !g.is_leader {
+                g.progress.committed(collection)
+            } else {
+                let replicas = g.replicas.clone();
+                g.progress.advance(collection, durable_lsn, &replicas)
+            }
+        };
+        self.apply_committed(collection, committed);
+        committed
     }
 
     pub fn note_leader_committed(&self, collection: &str, lsn: u64) {
@@ -117,6 +134,34 @@ impl AppState {
             if lsn > *slot {
                 *slot = lsn;
             }
+        }
+        self.apply_committed(collection, lsn);
+    }
+
+    /// What this node believes is committed: its own quorum when it leads, the
+    /// leader's reported watermark when it follows.
+    pub fn committed_hint(&self, collection: &str) -> u64 {
+        match self.replication.as_ref() {
+            Some(r) => {
+                let g = r.read().unwrap();
+                if g.is_leader {
+                    g.progress.committed(collection)
+                } else {
+                    g.leader_committed.get(collection).copied().unwrap_or(0)
+                }
+            },
+            None => 0,
+        }
+    }
+
+    // Never called while the replication lock is held: apply takes the pending and
+    // index locks, and note_ack reaches the collections lock the other way round.
+    pub fn apply_committed(&self, collection: &str, committed: u64) {
+        if committed == 0 {
+            return;
+        }
+        if let Some(col) = self.db.as_ref().and_then(|db| db.get_collection(collection).ok()) {
+            col.apply_committed(committed);
         }
     }
 

@@ -213,6 +213,19 @@ pub fn heartbeat_poll_task(state: AppState) {
                                     }
                                 }
                             }
+                            for (col, lsn) in hb
+                                .get("committed")
+                                .and_then(|c| c.as_object())
+                                .map(|m| {
+                                    m.iter()
+                                        .filter_map(|(k, v)| v.as_u64().map(|l| (k.clone(), l)))
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default()
+                            {
+                                state.note_leader_committed(&col, lsn);
+                            }
+
                             if let Some(t) = adopted {
                                 let _ = ReplicationMeta { term: t, is_leader: false, voted_for: None }
                                     .save(&state.config.data_dir);
@@ -271,7 +284,10 @@ fn contact_lost(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{leaders, node_by_id, put_doc_http, read_doc_http, settle_leader, temp_root, three_node_cluster};
+    use crate::test_support::{
+        leaders, node_by_id, put_doc_at, put_doc_http, read_doc_http, settle_leader, temp_root,
+        three_node_cluster,
+    };
     use axum::http::StatusCode;
 
     fn ago(ms: u64) -> std::time::Instant {
@@ -301,9 +317,11 @@ mod tests {
         assert!(new_leader.term() > term_before,
             "the new leader must run at a higher term ({} vs {})", new_leader.term(), term_before);
 
-        assert_eq!(put_doc_http(&client, &new_leader.url(), "k2", 2).await, StatusCode::CREATED,
-            "the new leader must accept writes");
-        assert_eq!(read_doc_http(&client, &new_leader.url(), "k2").await, Some(2));
+        assert_eq!(
+            put_doc_at(&client, &new_leader.url(), "t", "k2", 2, "?w=majority&wtimeout=4000").await,
+            StatusCode::CREATED, "the new leader must accept writes");
+        assert_eq!(read_doc_http(&client, &new_leader.url(), "k2").await, Some(2),
+            "a committed write is readable straight away");
         assert_eq!(read_doc_http(&client, &new_leader.url(), "k1").await, Some(1),
             "data written before the failover must survive it");
 

@@ -32,6 +32,8 @@ fn collection_metrics(db: &Database) -> Vec<serde_json::Value> {
             "live_bytes": usage.as_ref().map(|u| u.live_bytes),
             "dead_bytes": usage.as_ref().map(|u| u.dead_bytes()),
             "dead_ratio": usage.as_ref().map(|u| u.dead_ratio()),
+            "applied_lsn": col.applied_lsn(),
+            "pending_apply": col.pending_len(),
             "cached_documents": cached,
             "cache_bytes": col.inline_bytes.load(Ordering::Relaxed),
             "compacting": col.compacting.load(Ordering::Relaxed),

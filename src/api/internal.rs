@@ -136,17 +136,18 @@ pub async fn replicate_handler(
             match commit_rx.await {
                 Ok(Ok(())) => {
                     if let Some(entry) = entry_opt {
-                        let mut index = col.index.write().unwrap();
-                        match entry {
+                        let staged = match entry {
                             LogEntry::Put { key, .. } => {
-                                let e = col.build_entry(wal_id, offset, &payload_for_index);
-                                col.apply_index_put(&mut index, key, e);
+                                (key, Some(col.build_entry(wal_id, offset, &payload_for_index)))
                             },
-                            LogEntry::Del { key, .. } => {
-                                col.apply_index_remove(&mut index, &key);
-                            }
-                        }
+                            LogEntry::Del { key, .. } => (key, None),
+                        };
+                        col.stage(lsn, staged.0, wal_id, offset, staged.1);
                     }
+                    // The watermark the leader sent is one message behind this frame,
+                    // so the frame itself becomes visible on the next replicate or
+                    // heartbeat that carries a higher commit index.
+                    col.apply_committed(state.committed_hint(&req.collection));
 
                     if let Some(ref repl) = state.replication {
                         let mut r = repl.write().unwrap();
@@ -248,6 +249,10 @@ pub async fn heartbeat_handler(
         "node_id": state.config.node_id,
         "durable_lsn": state.db.as_ref().map_or(0, |db| db.durable_lsn.load(Ordering::SeqCst)),
         "commit_index": state.max_committed_lsn(),
+        // Followers need this to publish the last entry of an otherwise idle cluster.
+        "committed": state.all_committed().into_iter()
+            .map(|(k, v)| (k, serde_json::Value::from(v)))
+            .collect::<serde_json::Map<String, serde_json::Value>>(),
     }))).into_response()
 }
 

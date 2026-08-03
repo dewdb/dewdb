@@ -44,6 +44,10 @@ impl Progress {
         self.committed.get(collection).copied().unwrap_or(0)
     }
 
+    pub fn all_committed(&self) -> Vec<(String, u64)> {
+        self.committed.iter().map(|(k, v)| (k.clone(), *v)).collect()
+    }
+
     pub fn max_committed(&self) -> u64 {
         self.committed.values().copied().max().unwrap_or(0)
     }

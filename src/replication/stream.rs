@@ -349,7 +349,8 @@ mod tests {
     use super::*;
     use crate::storage::{Database, ReplicaApply};
     use crate::test_support::{
-        idx, make_frame, put_doc_at, put_doc_http, temp_root, three_node_cluster, wait_for_doc,
+        idx, make_frame, put_doc_at, put_doc_http, read_doc_http, temp_root, three_node_cluster,
+        wait_for_doc,
     };
     use std::fs;
 
@@ -544,6 +545,10 @@ mod tests {
         assert!(tail > committed_before, "the entry is durable on the leader");
         assert_eq!(leader.committed_lsn("t"), committed_before,
             "one node of three is not a quorum, so the entry stays uncommitted;              a watermark driven by local fsync would have claimed it committed");
+        assert_eq!(read_doc_http(&client, &n1.url(), "k2").await, None,
+            "an uncommitted entry must not be readable: a new leader without it could win              the next election and revoke it");
+        assert_eq!(read_doc_http(&client, &n1.url(), "k1").await, Some(1),
+            "the committed entry is still served");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -565,6 +570,40 @@ mod tests {
         assert!(put_doc_at(&client, &n1.url(), "beta", "k", 2, "?w=all&wtimeout=4000").await.is_success());
         assert!(leader.committed_lsn("beta") > alpha, "beta commits at its own, later LSN");
         assert_eq!(leader.committed_lsn("alpha"), alpha, "alpha's watermark is unchanged");
+
+        drop(n2);
+        drop(n3);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn followers_publish_the_last_write_of_an_idle_cluster() {
+        let root = temp_root();
+        let (n1, n2, n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+
+        // A single write and then silence: the frame's own commit index only reaches
+        // the replicas on a later message, so heartbeats have to carry it.
+        assert!(put_doc_at(&client, &n1.url(), "t", "only", 7, "?w=majority&wtimeout=4000").await.is_success());
+
+        for replica in [&n2, &n3] {
+            assert!(
+                wait_for_doc(&client, &replica.url(), "t", "only", 7, Duration::from_secs(10)).await,
+                "{} never published the entry; an idle cluster must not strand it", replica.node_id);
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_committed_write_is_readable_on_the_leader_immediately() {
+        let root = temp_root();
+        let (n1, n2, n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+
+        assert!(put_doc_at(&client, &n1.url(), "t", "k", 3, "?w=majority&wtimeout=4000").await.is_success());
+        assert_eq!(read_doc_http(&client, &n1.url(), "k").await, Some(3),
+            "w=majority returns only after the quorum ack applied the entry");
 
         drop(n2);
         drop(n3);

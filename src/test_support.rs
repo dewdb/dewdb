@@ -51,6 +51,21 @@ pub fn make_frame(term: u64, lsn: u64, prev_lsn: u64, prev_term: u64, key: &str,
     frame
 }
 
+/// Appends and stages a write the way the leader write path does, leaving it
+/// durable but uncommitted.
+pub fn stage_put(col: &Arc<Collection>, key: &str, v: i64) -> u64 {
+    let (frame, wal_id, offset, lsn) = col.put(key.into(), serde_json::json!({"v": v}), 1).unwrap();
+    let entry = col.build_entry(wal_id, offset, &frame[HEADER_LEN..]);
+    col.stage(lsn, key.to_string(), wal_id, offset, Some(entry));
+    lsn
+}
+
+pub fn stage_delete(col: &Arc<Collection>, key: &str) -> u64 {
+    let (_frame, wal_id, offset, lsn) = col.delete(key.into(), 1).unwrap();
+    col.stage(lsn, key.to_string(), wal_id, offset, None);
+    lsn
+}
+
 pub fn live_put(col: &Arc<Collection>, key: &str, v: i64) {
     let (f, w, o, _) = col.put(key.into(), serde_json::json!({"v": v}), 1).unwrap();
     let entry = col.build_entry(w, o, &f[HEADER_LEN..]);
