@@ -1,0 +1,189 @@
+//! Latency histograms, replica ack watermarks, and repair counters.
+
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+pub const LATENCY_BUCKETS_MS: [f64; 11] = [0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0];
+
+#[derive(Clone, Default)]
+pub struct RouteStats {
+    pub count: u64,
+    pub errors: u64,
+    pub nanos_total: u64,
+    pub buckets: [u64; 12],
+}
+
+impl RouteStats {
+    pub fn observe(&mut self, nanos: u64, is_error: bool) {
+        self.count += 1;
+        self.nanos_total += nanos;
+        if is_error {
+            self.errors += 1;
+        }
+        let ms = nanos as f64 / 1_000_000.0;
+        let slot = LATENCY_BUCKETS_MS.iter().position(|b| ms <= *b).unwrap_or(LATENCY_BUCKETS_MS.len());
+        self.buckets[slot] += 1;
+    }
+
+    pub fn quantile_ms(&self, q: f64) -> f64 {
+        if self.count == 0 {
+            return 0.0;
+        }
+        let target = (self.count as f64 * q).ceil() as u64;
+        let mut seen = 0u64;
+        for (i, n) in self.buckets.iter().enumerate() {
+            seen += n;
+            if seen >= target {
+                return LATENCY_BUCKETS_MS.get(i).copied().unwrap_or(f64::INFINITY);
+            }
+        }
+        f64::INFINITY
+    }
+
+    pub fn avg_ms(&self) -> f64 {
+        if self.count == 0 {
+            return 0.0;
+        }
+        self.nanos_total as f64 / self.count as f64 / 1_000_000.0
+    }
+}
+
+pub struct Metrics {
+    pub started_at: std::time::Instant,
+    pub routes: std::sync::Mutex<BTreeMap<String, RouteStats>>,
+    pub replica_acked_lsn: std::sync::Mutex<BTreeMap<String, u64>>,
+    pub gaps: AtomicU64,
+    pub divergences: AtomicU64,
+    pub resyncs: AtomicU64,
+}
+
+impl Metrics {
+    pub fn new() -> Self {
+        Self {
+            started_at: std::time::Instant::now(),
+            routes: std::sync::Mutex::new(BTreeMap::new()),
+            replica_acked_lsn: std::sync::Mutex::new(BTreeMap::new()),
+            gaps: AtomicU64::new(0),
+            divergences: AtomicU64::new(0),
+            resyncs: AtomicU64::new(0),
+        }
+    }
+
+    pub fn note_gap(&self) {
+        self.gaps.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_divergence(&self) {
+        self.divergences.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn note_resync(&self) {
+        self.resyncs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn repair_counts(&self) -> (u64, u64, u64) {
+        (
+            self.gaps.load(Ordering::Relaxed),
+            self.divergences.load(Ordering::Relaxed),
+            self.resyncs.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn observe(&self, key: String, nanos: u64, is_error: bool) {
+        self.routes.lock().unwrap().entry(key).or_default().observe(nanos, is_error);
+    }
+
+    pub fn note_replica_ack(&self, replica_url: &str, lsn: u64) {
+        let mut acked = self.replica_acked_lsn.lock().unwrap();
+        let slot = acked.entry(replica_url.to_string()).or_insert(0);
+        if lsn > *slot {
+            *slot = lsn;
+        }
+    }
+
+    pub fn uptime_secs(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
+    }
+
+    pub fn routes_snapshot(&self) -> Vec<(String, RouteStats)> {
+        self.routes.lock().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+
+    pub fn replica_lag(&self, primary_lsn: u64, replicas: &[String]) -> Vec<(String, u64, u64)> {
+        let acked = self.replica_acked_lsn.lock().unwrap();
+        replicas.iter().map(|url| {
+            let seen = acked.get(url).copied().unwrap_or(0);
+            (url.clone(), seen, primary_lsn.saturating_sub(seen))
+        }).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latency_histogram_buckets_and_quantiles() {
+        let mut st = RouteStats::default();
+        for _ in 0..90 { st.observe(400_000, false); }
+        for _ in 0..9 { st.observe(30_000_000, false); }
+        st.observe(900_000_000, true);
+
+        assert_eq!(st.count, 100);
+        assert_eq!(st.errors, 1);
+        assert_eq!(st.buckets[0], 90, "0.4ms lands in the 0.5ms bucket");
+        assert_eq!(st.quantile_ms(0.50), 0.5, "p50 sits in the fast bucket");
+        assert_eq!(st.quantile_ms(0.95), 50.0, "p95 reflects the slow tail");
+        assert_eq!(st.quantile_ms(0.99), 50.0);
+        assert!((st.avg_ms() - 12.06).abs() < 0.01, "mean of 90x0.4ms + 9x30ms + 900ms, got {}", st.avg_ms());
+
+        let empty = RouteStats::default();
+        assert_eq!(empty.quantile_ms(0.99), 0.0, "an unused route must not divide by zero");
+        assert_eq!(empty.avg_ms(), 0.0);
+    }
+
+    #[test]
+    fn slow_requests_fall_into_the_overflow_bucket() {
+        let mut st = RouteStats::default();
+        st.observe(5_000_000_000, false);
+        assert_eq!(*st.buckets.last().unwrap(), 1, "5s must land in +Inf, not be dropped");
+        assert_eq!(st.quantile_ms(0.99), f64::INFINITY);
+    }
+
+    #[test]
+    fn replica_lag_is_primary_lsn_minus_acked() {
+        let m = Metrics::new();
+        let replicas = vec!["http://a".to_string(), "http://b".to_string()];
+
+        let lag = m.replica_lag(100, &replicas);
+        assert_eq!(lag[0].2, 100, "a replica that never acked is fully behind");
+
+        m.note_replica_ack("http://a", 100);
+        m.note_replica_ack("http://b", 60);
+        let lag = m.replica_lag(100, &replicas);
+        assert_eq!(lag[0].1, 100);
+        assert_eq!(lag[0].2, 0, "a caught-up replica has zero lag");
+        assert_eq!(lag[1].2, 40, "a trailing replica reports the gap");
+
+        m.note_replica_ack("http://b", 50);
+        assert_eq!(m.replica_lag(100, &replicas)[1].1, 60,
+            "an out-of-order ack must not move the watermark backwards");
+
+        assert_eq!(m.replica_lag(10, &replicas)[0].2, 0,
+            "an acked lsn ahead of the primary must not underflow");
+    }
+
+    #[test]
+    fn metrics_records_errors_separately_from_traffic() {
+        let m = Metrics::new();
+        m.observe("GET /x".to_string(), 1_000_000, false);
+        m.observe("GET /x".to_string(), 1_000_000, true);
+        m.observe("POST /y".to_string(), 1_000_000, false);
+
+        let snap = m.routes_snapshot();
+        assert_eq!(snap.len(), 2, "routes are tracked by template, not by URL");
+        let x = &snap.iter().find(|(k, _)| k == "GET /x").unwrap().1;
+        assert_eq!(x.count, 2);
+        assert_eq!(x.errors, 1);
+    }
+}

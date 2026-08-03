@@ -1,0 +1,350 @@
+//! /internal/* endpoints that cluster nodes call on each other.
+
+use crate::consensus::{decide_vote, heartbeat_poll_task, ReplicationMeta, VoteResponse, VoteRequest};
+use crate::model::err_json;
+use crate::replication::snapshot::{replica_sync_from_primary, SnapshotFileEntry};
+use crate::replication::{DropRequest, ReplicateRequest, ResyncRequest};
+use crate::state::AppState;
+use crate::storage::{FrameHeader, LogEntry, ReplicaApply, HEADER_LEN};
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::Json;
+use serde::Deserialize;
+use std::fs;
+use std::io;
+use std::sync::atomic::Ordering;
+use tracing::{info, warn};
+
+pub async fn internal_drop_handler(
+    State(state): State<AppState>,
+    Json(req): Json<DropRequest>,
+) -> impl axum::response::IntoResponse {
+    if !state.is_shard() || state.is_leader() {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "status": "not_a_replica",
+            "term": state.current_term(),
+        }))).into_response();
+    }
+
+    let our_term = state.current_term();
+    if req.term < our_term {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "status": "stale_term",
+            "term": our_term,
+        }))).into_response();
+    }
+
+    let db = state.db.as_ref().unwrap().clone();
+    let name = req.collection.clone();
+    match tokio::task::spawn_blocking(move || db.drop_collection(&name)).await {
+        Ok(Ok(existed)) => {
+            info!(target: "replica", "Dropped collection '{}' on primary's instruction", req.collection);
+            (StatusCode::OK, Json(serde_json::json!({"status": "dropped", "existed": existed}))).into_response()
+        },
+        Ok(Err(e)) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+pub async fn replicate_handler(
+    State(state): State<AppState>,
+    Json(req): Json<ReplicateRequest>,
+) -> impl axum::response::IntoResponse {
+    if let Some(idx) = req.commit_index {
+        if let Some(ref repl) = state.replication {
+            let mut r = repl.write().unwrap();
+            r.last_known_primary_position = Some(idx);
+        }
+    }
+
+    if !state.is_shard() || state.is_leader() {
+        let our_term = state.current_term();
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "status": "not_a_replica",
+            "term": our_term,
+        }))).into_response();
+    }
+
+    let our_term = state.current_term();
+    if req.term < our_term {
+        return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "status": "stale_term",
+            "term": our_term,
+        }))).into_response();
+    }
+
+    if req.term > our_term {
+        if let Some(ref repl) = state.replication {
+            let new_term = {
+                let mut r = repl.write().unwrap();
+                if req.term > r.term {
+                    r.term = req.term;
+                    r.voted_for = None;
+                    Some(r.term)
+                } else {
+                    None
+                }
+            };
+            if let Some(t) = new_term {
+                let _ = ReplicationMeta { term: t, is_leader: false, voted_for: None }.save(&state.config.data_dir);
+                info!(target: "replicate", "Adopted higher term {} from primary", t);
+            }
+        }
+    }
+
+    let db = match state.db.as_ref() {
+        Some(db) => db.clone(),
+        None => return (StatusCode::INTERNAL_SERVER_ERROR, "No database on this node").into_response(),
+    };
+
+    let col = match db.get_collection(&req.collection) {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    let frame = req.wal_frame;
+    let payload_for_index: Vec<u8> = if frame.len() > HEADER_LEN {
+        frame[HEADER_LEN..].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    // The header is authoritative; request fields are cross-checked so a mismatched
+    // sender is rejected instead of applying the wrong chain link.
+    if let Some(header) = FrameHeader::parse(&frame) {
+        if header.lsn != req.lsn {
+            return (StatusCode::BAD_REQUEST, "Frame lsn does not match request lsn").into_response();
+        }
+        if header.prev_lsn != req.prev_lsn {
+            return (StatusCode::BAD_REQUEST, "Frame prev_lsn does not match request prev_lsn").into_response();
+        }
+    }
+
+    let col_clone = col.clone();
+
+    let entry_opt = if frame.len() >= HEADER_LEN {
+        serde_json::from_slice::<LogEntry>(&frame[HEADER_LEN..]).ok()
+    } else {
+        None
+    };
+
+    match tokio::task::spawn_blocking(move || col_clone.append_raw_frame(&frame)).await {
+        Ok(Ok(ReplicaApply::Applied { wal_id, offset, lsn })) => {
+            let commit_rx = col.enqueue_commit();
+            match commit_rx.await {
+                Ok(Ok(())) => {
+                    if let Some(entry) = entry_opt {
+                        let mut index = col.index.write().unwrap();
+                        match entry {
+                            LogEntry::Put { key, .. } => {
+                                let e = col.build_entry(wal_id, offset, &payload_for_index);
+                                col.apply_index_put(&mut index, key, e);
+                            },
+                            LogEntry::Del { key, .. } => {
+                                col.apply_index_remove(&mut index, &key);
+                            }
+                        }
+                    }
+
+                    if let Some(ref repl) = state.replication {
+                        let mut r = repl.write().unwrap();
+                        r.last_replication = Some(std::time::Instant::now());
+                        r.was_receiving_replication = true;
+                    }
+                    (StatusCode::OK, Json(serde_json::json!({"status": "applied", "lsn": lsn}))).into_response()
+                },
+                Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+            }
+        },
+        Ok(Ok(ReplicaApply::Duplicate { last_lsn })) => {
+            if let Some(ref repl) = state.replication {
+                let mut r = repl.write().unwrap();
+                r.last_replication = Some(std::time::Instant::now());
+                r.was_receiving_replication = true;
+            }
+            (StatusCode::OK, Json(serde_json::json!({"status": "duplicate", "last_lsn": last_lsn}))).into_response()
+        },
+        Ok(Ok(ReplicaApply::Gap { last_lsn, last_term })) => {
+            warn!(target: "replicate", "Gap detected: got prev_lsn {} but replica is at lsn {}", req.prev_lsn, last_lsn);
+            (StatusCode::CONFLICT, Json(serde_json::json!({
+                "status": "gap",
+                "last_lsn": last_lsn,
+                "last_term": last_term,
+            }))).into_response()
+        },
+        Ok(Ok(ReplicaApply::Divergent { last_lsn, last_term })) => {
+            warn!(target: "replicate", collection = %req.collection, lsn = req.lsn, term = req.term,
+                last_lsn, last_term,
+                "Log divergence: our tail came from a superseded leader, awaiting snapshot");
+            (StatusCode::CONFLICT, Json(serde_json::json!({
+                "status": "divergent",
+                "last_lsn": last_lsn,
+                "last_term": last_term,
+            }))).into_response()
+        },
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+pub async fn resync_handler(
+    State(state): State<AppState>,
+    Json(req): Json<ResyncRequest>,
+) -> impl axum::response::IntoResponse {
+    if !state.is_shard() || state.is_leader() {
+        return (StatusCode::FORBIDDEN, "Only replica nodes accept resync").into_response();
+    }
+
+    let primary_addr = match state.replication.as_ref().and_then(|r| r.read().unwrap().primary_addr.clone()) {
+        Some(a) => a,
+        None => return (StatusCode::BAD_REQUEST, "No primary configured").into_response(),
+    };
+
+    let col = req.collection.clone();
+
+    {
+        let mut set = state.resyncing.lock().unwrap();
+        if set.contains(&col) {
+            return (StatusCode::OK, "resync already in progress").into_response();
+        }
+        set.insert(col.clone());
+    }
+
+    let db = state.db.as_ref().unwrap().clone();
+    let client = state.client.clone();
+    let repl = state.replication.clone();
+    let resyncing = state.resyncing.clone();
+
+    tokio::spawn(async move {
+        if let Err(e) = replica_sync_from_primary(&client, &primary_addr, &db, &col).await {
+            warn!(target: "resync", "Failed for '{}': {}", col, e);
+        } else {
+            if let Some(r) = repl {
+                let mut g = r.write().unwrap();
+                g.last_replication = Some(std::time::Instant::now());
+                g.was_receiving_replication = true;
+            }
+            if let Err(e) = db.recompute_commit_index() {
+                warn!(target: "resync", "could not recompute commit index for '{}': {}", col, e);
+            }
+        }
+        resyncing.lock().unwrap().remove(&col);
+    });
+
+    (StatusCode::OK, "resync started").into_response()
+}
+
+pub async fn heartbeat_handler(
+    State(state): State<AppState>,
+) -> impl axum::response::IntoResponse {
+    let term = state.current_term();
+    let role = if state.is_leader() { "primary" } else { "replica" };
+    (StatusCode::OK, Json(serde_json::json!({
+        "term": term,
+        "role": role,
+        "node_id": state.config.node_id,
+        "commit_index": state.db.as_ref().map_or(0, |db| db.global_commit_index.load(Ordering::SeqCst)),
+    }))).into_response()
+}
+
+pub async fn vote_handler(
+    State(state): State<AppState>,
+    Json(req): Json<VoteRequest>,
+) -> impl axum::response::IntoResponse {
+    if !state.is_shard() {
+        return (StatusCode::FORBIDDEN, "Not a voting node").into_response();
+    }
+
+    let repl = match state.replication.as_ref() {
+        Some(r) => r,
+        None => return (StatusCode::FORBIDDEN, "No replication state").into_response(),
+    };
+
+    let my_lsn = state.db.as_ref().map_or(0, |db| db.global_commit_index.load(Ordering::SeqCst));
+    let my_log_term = state.db.as_ref().map_or(0, |db| db.last_log_term.load(Ordering::SeqCst));
+
+    let (granted, resp_term, restart_poll, persist) = {
+        let mut g = repl.write().unwrap();
+        let was_leader = g.is_leader;
+        let old_term = g.term;
+
+        let d = decide_vote(g.term, &g.voted_for, my_log_term, my_lsn, &req);
+
+        let mut restart = false;
+        g.term = d.term;
+        g.voted_for = d.voted_for.clone();
+
+        if d.term > old_term && was_leader {
+            g.is_leader = false;
+            restart = !g.heartbeat_running;
+            g.heartbeat_running = true;
+        }
+
+        if d.granted {
+            g.last_heartbeat = Some(std::time::Instant::now());
+        }
+
+        let persist = ReplicationMeta { term: g.term, is_leader: g.is_leader, voted_for: g.voted_for.clone() };
+        (d.granted, d.term, restart, persist)
+    };
+
+    let _ = persist.save(&state.config.data_dir);
+    if restart_poll {
+        heartbeat_poll_task(state.clone());
+    }
+    if granted {
+        info!(target: "vote", "Granted vote to {} for term {}", req.candidate_id, req.term);
+    }
+
+    (StatusCode::OK, Json(VoteResponse { term: resp_term, vote_granted: granted })).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct SnapshotQuery {
+    pub collection: String,
+}
+
+pub async fn snapshot_handler(
+    State(state): State<AppState>,
+    Query(params): Query<SnapshotQuery>,
+) -> impl axum::response::IntoResponse {
+    if !state.is_leader() {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Only primary nodes serve snapshots"}))).into_response();
+    }
+
+    let db = match state.db.as_ref() {
+        Some(db) => db.clone(),
+        None => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "No database".to_string()),
+    };
+
+    let col = match db.get_collection(&params.collection) {
+        Ok(c) => c,
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    let col_clone = col.clone();
+    let _ = tokio::task::spawn_blocking(move || col_clone.save_index()).await;
+
+    let col_path = col.root_path.clone();
+    let files = match tokio::task::spawn_blocking(move || -> io::Result<Vec<SnapshotFileEntry>> {
+        let mut entries = Vec::new();
+        for dir_entry in fs::read_dir(&col_path)? {
+            let dir_entry = dir_entry?;
+            let path = dir_entry.path();
+            if path.is_file() {
+                let filename = dir_entry.file_name().to_string_lossy().to_string();
+                let data = fs::read(&path)?;
+                entries.push(SnapshotFileEntry { filename, data });
+            }
+        }
+        Ok(entries)
+    }).await {
+        Ok(Ok(entries)) => entries,
+        Ok(Err(e)) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+
+    (StatusCode::OK, Json(files)).into_response()
+}
