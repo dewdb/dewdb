@@ -3,7 +3,7 @@
 use crate::api::build_app;
 use crate::auth::build_client;
 use crate::config::NodeConfig;
-use crate::consensus::{heartbeat_poll_task, ReplicationMeta, ReplicationState};
+use crate::consensus::{heartbeat_poll_task, Progress, ReplicationMeta, ReplicationState};
 use crate::metrics::Metrics;
 use crate::state::AppState;
 use crate::storage::index::IndexEntry;
@@ -157,6 +157,8 @@ impl TestNode {
                     replicas: config.replicas.clone(),
                     primary_addr: config.primary_addr.clone(),
                     last_known_primary_position: None,
+            progress: Progress::new(),
+            leader_committed: HashMap::new(),
                 }));
 
                 let state = AppState {

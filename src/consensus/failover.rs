@@ -103,8 +103,8 @@ async fn resync_all_from(state: &AppState, leader: &str) {
         }
     }
 
-    if let Err(e) = db.recompute_commit_index() {
-        warn!(target: "demote", "could not recompute commit index after resync: {}", e);
+    if let Err(e) = db.recompute_durable_lsn() {
+        warn!(target: "demote", "could not recompute durable LSN after resync: {}", e);
     }
 }
 

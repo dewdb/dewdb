@@ -51,7 +51,6 @@ impl RouteStats {
 pub struct Metrics {
     pub started_at: std::time::Instant,
     pub routes: std::sync::Mutex<BTreeMap<String, RouteStats>>,
-    pub replica_acked_lsn: std::sync::Mutex<BTreeMap<String, u64>>,
     pub gaps: AtomicU64,
     pub divergences: AtomicU64,
     pub resyncs: AtomicU64,
@@ -62,7 +61,6 @@ impl Metrics {
         Self {
             started_at: std::time::Instant::now(),
             routes: std::sync::Mutex::new(BTreeMap::new()),
-            replica_acked_lsn: std::sync::Mutex::new(BTreeMap::new()),
             gaps: AtomicU64::new(0),
             divergences: AtomicU64::new(0),
             resyncs: AtomicU64::new(0),
@@ -93,14 +91,6 @@ impl Metrics {
         self.routes.lock().unwrap().entry(key).or_default().observe(nanos, is_error);
     }
 
-    pub fn note_replica_ack(&self, replica_url: &str, lsn: u64) {
-        let mut acked = self.replica_acked_lsn.lock().unwrap();
-        let slot = acked.entry(replica_url.to_string()).or_insert(0);
-        if lsn > *slot {
-            *slot = lsn;
-        }
-    }
-
     pub fn uptime_secs(&self) -> u64 {
         self.started_at.elapsed().as_secs()
     }
@@ -109,13 +99,6 @@ impl Metrics {
         self.routes.lock().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect()
     }
 
-    pub fn replica_lag(&self, primary_lsn: u64, replicas: &[String]) -> Vec<(String, u64, u64)> {
-        let acked = self.replica_acked_lsn.lock().unwrap();
-        replicas.iter().map(|url| {
-            let seen = acked.get(url).copied().unwrap_or(0);
-            (url.clone(), seen, primary_lsn.saturating_sub(seen))
-        }).collect()
-    }
 }
 
 #[cfg(test)]
@@ -148,29 +131,6 @@ mod tests {
         st.observe(5_000_000_000, false);
         assert_eq!(*st.buckets.last().unwrap(), 1, "5s must land in +Inf, not be dropped");
         assert_eq!(st.quantile_ms(0.99), f64::INFINITY);
-    }
-
-    #[test]
-    fn replica_lag_is_primary_lsn_minus_acked() {
-        let m = Metrics::new();
-        let replicas = vec!["http://a".to_string(), "http://b".to_string()];
-
-        let lag = m.replica_lag(100, &replicas);
-        assert_eq!(lag[0].2, 100, "a replica that never acked is fully behind");
-
-        m.note_replica_ack("http://a", 100);
-        m.note_replica_ack("http://b", 60);
-        let lag = m.replica_lag(100, &replicas);
-        assert_eq!(lag[0].1, 100);
-        assert_eq!(lag[0].2, 0, "a caught-up replica has zero lag");
-        assert_eq!(lag[1].2, 40, "a trailing replica reports the gap");
-
-        m.note_replica_ack("http://b", 50);
-        assert_eq!(m.replica_lag(100, &replicas)[1].1, 60,
-            "an out-of-order ack must not move the watermark backwards");
-
-        assert_eq!(m.replica_lag(10, &replicas)[0].2, 0,
-            "an acked lsn ahead of the primary must not underflow");
     }
 
     #[test]

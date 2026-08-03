@@ -49,7 +49,7 @@ pub fn replicate_to_peers(
                 };
                 match client.post(&url).json(&req_body).send().await {
                     Ok(r) if r.status().is_success() => {
-                        state.metrics.note_replica_ack(&replica_url, lsn);
+                        state.note_ack(&replica_url, &col, lsn, term);
                     },
                     Ok(r) if r.status() == StatusCode::CONFLICT => {
                         let body = r.json::<serde_json::Value>().await.ok();
@@ -180,7 +180,7 @@ async fn repair_replica(
     }
 
     let term = state.current_term();
-    let commit_index = db.global_commit_index.load(Ordering::SeqCst);
+    let commit_index = state.committed_lsn(&collection);
     let sent = chained.len();
     let mut prev = reported_last_lsn;
 
@@ -239,7 +239,7 @@ async fn repair_replica(
         }
     }
 
-    state.metrics.note_replica_ack(&replica_url, prev);
+    state.note_ack(&replica_url, &collection, prev, term);
     info!(target: "repair", "Streamed {} frames to {}; caught up to lsn {} for '{}'", sent, replica_url, prev, collection);
     prev >= target
 }
@@ -265,7 +265,7 @@ async fn replicate_one_await(
     };
     match state.client.post(&url).json(&req).send().await {
         Ok(r) if r.status().is_success() => {
-            state.metrics.note_replica_ack(replica_url, lsn);
+            state.note_ack(replica_url, collection, lsn, term);
             true
         },
         Ok(r) if r.status() == StatusCode::CONFLICT => {
@@ -348,7 +348,9 @@ pub async fn replicate_and_await(
 mod tests {
     use super::*;
     use crate::storage::{Database, ReplicaApply};
-    use crate::test_support::{idx, make_frame, temp_root, three_node_cluster, put_doc_at, wait_for_doc};
+    use crate::test_support::{
+        idx, make_frame, put_doc_at, put_doc_http, temp_root, three_node_cluster, wait_for_doc,
+    };
     use std::fs;
 
     #[tokio::test]
@@ -362,7 +364,7 @@ mod tests {
             let _ = pcol.put(format!("k{}", i), serde_json::json!({"i": i}), 1).unwrap();
         }
         pcol.enqueue_commit().await.unwrap().unwrap();
-        assert_eq!(pdb.global_commit_index.load(Ordering::SeqCst), 5);
+        assert_eq!(pdb.durable_lsn.load(Ordering::SeqCst), 5);
 
         let all = chain_prefix(0, 0, pcol.read_frames_after(0, 5).unwrap());
         let lsns: Vec<u64> = all.iter().map(|(l, _)| *l).collect();
@@ -398,7 +400,7 @@ mod tests {
         for i in 1..=5 {
             assert_eq!(rcol2.get(&format!("k{}", i)).unwrap(), Some(serde_json::json!({"i": i})));
         }
-        assert_eq!(rdb2.global_commit_index.load(Ordering::SeqCst), 5, "replica must reach primary's LSN after backfill");
+        assert_eq!(rdb2.durable_lsn.load(Ordering::SeqCst), 5, "replica must reach primary's LSN after backfill");
 
         let _ = fs::remove_dir_all(&proot);
         let _ = fs::remove_dir_all(&rroot);
@@ -417,7 +419,7 @@ mod tests {
         let (f2, w2, o2, _) = col.put("b".into(), serde_json::json!({"v": 9}), 1).unwrap();
         col.index.write().unwrap().insert("b".into(), idx(&f2, w2, o2));
         col.enqueue_commit().await.unwrap().unwrap();
-        assert_eq!(db.global_commit_index.load(Ordering::SeqCst), 4);
+        assert_eq!(db.durable_lsn.load(Ordering::SeqCst), 4);
 
         col.compact().unwrap();
 
@@ -493,6 +495,79 @@ mod tests {
              chaining on lsn-1 instead of the collection's own predecessor makes \
              every second write look like a gap and drags in a full snapshot resync");
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_quorum_acknowledgement_advances_the_commit_index() {
+        let root = temp_root();
+        let (n1, n2, n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+
+        let leader = n1.state.as_ref().unwrap();
+        assert_eq!(leader.committed_lsn("t"), 0, "nothing is committed before the first write");
+
+        assert!(put_doc_at(&client, &n1.url(), "t", "k1", 1, "?w=all&wtimeout=4000").await.is_success());
+
+        let tail = leader.db.as_ref().unwrap()
+            .get_collection("t").unwrap().last_appended_lsn();
+        assert!(tail > 0);
+        assert_eq!(leader.committed_lsn("t"), tail,
+            "an entry both replicas acknowledged must be committed");
+        assert_eq!(leader.max_committed_lsn(), tail);
+
+        drop(n2);
+        drop(n3);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_entry_only_the_leader_holds_is_never_committed() {
+        let root = temp_root();
+        let (n1, mut n2, mut n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+
+        assert!(put_doc_at(&client, &n1.url(), "t", "k1", 1, "?w=all&wtimeout=4000").await.is_success());
+        let committed_before = n1.state.as_ref().unwrap().committed_lsn("t");
+        assert!(committed_before > 0, "the first write reached a quorum");
+
+        n2.kill();
+        n3.kill();
+
+        assert_eq!(put_doc_http(&client, &n1.url(), "k2", 2).await, StatusCode::CREATED,
+            "the leader still accepts a w=1 write with no reachable replica");
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        let leader = n1.state.as_ref().unwrap();
+        let tail = leader.db.as_ref().unwrap()
+            .get_collection("t").unwrap().last_appended_lsn();
+        assert!(tail > committed_before, "the entry is durable on the leader");
+        assert_eq!(leader.committed_lsn("t"), committed_before,
+            "one node of three is not a quorum, so the entry stays uncommitted;              a watermark driven by local fsync would have claimed it committed");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn each_collection_commits_on_its_own_acknowledgements() {
+        let root = temp_root();
+        let (n1, n2, n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+
+        assert!(put_doc_at(&client, &n1.url(), "alpha", "k", 1, "?w=all&wtimeout=4000").await.is_success());
+
+        let leader = n1.state.as_ref().unwrap();
+        let alpha = leader.committed_lsn("alpha");
+        assert!(alpha > 0);
+        assert_eq!(leader.committed_lsn("beta"), 0,
+            "acknowledging alpha says nothing about a collection nobody has written");
+
+        assert!(put_doc_at(&client, &n1.url(), "beta", "k", 2, "?w=all&wtimeout=4000").await.is_success());
+        assert!(leader.committed_lsn("beta") > alpha, "beta commits at its own, later LSN");
+        assert_eq!(leader.committed_lsn("alpha"), alpha, "alpha's watermark is unchanged");
+
+        drop(n2);
+        drop(n3);
         let _ = fs::remove_dir_all(&root);
     }
 }

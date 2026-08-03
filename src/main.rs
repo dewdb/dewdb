@@ -24,7 +24,7 @@ use crate::api::build_app;
 use crate::auth::build_client;
 use crate::cluster::probe::{router_probe_task, ROUTER_PROBE_INTERVAL_SECS};
 use crate::config::{config_warnings, NodeConfig};
-use crate::consensus::{heartbeat_poll_task, ReplicationMeta, ReplicationState};
+use crate::consensus::{heartbeat_poll_task, Progress, ReplicationMeta, ReplicationState};
 use crate::logging::init_logging;
 use crate::maintenance::maintenance_task;
 use crate::metrics::Metrics;
@@ -119,6 +119,8 @@ async fn main() -> io::Result<()> {
             replicas: config.replicas.clone(),
             primary_addr: config.primary_addr.clone(),
             last_known_primary_position: None,
+            progress: Progress::new(),
+            leader_committed: HashMap::new(),
         })))
     } else {
         None
@@ -162,8 +164,8 @@ async fn main() -> io::Result<()> {
                 }
             }
 
-            if let Err(e) = db.recompute_commit_index() {
-                warn!(target: "replica", "Could not recompute commit index after boot sync: {}", e);
+            if let Err(e) = db.recompute_durable_lsn() {
+                warn!(target: "replica", "Could not recompute durable LSN after boot sync: {}", e);
             }
         }
     }

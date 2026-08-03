@@ -9,7 +9,6 @@ use crate::state::AppState;
 use crate::storage::{Collection, FrameHeader, HEADER_LEN};
 use axum::http::StatusCode;
 use std::io;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -85,8 +84,14 @@ async fn finish_write(
         return WriteOutcome { met: true, acks: 1, required: 1, existed: pending.existed };
     }
 
-    let db = state.db.as_ref().unwrap();
-    let commit_index = db.global_commit_index.load(Ordering::SeqCst);
+    // The frame is already fsynced here, so fold our own durability into the
+    // quorum before replicating. A leader with no replicas commits on this alone.
+    let own_durable = state
+        .db
+        .as_ref()
+        .and_then(|db| db.get_collection(col_name).ok())
+        .map_or(0, |col| col.durable_lsn());
+    let commit_index = state.advance_own_commit(col_name, own_durable);
     let replicas = state.get_replicas();
     let required = required_acks(&wc, replicas.len());
     // From the frame header, not lsn - 1: the previous LSN belongs to whichever

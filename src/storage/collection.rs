@@ -33,7 +33,9 @@ pub struct Collection {
     pub compacting: AtomicBool,
     pub cache: ReadCacheConfig,
     pub inline_bytes: AtomicU64,
-    pub db_global_commit_index: Arc<AtomicU64>,
+    // Highest LSN of this collection that has been fsynced.
+    pub durable_lsn: AtomicU64,
+    pub db_durable_lsn: Arc<AtomicU64>,
     pub db_next_lsn: Arc<AtomicU64>,
     pub db_last_log_term: Arc<AtomicU64>,
 }
@@ -44,7 +46,7 @@ impl Collection {
     pub fn open(
         name: String,
         root_path: PathBuf,
-        db_global_commit_index: Arc<AtomicU64>,
+        db_durable_lsn: Arc<AtomicU64>,
         db_next_lsn: Arc<AtomicU64>,
         db_last_log_term: Arc<AtomicU64>,
         cache: ReadCacheConfig,
@@ -171,7 +173,8 @@ impl Collection {
             compacting: AtomicBool::new(false),
             cache,
             inline_bytes: AtomicU64::new(inline_total),
-            db_global_commit_index,
+            durable_lsn: AtomicU64::new(boot_lsn),
+            db_durable_lsn,
             db_next_lsn,
             db_last_log_term,
         })
@@ -309,8 +312,9 @@ impl Collection {
 
                 if count > 0 && result.is_ok() {
                     let last_lsn = { col.wal_writer.lock().unwrap().last_appended_lsn };
-                    col.db_global_commit_index.fetch_max(last_lsn, Ordering::SeqCst);
-                    let commit_lsn = col.db_global_commit_index.load(Ordering::SeqCst);
+                    col.durable_lsn.fetch_max(last_lsn, Ordering::SeqCst);
+                    col.db_durable_lsn.fetch_max(last_lsn, Ordering::SeqCst);
+                    let commit_lsn = col.db_durable_lsn.load(Ordering::SeqCst);
                     let meta = LsnMeta { commit_lsn };
                     if let Err(e) = meta.save(&col.data_root) {
                         error!(target: "storage", collection = %col.name, error = %e, "Failed to persist lsn meta");
@@ -425,6 +429,10 @@ impl Collection {
         }
 
         Ok(resolved)
+    }
+
+    pub fn durable_lsn(&self) -> u64 {
+        self.durable_lsn.load(Ordering::SeqCst)
     }
 
     pub fn last_appended_lsn(&self) -> u64 {

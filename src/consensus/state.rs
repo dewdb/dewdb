@@ -1,6 +1,8 @@
 //! Durable term/vote state and the demotion transition.
 
+use super::progress::Progress;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -24,6 +26,10 @@ pub struct ReplicationState {
     pub primary_addr: Option<String>,
     pub replicas: Vec<String>,
     pub last_known_primary_position: Option<u64>,
+    // Leader side: what each replica holds, and what a quorum has committed.
+    pub progress: Progress,
+    // Follower side: the commit watermark the leader last told us, per collection.
+    pub leader_committed: HashMap<String, u64>,
 }
 
 impl ReplicationMeta {
@@ -74,6 +80,8 @@ mod tests {
             primary_addr: None,
             replicas: vec![],
             last_known_primary_position: None,
+            progress: Progress::new(),
+            leader_committed: HashMap::new(),
         }
     }
 

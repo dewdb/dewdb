@@ -45,7 +45,7 @@ fn replication_metrics(state: &AppState) -> serde_json::Value {
         None => return serde_json::Value::Null,
     };
 
-    let commit_index = db.global_commit_index.load(Ordering::SeqCst);
+    let durable_lsn = db.durable_lsn.load(Ordering::SeqCst);
     let leader = state.is_leader();
     let term = state.current_term();
 
@@ -65,12 +65,32 @@ fn replication_metrics(state: &AppState) -> serde_json::Value {
 
     if leader {
         let replicas = state.get_replicas();
-        let lag = state.metrics.replica_lag(commit_index, &replicas);
-        let max_lag = lag.iter().map(|(_, _, l)| *l).max().unwrap_or(0);
+        // Lag is measured per collection against that collection's own tail, since
+        // a replica can be current on one collection and behind on another.
+        let tails: Vec<(String, u64)> = {
+            let open = db.collections.read().unwrap();
+            open.iter().map(|(n, c)| (n.clone(), c.last_appended_lsn())).collect()
+        };
+        let mut per_replica: std::collections::BTreeMap<String, (serde_json::Map<String, serde_json::Value>, u64)> =
+            replicas.iter().map(|url| (url.clone(), (serde_json::Map::new(), 0))).collect();
+        let mut committed = serde_json::Map::new();
+
+        for (name, tail) in &tails {
+            committed.insert(name.clone(), serde_json::Value::from(state.committed_lsn(name)));
+            for (url, (matched_map, worst_lag)) in per_replica.iter_mut() {
+                let matched = state.matched_lsn(url, name);
+                matched_map.insert(name.clone(), serde_json::Value::from(matched));
+                *worst_lag = (*worst_lag).max(tail.saturating_sub(matched));
+            }
+        }
+
+        let max_lag = per_replica.values().map(|(_, l)| *l).max().unwrap_or(0);
         serde_json::json!({
             "role": "primary",
             "term": term,
-            "commit_index": commit_index,
+            "durable_lsn": durable_lsn,
+            "commit_index": state.max_committed_lsn(),
+            "committed_by_collection": committed,
             "last_log_term": db.last_log_term.load(Ordering::SeqCst),
             "replica_count": replicas.len(),
             "max_replica_lag": max_lag,
@@ -79,9 +99,9 @@ fn replication_metrics(state: &AppState) -> serde_json::Value {
                 "divergences": divergences,
                 "resyncs_triggered": resyncs,
             },
-            "replicas": lag.into_iter().map(|(url, acked, l)| serde_json::json!({
+            "replicas": per_replica.into_iter().map(|(url, (matched, l))| serde_json::json!({
                 "url": url,
-                "acked_lsn": acked,
+                "matched": matched,
                 "lag": l,
             })).collect::<Vec<_>>(),
         })
@@ -89,11 +109,11 @@ fn replication_metrics(state: &AppState) -> serde_json::Value {
         serde_json::json!({
             "role": "replica",
             "term": term,
-            "commit_index": commit_index,
+            "durable_lsn": durable_lsn,
             "last_log_term": db.last_log_term.load(Ordering::SeqCst),
             "primary": primary_addr,
-            "primary_lsn": primary_position,
-            "lag": primary_position.map(|p| p.saturating_sub(commit_index)),
+            "primary_commit_index": primary_position,
+            "lag": primary_position.map(|p| p.saturating_sub(durable_lsn)),
             "seconds_since_replication": last_replication_secs,
         })
     }
@@ -158,6 +178,15 @@ fn render_prometheus(state: &AppState, collections: &[serde_json::Value], replic
 
     let (gaps, divergences, resyncs) = state.metrics.repair_counts();
     let node_label = format!("node_id=\"{}\"", node);
+    out.push_str("# HELP dewdb_commit_index Highest LSN a quorum has acknowledged.
+# TYPE dewdb_commit_index gauge
+");
+    prometheus_line(&mut out, "dewdb_commit_index", &node_label, state.max_committed_lsn() as f64);
+    out.push_str("# HELP dewdb_durable_lsn Highest LSN this node has fsynced.
+# TYPE dewdb_durable_lsn gauge
+");
+    prometheus_line(&mut out, "dewdb_durable_lsn", &node_label,
+        state.db.as_ref().map_or(0.0, |db| db.durable_lsn.load(Ordering::SeqCst) as f64));
     out.push_str("# HELP dewdb_replication_gaps_total Replicas that reported missing frames.\n# TYPE dewdb_replication_gaps_total counter\n");
     prometheus_line(&mut out, "dewdb_replication_gaps_total", &node_label, gaps as f64);
     out.push_str("# HELP dewdb_replication_divergences_total Replicas whose log conflicted with ours.\n# TYPE dewdb_replication_divergences_total counter\n");

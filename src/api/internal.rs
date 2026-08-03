@@ -52,6 +52,7 @@ pub async fn replicate_handler(
     Json(req): Json<ReplicateRequest>,
 ) -> impl axum::response::IntoResponse {
     if let Some(idx) = req.commit_index {
+        state.note_leader_committed(&req.collection, idx);
         if let Some(ref repl) = state.replication {
             let mut r = repl.write().unwrap();
             r.last_known_primary_position = Some(idx);
@@ -226,8 +227,8 @@ pub async fn resync_handler(
                 g.last_replication = Some(std::time::Instant::now());
                 g.was_receiving_replication = true;
             }
-            if let Err(e) = db.recompute_commit_index() {
-                warn!(target: "resync", "could not recompute commit index for '{}': {}", col, e);
+            if let Err(e) = db.recompute_durable_lsn() {
+                warn!(target: "resync", "could not recompute durable LSN for '{}': {}", col, e);
             }
         }
         resyncing.lock().unwrap().remove(&col);
@@ -245,7 +246,8 @@ pub async fn heartbeat_handler(
         "term": term,
         "role": role,
         "node_id": state.config.node_id,
-        "commit_index": state.db.as_ref().map_or(0, |db| db.global_commit_index.load(Ordering::SeqCst)),
+        "durable_lsn": state.db.as_ref().map_or(0, |db| db.durable_lsn.load(Ordering::SeqCst)),
+        "commit_index": state.max_committed_lsn(),
     }))).into_response()
 }
 
@@ -262,7 +264,7 @@ pub async fn vote_handler(
         None => return (StatusCode::FORBIDDEN, "No replication state").into_response(),
     };
 
-    let my_lsn = state.db.as_ref().map_or(0, |db| db.global_commit_index.load(Ordering::SeqCst));
+    let my_lsn = state.db.as_ref().map_or(0, |db| db.durable_lsn.load(Ordering::SeqCst));
     let my_log_term = state.db.as_ref().map_or(0, |db| db.last_log_term.load(Ordering::SeqCst));
 
     let (granted, resp_term, restart_poll, persist) = {

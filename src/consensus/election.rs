@@ -114,7 +114,7 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64) {
         return;
     }
 
-    let my_lsn = state.db.as_ref().map_or(0, |db| db.global_commit_index.load(Ordering::SeqCst));
+    let my_lsn = state.db.as_ref().map_or(0, |db| db.durable_lsn.load(Ordering::SeqCst));
     let my_log_term = state.db.as_ref().map_or(0, |db| db.last_log_term.load(Ordering::SeqCst));
     let candidate_id = state.config.node_id.clone();
 
@@ -217,6 +217,7 @@ async fn become_leader(state: &AppState, term: u64, candidate_id: &str) {
         repl.is_leader = true;
         repl.heartbeat_running = false;
         repl.primary_addr = None;
+        repl.progress.reset();
         repl.replicas = leader_replica_set(
             &state.config.replicas,
             &state.config.peers,

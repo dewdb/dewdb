@@ -51,6 +51,75 @@ impl AppState {
         0
     }
 
+    // Records a replica's acknowledgement and returns the collection's new commit
+    // watermark. Acks from an older term are recorded but never advance the
+    // watermark: only the current leader's own entries can be counted to a quorum.
+    pub fn note_ack(&self, replica: &str, collection: &str, lsn: u64, ack_term: u64) -> u64 {
+        let repl = match self.replication.as_ref() {
+            Some(r) => r,
+            None => return 0,
+        };
+        let leader_durable = self
+            .db
+            .as_ref()
+            .and_then(|db| db.get_collection(collection).ok())
+            .map_or(0, |col| col.durable_lsn());
+
+        let mut g = repl.write().unwrap();
+        g.progress.observe_ack(replica, collection, lsn);
+        if !g.is_leader || ack_term != g.term {
+            return g.progress.committed(collection);
+        }
+        let replicas = g.replicas.clone();
+        g.progress.advance(collection, leader_durable, &replicas)
+    }
+
+    pub fn committed_lsn(&self, collection: &str) -> u64 {
+        match self.replication.as_ref() {
+            Some(r) => r.read().unwrap().progress.committed(collection),
+            None => 0,
+        }
+    }
+
+    pub fn matched_lsn(&self, replica: &str, collection: &str) -> u64 {
+        match self.replication.as_ref() {
+            Some(r) => r.read().unwrap().progress.matched(replica, collection),
+            None => 0,
+        }
+    }
+
+    pub fn max_committed_lsn(&self) -> u64 {
+        match self.replication.as_ref() {
+            Some(r) => r.read().unwrap().progress.max_committed(),
+            None => 0,
+        }
+    }
+
+    // A leader with no replicas commits as soon as its own write is durable, so
+    // single-node deployments still make progress.
+    pub fn advance_own_commit(&self, collection: &str, durable_lsn: u64) -> u64 {
+        let repl = match self.replication.as_ref() {
+            Some(r) => r,
+            None => return 0,
+        };
+        let mut g = repl.write().unwrap();
+        if !g.is_leader {
+            return g.progress.committed(collection);
+        }
+        let replicas = g.replicas.clone();
+        g.progress.advance(collection, durable_lsn, &replicas)
+    }
+
+    pub fn note_leader_committed(&self, collection: &str, lsn: u64) {
+        if let Some(repl) = self.replication.as_ref() {
+            let mut g = repl.write().unwrap();
+            let slot = g.leader_committed.entry(collection.to_string()).or_insert(0);
+            if lsn > *slot {
+                *slot = lsn;
+            }
+        }
+    }
+
     pub fn get_replicas(&self) -> Vec<String> {
         if let Some(ref repl) = self.replication {
             return repl.read().unwrap().replicas.clone();

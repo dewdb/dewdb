@@ -11,13 +11,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tracing::{error, info};
 
-// global_commit_index is local durability (fsynced), not a quorum commit point.
-// Do not read it as "safely replicated".
+// durable_lsn is what this node has fsynced. It says nothing about replication;
+// the quorum-committed watermark lives in consensus::Progress.
 pub struct Database {
     pub root_path: PathBuf,
     pub cache: ReadCacheConfig,
     pub collections: RwLock<HashMap<String, Arc<Collection>>>,
-    pub global_commit_index: Arc<AtomicU64>,
+    pub durable_lsn: Arc<AtomicU64>,
     pub next_lsn: Arc<AtomicU64>,
     pub last_log_term: Arc<AtomicU64>,
 }
@@ -32,13 +32,13 @@ impl Database {
         fs::create_dir_all(&root_path)?;
         let boot_lsn = LsnMeta::load(&root_path).map(|m| m.commit_lsn).unwrap_or(0);
         if boot_lsn > 0 {
-            info!(target: "db", "Restored commit LSN {} from lsn.meta", boot_lsn);
+            info!(target: "db", "Restored durable LSN {} from lsn.meta", boot_lsn);
         }
         Ok(Self {
             root_path,
             cache,
             collections: RwLock::new(HashMap::new()),
-            global_commit_index: Arc::new(AtomicU64::new(boot_lsn)),
+            durable_lsn: Arc::new(AtomicU64::new(boot_lsn)),
             next_lsn: Arc::new(AtomicU64::new(boot_lsn)),
             last_log_term: Arc::new(AtomicU64::new(0)),
         })
@@ -61,7 +61,7 @@ impl Database {
         let col = Arc::new(Collection::open(
             name.to_string(),
             col_path,
-            self.global_commit_index.clone(),
+            self.durable_lsn.clone(),
             self.next_lsn.clone(),
             self.last_log_term.clone(),
             self.cache.clone(),
@@ -123,18 +123,18 @@ impl Database {
         Ok(existed)
     }
 
-    // Elections compare this watermark, so it must come back down when a snapshot
-    // replaces the log. This is the only place it may decrease.
-    pub fn recompute_commit_index(&self) -> io::Result<u64> {
+    // The watermark normally only rises. A snapshot can shrink the log, so this is
+    // the one place it may go down.
+    pub fn recompute_durable_lsn(&self) -> io::Result<u64> {
         let mut highest = 0u64;
         for name in self.list_collections()? {
             highest = highest.max(self.get_collection(&name)?.last_appended_lsn());
         }
 
-        let previous = self.global_commit_index.swap(highest, Ordering::SeqCst);
+        let previous = self.durable_lsn.swap(highest, Ordering::SeqCst);
         if highest < previous {
             info!(target: "db", from = previous, to = highest,
-                "Lowered commit index to match on-disk log after resync");
+                "Lowered durable LSN to match on-disk log after resync");
             let _ = LsnMeta { commit_lsn: highest }.save(&self.root_path);
         }
         Ok(highest)
@@ -147,7 +147,7 @@ impl Database {
             if let Err(e) = wal.current_wal.sync_data() {
                 error!(target: "storage", collection = %name, error = %e, "Failed to force sync WAL on shutdown");
             }
-            self.global_commit_index.fetch_max(wal.last_appended_lsn, Ordering::SeqCst);
+            self.durable_lsn.fetch_max(wal.last_appended_lsn, Ordering::SeqCst);
             drop(wal);
             let notifiers: Vec<_> = {
                 let mut q = col.commit_notifiers.lock().unwrap();
@@ -159,7 +159,7 @@ impl Database {
             }
             info!(target: "storage", collection = %name, pending = count, "Flushed pending writes on shutdown");
         }
-        let meta = LsnMeta { commit_lsn: self.global_commit_index.load(Ordering::SeqCst) };
+        let meta = LsnMeta { commit_lsn: self.durable_lsn.load(Ordering::SeqCst) };
         if let Err(e) = meta.save(&self.root_path) {
             error!(target: "db", "Failed to persist lsn meta on shutdown: {}", e);
         }
@@ -182,25 +182,25 @@ mod tests {
                 let _ = col.put(format!("a:{}", i), serde_json::json!({"i": i}), 1).unwrap();
             }
             col.enqueue_commit().await.unwrap().unwrap();
-            assert_eq!(db.global_commit_index.load(Ordering::SeqCst), 10);
+            assert_eq!(db.durable_lsn.load(Ordering::SeqCst), 10);
         }
 
         {
             let db = Database::new(&root).unwrap();
-            assert_eq!(db.global_commit_index.load(Ordering::SeqCst), 10, "Commit LSN must be restored from lsn.meta");
+            assert_eq!(db.durable_lsn.load(Ordering::SeqCst), 10, "Commit LSN must be restored from lsn.meta");
             let col = db.get_collection("lsn_check").unwrap();
             for i in 0..5 {
                 let _ = col.put(format!("b:{}", i), serde_json::json!({"i": i}), 1).unwrap();
             }
             col.enqueue_commit().await.unwrap().unwrap();
-            assert_eq!(db.global_commit_index.load(Ordering::SeqCst), 15, "LSN must continue from restored value, not reset to zero");
+            assert_eq!(db.durable_lsn.load(Ordering::SeqCst), 15, "LSN must continue from restored value, not reset to zero");
         }
 
         let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
-    async fn recompute_commit_index_follows_the_log_back_down() {
+    async fn recompute_durable_lsn_follows_the_log_back_down() {
         let root = temp_root();
         let db = Database::new(&root).unwrap();
 
@@ -213,17 +213,17 @@ mod tests {
         a.enqueue_commit().await.unwrap().unwrap();
         b.enqueue_commit().await.unwrap().unwrap();
 
-        let real_end = db.global_commit_index.load(Ordering::SeqCst);
+        let real_end = db.durable_lsn.load(Ordering::SeqCst);
         assert_eq!(real_end, 4);
 
-        db.global_commit_index.store(999, Ordering::SeqCst);
-        assert_eq!(db.recompute_commit_index().unwrap(), real_end);
-        assert_eq!(db.global_commit_index.load(Ordering::SeqCst), real_end,
+        db.durable_lsn.store(999, Ordering::SeqCst);
+        assert_eq!(db.recompute_durable_lsn().unwrap(), real_end);
+        assert_eq!(db.durable_lsn.load(Ordering::SeqCst), real_end,
             "an inflated watermark must come back down to the real end of the log");
         assert_eq!(LsnMeta::load(&root).map(|m| m.commit_lsn), Some(real_end),
             "the persisted watermark must be corrected too, or a restart re-inflates it");
 
-        assert_eq!(db.recompute_commit_index().unwrap(), real_end, "recomputing is idempotent");
+        assert_eq!(db.recompute_durable_lsn().unwrap(), real_end, "recomputing is idempotent");
 
         let _ = fs::remove_dir_all(&root);
     }

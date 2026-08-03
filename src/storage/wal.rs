@@ -370,7 +370,7 @@ mod tests {
         }
         assert_eq!(missing, 0, "All 100 docs should be recovered after restart");
 
-        assert!(db2.global_commit_index.load(Ordering::SeqCst) >= 100, "Commit LSN should survive restart");
+        assert!(db2.durable_lsn.load(Ordering::SeqCst) >= 100, "Commit LSN should survive restart");
 
         col2.save_index().unwrap();
 
@@ -482,7 +482,7 @@ mod tests {
         assert_eq!(rcol2.get("k1").unwrap(), Some(serde_json::json!({"v": 1})));
         assert_eq!(rcol2.get("k2").unwrap(), Some(serde_json::json!({"v": 2})));
         assert_eq!(rcol2.get("k3").unwrap(), Some(serde_json::json!({"v": 3})));
-        assert_eq!(rdb2.global_commit_index.load(Ordering::SeqCst), 3, "Replica LSN must match the frames it applied from the primary");
+        assert_eq!(rdb2.durable_lsn.load(Ordering::SeqCst), 3, "Replica LSN must match the frames it applied from the primary");
 
         let _ = fs::remove_dir_all(&proot);
         let _ = fs::remove_dir_all(&rroot);
