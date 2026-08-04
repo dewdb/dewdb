@@ -7,8 +7,7 @@ use std::time::Duration;
 
 const DIR_REMOVE_ATTEMPTS: usize = 5;
 
-// Configs mix "http://host:port" and "host:port" for the same node, so
-// comparisons must ignore the scheme or a node fails to recognise itself.
+// Configs mix "http://host:port" and "host:port"; without this a node fails to recognise itself.
 pub fn endpoint_of(url: &str) -> &str {
     url.trim_end_matches('/')
         .rsplit("//")
@@ -20,8 +19,7 @@ pub fn same_endpoint(a: &str, b: &str) -> bool {
     endpoint_of(a) == endpoint_of(b)
 }
 
-// Windows can briefly hold a closed file open, so removal is retried instead of
-// failing the caller.
+// Windows can briefly hold a closed file open.
 pub fn remove_file_with_retry(path: &Path) -> io::Result<()> {
     let mut last_err = None;
     for attempt in 0..DIR_REMOVE_ATTEMPTS {
@@ -35,6 +33,21 @@ pub fn remove_file_with_retry(path: &Path) -> io::Result<()> {
         }
     }
     Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to remove file")))
+}
+
+// Same Windows quirk: an indexer holding the destination fails the replace transiently.
+pub fn rename_with_retry(from: &Path, to: &Path) -> io::Result<()> {
+    let mut last_err = None;
+    for attempt in 0..DIR_REMOVE_ATTEMPTS {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(20 * (attempt + 1) as u64));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to rename file")))
 }
 
 pub fn remove_dir_with_retry(path: &Path) -> io::Result<()> {
@@ -52,9 +65,7 @@ pub fn remove_dir_with_retry(path: &Path) -> io::Result<()> {
     Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to remove directory")))
 }
 
-// serialize/deserialize look dead: they are named by #[serde(with =
-// "base64_bytes")] at the fields using them, so a dead-code sweep will
-// wrongly flag them.
+// serialize/deserialize are reached only via #[serde(with = "base64_bytes")]; dead-code sweeps flag them.
 pub mod base64_bytes {
     use serde::{Deserialize, Deserializer, Serializer};
     use serde::de;

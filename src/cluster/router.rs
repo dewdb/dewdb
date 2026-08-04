@@ -33,8 +33,7 @@ fn build_forward(client: &reqwest::Client, method: &ForwardMethod, url: &str, bo
     }
 }
 
-// A shard's 4xx is a real answer and must not trigger failover: a PATCH 404
-// means the document is missing, not that the node is down.
+// A shard's 4xx is an answer, not a failure: a PATCH 404 means no document, not a dead node.
 fn authoritative_write_status(s: StatusCode) -> bool {
     s.is_success()
         || s == StatusCode::BAD_REQUEST
@@ -376,8 +375,7 @@ pub async fn router_query(
         };
         let shards = unique_shards(state);
         let n = shards.len().max(1);
-        // Sorted queries ask each shard for the full limit: the top rows may all live on
-        // one shard, so limit/n per shard would return the wrong global order.
+        // Full limit per shard: the top rows may all live on one, and limit/n would misorder the merge.
         let per_shard = if sort.is_some() { limit } else { ((limit + n - 1) / n).max(1) };
 
         let mut futures = Vec::new();

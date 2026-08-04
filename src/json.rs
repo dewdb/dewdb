@@ -28,8 +28,7 @@ fn type_rank(v: &serde_json::Value) -> u8 {
     }
 }
 
-// Total order across types matters: shards sort locally and the router merges
-// their pages, so two nodes must never order the same pair differently.
+// Total order across types is required: shards sort locally and the router merges their pages.
 pub fn json_cmp(a: &serde_json::Value, b: &serde_json::Value) -> std::cmp::Ordering {
     use serde_json::Value;
     use std::cmp::Ordering;

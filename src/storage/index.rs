@@ -49,8 +49,7 @@ impl Default for ReadCacheConfig {
 }
 
 #[derive(Serialize, Deserialize)]
-// Compatibility: bincode carries no version tag, so a failed decode must be
-// treated as "no snapshot" and the WAL replayed instead.
+// Compatibility: bincode carries no version tag, so a failed decode means "no snapshot" and a full replay.
 pub struct IndexSnapshot {
     pub last_wal_id: u64,
     pub last_offset: u64,
@@ -65,9 +64,8 @@ pub struct LsnMeta {
     pub commit_lsn: u64,
 }
 
-// How far this collection's index reflects its log. Boot replays the whole WAL but
-// may only publish up to here; anything above was never committed and has to stay
-// staged, or a restart would expose entries a leader change can still revoke.
+// How far the index reflects the log. Boot replays everything but publishes only to here;
+// anything above was never committed and must stay staged across the restart.
 #[derive(Serialize, Deserialize)]
 pub struct AppliedMeta {
     pub applied_lsn: u64,

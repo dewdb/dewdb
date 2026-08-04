@@ -25,8 +25,7 @@ pub struct ResyncRequest {
     pub collection: String,
 }
 
-// Gap is recoverable by streaming. Divergent is not: the replica holds entries
-// we do not, and only replacing its copy converges.
+// Gap streams back; divergence does not, since the replica holds entries we lack.
 pub enum ConflictKind {
     StaleTerm(u64),
     Gap(u64, u64),

@@ -11,8 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
-// Fire-and-forget, so frames can arrive out of order and a reported gap is
-// normal rather than a fault; repair resolves it.
+// Fire-and-forget: frames arrive out of order and a reported gap is routine, not a fault.
 pub fn replicate_to_peers(
     state: AppState,
     collection: String,
@@ -93,9 +92,8 @@ pub fn replicate_to_peers(
     });
 }
 
-// Repair invariant: frames must form an unbroken predecessor chain from the
-// replica's tail. LSNs are sparse per collection, so "next" is not +1, and a
-// chain broken by compaction is the signal to fall back to a snapshot.
+// Repair invariant: an unbroken predecessor chain from the replica's tail.
+// LSNs are sparse per collection, and a chain broken by compaction forces a snapshot.
 fn chain_prefix(after_lsn: u64, after_term: u64, mut frames: Vec<(u64, Vec<u8>)>) -> Vec<(u64, Vec<u8>)> {
     frames.sort_by_key(|(lsn, _)| *lsn);
 
@@ -155,8 +153,7 @@ async fn repair_replica(
         Err(_) => return false,
     };
 
-    // Catch up to this collection's tail, not the global commit index: another
-    // collection may hold the highest LSN, which this one can never reach.
+    // This collection's tail, not the global commit index: another collection may hold the highest LSN.
     let target = col.last_appended_lsn();
 
     if reported_last_lsn >= target {
@@ -582,8 +579,7 @@ mod tests {
         let (n1, n2, n3) = three_node_cluster(&root).await;
         let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
 
-        // A single write and then silence: the frame's own commit index only reaches
-        // the replicas on a later message, so heartbeats have to carry it.
+        // One write then silence: the frame's commit index reaches replicas only on a later message.
         assert!(put_doc_at(&client, &n1.url(), "t", "only", 7, "?w=majority&wtimeout=4000").await.is_success());
 
         for replica in [&n2, &n3] {

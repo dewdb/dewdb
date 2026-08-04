@@ -14,8 +14,7 @@ pub struct PrimaryOverride {
     pub cached_at: std::time::Instant,
 }
 
-// A failover override is cached so every request need not re-probe, and expires
-// so the configured primary is retried once it recovers.
+// Cached to avoid re-probing per request; expires to retry the configured primary.
 const OVERRIDE_TTL_SECS: u64 = 30;
 
 #[derive(Clone)]
@@ -51,9 +50,8 @@ impl AppState {
         0
     }
 
-    // Records a replica's acknowledgement and returns the collection's new commit
-    // watermark. Acks from an older term are recorded but never advance the
-    // watermark: only the current leader's own entries can be counted to a quorum.
+    // Acks from an older term are recorded but never advance the watermark:
+    // only current-term entries count toward a quorum.
     pub fn note_ack(&self, replica: &str, collection: &str, lsn: u64, ack_term: u64) -> u64 {
         let repl = match self.replication.as_ref() {
             Some(r) => r,
@@ -107,8 +105,7 @@ impl AppState {
         }
     }
 
-    // A leader with no replicas commits as soon as its own write is durable, so
-    // single-node deployments still make progress.
+    // A leader with no replicas commits on its own durability, so single-node still progresses.
     pub fn advance_own_commit(&self, collection: &str, durable_lsn: u64) -> u64 {
         let repl = match self.replication.as_ref() {
             Some(r) => r,
@@ -138,8 +135,7 @@ impl AppState {
         self.apply_committed(collection, lsn);
     }
 
-    /// What this node believes is committed: its own quorum when it leads, the
-    /// leader's reported watermark when it follows.
+    /// Own quorum when leading, the leader's reported watermark when following.
     pub fn committed_hint(&self, collection: &str) -> u64 {
         match self.replication.as_ref() {
             Some(r) => {
@@ -154,8 +150,8 @@ impl AppState {
         }
     }
 
-    // Never called while the replication lock is held: apply takes the pending and
-    // index locks, and note_ack reaches the collections lock the other way round.
+    // Never call with the replication lock held: this takes pending and index,
+    // while note_ack reaches the collections lock in the opposite order.
     pub fn apply_committed(&self, collection: &str, committed: u64) {
         if committed == 0 {
             return;

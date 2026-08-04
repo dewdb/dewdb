@@ -78,7 +78,7 @@ async fn main() -> io::Result<()> {
 
     let db_clone = db.clone();
     tokio::spawn(async move {
-        // Flush pending group-commit waiters before exit so their writes are durable.
+        // Pending group-commit waiters are not yet durable.
         let _ = tokio::signal::ctrl_c().await;
         info!(target: "boot", "Received Ctrl-C; shutting down and forcing WAL commits");
         if let Some(d) = db_clone {
@@ -88,9 +88,9 @@ async fn main() -> io::Result<()> {
     });
 
     let replication = if config.role == "shard" {
-        let meta = ReplicationMeta::load(&config.data_dir);
-        // A node that led before restart rejoins as a follower unless it is a solo
-        // primary: the cluster may have elected someone else while it was down.
+        let meta = ReplicationMeta::load(&config.data_dir)
+            .expect("Cannot read replication.meta; starting would rewind this node's term and vote");
+        // A former leader rejoins as a follower unless solo; the cluster may have moved on.
         let solo_primary = config.peers.is_empty() && config.shard_role.as_deref() == Some("primary");
 
         let (term, is_leader, voted_for) = if let Some(ref m) = meta {
@@ -106,7 +106,9 @@ async fn main() -> io::Result<()> {
             (0, is_primary, None)
         };
 
-        let _ = ReplicationMeta { term, is_leader, voted_for: voted_for.clone() }.save(&config.data_dir);
+        if let Err(e) = (ReplicationMeta { term, is_leader, voted_for: voted_for.clone() }).save(&config.data_dir) {
+            warn!(target: "boot", "Could not persist replication state: {}; votes cannot be durably recorded", e);
+        }
 
         Some(Arc::new(RwLock::new(ReplicationState {
             term,

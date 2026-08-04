@@ -1,4 +1,4 @@
-//! Client-facing wire types. These are the public REST contract.
+//! Client-facing wire types: the public REST contract.
 
 use axum::http::StatusCode;
 use axum::response::IntoResponse;

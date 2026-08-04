@@ -88,8 +88,12 @@ pub async fn replicate_handler(
                 }
             };
             if let Some(t) = new_term {
-                let _ = ReplicationMeta { term: t, is_leader: false, voted_for: None }.save(&state.config.data_dir);
-                info!(target: "replicate", "Adopted higher term {} from primary", t);
+                match (ReplicationMeta { term: t, is_leader: false, voted_for: None }).save(&state.config.data_dir) {
+                    Ok(()) => info!(target: "replicate", "Adopted higher term {} from primary", t),
+                    // A lost adoption rewinds to the older (term, vote) pair, under which nothing was granted.
+                    Err(e) => warn!(target: "replicate", error = %e,
+                        "Adopted term {} in memory but could not persist it", t),
+                }
             }
         }
     }
@@ -111,8 +115,7 @@ pub async fn replicate_handler(
         Vec::new()
     };
 
-    // The header is authoritative; request fields are cross-checked so a mismatched
-    // sender is rejected instead of applying the wrong chain link.
+    // Header is authoritative; a mismatched request field means a confused sender, not a link to apply.
     if let Some(header) = FrameHeader::parse(&frame) {
         if header.lsn != req.lsn {
             return (StatusCode::BAD_REQUEST, "Frame lsn does not match request lsn").into_response();
@@ -144,9 +147,7 @@ pub async fn replicate_handler(
                         };
                         col.stage(lsn, staged.0, wal_id, offset, staged.1);
                     }
-                    // The watermark the leader sent is one message behind this frame,
-                    // so the frame itself becomes visible on the next replicate or
-                    // heartbeat that carries a higher commit index.
+                    // The leader's watermark trails this frame by a message; visibility waits for the next one.
                     col.apply_committed(state.committed_hint(&req.collection));
 
                     if let Some(ref repl) = state.replication {
@@ -297,10 +298,17 @@ pub async fn vote_handler(
         (d.granted, d.term, restart, persist)
     };
 
-    let _ = persist.save(&state.config.data_dir);
     if restart_poll {
         heartbeat_poll_task(state.clone());
     }
+
+    // Election safety: a vote promised before it is durable can be cast twice in one term after a restart.
+    if let Err(e) = persist.save(&state.config.data_dir) {
+        warn!(target: "vote", error = %e,
+            "Could not persist term/vote; denying the vote rather than promising one we may forget");
+        return (StatusCode::OK, Json(VoteResponse { term: resp_term, vote_granted: false })).into_response();
+    }
+
     if granted {
         info!(target: "vote", "Granted vote to {} for term {}", req.candidate_id, req.term);
     }

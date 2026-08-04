@@ -61,16 +61,13 @@ impl Collection {
         Ok(SpaceUsage { total_bytes, live_bytes, live_keys: index.len() })
     }
 
-    // Writes continue throughout: frozen WALs are <= N, the rewritten output is
-    // N+1, and the new active WAL is N+2. Only the brief lock swaps the writer.
-    // Dropping superseded frames breaks the per-collection chain, so a replica
-    // behind this point can no longer be repaired incrementally and must snapshot.
+    // Frozen WALs are <= N, rewritten output N+1, new active N+2; only the writer swap takes the lock.
+    // Dropping superseded frames breaks the per-collection chain: replicas behind this must snapshot.
     pub fn compact(&self) -> io::Result<()> {
         if self.compacting.swap(true, Ordering::SeqCst) {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "Compaction already in progress"));
         }
-        // Uncommitted frames are absent from the index, so relocation would not copy
-        // them and retiring their WAL would lose them. Wait for the commit to land.
+        // Uncommitted frames are absent from the index; retiring their WAL would lose them.
         if self.pending_len() > 0 {
             self.compacting.store(false, Ordering::SeqCst);
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "Uncommitted frames pending"));
@@ -95,7 +92,7 @@ impl Collection {
             wal.current_wal_id = active_id;
             wal.current_wal_size = 0;
 
-            // Iterated in key order, so the compacted WAL is not LSN-ordered.
+            // Key-order iteration leaves the compacted WAL not LSN-ordered.
             let frozen: Vec<(String, u64, u64)> = self.index.read().unwrap()
                 .iter()
                 .filter(|(_, e)| e.wal_id <= frozen_through)
@@ -126,8 +123,7 @@ impl Collection {
             let _wal = self.wal_writer.lock().unwrap();
             let mut index = self.index.write().unwrap();
 
-            // A key overwritten while we were copying must keep the newer frame, so remap
-            // only entries still pointing at the location we read.
+            // Remap only entries still pointing at the location we read; a concurrent overwrite wins.
             for (key, old_wal_id, old_offset, new_entry) in relocated {
                 let unchanged = index.get(&key)
                     .map_or(false, |cur| cur.wal_id == old_wal_id && cur.offset == old_offset);

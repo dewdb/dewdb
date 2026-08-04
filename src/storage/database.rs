@@ -11,8 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tracing::{error, info};
 
-// durable_lsn is what this node has fsynced. It says nothing about replication;
-// the quorum-committed watermark lives in consensus::Progress.
+// durable_lsn is fsync progress, not replication; the quorum watermark lives in consensus::Progress.
 pub struct Database {
     pub root_path: PathBuf,
     pub cache: ReadCacheConfig,
@@ -123,8 +122,7 @@ impl Database {
         Ok(existed)
     }
 
-    // The watermark normally only rises. A snapshot can shrink the log, so this is
-    // the one place it may go down.
+    // The one place the watermark may fall: a snapshot can shrink the log.
     pub fn recompute_durable_lsn(&self) -> io::Result<u64> {
         let mut highest = 0u64;
         for name in self.list_collections()? {

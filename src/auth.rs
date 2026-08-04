@@ -45,7 +45,7 @@ impl AuthConfig {
     }
 }
 
-// Constant time so a wrong secret cannot be recovered byte by byte.
+// Constant time: a byte-by-byte comparison leaks the secret's prefix.
 fn constant_time_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
@@ -89,7 +89,7 @@ pub fn authorize(
         };
     }
 
-    // /health stays open for probes; /metrics does not, since it exposes topology.
+    // /health stays open for probes; /metrics exposes topology.
     if path == "/health" || !cfg.public_locked() {
         return AuthOutcome::Allow;
     }

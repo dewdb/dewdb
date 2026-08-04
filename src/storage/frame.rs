@@ -3,14 +3,11 @@
 use serde::{Deserialize, Serialize};
 
 pub const MAX_RECORD_SIZE: u64 = 10 * 1024 * 1024;
-// Compatibility: frames carry no version field, so changing this length or the
-// field order invalidates every existing WAL.
+// Compatibility: no version field, so changing this length or the field order invalidates every WAL.
 pub const HEADER_LEN: usize = 40;
 
-// Format invariant:
-// prev_lsn/prev_term name the predecessor in THIS collection, not lsn - 1.
-// LSNs come from one database-wide counter, so a collection's frames are
-// sparse in it; chaining globally makes every interleaved write look like a gap.
+// Format invariant: prev_lsn/prev_term name the predecessor in THIS collection, not lsn - 1.
+// LSNs are database-wide, so a collection's frames are sparse and global chaining fakes gaps.
 #[derive(Debug, Clone, Copy)]
 pub struct FrameHeader {
     pub len: u32,

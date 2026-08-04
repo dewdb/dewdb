@@ -67,8 +67,7 @@ fn replication_metrics(state: &AppState) -> serde_json::Value {
 
     if leader {
         let replicas = state.get_replicas();
-        // Lag is measured per collection against that collection's own tail, since
-        // a replica can be current on one collection and behind on another.
+        // Per-collection: a replica can be current on one collection and behind on another.
         let tails: Vec<(String, u64)> = {
             let open = db.collections.read().unwrap();
             open.iter().map(|(n, c)| (n.clone(), c.last_appended_lsn())).collect()

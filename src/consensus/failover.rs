@@ -121,7 +121,9 @@ pub async fn demote(state: &AppState, new_term: u64) {
         }
     };
 
-    let _ = ReplicationMeta { term: new_term, is_leader: false, voted_for: None }.save(&state.config.data_dir);
+    if let Err(e) = (ReplicationMeta { term: new_term, is_leader: false, voted_for: None }).save(&state.config.data_dir) {
+        warn!(target: "demote", error = %e, "Stepped down in memory but could not persist term {}", new_term);
+    }
     info!(target: "demote", "Discovered higher term {}, stepping down to replica", new_term);
 
     if restart {
@@ -227,9 +229,14 @@ pub fn heartbeat_poll_task(state: AppState) {
                             }
 
                             if let Some(t) = adopted {
-                                let _ = ReplicationMeta { term: t, is_leader: false, voted_for: None }
-                                    .save(&state.config.data_dir);
-                                info!(target: "heartbeat", "Adopted higher term {} from primary {}", t, primary_addr);
+                                match (ReplicationMeta { term: t, is_leader: false, voted_for: None })
+                                    .save(&state.config.data_dir)
+                                {
+                                    Ok(()) => info!(target: "heartbeat",
+                                        "Adopted higher term {} from primary {}", t, primary_addr),
+                                    Err(e) => warn!(target: "heartbeat", error = %e,
+                                        "Adopted term {} in memory but could not persist it", t),
+                                }
                             }
                         }
                     },
@@ -266,9 +273,7 @@ pub fn heartbeat_poll_task(state: AppState) {
     });
 }
 
-// Failover triggers on the NEWER of heartbeat and replication. Requiring
-// replication to be fresh while the heartbeat is stale can never hold, so a dead
-// leader would never be detected.
+// Newer of the two signals: requiring fresh replication under a stale heartbeat never holds.
 fn contact_lost(
     last_heartbeat: Option<std::time::Instant>,
     last_replication: Option<std::time::Instant>,
@@ -286,7 +291,7 @@ mod tests {
     use super::*;
     use crate::test_support::{
         leaders, node_by_id, put_doc_at, put_doc_http, read_doc_http, settle_leader, temp_root,
-        three_node_cluster,
+        three_node_cluster, TestNode,
     };
     use axum::http::StatusCode;
 
@@ -428,6 +433,65 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(caught_up, "the rejoined node must receive the writes it missed while down");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_election_records_the_term_and_vote_on_disk() {
+        let root = temp_root();
+        let (mut n1, n2, n3) = three_node_cluster(&root).await;
+
+        n1.kill();
+        let winner = settle_leader(&[&n2, &n3], Duration::from_secs(20)).await
+            .expect("no leader was elected");
+        let leader = node_by_id(&[&n2, &n3], &winner);
+        let elected_term = leader.term();
+
+        let on_disk = |n: &TestNode| ReplicationMeta::load(&n.data_dir.to_string_lossy()).unwrap().unwrap();
+
+        let leader_meta = on_disk(leader);
+        assert_eq!(leader_meta.term, elected_term, "the term it leads at must be the term on disk");
+        assert_eq!(leader_meta.voted_for.as_deref(), Some(winner.as_str()),
+            "a leader must have durably voted for itself before soliciting votes");
+        assert!(leader_meta.is_leader);
+
+        let follower = if winner == "n2" { &n3 } else { &n2 };
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(10) && on_disk(follower).term < elected_term {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let follower_meta = on_disk(follower);
+        assert_eq!(follower_meta.term, elected_term,
+            "the voter must record the term it voted in, or a restart would let it vote again");
+        assert!(follower_meta.voted_for.is_some(), "the vote itself must be recorded, not just the term");
+        assert!(!follower_meta.is_leader);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_node_comes_back_at_the_term_it_recorded() {
+        let root = temp_root();
+        let (mut n1, n2, n3) = three_node_cluster(&root).await;
+
+        n1.kill();
+        let winner = settle_leader(&[&n2, &n3], Duration::from_secs(20)).await
+            .expect("no leader was elected");
+        let elected_term = node_by_id(&[&n2, &n3], &winner).term();
+
+        let mut restarting = if winner == "n2" { n3 } else { n2 };
+        let recorded = ReplicationMeta::load(&restarting.data_dir.to_string_lossy()).unwrap().unwrap();
+        assert!(recorded.term >= elected_term);
+
+        restarting.kill();
+        restarting.start();
+
+        assert_eq!(restarting.term(), recorded.term,
+            "a node must resume at the term it last recorded; starting lower would let it \
+             grant a second vote in a term it has already voted in");
+        assert!(!restarting.is_leader());
 
         let _ = fs::remove_dir_all(&root);
     }

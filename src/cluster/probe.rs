@@ -19,7 +19,7 @@ async fn probe_node(client: &reqwest::Client, url: &str) -> Option<(String, u64)
     Some((role, term))
 }
 
-// Highest term wins so a partitioned old primary cannot reclaim traffic.
+// Highest term wins: a partitioned old primary must not reclaim traffic.
 fn select_primary(probes: &[(String, Option<(String, u64)>)]) -> Option<String> {
     let mut best: Option<(u64, String)> = None;
     for (url, res) in probes {

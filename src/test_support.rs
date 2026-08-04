@@ -51,8 +51,7 @@ pub fn make_frame(term: u64, lsn: u64, prev_lsn: u64, prev_term: u64, key: &str,
     frame
 }
 
-/// Appends and stages a write the way the leader write path does, leaving it
-/// durable but uncommitted.
+/// Mirrors the leader write path: durable but uncommitted.
 pub fn stage_put(col: &Arc<Collection>, key: &str, v: i64) -> u64 {
     let (frame, wal_id, offset, lsn) = col.put(key.into(), serde_json::json!({"v": v}), 1).unwrap();
     let entry = col.build_entry(wal_id, offset, &frame[HEADER_LEN..]);
@@ -86,11 +85,20 @@ pub struct TestNode {
     pub thread: Option<std::thread::JoinHandle<()>>,
 }
 
+// Binding :0 and dropping the listener lets the OS hand the same port to two
+// concurrent callers, so the counter rather than the OS guarantees uniqueness.
+static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(20000);
+
 fn free_port() -> u16 {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = l.local_addr().unwrap().port();
-    drop(l);
-    port
+    loop {
+        let port = NEXT_PORT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if port < 20000 {
+            continue;
+        }
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 fn node_config(n: &TestNode) -> NodeConfig {
@@ -152,14 +160,15 @@ impl TestNode {
                 let db = Arc::new(
                     Database::with_cache(&config.data_dir, ReadCacheConfig::default()).unwrap());
 
-                let meta = ReplicationMeta::load(&config.data_dir);
+                let meta = ReplicationMeta::load(&config.data_dir).expect("unreadable replication.meta");
                 let solo = config.peers.is_empty() && config.shard_role.as_deref() == Some("primary");
                 let (term, is_leader, voted_for) = match &meta {
                     Some(m) => (m.term, solo, m.voted_for.clone()),
                     None => (0, config.shard_role.as_deref() == Some("primary"), None),
                 };
-                let _ = ReplicationMeta { term, is_leader, voted_for: voted_for.clone() }
-                    .save(&config.data_dir);
+                ReplicationMeta { term, is_leader, voted_for: voted_for.clone() }
+                    .save(&config.data_dir)
+                    .expect("could not persist replication state");
 
                 let replication = Arc::new(RwLock::new(ReplicationState {
                     term,

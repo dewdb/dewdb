@@ -133,8 +133,7 @@ impl Collection {
             valid_end_offset = offset;
         }
 
-        // Crash recovery: a torn tail is expected, so stop at the first bad frame and
-        // truncate rather than refusing to boot.
+        // Crash recovery: a torn tail is expected, so stop at the first bad frame and truncate.
         if valid_end_offset < file_len {
             file.set_len(valid_end_offset)?;
             warn!(target: "wal", file = %path.display(), size = valid_end_offset, "Truncated corrupted WAL file");
@@ -182,8 +181,7 @@ impl Collection {
             crc,
             term,
             lsn,
-            // The chain is only correct because prev_* is sampled under the same lock that
-            // appends; sampling outside it interleaves two writers' links.
+            // prev_* must be sampled under the append lock; outside it, two writers interleave their links.
             prev_lsn: wal.last_appended_lsn,
             prev_term: wal.last_appended_term,
         }.encode();
@@ -237,9 +235,8 @@ impl Collection {
         let last = wal.last_appended_lsn;
         let last_term = wal.last_appended_term;
 
-        // Ordering invariant: divergence is tested before duplicate. A newer term
-        // re-using an LSN we already hold is a conflicting log, not a retransmit, and
-        // checking duplicate first silently keeps a deposed leader's tail.
+        // Ordering invariant: divergence before duplicate. A newer term reusing an LSN we hold is a
+        // conflicting log, not a retransmit, and checking duplicate first keeps a deposed leader's tail.
         if header.lsn <= last && header.term > last_term {
             return Ok(ReplicaApply::Divergent { last_lsn: last, last_term });
         }

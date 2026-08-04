@@ -36,8 +36,7 @@ async fn local_write_inner(
     let key_clone = key.clone();
     let is_delete = value.is_none();
     let term = state.current_term();
-    // Sampled before the append while the key lock is held, so created/replaced
-    // reflects what this write actually did.
+    // Sampled under the key lock: created/replaced must reflect this write, not a racing one.
     let existed = col.exists(&key);
 
     let write_res = tokio::task::spawn_blocking(move || {
@@ -81,8 +80,7 @@ async fn finish_write(
         return WriteOutcome { met: true, acks: 1, required: 1, existed: pending.existed };
     }
 
-    // The frame is already fsynced here, so fold our own durability into the
-    // quorum before replicating. A leader with no replicas commits on this alone.
+    // The frame is already fsynced; a leader with no replicas commits on this alone.
     let own_durable = state
         .db
         .as_ref()
@@ -91,8 +89,7 @@ async fn finish_write(
     let commit_index = state.advance_own_commit(col_name, own_durable);
     let replicas = state.get_replicas();
     let required = required_acks(&wc, replicas.len());
-    // From the frame header, not lsn - 1: the previous LSN belongs to whichever
-    // collection was written last, which is usually a different one.
+    // From the header, not lsn - 1: the previous LSN usually belongs to another collection.
     let prev_lsn = FrameHeader::parse(&pending.frame).map_or(0, |h| h.prev_lsn);
 
     let acks = if required <= 1 {

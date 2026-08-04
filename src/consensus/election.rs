@@ -32,8 +32,7 @@ pub struct VoteDecision {
     pub voted_for: Option<String>,
 }
 
-// A promoted follower with no configured replicas must adopt its peers, or it
-// accepts writes and replicates them nowhere.
+// A promoted follower with no configured replicas would accept writes and replicate them nowhere.
 fn leader_replica_set(configured: &[String], peers: &[String], listen_addr: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for candidate in configured.iter().chain(peers.iter()) {
@@ -47,13 +46,12 @@ fn leader_replica_set(configured: &[String], peers: &[String], listen_addr: &str
     out
 }
 
-// Cluster size is peers + self, so peers must exclude this node or the threshold
-// is computed against an inflated cluster.
+// Cluster size is peers + self; peers must exclude this node or the threshold inflates.
 pub fn majority(cluster_size: usize) -> usize {
     cluster_size / 2 + 1
 }
 
-// Staggers candidates so a shared timeout does not split the vote every round.
+// Staggered: a shared timeout splits the vote every round.
 fn election_jitter(node_id: &str, max_delay_ms: u64) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -66,9 +64,8 @@ fn election_jitter(node_id: &str, max_delay_ms: u64) -> u64 {
     h.finish() % max_delay_ms
 }
 
-// Election invariants: at most one vote per term, and never for a candidate
-// whose log is behind. (last_term, last_lsn) compares as a tuple, so a higher
-// last term wins regardless of LSN.
+// Election invariant: at most one vote per term, never for a candidate whose log is behind.
+// (last_term, last_lsn) compares as a tuple: a higher last term wins regardless of LSN.
 pub fn decide_vote(
     cur_term: u64,
     cur_voted_for: &Option<String>,
@@ -124,7 +121,14 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64) {
         repl.voted_for = Some(candidate_id.clone());
         repl.term
     };
-    let _ = ReplicationMeta { term: new_term, is_leader: false, voted_for: Some(candidate_id.clone()) }.save(&state.config.data_dir);
+    // Standing is a self-vote: forget it across a restart and this node can grant the same term twice.
+    if let Err(e) = (ReplicationMeta { term: new_term, is_leader: false, voted_for: Some(candidate_id.clone()) })
+        .save(&state.config.data_dir)
+    {
+        warn!(target: "election", error = %e,
+            "Could not persist candidacy for term {}; abandoning this election", new_term);
+        return;
+    }
 
     let peers = state.config.peers.clone();
     let cluster_size = peers.len() + 1;
@@ -205,8 +209,7 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64) {
     }
 }
 
-// The vote round is async, so re-check that term and vote still match before
-// claiming leadership; another node may have moved us on meanwhile.
+// The vote round is async; another node may have moved our term while it ran.
 async fn become_leader(state: &AppState, term: u64, candidate_id: &str) {
     {
         let mut repl = state.replication.as_ref().unwrap().write().unwrap();
@@ -224,7 +227,12 @@ async fn become_leader(state: &AppState, term: u64, candidate_id: &str) {
             &state.config.listen_addr,
         );
     }
-    let _ = ReplicationMeta { term, is_leader: true, voted_for: Some(candidate_id.to_string()) }.save(&state.config.data_dir);
+    // Term and self-vote are already durable; losing only is_leader rejoins as a follower.
+    if let Err(e) = (ReplicationMeta { term, is_leader: true, voted_for: Some(candidate_id.to_string()) })
+        .save(&state.config.data_dir)
+    {
+        warn!(target: "election", error = %e, "Won term {} but could not record leadership", term);
+    }
     info!(target: "election", "*** WON election: PROMOTED to primary at term {} ***", term);
     info!(target: "election", "Node {} is now accepting writes", candidate_id);
 }

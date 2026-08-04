@@ -3,9 +3,8 @@
 use crate::consensus::election::majority;
 use std::collections::HashMap;
 
-// Per-collection because LSNs come from one database-wide counter but replication
-// is per collection: a replica acking lsn 7 for "users" says nothing about
-// "orders", so one global watermark per replica would over-claim.
+// LSNs come from one database-wide counter but replication is per collection.
+// An ack of lsn 7 for "users" says nothing about "orders"; a global watermark over-claims.
 #[derive(Default)]
 pub struct Progress {
     matched: HashMap<String, HashMap<String, u64>>,
@@ -17,8 +16,7 @@ impl Progress {
         Self::default()
     }
 
-    // A new term starts with no knowledge of what anyone holds. Carrying match
-    // state across a leader change would let us commit on stale evidence.
+    // Match state from a previous term is stale evidence for a quorum.
     pub fn reset(&mut self) {
         self.matched.clear();
         self.committed.clear();
@@ -52,10 +50,8 @@ impl Progress {
         self.committed.values().copied().max().unwrap_or(0)
     }
 
-    /// Highest LSN a majority of the cluster holds, counting the leader itself.
-    ///
-    /// Never moves backwards: a replica that is replaced by a snapshot can report
-    /// a lower match than before, and an entry stays committed regardless.
+    /// Highest LSN a majority holds, counting the leader. Never moves backwards:
+    /// a resynced replica can report a lower match than before.
     pub fn advance(&mut self, collection: &str, leader_durable: u64, replicas: &[String]) -> u64 {
         let mut held: Vec<u64> = Vec::with_capacity(replicas.len() + 1);
         held.push(leader_durable);

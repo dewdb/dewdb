@@ -19,7 +19,7 @@ pub fn parse_write_concern(w: Option<&str>) -> WriteConcern {
     }
 }
 
-// Counts the primary itself, so a majority of a 3-node group is 2 acks total.
+// Counts the primary: a majority of three is 2 acks total.
 pub fn required_acks(wc: &WriteConcern, replica_count: usize) -> usize {
     let total = 1 + replica_count;
     match wc {

@@ -33,10 +33,9 @@ pub struct Collection {
     pub compacting: AtomicBool,
     pub cache: ReadCacheConfig,
     pub inline_bytes: AtomicU64,
-    // Highest LSN of this collection that has been fsynced.
+    // This collection's fsynced tail, distinct from the database-wide durable_lsn.
     pub durable_lsn: AtomicU64,
-    // Frames that are durable but not yet committed. The index holds committed
-    // state only, so readers never see an entry a leader change could revoke.
+    // Durable but uncommitted. The index holds committed state only: a leader change can still revoke these.
     pub pending: std::sync::Mutex<BTreeMap<u64, StagedApply>>,
     pub applied_lsn: AtomicU64,
     watermark_recorded: AtomicBool,
@@ -53,8 +52,7 @@ pub struct StagedApply {
 }
 
 impl Collection {
-    // Recovery ordering: the snapshot decides where replay resumes, and the tail
-    // LSN is the max of the snapshot and everything replayed after it.
+    // Recovery ordering: the snapshot sets the replay resume point; the tail LSN is the max of both.
     pub fn open(
         name: String,
         root_path: PathBuf,
@@ -66,8 +64,7 @@ impl Collection {
         fs::create_dir_all(&root_path)?;
         let data_root = root_path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
-        // Absent means this collection has no consensus history (a fresh node, or the
-        // storage engine used on its own), so its whole log is its state.
+        // Absent means no consensus history (fresh node, or standalone engine): replay everything.
         let applied_through = AppliedMeta::load(&root_path)
             .map(|m| m.applied_lsn)
             .unwrap_or(u64::MAX);
@@ -230,8 +227,7 @@ impl Collection {
         }
     }
 
-    // Locks are striped, so distinct keys can share one. Batch callers must dedupe
-    // stripes before locking or they deadlock against themselves.
+    // Striped: distinct keys share locks, and batch callers must dedupe stripes or self-deadlock.
     pub fn key_stripe(&self, key: &str) -> usize {
         xxhash_rust::xxh64::xxh64(key.as_bytes(), 0) as usize % KEY_LOCK_STRIPES
     }
@@ -265,8 +261,7 @@ impl Collection {
         self.append(entry, term)
     }
 
-    // Group commit: one fsync serves every waiter. Only the first enqueue and a full
-    // batch signal early; otherwise the interval tick bounds latency.
+    // Group commit: one fsync serves every waiter; the tick bounds latency when the batch stays short.
     pub fn enqueue_commit(&self) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut q = self.commit_notifiers.lock().unwrap();
@@ -475,13 +470,10 @@ impl Collection {
         self.pending.lock().unwrap().len()
     }
 
-    /// Holds a durable frame back until it is committed.
-    ///
-    /// `entry` is None for a delete. Keyed by LSN so draining is in log order.
+    /// `entry` is None for a delete; keyed by LSN to drain in log order.
     pub fn stage(&self, lsn: u64, key: String, wal_id: u64, offset: u64, entry: Option<IndexEntry>) {
-        // First staged frame means this collection is consensus-managed. Record the
-        // watermark now, or a restart before the first commit would apply-all and
-        // publish entries nobody ever acknowledged.
+        // First stage marks this collection consensus-managed. Without the watermark now, a restart
+        // before the first commit would apply-all and publish unacknowledged entries.
         if !self.watermark_recorded.swap(true, Ordering::SeqCst) {
             let applied_lsn = self.applied_lsn();
             if let Err(e) = (AppliedMeta { applied_lsn }).save(&self.root_path) {
@@ -502,7 +494,7 @@ impl Collection {
         pending.values().next().map(|s| (s.wal_id, s.offset))
     }
 
-    /// Publishes every staged frame at or below `committed_lsn`, in log order.
+    /// Drains in log order; staged frames can arrive out of order.
     pub fn apply_committed(&self, committed_lsn: u64) -> usize {
         let ready = {
             let mut pending = self.pending.lock().unwrap();
@@ -531,8 +523,7 @@ impl Collection {
         ready.len()
     }
 
-    /// Read-modify-write must see the newest durable value, not the newest
-    /// committed one, or a patch racing an uncommitted write silently drops it.
+    /// Read-modify-write must read the newest durable value; the committed one drops a racing write.
     pub fn get_including_staged(&self, key: &str) -> io::Result<Option<serde_json::Value>> {
         let staged = {
             let pending = self.pending.lock().unwrap();
@@ -553,12 +544,10 @@ impl Collection {
         self.wal_writer.lock().unwrap().last_appended_lsn
     }
 
-    // Written to a temp file and renamed, so a crash mid-write leaves the previous
-    // snapshot intact.
+    // Temp file plus rename: a crash mid-write must leave the previous snapshot intact.
     pub fn save_index(&self) -> io::Result<u64> {
         let wal_writer = self.wal_writer.lock().unwrap();
-        // Uncommitted frames are not in the index, so replay has to start at the
-        // oldest of them or their keys would be skipped on the next boot.
+        // Uncommitted frames are absent from the index; replay must resume at the oldest or lose them.
         let floor = self.pending_floor();
         let index = self.index.read().unwrap();
 
@@ -592,8 +581,7 @@ impl Collection {
         Ok(saved_lsn)
     }
 
-    // Windows will not delete a file that is still open, so the writer is pointed at
-    // a throwaway tombstone before the caller removes the collection directory.
+    // Windows will not delete an open file; the writer is parked on a throwaway tombstone first.
     pub fn release_handles(&self) -> io::Result<PathBuf> {
         self.released.store(true, Ordering::SeqCst);
 
@@ -1095,7 +1083,7 @@ mod tests {
         assert_eq!(col2.applied_lsn(), committed);
         assert_eq!(col2.pending_len(), 1, "it is still durable, just not visible");
 
-        // once the cluster commits it, the restored node publishes it like any other
+        // The restored node publishes it once the cluster commits it.
         col2.apply_committed(committed + 1);
         assert_eq!(col2.get("risky").unwrap(), Some(serde_json::json!({"v": 2})));
 
