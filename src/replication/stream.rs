@@ -8,6 +8,7 @@ use crate::replication::protocol::forbidden_term;
 use crate::state::AppState;
 use crate::storage::FrameHeader;
 use axum::http::StatusCode;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +16,20 @@ use tracing::{info, warn};
 
 // Bounds one request's size and the receiver's blocking append run, not just the payload.
 const REPLICATION_BATCH_FRAMES: usize = 64;
+
+// A couple of misses are normal under load, so backoff only starts after that. The cap keeps a
+// long-dead replica polled often enough that it rejoins promptly.
+const DRIVE_MISSES_BEFORE_BACKOFF: u32 = 2;
+const DRIVE_BACKOFF_SHIFT_CAP: u32 = 4;
+
+/// Ticks to skip after `misses` consecutive rounds that made no progress. Only the periodic driver
+/// backs off; a write still triggers repair immediately, so this delays nothing but the idle case.
+fn drive_backoff_ticks(misses: u32) -> u32 {
+    if misses < DRIVE_MISSES_BEFORE_BACKOFF {
+        return 0;
+    }
+    1u32 << (misses - DRIVE_MISSES_BEFORE_BACKOFF).min(DRIVE_BACKOFF_SHIFT_CAP)
+}
 
 // Fire-and-forget: frames arrive out of order and a reported gap is routine, not a fault.
 pub fn replicate_to_peers(
@@ -116,6 +131,10 @@ pub fn replicate_to_peers(
 pub fn replication_drive_task(state: AppState) {
     let interval = Duration::from_millis(state.config.flow_control.drive_interval_ms.max(50));
     tokio::spawn(async move {
+        // Local to this task, so no shared state and no locking. Keyed by replica.
+        let mut misses: HashMap<String, u32> = HashMap::new();
+        let mut skips: HashMap<String, u32> = HashMap::new();
+
         loop {
             tokio::time::sleep(interval).await;
             if !state.is_leader() {
@@ -130,6 +149,7 @@ pub fn replication_drive_task(state: AppState) {
                 continue;
             }
 
+            let mut work = Vec::new();
             for name in db.list_collections().unwrap_or_default() {
                 let tail = match db.get_collection(&name) {
                     Ok(col) => col.last_appended_lsn(),
@@ -138,18 +158,49 @@ pub fn replication_drive_task(state: AppState) {
                 if tail == 0 {
                     continue;
                 }
-                for replica in &replicas {
+                for replica in replicas.iter() {
+                    // A replica that has failed repeatedly is polled on a widening interval, so a
+                    // node that is simply down does not cost a full scan and a connect every tick.
+                    let due = skips.get(replica).copied().unwrap_or(0) == 0;
+                    if !due {
+                        continue;
+                    }
                     // No cursor means we have never sent here and have nothing to resume from;
                     // the reactive path still establishes one on the next write.
                     if let Some(cursor) = state.sent_through(replica, &name) {
                         if cursor < tail {
-                            let s = state.clone();
-                            let r = replica.clone();
-                            let c = name.clone();
-                            tokio::spawn(async move {
-                                let _ = repair_replica(s, r, c, cursor, None).await;
-                            });
+                            work.push((replica.clone(), name.clone(), cursor));
                         }
+                    }
+                }
+            }
+
+            for count in skips.values_mut() {
+                *count = count.saturating_sub(1);
+            }
+
+            let outcomes = futures::future::join_all(work.into_iter().map(|(replica, name, cursor)| {
+                let state = state.clone();
+                async move {
+                    let before = state.sent_through(&replica, &name).unwrap_or(cursor);
+                    let _ = repair_replica(state.clone(), replica.clone(), name.clone(), cursor, None).await;
+                    // Judged on whether the cursor moved, not on the return value: a repair that
+                    // coalesced behind another worker reports false without anything being wrong.
+                    let moved = state.sent_through(&replica, &name).unwrap_or(before) > before;
+                    (replica, moved)
+                }
+            })).await;
+
+            for (replica, moved) in outcomes {
+                if moved {
+                    misses.remove(&replica);
+                    skips.remove(&replica);
+                } else {
+                    let n = misses.entry(replica.clone()).or_insert(0);
+                    *n = n.saturating_add(1);
+                    let ticks = drive_backoff_ticks(*n);
+                    if ticks > 0 {
+                        skips.insert(replica, ticks);
                     }
                 }
             }
@@ -768,6 +819,20 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[test]
+    fn the_driver_backs_off_on_a_dead_replica_but_never_gives_up() {
+        assert_eq!(drive_backoff_ticks(0), 0);
+        assert_eq!(drive_backoff_ticks(1), 0, "a miss or two is normal under load");
+        assert_eq!(drive_backoff_ticks(2), 1);
+        assert_eq!(drive_backoff_ticks(3), 2, "the interval widens as the replica stays silent");
+        assert_eq!(drive_backoff_ticks(6), 16);
+
+        let cap = drive_backoff_ticks(u32::MAX);
+        assert_eq!(cap, 1 << DRIVE_BACKOFF_SHIFT_CAP,
+            "the wait must stay bounded, or a long-dead replica would effectively never be retried");
+        assert!(cap <= 16, "a returning replica on an idle cluster waits at most {} ticks", cap);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_replica_catches_up_on_an_idle_cluster_with_no_further_writes() {
         let root = temp_root();
@@ -816,6 +881,66 @@ mod tests {
         assert!(wait_for_doc(&client, &n3.url(), "t", "solo", 42, Duration::from_secs(15)).await,
             "a write whose only send attempt failed must still be delivered; without a retry it is \
              lost on that replica until unrelated traffic happens to arrive");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Not part of the suite: a measurement, run with
+    /// `cargo test --release -- --ignored --nocapture write_latency_profile`.
+    /// Reuses one client so connection setup is not counted, and drives concurrent writers so the
+    /// commit and replication pipelines are both busy.
+    #[ignore]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn write_latency_profile() {
+        let root = temp_root();
+        let (n1, _n2, _n3) = three_node_cluster(&root).await;
+        let client = Arc::new(reqwest::Client::builder()
+            .pool_max_idle_per_host(64)
+            .timeout(Duration::from_secs(10))
+            .build().unwrap());
+
+        let concurrency = 16usize;
+        let per_writer = 40usize;
+
+        // Warm the connection pool and the collection so the measured phase excludes first-touch.
+        for i in 0..8 {
+            let _ = put_doc_at(&client, &n1.url(), "t", &format!("warm{}", i), i, "?w=majority&wtimeout=8000").await;
+        }
+
+        let started = std::time::Instant::now();
+        let mut tasks = Vec::new();
+        for w in 0..concurrency {
+            let client = client.clone();
+            let url = n1.url();
+            tasks.push(tokio::spawn(async move {
+                let mut samples = Vec::with_capacity(per_writer);
+                for i in 0..per_writer {
+                    let key = format!("w{}k{}", w, i);
+                    let t = std::time::Instant::now();
+                    let st = put_doc_at(&client, &url, "t", &key, i as i64, "?w=majority&wtimeout=8000").await;
+                    samples.push((t.elapsed().as_secs_f64() * 1000.0, st.is_success()));
+                }
+                samples
+            }));
+        }
+
+        let mut latencies = Vec::new();
+        let mut failures = 0;
+        for t in tasks {
+            for (ms, ok) in t.await.unwrap() {
+                if ok { latencies.push(ms) } else { failures += 1 }
+            }
+        }
+        let wall = started.elapsed().as_secs_f64();
+
+        latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pick = |q: f64| latencies[((latencies.len() as f64 * q) as usize).min(latencies.len() - 1)];
+        let avg: f64 = latencies.iter().sum::<f64>() / latencies.len() as f64;
+
+        eprintln!(
+            "PROFILE n={} conc={} ok={} fail={} wall={:.2}s tput={:.0}/s avg={:.2}ms p50={:.2}ms p95={:.2}ms p99={:.2}ms",
+            latencies.len(), concurrency, latencies.len(), failures, wall,
+            latencies.len() as f64 / wall, avg, pick(0.50), pick(0.95), pick(0.99));
 
         let _ = fs::remove_dir_all(&root);
     }
