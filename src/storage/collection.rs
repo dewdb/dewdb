@@ -544,6 +544,12 @@ impl Collection {
         self.wal_writer.lock().unwrap().last_appended_lsn
     }
 
+    /// This log's tail as `(term, lsn)`. Sampled together: the pair must name one real frame.
+    pub fn last_appended(&self) -> (u64, u64) {
+        let wal = self.wal_writer.lock().unwrap();
+        (wal.last_appended_term, wal.last_appended_lsn)
+    }
+
     // Temp file plus rename: a crash mid-write must leave the previous snapshot intact.
     pub fn save_index(&self) -> io::Result<u64> {
         let wal_writer = self.wal_writer.lock().unwrap();

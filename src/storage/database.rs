@@ -227,6 +227,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn last_appended_reports_this_collections_own_tail() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+
+        let users = db.get_collection("users").unwrap();
+        let orders = db.get_collection("orders").unwrap();
+        for i in 0..3 {
+            live_put(&users, &format!("k{}", i), i);
+        }
+        live_put(&orders, "k", 9);
+
+        assert_eq!(users.last_appended(), (1, 3));
+        assert_eq!(orders.last_appended(), (1, 4),
+            "LSNs are database-wide, so a collection's tail is not its own write count");
+
+        live_put(&users, "k9", 9);
+
+        assert_eq!(users.last_appended(), (1, 5));
+        assert_eq!(orders.last_appended(), (1, 4),
+            "a write to one collection must not move another's tail; election freshness reads these");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn list_collections_merges_disk_and_memory_and_hides_transient_dirs() {
         let root = temp_root();
         let db = Database::new(&root).unwrap();

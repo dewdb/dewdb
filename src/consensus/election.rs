@@ -5,6 +5,7 @@ use crate::consensus::state::ReplicationMeta;
 use crate::state::AppState;
 use crate::util::same_endpoint;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,12 +13,22 @@ use tracing::{info, warn};
 
 const VOTE_REQUEST_TIMEOUT_MS: u64 = 1500;
 
+// Field order is the comparison order: derived Ord gives Raft's (term, index) freshness test.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LogTail {
+    pub last_term: u64,
+    pub last_lsn: u64,
+}
+
+// last_lsn/last_term are the database-wide summary, kept for peers that predate `logs`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VoteRequest {
     pub term: u64,
     pub candidate_id: String,
     pub last_lsn: u64,
     pub last_term: u64,
+    #[serde(default)]
+    pub logs: HashMap<String, LogTail>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -46,6 +57,23 @@ fn leader_replica_set(configured: &[String], peers: &[String], listen_addr: &str
     out
 }
 
+// Opens every collection on disk: one we have not opened yet still holds entries we could lose.
+// Takes the collections lock, so never call this while holding the replication lock.
+pub fn local_log_tails(state: &AppState) -> HashMap<String, LogTail> {
+    let db = match state.db.as_ref() {
+        Some(d) => d,
+        None => return HashMap::new(),
+    };
+    let mut tails = HashMap::new();
+    for name in db.list_collections().unwrap_or_default() {
+        if let Ok(col) = db.get_collection(&name) {
+            let (last_term, last_lsn) = col.last_appended();
+            tails.insert(name, LogTail { last_term, last_lsn });
+        }
+    }
+    tails
+}
+
 // Cluster size is peers + self; peers must exclude this node or the threshold inflates.
 pub fn majority(cluster_size: usize) -> usize {
     cluster_size / 2 + 1
@@ -64,13 +92,22 @@ fn election_jitter(node_id: &str, max_delay_ms: u64) -> u64 {
     h.finish() % max_delay_ms
 }
 
+/// Every collection is an independent log and one leader serves all of them, so a candidate
+/// behind on any single collection could lose that collection's committed entries once elected.
+fn candidate_is_current(my_logs: &HashMap<String, LogTail>, my_summary: LogTail, req: &VoteRequest) -> bool {
+    if req.logs.is_empty() {
+        return LogTail { last_term: req.last_term, last_lsn: req.last_lsn } >= my_summary;
+    }
+    // A collection absent from the candidate's map is a log it holds nothing of.
+    my_logs.iter().all(|(name, mine)| req.logs.get(name).copied().unwrap_or_default() >= *mine)
+}
+
 // Election invariant: at most one vote per term, never for a candidate whose log is behind.
-// (last_term, last_lsn) compares as a tuple: a higher last term wins regardless of LSN.
 pub fn decide_vote(
     cur_term: u64,
     cur_voted_for: &Option<String>,
-    my_log_term: u64,
-    my_lsn: u64,
+    my_logs: &HashMap<String, LogTail>,
+    my_summary: LogTail,
     req: &VoteRequest,
 ) -> VoteDecision {
     if req.term < cur_term {
@@ -88,7 +125,7 @@ pub fn decide_vote(
         None => true,
         Some(v) => v == &req.candidate_id,
     };
-    let up_to_date = (req.last_term, req.last_lsn) >= (my_log_term, my_lsn);
+    let up_to_date = candidate_is_current(my_logs, my_summary, req);
 
     if can_vote && up_to_date {
         VoteDecision { granted: true, term, voted_for: Some(req.candidate_id.clone()) }
@@ -113,6 +150,7 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64) {
 
     let my_lsn = state.db.as_ref().map_or(0, |db| db.durable_lsn.load(Ordering::SeqCst));
     let my_log_term = state.db.as_ref().map_or(0, |db| db.last_log_term.load(Ordering::SeqCst));
+    let my_logs = local_log_tails(state);
     let candidate_id = state.config.node_id.clone();
 
     let new_term = {
@@ -152,6 +190,7 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64) {
             candidate_id: candidate_id.clone(),
             last_lsn: my_lsn,
             last_term: my_log_term,
+            logs: my_logs.clone(),
         };
         let tx = tx.clone();
         tokio::spawn(async move {
@@ -241,8 +280,37 @@ async fn become_leader(state: &AppState, term: u64, candidate_id: &str) {
 mod tests {
     use super::*;
 
+    // No `logs`, so these exercise the scalar fallback a pre-`logs` peer still sends.
     fn vote_req(term: u64, candidate: &str, last_term: u64, last_lsn: u64) -> VoteRequest {
-        VoteRequest { term, candidate_id: candidate.to_string(), last_term, last_lsn }
+        VoteRequest {
+            term,
+            candidate_id: candidate.to_string(),
+            last_term,
+            last_lsn,
+            logs: HashMap::new(),
+        }
+    }
+
+    fn tails(pairs: &[(&str, u64, u64)]) -> HashMap<String, LogTail> {
+        pairs.iter()
+            .map(|(n, t, l)| (n.to_string(), LogTail { last_term: *t, last_lsn: *l }))
+            .collect()
+    }
+
+    fn per_log_req(term: u64, candidate: &str, pairs: &[(&str, u64, u64)]) -> VoteRequest {
+        let logs = tails(pairs);
+        let summary = logs.values().copied().max().unwrap_or_default();
+        VoteRequest {
+            term,
+            candidate_id: candidate.to_string(),
+            last_term: summary.last_term,
+            last_lsn: logs.values().map(|t| t.last_lsn).max().unwrap_or(0),
+            logs,
+        }
+    }
+
+    fn scalar(last_term: u64, last_lsn: u64) -> LogTail {
+        LogTail { last_term, last_lsn }
     }
 
     #[test]
@@ -256,7 +324,7 @@ mod tests {
 
     #[test]
     fn vote_granted_for_fresh_higher_term_when_up_to_date() {
-        let d = decide_vote(2, &None, 2, 100, &vote_req(3, "n1", 2, 100));
+        let d = decide_vote(2, &None, &HashMap::new(), scalar(2, 100), &vote_req(3, "n1", 2, 100));
         assert!(d.granted);
         assert_eq!(d.term, 3);
         assert_eq!(d.voted_for.as_deref(), Some("n1"));
@@ -264,7 +332,7 @@ mod tests {
 
     #[test]
     fn vote_denied_for_stale_candidate_term() {
-        let d = decide_vote(5, &None, 5, 100, &vote_req(4, "n1", 5, 100));
+        let d = decide_vote(5, &None, &HashMap::new(), scalar(5, 100), &vote_req(4, "n1", 5, 100));
         assert!(!d.granted);
         assert_eq!(d.term, 5);
         assert_eq!(d.voted_for, None);
@@ -272,37 +340,143 @@ mod tests {
 
     #[test]
     fn vote_at_most_once_per_term() {
-        let d1 = decide_vote(3, &None, 1, 50, &vote_req(3, "n1", 1, 50));
+        let d1 = decide_vote(3, &None, &HashMap::new(), scalar(1, 50), &vote_req(3, "n1", 1, 50));
         assert!(d1.granted);
         assert_eq!(d1.voted_for.as_deref(), Some("n1"));
 
-        let d2 = decide_vote(3, &d1.voted_for, 1, 50, &vote_req(3, "n2", 1, 50));
+        let d2 = decide_vote(3, &d1.voted_for, &HashMap::new(), scalar(1, 50), &vote_req(3, "n2", 1, 50));
         assert!(!d2.granted, "must not vote for a second candidate in the same term");
         assert_eq!(d2.voted_for.as_deref(), Some("n1"));
 
-        let d3 = decide_vote(3, &d1.voted_for, 1, 50, &vote_req(3, "n1", 1, 50));
+        let d3 = decide_vote(3, &d1.voted_for, &HashMap::new(), scalar(1, 50), &vote_req(3, "n1", 1, 50));
         assert!(d3.granted, "re-voting for the same candidate is idempotent");
     }
 
     #[test]
     fn vote_denied_when_candidate_log_behind() {
-        let behind_lsn = decide_vote(3, &None, 2, 100, &vote_req(4, "n1", 2, 99));
+        let behind_lsn = decide_vote(3, &None, &HashMap::new(), scalar(2, 100), &vote_req(4, "n1", 2, 99));
         assert!(!behind_lsn.granted, "candidate with lower lsn at same log term must lose");
 
-        let behind_term = decide_vote(3, &None, 2, 100, &vote_req(4, "n1", 1, 500));
+        let behind_term = decide_vote(3, &None, &HashMap::new(), scalar(2, 100), &vote_req(4, "n1", 1, 500));
         assert!(!behind_term.granted, "candidate with lower last log term must lose even with higher lsn");
 
-        let ahead = decide_vote(3, &None, 2, 100, &vote_req(4, "n1", 3, 1));
+        let ahead = decide_vote(3, &None, &HashMap::new(), scalar(2, 100), &vote_req(4, "n1", 3, 1));
         assert!(ahead.granted, "higher last log term wins regardless of lsn");
     }
 
     #[test]
     fn higher_term_vote_resets_prior_vote() {
         let prior = Some("n2".to_string());
-        let d = decide_vote(3, &prior, 1, 50, &vote_req(4, "n1", 1, 50));
+        let d = decide_vote(3, &prior, &HashMap::new(), scalar(1, 50), &vote_req(4, "n1", 1, 50));
         assert!(d.granted, "a higher term clears the old vote, so n1 can win");
         assert_eq!(d.term, 4);
         assert_eq!(d.voted_for.as_deref(), Some("n1"));
+    }
+
+    #[test]
+    fn a_candidate_behind_on_one_collection_is_refused() {
+        let mine = tails(&[("users", 4, 10), ("orders", 4, 3)]);
+        let summary = scalar(4, 10);
+
+        // Same global max LSN and same term, but the two logs are swapped.
+        let swapped = per_log_req(5, "n1", &[("users", 4, 3), ("orders", 4, 10)]);
+        assert_eq!(swapped.last_lsn, 10, "the global summary cannot tell these two apart");
+
+        let d = decide_vote(4, &None, &mine, summary, &swapped);
+        assert!(!d.granted,
+            "the candidate is missing users 4..10; electing it would drop entries a quorum may hold");
+        assert_eq!(d.term, 5, "the term still advances even though the vote is refused");
+    }
+
+    #[test]
+    fn a_higher_term_on_one_collection_does_not_excuse_a_stale_other() {
+        let mine = tails(&[("users", 4, 10), ("orders", 4, 11)]);
+
+        let d = decide_vote(4, &None, &mine, scalar(4, 11),
+            &per_log_req(5, "n1", &[("users", 4, 5), ("orders", 5, 12)]));
+        assert!(!d.granted,
+            "a newer term on orders says nothing about users, where this candidate is behind");
+    }
+
+    #[test]
+    fn a_candidate_current_on_every_collection_wins() {
+        let mine = tails(&[("users", 4, 10), ("orders", 4, 11)]);
+
+        let equal = decide_vote(4, &None, &mine, scalar(4, 11),
+            &per_log_req(5, "n1", &[("users", 4, 10), ("orders", 4, 11)]));
+        assert!(equal.granted, "matching every log is up to date");
+
+        let ahead = decide_vote(4, &None, &mine, scalar(4, 11),
+            &per_log_req(5, "n2", &[("users", 5, 20), ("orders", 4, 11)]));
+        assert!(ahead.granted, "ahead on one log and level on the rest is up to date");
+    }
+
+    #[test]
+    fn a_collection_the_candidate_has_never_seen_makes_it_stale() {
+        let mine = tails(&[("users", 4, 10), ("orders", 4, 3)]);
+
+        let d = decide_vote(4, &None, &mine, scalar(4, 10),
+            &per_log_req(5, "n1", &[("users", 4, 10)]));
+        assert!(!d.granted, "a log absent from the candidate is one it holds nothing of");
+
+        let empty_too = tails(&[("users", 4, 10), ("orders", 0, 0)]);
+        let d = decide_vote(4, &None, &empty_too, scalar(4, 10),
+            &per_log_req(5, "n2", &[("users", 4, 10)]));
+        assert!(d.granted, "but an empty collection dir costs the candidate nothing");
+    }
+
+    #[test]
+    fn collections_the_candidate_alone_holds_do_not_block_it() {
+        let mine = tails(&[("users", 4, 10)]);
+
+        let d = decide_vote(4, &None, &mine, scalar(4, 10),
+            &per_log_req(5, "n1", &[("users", 4, 10), ("audit", 4, 99)]));
+        assert!(d.granted, "only logs this voter holds can be lost, so extras are irrelevant");
+    }
+
+    #[test]
+    fn a_voter_holding_no_log_grants_freely() {
+        let d = decide_vote(0, &None, &HashMap::new(), LogTail::default(),
+            &per_log_req(1, "n1", &[("users", 3, 40)]));
+        assert!(d.granted, "a node with nothing to lose has no grounds to refuse");
+    }
+
+    #[test]
+    fn a_peer_that_sends_no_summaries_falls_back_to_the_scalar_compare() {
+        let mine = tails(&[("users", 4, 10), ("orders", 4, 3)]);
+
+        let current = decide_vote(4, &None, &mine, scalar(4, 10), &vote_req(5, "n1", 4, 10));
+        assert!(current.granted, "a pre-`logs` peer is still judged on the summary it does send");
+
+        let behind = decide_vote(4, &None, &mine, scalar(4, 10), &vote_req(5, "n2", 4, 9));
+        assert!(!behind.granted);
+
+        let nothing = decide_vote(4, &None, &mine, scalar(4, 10), &vote_req(5, "n3", 0, 0));
+        assert!(!nothing.granted, "an empty log must lose to a voter that holds entries");
+    }
+
+    #[test]
+    fn a_vote_request_without_logs_decodes_as_an_empty_map() {
+        let old_wire = r#"{"term":3,"candidate_id":"n1","last_lsn":10,"last_term":2}"#;
+        let req: VoteRequest = serde_json::from_str(old_wire).unwrap();
+
+        assert!(req.logs.is_empty(),
+            "a peer that predates `logs` must still decode, or no vote succeeds mid-upgrade");
+        assert_eq!(req.last_lsn, 10, "and its scalar summary must survive to drive the fallback");
+    }
+
+    #[test]
+    fn per_log_summaries_survive_the_wire() {
+        let req = per_log_req(5, "n1", &[("users", 4, 10), ("orders", 3, 7)]);
+        let back: VoteRequest = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+
+        assert_eq!(back.logs, req.logs);
+    }
+
+    #[test]
+    fn log_tails_order_by_term_before_lsn() {
+        assert!(LogTail { last_term: 5, last_lsn: 1 } > LogTail { last_term: 4, last_lsn: 900 },
+            "field order in LogTail is the comparison order; reordering it silently inverts this");
     }
 
     #[test]

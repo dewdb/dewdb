@@ -1,6 +1,9 @@
 //! /internal/* endpoints that cluster nodes call on each other.
 
-use crate::consensus::{decide_vote, heartbeat_poll_task, ReplicationMeta, VoteResponse, VoteRequest};
+use crate::consensus::{
+    decide_vote, heartbeat_poll_task, local_log_tails, LogTail, ReplicationMeta, VoteRequest,
+    VoteResponse,
+};
 use crate::model::err_json;
 use crate::replication::snapshot::{replica_sync_from_primary, SnapshotFileEntry};
 use crate::replication::{DropRequest, ReplicateRequest, ResyncRequest};
@@ -272,13 +275,16 @@ pub async fn vote_handler(
 
     let my_lsn = state.db.as_ref().map_or(0, |db| db.durable_lsn.load(Ordering::SeqCst));
     let my_log_term = state.db.as_ref().map_or(0, |db| db.last_log_term.load(Ordering::SeqCst));
+    // Collected before the replication lock: local_log_tails reaches the collections lock.
+    let my_logs = local_log_tails(&state);
+    let my_summary = LogTail { last_term: my_log_term, last_lsn: my_lsn };
 
     let (granted, resp_term, restart_poll, persist) = {
         let mut g = repl.write().unwrap();
         let was_leader = g.is_leader;
         let old_term = g.term;
 
-        let d = decide_vote(g.term, &g.voted_for, my_log_term, my_lsn, &req);
+        let d = decide_vote(g.term, &g.voted_for, &my_logs, my_summary, &req);
 
         let mut restart = false;
         g.term = d.term;
