@@ -77,6 +77,24 @@ impl AppState {
         committed
     }
 
+    /// Where to resume sending to this replica. `None` means we hold no cursor and must probe.
+    pub fn sent_through(&self, replica: &str, collection: &str) -> Option<u64> {
+        self.replication.as_ref()
+            .and_then(|r| r.read().unwrap().progress.sent_through(replica, collection))
+    }
+
+    pub fn note_sent(&self, replica: &str, collection: &str, lsn: u64) {
+        if let Some(r) = self.replication.as_ref() {
+            r.write().unwrap().progress.note_sent(replica, collection, lsn);
+        }
+    }
+
+    pub fn rewind_replica(&self, replica: &str, collection: &str, lsn: u64) {
+        if let Some(r) = self.replication.as_ref() {
+            r.write().unwrap().progress.rewind_to(replica, collection, lsn);
+        }
+    }
+
     pub fn committed_lsn(&self, collection: &str) -> u64 {
         match self.replication.as_ref() {
             Some(r) => r.read().unwrap().progress.committed(collection),

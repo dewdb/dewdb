@@ -1,6 +1,7 @@
 //! The vote round: eligibility, tallying, and assuming leadership.
 
 use super::failover::{adopt_existing_leader, demote};
+use super::progress::ProgressMeta;
 use crate::consensus::state::ReplicationMeta;
 use crate::state::AppState;
 use crate::util::same_endpoint;
@@ -249,6 +250,23 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64) {
 }
 
 // The vote round is async; another node may have moved our term while it ran.
+/// Seeds every replica's send cursor from our own log, lowered by any persisted hint.
+/// Also used at boot by a node configured as primary, which never runs an election.
+pub fn seed_leader_progress(state: &AppState) {
+    // Both reach the collections lock, so they are gathered before the replication lock.
+    let own_tails: HashMap<String, u64> = local_log_tails(state)
+        .into_iter()
+        .map(|(name, tail)| (name, tail.last_lsn))
+        .collect();
+    let hints = ProgressMeta::load(&state.config.data_dir).sent_through;
+
+    if let Some(repl) = state.replication.as_ref() {
+        let mut g = repl.write().unwrap();
+        let replicas = g.replicas.clone();
+        g.progress.reinit_as_leader(&replicas, &own_tails, &hints);
+    }
+}
+
 async fn become_leader(state: &AppState, term: u64, candidate_id: &str) {
     {
         let mut repl = state.replication.as_ref().unwrap().write().unwrap();
@@ -259,13 +277,13 @@ async fn become_leader(state: &AppState, term: u64, candidate_id: &str) {
         repl.is_leader = true;
         repl.heartbeat_running = false;
         repl.primary_addr = None;
-        repl.progress.reset();
         repl.replicas = leader_replica_set(
             &state.config.replicas,
             &state.config.peers,
             &state.config.listen_addr,
         );
     }
+    seed_leader_progress(state);
     // Term and self-vote are already durable; losing only is_leader rejoins as a follower.
     if let Err(e) = (ReplicationMeta { term, is_leader: true, voted_for: Some(candidate_id.to_string()) })
         .save(&state.config.data_dir)

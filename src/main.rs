@@ -24,7 +24,10 @@ use crate::api::build_app;
 use crate::auth::build_client;
 use crate::cluster::probe::{router_probe_task, ROUTER_PROBE_INTERVAL_SECS};
 use crate::config::{config_warnings, NodeConfig};
-use crate::consensus::{heartbeat_poll_task, Progress, ReplicationMeta, ReplicationState};
+use crate::consensus::{
+    heartbeat_poll_task, progress_flush_task, seed_leader_progress, Progress, ReplicationMeta,
+    ReplicationState,
+};
 use crate::logging::init_logging;
 use crate::maintenance::maintenance_task;
 use crate::metrics::Metrics;
@@ -173,6 +176,13 @@ async fn main() -> io::Result<()> {
     }
 
     let app = build_app(&state);
+
+    if config.role == "shard" {
+        if state.is_leader() {
+            seed_leader_progress(&state);
+        }
+        progress_flush_task(state.clone());
+    }
 
     if config.role == "shard" && !state.is_leader() {
         info!(target: "boot", "Starting heartbeat poll task (timeout={}s, delay={}ms)",

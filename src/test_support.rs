@@ -3,7 +3,10 @@
 use crate::api::build_app;
 use crate::auth::build_client;
 use crate::config::NodeConfig;
-use crate::consensus::{heartbeat_poll_task, Progress, ReplicationMeta, ReplicationState};
+use crate::consensus::{
+    heartbeat_poll_task, progress_flush_task, seed_leader_progress, Progress, ReplicationMeta,
+    ReplicationState,
+};
 use crate::metrics::Metrics;
 use crate::state::AppState;
 use crate::storage::index::IndexEntry;
@@ -199,9 +202,12 @@ impl TestNode {
                 };
 
                 let app = build_app(&state);
-                if !state.is_leader() {
+                if state.is_leader() {
+                    seed_leader_progress(&state);
+                } else {
                     heartbeat_poll_task(state.clone());
                 }
+                progress_flush_task(state.clone());
 
                 let listener = bind_with_retry(&addr).await;
                 tokio::spawn(async move {

@@ -35,6 +35,25 @@ pub fn remove_file_with_retry(path: &Path) -> io::Result<()> {
     Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "Failed to remove file")))
 }
 
+/// Durable on return. The staging file is `<name>.tmp`; readers that recover from it depend on
+/// that spelling, and on it being fsynced before the rename.
+pub fn write_atomic(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+    let tmp = dir.join(format!("{}.tmp", name));
+    {
+        let mut f = fs::File::create(&tmp)?;
+        io::Write::write_all(&mut f, bytes)?;
+        f.sync_all()?;
+    }
+    rename_with_retry(&tmp, &dir.join(name))?;
+
+    // The rename is durable only once the directory entry is synced.
+    // Windows refuses to open a directory as a file: best effort there.
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
+}
+
 // Same Windows quirk: an indexer holding the destination fails the replace transiently.
 pub fn rename_with_retry(from: &Path, to: &Path) -> io::Result<()> {
     let mut last_err = None;

@@ -1,12 +1,11 @@
 //! Durable term/vote state and the demotion transition.
 
 use super::progress::Progress;
-use crate::util::rename_with_retry;
+use crate::util::write_atomic;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -85,21 +84,7 @@ impl ReplicationMeta {
 
         let content = serde_json::to_vec(self)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-        let tmp = dir.join(META_TMP);
-        {
-            let mut f = fs::File::create(&tmp)?;
-            f.write_all(&content)?;
-            f.sync_all()?;
-        }
-        rename_with_retry(&tmp, &dir.join(META_FILE))?;
-
-        // The rename is durable only once the directory entry is synced.
-        // Windows refuses to open a directory as a file: best effort there.
-        if let Ok(d) = fs::File::open(&dir) {
-            let _ = d.sync_all();
-        }
-        Ok(())
+        write_atomic(&dir, META_FILE, &content)
     }
 }
 

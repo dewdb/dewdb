@@ -1,10 +1,12 @@
 //! Follower watchdog: detect leader silence, find the new leader, step down.
 
 use super::election::run_election;
+use super::progress::{ProgressMeta, PROGRESS_FLUSH_INTERVAL_SECS};
 use super::state::{apply_demotion, ReplicationMeta};
 use crate::replication::snapshot::replica_sync_from_primary;
 use crate::state::AppState;
 use crate::util::same_endpoint;
+use std::collections::HashMap;
 use std::fs;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -171,6 +173,28 @@ pub async fn adopt_existing_leader(state: &AppState) -> bool {
         });
     }
     true
+}
+
+pub fn progress_flush_task(state: AppState) {
+    tokio::spawn(async move {
+        let mut last: HashMap<String, HashMap<String, u64>> = HashMap::new();
+        loop {
+            tokio::time::sleep(Duration::from_secs(PROGRESS_FLUSH_INTERVAL_SECS)).await;
+
+            let snapshot = match state.replication.as_ref() {
+                Some(r) => r.read().unwrap().progress.cursor_snapshot(),
+                None => return,
+            };
+            if snapshot == last {
+                continue;
+            }
+            if let Err(e) = (ProgressMeta { sent_through: snapshot.clone() }).save(&state.config.data_dir) {
+                warn!(target: "replication", error = %e, "Could not persist replication cursors");
+                continue;
+            }
+            last = snapshot;
+        }
+    });
 }
 
 pub fn heartbeat_poll_task(state: AppState) {

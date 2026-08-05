@@ -37,6 +37,11 @@ pub fn replicate_to_peers(
             let state = state.clone();
             handles.push(tokio::spawn(async move {
                 let _permit = sem.acquire().await;
+
+                if stream_backlog_if_behind(&state, &replica_url, &col, prev_lsn).await.is_some() {
+                    return;
+                }
+
                 let url = format!("{}/internal/replicate", replica_url);
                 let req_body = ReplicateRequest {
                     collection: col.clone(),
@@ -48,6 +53,7 @@ pub fn replicate_to_peers(
                 };
                 match client.post(&url).json(&req_body).send().await {
                     Ok(r) if r.status().is_success() => {
+                        state.note_sent(&replica_url, &col, lsn);
                         state.note_ack(&replica_url, &col, lsn, term);
                     },
                     Ok(r) if r.status() == StatusCode::CONFLICT => {
@@ -60,12 +66,15 @@ pub fn replicate_to_peers(
                             ConflictKind::Divergent(last_lsn) => {
                                 state.metrics.note_divergence();
                                 warn!(target: "replication", "Replica {} diverges from us at lsn {} (its last_lsn={}); snapshotting it", replica_url, lsn, last_lsn);
+                                // The snapshot decides its tail, so the cursor is stale either way.
+                                state.rewind_replica(&replica_url, &col, last_lsn);
                                 trigger_resync(&state, &replica_url, &col).await;
                             },
                             ConflictKind::Gap(last_lsn, last_term) => {
                                 state.metrics.note_gap();
                                 warn!(target: "replication", "Replica {} gap at lsn {} (its last_lsn={}), starting repair", replica_url, lsn, last_lsn);
-                                let _ = repair_replica(state, replica_url.clone(), col, last_lsn, last_term).await;
+                                state.rewind_replica(&replica_url, &col, last_lsn);
+                                let _ = repair_replica(state, replica_url.clone(), col, last_lsn, Some(last_term)).await;
                             }
                         }
                     },
@@ -129,12 +138,15 @@ async fn trigger_resync(state: &AppState, replica_url: &str, collection: &str) {
     }
 }
 
+/// `reported_last_term` is `Some` only when the replica told us its tail term, and then the chain
+/// is validated against it so a divergent tail is caught here. `None` means we are driving from our
+/// own cursor, where the predecessor term comes from our own next frame's header.
 async fn repair_replica(
     state: AppState,
     replica_url: String,
     collection: String,
     reported_last_lsn: u64,
-    reported_last_term: u64,
+    reported_last_term: Option<u64>,
 ) -> bool {
     let lock = {
         let mut locks = state.repair_locks.lock().unwrap();
@@ -167,7 +179,15 @@ async fn repair_replica(
         _ => return false,
     };
 
-    let chained = chain_prefix(reported_last_lsn, reported_last_term, frames);
+    let after_term = match reported_last_term {
+        Some(t) => t,
+        None => frames.iter()
+            .min_by_key(|(lsn, _)| *lsn)
+            .and_then(|(_, f)| FrameHeader::parse(f))
+            .map_or(0, |h| h.prev_term),
+    };
+
+    let chained = chain_prefix(reported_last_lsn, after_term, frames);
     let reaches_target = chained.last().map_or(false, |(lsn, _)| *lsn >= target);
 
     if !reaches_target {
@@ -195,6 +215,7 @@ async fn repair_replica(
         match state.client.post(&url).json(&req).send().await {
             Ok(r) if r.status().is_success() => {
                 prev = lsn;
+                state.note_sent(&replica_url, &collection, lsn);
             },
             Ok(r) if r.status() == StatusCode::CONFLICT => {
                 let body = r.json::<serde_json::Value>().await.ok();
@@ -206,11 +227,13 @@ async fn repair_replica(
                     },
                     ConflictKind::Divergent(last_lsn) => {
                         warn!(target: "repair", "Replica {} diverges from us at lsn {} (its last_lsn={}); snapshotting it", replica_url, lsn, last_lsn);
+                        state.rewind_replica(&replica_url, &collection, last_lsn);
                         trigger_resync(&state, &replica_url, &collection).await;
                         return false;
                     },
-                    ConflictKind::Gap(..) => {
+                    ConflictKind::Gap(last_lsn, _) => {
                         warn!(target: "repair", "Replica {} still gapped during backfill at lsn {}, falling back to snapshot", replica_url, lsn);
+                        state.rewind_replica(&replica_url, &collection, last_lsn);
                         trigger_resync(&state, &replica_url, &collection).await;
                         return false;
                     }
@@ -241,6 +264,26 @@ async fn repair_replica(
     prev >= target
 }
 
+/// Leader-driven: a cursor short of this frame's predecessor means the replica is behind, and
+/// sending only the newest frame would buy nothing but a rejection. Streaming from the cursor
+/// instead is what makes repair planned rather than a reaction to the replica's complaint.
+///
+/// `Some(caught_up)` means the backlog was handled here; `None` means send the frame normally.
+/// Both send paths route through this, or one of them silently reverts to reactive repair.
+async fn stream_backlog_if_behind(
+    state: &AppState,
+    replica_url: &str,
+    collection: &str,
+    prev_lsn: u64,
+) -> Option<bool> {
+    match state.sent_through(replica_url, collection) {
+        Some(cursor) if cursor < prev_lsn => Some(
+            repair_replica(state.clone(), replica_url.to_string(), collection.to_string(), cursor, None).await,
+        ),
+        _ => None,
+    }
+}
+
 async fn replicate_one_await(
     state: &AppState,
     replica_url: &str,
@@ -251,6 +294,10 @@ async fn replicate_one_await(
     lsn: u64,
     prev_lsn: u64,
 ) -> bool {
+    if let Some(caught_up) = stream_backlog_if_behind(state, replica_url, collection, prev_lsn).await {
+        return caught_up;
+    }
+
     let url = format!("{}/internal/replicate", replica_url);
     let req = ReplicateRequest {
         collection: collection.to_string(),
@@ -262,6 +309,7 @@ async fn replicate_one_await(
     };
     match state.client.post(&url).json(&req).send().await {
         Ok(r) if r.status().is_success() => {
+            state.note_sent(replica_url, collection, lsn);
             state.note_ack(replica_url, collection, lsn, term);
             true
         },
@@ -275,12 +323,14 @@ async fn replicate_one_await(
                 ConflictKind::Divergent(last_lsn) => {
                     state.metrics.note_divergence();
                     warn!(target: "replication", "Replica {} diverges from us at lsn {} (its last_lsn={}); snapshotting it", replica_url, lsn, last_lsn);
+                    state.rewind_replica(replica_url, collection, last_lsn);
                     trigger_resync(state, replica_url, collection).await;
                     false
                 },
                 ConflictKind::Gap(last_lsn, last_term) => {
                     state.metrics.note_gap();
-                    repair_replica(state.clone(), replica_url.to_string(), collection.to_string(), last_lsn, last_term).await
+                    state.rewind_replica(replica_url, collection, last_lsn);
+                    repair_replica(state.clone(), replica_url.to_string(), collection.to_string(), last_lsn, Some(last_term)).await
                 }
             }
         },
@@ -492,6 +542,42 @@ mod tests {
             "alternating writes between two collections must replicate directly; \
              chaining on lsn-1 instead of the collection's own predecessor makes \
              every second write look like a gap and drags in a full snapshot resync");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_returning_replica_is_streamed_its_backlog_without_reporting_a_gap() {
+        let root = temp_root();
+        let (n1, _n2, mut n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+
+        assert!(put_doc_at(&client, &n1.url(), "t", "k0", 0, "?w=all&wtimeout=4000").await.is_success());
+        assert!(wait_for_doc(&client, &n3.url(), "t", "k0", 0, Duration::from_secs(10)).await);
+
+        let (gaps_before, _, _) = n1.state.as_ref().unwrap().metrics.repair_counts();
+
+        n3.kill();
+        for i in 1..5 {
+            assert!(put_doc_at(&client, &n1.url(), "t", &format!("k{}", i), i, "?w=majority&wtimeout=4000")
+                .await.is_success(), "the remaining majority must keep accepting writes");
+        }
+
+        n3.start();
+        // The cursor stalled at k0 while n3 was gone, so this write is what the leader notices on.
+        assert!(put_doc_at(&client, &n1.url(), "t", "k9", 9, "?w=majority&wtimeout=4000").await.is_success());
+
+        for i in 1..5 {
+            assert!(wait_for_doc(&client, &n3.url(), "t", &format!("k{}", i), i, Duration::from_secs(15)).await,
+                "the backlogged write k{} must reach the returning replica", i);
+        }
+        assert!(wait_for_doc(&client, &n3.url(), "t", "k9", 9, Duration::from_secs(15)).await);
+
+        let (gaps_after, _, resyncs) = n1.state.as_ref().unwrap().metrics.repair_counts();
+        assert_eq!(gaps_after, gaps_before,
+            "the leader tracks how far behind each replica is, so it streams the backlog directly; \
+             needing a gap report first means the cursor was not consulted");
+        assert_eq!(resyncs, 0, "a short backlog must never escalate to a full snapshot");
 
         let _ = fs::remove_dir_all(&root);
     }
