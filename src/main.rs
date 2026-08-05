@@ -18,6 +18,8 @@ mod storage;
 mod util;
 
 #[cfg(test)]
+mod bench;
+#[cfg(test)]
 mod test_support;
 
 use crate::api::build_app;

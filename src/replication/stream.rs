@@ -885,66 +885,6 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Not part of the suite: a measurement, run with
-    /// `cargo test --release -- --ignored --nocapture write_latency_profile`.
-    /// Reuses one client so connection setup is not counted, and drives concurrent writers so the
-    /// commit and replication pipelines are both busy.
-    #[ignore]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-    async fn write_latency_profile() {
-        let root = temp_root();
-        let (n1, _n2, _n3) = three_node_cluster(&root).await;
-        let client = Arc::new(reqwest::Client::builder()
-            .pool_max_idle_per_host(64)
-            .timeout(Duration::from_secs(10))
-            .build().unwrap());
-
-        let concurrency = 16usize;
-        let per_writer = 40usize;
-
-        // Warm the connection pool and the collection so the measured phase excludes first-touch.
-        for i in 0..8 {
-            let _ = put_doc_at(&client, &n1.url(), "t", &format!("warm{}", i), i, "?w=majority&wtimeout=8000").await;
-        }
-
-        let started = std::time::Instant::now();
-        let mut tasks = Vec::new();
-        for w in 0..concurrency {
-            let client = client.clone();
-            let url = n1.url();
-            tasks.push(tokio::spawn(async move {
-                let mut samples = Vec::with_capacity(per_writer);
-                for i in 0..per_writer {
-                    let key = format!("w{}k{}", w, i);
-                    let t = std::time::Instant::now();
-                    let st = put_doc_at(&client, &url, "t", &key, i as i64, "?w=majority&wtimeout=8000").await;
-                    samples.push((t.elapsed().as_secs_f64() * 1000.0, st.is_success()));
-                }
-                samples
-            }));
-        }
-
-        let mut latencies = Vec::new();
-        let mut failures = 0;
-        for t in tasks {
-            for (ms, ok) in t.await.unwrap() {
-                if ok { latencies.push(ms) } else { failures += 1 }
-            }
-        }
-        let wall = started.elapsed().as_secs_f64();
-
-        latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let pick = |q: f64| latencies[((latencies.len() as f64 * q) as usize).min(latencies.len() - 1)];
-        let avg: f64 = latencies.iter().sum::<f64>() / latencies.len() as f64;
-
-        eprintln!(
-            "PROFILE n={} conc={} ok={} fail={} wall={:.2}s tput={:.0}/s avg={:.2}ms p50={:.2}ms p95={:.2}ms p99={:.2}ms",
-            latencies.len(), concurrency, latencies.len(), failures, wall,
-            latencies.len() as f64 / wall, avg, pick(0.50), pick(0.95), pick(0.99));
-
-        let _ = fs::remove_dir_all(&root);
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_quorum_acknowledgement_advances_the_commit_index() {
         let root = temp_root();

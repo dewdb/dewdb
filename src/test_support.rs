@@ -349,6 +349,35 @@ pub fn node_by_id<'a>(nodes: &[&'a TestNode], id: &str) -> &'a TestNode {
     nodes.iter().find(|n| n.node_id == id).expect("leader vanished")
 }
 
+/// A leader with no peers, so writes commit on their own durability. Isolates local write cost
+/// from anything replication does.
+pub async fn single_node(root: &Path) -> TestNode {
+    let mut n = TestNode::new("solo", free_port(), root, "primary");
+    n.start();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    n
+}
+
+pub async fn get_raw(client: &reqwest::Client, base: &str, col: &str, key: &str) -> bool {
+    let url = format!("{}/collections/{}/docs/{}", base, col, key);
+    client.get(&url).send().await.map(|r| r.status().is_success()).unwrap_or(false)
+}
+
+pub async fn put_value(
+    client: &reqwest::Client,
+    base: &str,
+    col: &str,
+    key: &str,
+    value: serde_json::Value,
+    query: &str,
+) -> StatusCode {
+    let url = format!("{}/collections/{}/docs/{}{}", base, col, key, query);
+    match client.put(&url).json(&serde_json::json!({"value": value})).send().await {
+        Ok(r) => r.status(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
 pub async fn three_node_cluster(root: &Path) -> (TestNode, TestNode, TestNode) {
     let (p1, p2, p3) = (free_port(), free_port(), free_port());
     let (u1, u2, u3) = (
