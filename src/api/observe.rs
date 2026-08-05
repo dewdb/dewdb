@@ -64,6 +64,8 @@ fn replication_metrics(state: &AppState) -> serde_json::Value {
     };
 
     let (gaps, divergences, resyncs) = state.metrics.repair_counts();
+    let (batches, frames) = state.metrics.batch_counts();
+    let widest = state.metrics.max_batch_frames();
 
     if leader {
         let replicas = state.get_replicas();
@@ -99,6 +101,18 @@ fn replication_metrics(state: &AppState) -> serde_json::Value {
                 "gaps": gaps,
                 "divergences": divergences,
                 "resyncs_triggered": resyncs,
+            },
+            "batching": {
+                "batches_sent": batches,
+                "frames_sent": frames,
+                "max_batch_frames": widest,
+                "frames_per_batch": if batches > 0 { frames as f64 / batches as f64 } else { 0.0 },
+            },
+            "flow_control": {
+                "writes_rejected": state.metrics.writes_rejected(),
+                "max_uncommitted_frames": state.config.flow_control.max_uncommitted_frames,
+                "inflight_slots_available": state.replication_slots.available_permits(),
+                "max_inflight_requests": state.config.flow_control.max_inflight_requests,
             },
             "replicas": per_replica.into_iter().map(|(url, (matched, l))| serde_json::json!({
                 "url": url,

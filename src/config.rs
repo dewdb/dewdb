@@ -29,6 +29,8 @@ pub struct NodeConfig {
     #[serde(default = "default_election_delay")]
     pub election_delay_ms: u64,
     #[serde(default)]
+    pub flow_control: FlowControlConfig,
+    #[serde(default)]
     pub maintenance: MaintenanceConfig,
     #[serde(default)]
     pub read_cache: ReadCacheConfig,
@@ -38,6 +40,34 @@ pub struct NodeConfig {
     pub auth: AuthConfig,
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
+}
+
+/// Bounds on how far the leader lets replication fall behind before it stops accepting writes.
+/// Without `max_uncommitted_frames` a leader that has lost quorum keeps staging frames in memory
+/// forever, since the staging buffer only drains on commit.
+#[derive(Deserialize, Debug, Clone)]
+pub struct FlowControlConfig {
+    #[serde(default = "default_max_uncommitted")]
+    pub max_uncommitted_frames: usize,
+    #[serde(default = "default_max_inflight")]
+    pub max_inflight_requests: usize,
+    #[serde(default = "default_drive_interval")]
+    pub drive_interval_ms: u64,
+}
+
+// 0 disables the bound, which is the only way to get the old unbounded behaviour back.
+fn default_max_uncommitted() -> usize { 4096 }
+fn default_max_inflight() -> usize { 16 }
+fn default_drive_interval() -> u64 { 500 }
+
+impl Default for FlowControlConfig {
+    fn default() -> Self {
+        Self {
+            max_uncommitted_frames: default_max_uncommitted(),
+            max_inflight_requests: default_max_inflight(),
+            drive_interval_ms: default_drive_interval(),
+        }
+    }
 }
 
 fn default_data_dir() -> String { "./data".to_string() }

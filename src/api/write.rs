@@ -8,6 +8,7 @@ use crate::json::merge_patch;
 use crate::state::AppState;
 use crate::storage::{Collection, FrameHeader, HEADER_LEN};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -120,6 +121,21 @@ async fn finish_write(
     WriteOutcome { met: acks >= required, acks, required, existed: pending.existed }
 }
 
+/// 503 rather than 500: the write is not wrong, the leader is too far ahead of its quorum, and the
+/// same request will succeed once commits catch up.
+pub fn backpressure_response(collection: &str, pending: usize, bound: usize) -> axum::response::Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::RETRY_AFTER, "1")],
+        axum::Json(serde_json::json!({
+            "error": "replication backlog too large",
+            "collection": collection,
+            "uncommitted_frames": pending,
+            "max_uncommitted_frames": bound,
+        })),
+    ).into_response()
+}
+
 pub async fn local_write(
     state: &AppState,
     col_name: &str,
@@ -128,6 +144,11 @@ pub async fn local_write(
     wc: WriteConcern,
     wtimeout: Duration,
 ) -> Result<WriteOutcome, axum::response::Response> {
+    if let Err(pending) = state.admit_write(col_name) {
+        return Err(backpressure_response(
+            col_name, pending, state.config.flow_control.max_uncommitted_frames));
+    }
+
     let db = state.db.as_ref().unwrap();
     let col = match db.get_collection(col_name) {
         Ok(c) => c,
@@ -150,6 +171,11 @@ pub async fn local_patch(
     wc: WriteConcern,
     wtimeout: Duration,
 ) -> Result<Option<WriteOutcome>, axum::response::Response> {
+    if let Err(pending) = state.admit_write(col_name) {
+        return Err(backpressure_response(
+            col_name, pending, state.config.flow_control.max_uncommitted_frames));
+    }
+
     let db = state.db.as_ref().unwrap();
     let col = match db.get_collection(col_name) {
         Ok(c) => c,
@@ -227,6 +253,11 @@ pub async fn local_write_batch(
     wc: WriteConcern,
     wtimeout: Duration,
 ) -> Result<Vec<WriteOutcome>, axum::response::Response> {
+    if let Err(pending) = state.admit_write(col_name) {
+        return Err(backpressure_response(
+            col_name, pending, state.config.flow_control.max_uncommitted_frames));
+    }
+
     let db = state.db.as_ref().unwrap();
     let col = match db.get_collection(col_name) {
         Ok(c) => c,

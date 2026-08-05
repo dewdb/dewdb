@@ -54,6 +54,10 @@ pub struct Metrics {
     pub gaps: AtomicU64,
     pub divergences: AtomicU64,
     pub resyncs: AtomicU64,
+    pub batches_sent: AtomicU64,
+    pub frames_sent: AtomicU64,
+    pub max_batch_frames: AtomicU64,
+    pub writes_rejected: AtomicU64,
 }
 
 impl Metrics {
@@ -64,7 +68,39 @@ impl Metrics {
             gaps: AtomicU64::new(0),
             divergences: AtomicU64::new(0),
             resyncs: AtomicU64::new(0),
+            batches_sent: AtomicU64::new(0),
+            frames_sent: AtomicU64::new(0),
+            max_batch_frames: AtomicU64::new(0),
+            writes_rejected: AtomicU64::new(0),
         }
+    }
+
+    pub fn note_write_rejected(&self) {
+        self.writes_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn writes_rejected(&self) -> u64 {
+        self.writes_rejected.load(Ordering::Relaxed)
+    }
+
+    pub fn note_batch(&self, frames: usize) {
+        self.batches_sent.fetch_add(1, Ordering::Relaxed);
+        self.frames_sent.fetch_add(frames as u64, Ordering::Relaxed);
+        self.max_batch_frames.fetch_max(frames as u64, Ordering::Relaxed);
+    }
+
+    /// `(batches, frames)`. Frames above batches is the whole point of pipelining.
+    pub fn batch_counts(&self) -> (u64, u64) {
+        (
+            self.batches_sent.load(Ordering::Relaxed),
+            self.frames_sent.load(Ordering::Relaxed),
+        )
+    }
+
+    /// High-water mark rather than a windowed delta: repair can begin before the last write is
+    /// appended, so totals over an interval are racy while this is not.
+    pub fn max_batch_frames(&self) -> u64 {
+        self.max_batch_frames.load(Ordering::Relaxed)
     }
 
     pub fn note_gap(&self) {

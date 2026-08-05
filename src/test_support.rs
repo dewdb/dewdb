@@ -199,6 +199,8 @@ impl TestNode {
                     resyncing: Arc::new(std::sync::Mutex::new(HashSet::new())),
                     read_rr: Arc::new(AtomicUsize::new(0)),
                     metrics: Arc::new(Metrics::new()),
+                    replication_slots: Arc::new(tokio::sync::Semaphore::new(
+                        config.flow_control.max_inflight_requests.max(1))),
                 };
 
                 let app = build_app(&state);
@@ -208,6 +210,7 @@ impl TestNode {
                     heartbeat_poll_task(state.clone());
                 }
                 progress_flush_task(state.clone());
+                crate::replication::stream::replication_drive_task(state.clone());
 
                 let listener = bind_with_retry(&addr).await;
                 tokio::spawn(async move {

@@ -111,15 +111,8 @@ pub async fn replicate_handler(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
-    let frame = req.wal_frame;
-    let payload_for_index: Vec<u8> = if frame.len() > HEADER_LEN {
-        frame[HEADER_LEN..].to_vec()
-    } else {
-        Vec::new()
-    };
-
     // Header is authoritative; a mismatched request field means a confused sender, not a link to apply.
-    if let Some(header) = FrameHeader::parse(&frame) {
+    if let Some(header) = FrameHeader::parse(&req.wal_frame) {
         if header.lsn != req.lsn {
             return (StatusCode::BAD_REQUEST, "Frame lsn does not match request lsn").into_response();
         }
@@ -128,51 +121,81 @@ pub async fn replicate_handler(
         }
     }
 
-    let col_clone = col.clone();
+    let mut batch = Vec::with_capacity(1 + req.frames.len());
+    batch.push(req.wal_frame);
+    batch.extend(req.frames);
 
-    let entry_opt = if frame.len() >= HEADER_LEN {
-        serde_json::from_slice::<LogEntry>(&frame[HEADER_LEN..]).ok()
-    } else {
-        None
+    let col_clone = col.clone();
+    // Appends run to the first refusal, then one fsync covers the whole accepted run. Per-frame
+    // syncing here is what made catch-up cost a disk flush per entry.
+    let appended = tokio::task::spawn_blocking(move || {
+        let mut staged: Vec<(u64, String, u64, u64, Option<Vec<u8>>)> = Vec::new();
+        let mut highest_applied = 0u64;
+        let mut refusal = None;
+
+        for frame in &batch {
+            match col_clone.append_raw_frame(frame) {
+                Ok(ReplicaApply::Applied { wal_id, offset, lsn }) => {
+                    highest_applied = highest_applied.max(lsn);
+                    let payload = if frame.len() > HEADER_LEN { &frame[HEADER_LEN..] } else { &[][..] };
+                    match serde_json::from_slice::<LogEntry>(payload) {
+                        Ok(LogEntry::Put { key, .. }) => {
+                            staged.push((lsn, key, wal_id, offset, Some(payload.to_vec())))
+                        },
+                        Ok(LogEntry::Del { key, .. }) => staged.push((lsn, key, wal_id, offset, None)),
+                        Err(_) => {},
+                    }
+                },
+                // Already held: keep going, later entries in the batch may still be new.
+                Ok(ReplicaApply::Duplicate { .. }) => continue,
+                Ok(other) => {
+                    refusal = Some(Ok(other));
+                    break;
+                },
+                Err(e) => {
+                    refusal = Some(Err(e));
+                    break;
+                },
+            }
+        }
+        (highest_applied, staged, refusal)
+    }).await;
+
+    let (highest, staged, refusal) = match appended {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
-    match tokio::task::spawn_blocking(move || col_clone.append_raw_frame(&frame)).await {
-        Ok(Ok(ReplicaApply::Applied { wal_id, offset, lsn })) => {
-            let commit_rx = col.enqueue_commit();
-            match commit_rx.await {
-                Ok(Ok(())) => {
-                    if let Some(entry) = entry_opt {
-                        let staged = match entry {
-                            LogEntry::Put { key, .. } => {
-                                (key, Some(col.build_entry(wal_id, offset, &payload_for_index)))
-                            },
-                            LogEntry::Del { key, .. } => (key, None),
-                        };
-                        col.stage(lsn, staged.0, wal_id, offset, staged.1);
-                    }
-                    // The leader's watermark trails this frame by a message; visibility waits for the next one.
-                    col.apply_committed(state.committed_hint(&req.collection));
+    // Keyed on what was appended, not on what parsed: an unparseable payload is still on disk
+    // and still needs the sync before we report it durable.
+    if highest > 0 {
+        match col.enqueue_commit().await {
+            Ok(Ok(())) => {},
+            Ok(Err(e)) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        }
+        for (lsn, key, wal_id, offset, payload) in staged {
+            let entry = payload.map(|p| col.build_entry(wal_id, offset, &p));
+            col.stage(lsn, key, wal_id, offset, entry);
+        }
+        // The leader's watermark trails this frame by a message; visibility waits for the next one.
+        col.apply_committed(state.committed_hint(&req.collection));
+    }
 
-                    if let Some(ref repl) = state.replication {
-                        let mut r = repl.write().unwrap();
-                        r.last_replication = Some(std::time::Instant::now());
-                        r.was_receiving_replication = true;
-                    }
-                    (StatusCode::OK, Json(serde_json::json!({"status": "applied", "lsn": lsn}))).into_response()
-                },
-                Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-            }
-        },
-        Ok(Ok(ReplicaApply::Duplicate { last_lsn })) => {
-            if let Some(ref repl) = state.replication {
-                let mut r = repl.write().unwrap();
-                r.last_replication = Some(std::time::Instant::now());
-                r.was_receiving_replication = true;
-            }
-            (StatusCode::OK, Json(serde_json::json!({"status": "duplicate", "last_lsn": last_lsn}))).into_response()
-        },
-        Ok(Ok(ReplicaApply::Gap { last_lsn, last_term })) => {
+    if let Some(ref repl) = state.replication {
+        let mut r = repl.write().unwrap();
+        r.last_replication = Some(std::time::Instant::now());
+        r.was_receiving_replication = true;
+    }
+
+    match refusal {
+        // Nothing new in the whole batch: the old single-frame reply, which callers still parse.
+        None if highest == 0 => (StatusCode::OK, Json(serde_json::json!({
+            "status": "duplicate",
+            "last_lsn": col.last_appended_lsn(),
+        }))).into_response(),
+        None => (StatusCode::OK, Json(serde_json::json!({"status": "applied", "lsn": highest}))).into_response(),
+        Some(Ok(ReplicaApply::Gap { last_lsn, last_term })) => {
             warn!(target: "replicate", "Gap detected: got prev_lsn {} but replica is at lsn {}", req.prev_lsn, last_lsn);
             (StatusCode::CONFLICT, Json(serde_json::json!({
                 "status": "gap",
@@ -180,7 +203,7 @@ pub async fn replicate_handler(
                 "last_term": last_term,
             }))).into_response()
         },
-        Ok(Ok(ReplicaApply::Divergent { last_lsn, last_term })) => {
+        Some(Ok(ReplicaApply::Divergent { last_lsn, last_term })) => {
             warn!(target: "replicate", collection = %req.collection, lsn = req.lsn, term = req.term,
                 last_lsn, last_term,
                 "Log divergence: our tail came from a superseded leader, awaiting snapshot");
@@ -190,8 +213,8 @@ pub async fn replicate_handler(
                 "last_term": last_term,
             }))).into_response()
         },
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Some(Ok(_)) => (StatusCode::OK, Json(serde_json::json!({"status": "applied", "lsn": highest}))).into_response(),
+        Some(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 

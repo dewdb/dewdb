@@ -6,6 +6,8 @@ use crate::metrics::Metrics;
 use crate::ring::shard_owns;
 use crate::storage::Database;
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::fs;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, RwLock};
 
@@ -29,6 +31,9 @@ pub struct AppState {
     pub resyncing: Arc<std::sync::Mutex<HashSet<String>>>,
     pub read_rr: Arc<AtomicUsize>,
     pub metrics: Arc<Metrics>,
+    /// Node-wide cap on concurrent outbound replication requests. Shared across every write, unlike
+    /// a per-call semaphore, which bounds one write's fan-out and nothing else.
+    pub replication_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -41,6 +46,27 @@ impl AppState {
 
     pub fn is_shard(&self) -> bool {
         self.config.role == "shard"
+    }
+
+    /// `Err` means the collection has more durable-but-uncommitted frames than the bound allows.
+    /// Checked before the append: once a frame is on disk it is staged, and the staging buffer only
+    /// drains on commit, so admitting here is the last point where growth can still be refused.
+    pub fn admit_write(&self, collection: &str) -> Result<(), usize> {
+        let bound = self.config.flow_control.max_uncommitted_frames;
+        if bound == 0 || !self.is_leader() {
+            return Ok(());
+        }
+        let pending = self
+            .db
+            .as_ref()
+            .and_then(|db| db.get_collection(collection).ok())
+            .map_or(0, |col| col.pending_len());
+
+        if pending >= bound {
+            self.metrics.note_write_rejected();
+            return Err(pending);
+        }
+        Ok(())
     }
 
     pub fn current_term(&self) -> u64 {
@@ -179,6 +205,42 @@ impl AppState {
         }
     }
 
+    #[cfg(test)]
+    pub fn for_admission_test(
+        config: crate::config::NodeConfig,
+        db: Arc<Database>,
+        is_leader: bool,
+    ) -> Self {
+        use crate::consensus::{Progress, ReplicationState};
+        Self {
+            db: Some(db),
+            replication: Some(Arc::new(RwLock::new(ReplicationState {
+                term: 1,
+                is_leader,
+                voted_for: None,
+                last_heartbeat: None,
+                last_replication: None,
+                was_receiving_replication: false,
+                heartbeat_running: false,
+                primary_addr: None,
+                replicas: Vec::new(),
+                last_known_primary_position: None,
+                progress: Progress::new(),
+                leader_committed: HashMap::new(),
+            }))),
+            replication_slots: Arc::new(tokio::sync::Semaphore::new(
+                config.flow_control.max_inflight_requests.max(1))),
+            client: reqwest::Client::new(),
+            config: Arc::new(config),
+            primary_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            shard_failover_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            repair_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            resyncing: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            read_rr: Arc::new(AtomicUsize::new(0)),
+            metrics: Arc::new(Metrics::new()),
+        }
+    }
+
     pub fn get_replicas(&self) -> Vec<String> {
         if let Some(ref repl) = self.replication {
             return repl.read().unwrap().replicas.clone();
@@ -224,5 +286,67 @@ impl AppState {
             overrides.remove(original_url);
         }
         original_url.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{stage_put, temp_root};
+
+    fn config_with_bound(root: &std::path::Path, bound: usize) -> NodeConfig {
+        serde_json::from_value(serde_json::json!({
+            "node_id": "n1",
+            "role": "shard",
+            "shard_role": "primary",
+            "listen_addr": "127.0.0.1:1",
+            "data_dir": root.to_string_lossy(),
+            "flow_control": { "max_uncommitted_frames": bound },
+        })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn writes_are_refused_once_the_uncommitted_backlog_hits_the_bound() {
+        let root = temp_root();
+        let db = Arc::new(Database::new(&root).unwrap());
+        let state = AppState::for_admission_test(config_with_bound(&root, 3), db.clone(), true);
+        let col = db.get_collection("t").unwrap();
+
+        for i in 0..2 {
+            stage_put(&col, &format!("k{}", i), i);
+            assert!(state.admit_write("t").is_ok(), "under the bound the write is admitted");
+        }
+
+        stage_put(&col, "k2", 2);
+        assert_eq!(state.admit_write("t"), Err(3),
+            "at the bound the leader must refuse, or the staging buffer grows without limit \
+             for as long as commits are stalled");
+        assert_eq!(state.metrics.writes_rejected(), 1);
+
+        // A quorum catching up drains the buffer and reopens the door.
+        col.apply_committed(col.last_appended_lsn());
+        assert!(state.admit_write("t").is_ok(), "backpressure must lift once commits catch up");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_follower_is_never_backpressured_and_zero_disables_the_bound() {
+        let root = temp_root();
+        let db = Arc::new(Database::new(&root).unwrap());
+        let col = db.get_collection("t").unwrap();
+        for i in 0..5 {
+            stage_put(&col, &format!("k{}", i), i);
+        }
+
+        let follower = AppState::for_admission_test(config_with_bound(&root, 1), db.clone(), false);
+        assert!(follower.admit_write("t").is_ok(),
+            "a follower refusing replicated frames would look like a gap to the leader; its buffer \
+             is bounded by the leader's own admission control instead");
+
+        let unbounded = AppState::for_admission_test(config_with_bound(&root, 0), db.clone(), true);
+        assert!(unbounded.admit_write("t").is_ok(), "0 opts out of the bound");
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

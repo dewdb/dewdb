@@ -32,6 +32,7 @@ use crate::logging::init_logging;
 use crate::maintenance::maintenance_task;
 use crate::metrics::Metrics;
 use crate::replication::snapshot::replica_sync_from_primary;
+use crate::replication::stream::replication_drive_task;
 use crate::state::AppState;
 use crate::storage::Database;
 use std::collections::{HashMap, HashSet};
@@ -151,6 +152,8 @@ async fn main() -> io::Result<()> {
         resyncing: Arc::new(std::sync::Mutex::new(HashSet::new())),
         read_rr: Arc::new(AtomicUsize::new(0)),
         metrics: Arc::new(Metrics::new()),
+        replication_slots: Arc::new(tokio::sync::Semaphore::new(
+            config.flow_control.max_inflight_requests.max(1))),
     };
 
     if config.shard_role.as_deref() == Some("replica") {
@@ -182,6 +185,7 @@ async fn main() -> io::Result<()> {
             seed_leader_progress(&state);
         }
         progress_flush_task(state.clone());
+        replication_drive_task(state.clone());
     }
 
     if config.role == "shard" && !state.is_leader() {
