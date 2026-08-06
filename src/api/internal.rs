@@ -1,5 +1,6 @@
 //! /internal/* endpoints that cluster nodes call on each other.
 
+use crate::cluster::metadata::{Adoption, ClusterMetadata};
 use crate::consensus::{
     decide_vote, heartbeat_poll_task, local_log_tails, LogTail, ReplicationMeta, VoteRequest,
     VoteResponse,
@@ -265,6 +266,38 @@ pub async fn resync_handler(
     (StatusCode::OK, "resync started").into_response()
 }
 
+pub async fn cluster_view_handler(
+    State(state): State<AppState>,
+) -> impl axum::response::IntoResponse {
+    (StatusCode::OK, Json(state.cluster_view())).into_response()
+}
+
+/// Offers a view to this node. Idempotent: re-offering what we already hold is `200 stale`, not an
+/// error, since propagation retries and the sender cannot know what we adopted from someone else.
+pub async fn cluster_update_handler(
+    State(state): State<AppState>,
+    Json(incoming): Json<ClusterMetadata>,
+) -> impl axum::response::IntoResponse {
+    let offered = incoming.version;
+    match state.adopt_cluster(incoming) {
+        Adoption::Adopted { from, to } => {
+            info!(target: "cluster", "Adopted cluster view v{} (was v{})", to, from);
+            (StatusCode::OK, Json(serde_json::json!({
+                "status": "adopted", "version": to, "previous": from,
+            }))).into_response()
+        },
+        Adoption::Stale { current } => (StatusCode::OK, Json(serde_json::json!({
+            "status": "stale", "version": current, "offered": offered,
+        }))).into_response(),
+        Adoption::Rejected(why) => {
+            warn!(target: "cluster", "Refused cluster view v{}: {}", offered, why);
+            (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({
+                "status": "rejected", "reason": why, "version": state.cluster_version(),
+            }))).into_response()
+        },
+    }
+}
+
 pub async fn heartbeat_handler(
     State(state): State<AppState>,
 ) -> impl axum::response::IntoResponse {
@@ -274,6 +307,8 @@ pub async fn heartbeat_handler(
         "term": term,
         "role": role,
         "node_id": state.config.node_id,
+        // Lets a peer notice a topology change without fetching the whole view every poll.
+        "cluster_version": state.cluster_version(),
         "durable_lsn": state.db.as_ref().map_or(0, |db| db.durable_lsn.load(Ordering::SeqCst)),
         "commit_index": state.max_committed_lsn(),
         // Followers need this to publish the last entry of an otherwise idle cluster.

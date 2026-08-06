@@ -1,8 +1,9 @@
 //! Hash-ring ownership math and shard-map validation.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize, Clone, Debug)]
+// Serialized as part of the cluster view, so field names here are a wire format between nodes.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ShardInfo {
     pub start_hash: u64,
     pub end_hash: u64,

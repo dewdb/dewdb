@@ -10,11 +10,11 @@ pub mod write;
 use collections::{compact_collection, drop_collection, list_collections, snapshot_collection};
 use docs::{bulk_create_docs, create_doc, delete_doc, get_doc, list_docs, put_doc, query_docs, update_doc};
 use internal::{
-    heartbeat_handler, internal_drop_handler, replicate_handler, resync_handler, snapshot_handler,
-    vote_handler,
+    cluster_update_handler, cluster_view_handler, heartbeat_handler, internal_drop_handler,
+    replicate_handler, resync_handler, snapshot_handler, vote_handler,
 };
 use middleware::{auth_middleware, metrics_middleware};
-use observe::{health_handler, metrics_handler};
+use observe::{cluster_handler, health_handler, metrics_handler};
 
 use crate::state::AppState;
 use axum::routing::{delete, get, post};
@@ -24,6 +24,7 @@ pub fn build_app(state: &AppState) -> Router {
     let mut app = Router::new()
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
+        .route("/cluster", get(cluster_handler))
         .route("/collections", get(list_collections))
         .route("/collections/:name", delete(drop_collection))
         .route("/collections/:name/compact", post(compact_collection))
@@ -32,6 +33,11 @@ pub fn build_app(state: &AppState) -> Router {
         .route("/collections/:name/docs/bulk", post(bulk_create_docs))
         .route("/collections/:name/query", get(query_docs))
         .route("/collections/:name/docs/:id", get(get_doc).put(put_doc).patch(update_doc).delete(delete_doc));
+
+    // Every role carries a cluster view, so these are not gated on being a shard the way the
+    // consensus routes below are.
+    app = app
+        .route("/internal/cluster", get(cluster_view_handler).post(cluster_update_handler));
 
     if state.config.role == "shard" {
         app = app

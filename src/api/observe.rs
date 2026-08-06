@@ -163,6 +163,9 @@ fn render_prometheus(state: &AppState, collections: &[serde_json::Value], replic
     out.push_str("# HELP dewdb_term Current replication term.\n# TYPE dewdb_term gauge\n");
     prometheus_line(&mut out, "dewdb_term", &format!("node_id=\"{}\"", node), state.current_term() as f64);
 
+    out.push_str("# HELP dewdb_cluster_version Version of the topology this node is serving from.\n# TYPE dewdb_cluster_version gauge\n");
+    prometheus_line(&mut out, "dewdb_cluster_version", &format!("node_id=\"{}\"", node), state.cluster_version() as f64);
+
     out.push_str("# HELP dewdb_collection_documents Live documents per collection.\n# TYPE dewdb_collection_documents gauge\n");
     for c in collections {
         let name = escape_label(c["name"].as_str().unwrap_or(""));
@@ -259,6 +262,14 @@ pub async fn metrics_handler(
     let total_wal_bytes: u64 = collections.iter().filter_map(|c| c["wal_bytes"].as_u64()).sum();
     let total_documents: u64 = collections.iter().filter_map(|c| c["documents"].as_u64()).sum();
 
+    let view = state.cluster_view();
+    let cluster = serde_json::json!({
+        "version": view.version,
+        "updated_by": view.updated_by,
+        "members": view.members.len(),
+        "shards": view.shards.len(),
+    });
+
     let router = if state.config.role == "router" {
         let shards: Vec<serde_json::Value> = unique_shards(&state).into_iter().map(|(original, replicas)| {
             let effective = state.effective_primary(&original);
@@ -287,8 +298,24 @@ pub async fn metrics_handler(
             "total_wal_bytes": total_wal_bytes,
         },
         "replication": replication,
+        "cluster": cluster,
         "router": router,
         "requests": requests,
+    }))).into_response()
+}
+
+/// The topology as this node currently sees it. Nodes converge rather than agreeing instantly, so
+/// `version` is what tells an operator whether two nodes are answering from the same view.
+pub async fn cluster_handler(
+    State(state): State<AppState>,
+) -> impl axum::response::IntoResponse {
+    let view = state.cluster_view();
+    (StatusCode::OK, Json(serde_json::json!({
+        "version": view.version,
+        "updated_by": view.updated_by,
+        "seen_by": state.config.node_id,
+        "members": view.members,
+        "shards": view.shards,
     }))).into_response()
 }
 
@@ -322,8 +349,8 @@ pub async fn health_handler(
         }
     }
 
-    if state.config.role == "router" && state.config.shard_map.is_empty() {
-        reasons.push("router has no shards configured".to_string());
+    if state.config.role == "router" && state.cluster_view().shards.is_empty() {
+        reasons.push("router has no shards in its cluster view".to_string());
     }
 
     let healthy = reasons.is_empty();
@@ -335,6 +362,7 @@ pub async fn health_handler(
         "role": state.config.role,
         "leader": state.is_leader(),
         "term": state.current_term(),
+        "cluster_version": state.cluster_version(),
         "uptime_secs": state.metrics.uptime_secs(),
         "collections": state.db.as_ref().map_or(0, |db| db.collections.read().unwrap().len()),
         "reasons": reasons,

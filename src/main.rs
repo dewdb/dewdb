@@ -24,6 +24,7 @@ mod test_support;
 
 use crate::api::build_app;
 use crate::auth::build_client;
+use crate::cluster::metadata::ClusterMetadata;
 use crate::cluster::probe::{router_probe_task, ROUTER_PROBE_INTERVAL_SECS};
 use crate::config::{config_warnings, NodeConfig};
 use crate::consensus::{
@@ -40,10 +41,45 @@ use crate::storage::Database;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
-use std::path::Path;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, RwLock};
 use tracing::{info, warn};
+
+fn has_collection_dirs(data_dir: &str) -> bool {
+    fs::read_dir(data_dir)
+        .map(|entries| entries.flatten().any(|e| e.path().is_dir()))
+        .unwrap_or(false)
+}
+
+/// The durable view wins over config. Config is a bootstrap seed, so an edit to it after the first
+/// boot is silently ignored -- warn loudly rather than let an operator think their change took.
+fn load_cluster_view(config: &NodeConfig) -> ClusterMetadata {
+    let stored = ClusterMetadata::load(&config.data_dir)
+        .expect("Cannot read cluster.meta; delete it to re-seed the topology from config");
+
+    match stored {
+        Some(view) => {
+            let seeded = ClusterMetadata::seed_from_config(config);
+            if view.shards != seeded.shards {
+                warn!(target: "boot",
+                    "shard_map in config differs from the cluster view on disk (v{}); the durable \
+                     view is authoritative. Delete cluster.meta to re-seed from config", view.version);
+            }
+            info!(target: "boot", version = view.version, members = view.members.len(),
+                shards = view.shards.len(), "Loaded cluster view");
+            view
+        },
+        None => {
+            let seeded = ClusterMetadata::seed_from_config(config);
+            info!(target: "boot", members = seeded.members.len(), shards = seeded.shards.len(),
+                "No cluster view on disk; seeding v1 from config");
+            if let Err(e) = seeded.save(&config.data_dir) {
+                warn!(target: "boot", error = %e, "Could not persist the seeded cluster view");
+            }
+            seeded
+        },
+    }
+}
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -72,9 +108,13 @@ async fn main() -> io::Result<()> {
 
     info!(target: "boot", role = %config.role, shard_role = ?config.shard_role, "Booting node");
 
-    if config.role == "router" && Path::new(&config.data_dir).exists() {
+    // Routers keep cluster.meta in data_dir, so the directory existing is expected now;
+    // collection subdirectories in it are not.
+    if config.role == "router" && has_collection_dirs(&config.data_dir) {
         warn!(target: "boot", "Router node should not use local storage");
     }
+
+    let cluster = Arc::new(RwLock::new(load_cluster_view(&config)));
 
     let db = if config.role == "shard" {
         Some(Arc::new(Database::with_cache(&config.data_dir, config.read_cache.clone())?))
@@ -156,6 +196,7 @@ async fn main() -> io::Result<()> {
         metrics: Arc::new(Metrics::new()),
         replication_slots: Arc::new(tokio::sync::Semaphore::new(
             config.flow_control.max_inflight_requests.max(1))),
+        cluster,
     };
 
     if config.shard_role.as_deref() == Some("replica") {

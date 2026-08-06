@@ -1,5 +1,6 @@
 //! AppState: shared handle to storage, config, replication state, router caches.
 
+use crate::cluster::metadata::{adopt, Adoption, ClusterMetadata};
 use crate::config::NodeConfig;
 use crate::consensus::ReplicationState;
 use crate::metrics::Metrics;
@@ -34,6 +35,9 @@ pub struct AppState {
     /// Node-wide cap on concurrent outbound replication requests. Shared across every write, unlike
     /// a per-call semaphore, which bounds one write's fan-out and nothing else.
     pub replication_slots: Arc<tokio::sync::Semaphore>,
+    /// The live topology. Seeded from config on a node's first boot, durable thereafter, and the
+    /// only thing the routing path reads -- `config.shard_map` is a bootstrap value, not an authority.
+    pub cluster: Arc<RwLock<ClusterMetadata>>,
 }
 
 impl AppState {
@@ -206,12 +210,32 @@ impl AppState {
     }
 
     #[cfg(test)]
+    pub fn for_routing_test(config: crate::config::NodeConfig) -> Self {
+        let cluster = ClusterMetadata::seed_from_config(&config);
+        Self {
+            db: None,
+            replication: None,
+            replication_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            client: reqwest::Client::new(),
+            config: Arc::new(config),
+            primary_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            shard_failover_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            repair_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            resyncing: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            read_rr: Arc::new(AtomicUsize::new(0)),
+            metrics: Arc::new(Metrics::new()),
+            cluster: Arc::new(RwLock::new(cluster)),
+        }
+    }
+
+    #[cfg(test)]
     pub fn for_admission_test(
         config: crate::config::NodeConfig,
         db: Arc<Database>,
         is_leader: bool,
     ) -> Self {
         use crate::consensus::{Progress, ReplicationState};
+        let cluster = ClusterMetadata::seed_from_config(&config);
         Self {
             db: Some(db),
             replication: Some(Arc::new(RwLock::new(ReplicationState {
@@ -238,6 +262,7 @@ impl AppState {
             resyncing: Arc::new(std::sync::Mutex::new(HashSet::new())),
             read_rr: Arc::new(AtomicUsize::new(0)),
             metrics: Arc::new(Metrics::new()),
+            cluster: Arc::new(RwLock::new(cluster)),
         }
     }
 
@@ -248,8 +273,43 @@ impl AppState {
         Vec::new()
     }
 
+    pub fn cluster_view(&self) -> ClusterMetadata {
+        self.cluster.read().unwrap().clone()
+    }
+
+    pub fn cluster_version(&self) -> u64 {
+        self.cluster.read().unwrap().version
+    }
+
+    /// Shard owners in the live view, deduped: one node may own several ranges.
+    pub fn shard_owners(&self) -> Vec<(String, Vec<String>)> {
+        self.cluster.read().unwrap().shard_owners()
+    }
+
+    /// Persists only what it adopted. A view refused in memory must not reach disk, or the next
+    /// boot would come up on a topology this node already rejected.
+    pub fn adopt_cluster(&self, incoming: ClusterMetadata) -> Adoption {
+        let (outcome, to_persist) = {
+            let mut current = self.cluster.write().unwrap();
+            let outcome = adopt(&mut current, incoming);
+            let persist = matches!(outcome, Adoption::Adopted { .. }).then(|| current.clone());
+            (outcome, persist)
+        };
+
+        if let Some(view) = to_persist {
+            if let Err(e) = view.save(&self.config.data_dir) {
+                // In-memory adoption stands: a lost write costs a re-fetch, while refusing the
+                // update would leave this node routing by a topology the cluster has left behind.
+                tracing::warn!(target: "cluster", error = %e, version = view.version,
+                    "Adopted cluster view but could not persist it");
+            }
+        }
+        outcome
+    }
+
     pub fn get_effective_shard_url(&self, hash: u64) -> Option<(String, String, Vec<String>)> {
-        for shard in &self.config.shard_map {
+        let shards = self.cluster.read().unwrap().shards.clone();
+        for shard in &shards {
             if shard_owns(shard, hash) {
                 let mut overrides = self.primary_overrides.lock().unwrap();
                 if let Some(ov) = overrides.get(&shard.node_url) {
@@ -346,6 +406,89 @@ mod tests {
 
         let unbounded = AppState::for_admission_test(config_with_bound(&root, 0), db.clone(), true);
         assert!(unbounded.admit_write("t").is_ok(), "0 opts out of the bound");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    const HALF: u64 = 9223372036854775808;
+
+    fn router_state(root: &std::path::Path) -> AppState {
+        AppState::for_routing_test(serde_json::from_value(serde_json::json!({
+            "node_id": "r1",
+            "role": "router",
+            "listen_addr": "127.0.0.1:1",
+            "data_dir": root.to_string_lossy(),
+            "shard_map": [
+                {"start_hash": 0, "end_hash": HALF, "node_url": "http://a", "replica_urls": ["http://a2"]},
+                {"start_hash": HALF, "end_hash": 0, "node_url": "http://b", "replica_urls": ["http://b2"]}],
+        })).unwrap())
+    }
+
+    #[test]
+    fn routing_follows_the_adopted_view_not_the_configured_shard_map() {
+        let root = temp_root();
+        let state = router_state(&root);
+
+        // Seeded from config, so the starting behaviour matches the old config-only routing.
+        let (owner, _, replicas) = state.get_effective_shard_url(10).unwrap();
+        assert_eq!(owner, "http://a");
+        assert_eq!(replicas, vec!["http://a2".to_string()]);
+
+        // The same range, now owned by a node the config file has never heard of.
+        let moved = ClusterMetadata {
+            version: 2,
+            updated_by: "operator".into(),
+            seeded: false,
+            members: Vec::new(),
+            shards: vec![
+                crate::ring::ShardInfo {
+                    start_hash: 0, end_hash: HALF,
+                    node_url: "http://c".into(), replica_urls: vec!["http://c2".into()] },
+                crate::ring::ShardInfo {
+                    start_hash: HALF, end_hash: 0,
+                    node_url: "http://b".into(), replica_urls: vec!["http://b2".into()] },
+            ],
+        };
+        assert_eq!(state.adopt_cluster(moved), Adoption::Adopted { from: 1, to: 2 });
+
+        let (owner, original, replicas) = state.get_effective_shard_url(10).unwrap();
+        assert_eq!(owner, "http://c",
+            "a key must route by the live view; reading config.shard_map here would still say http://a");
+        assert_eq!(original, "http://c");
+        assert_eq!(replicas, vec!["http://c2".to_string()]);
+
+        assert_eq!(state.get_effective_shard_url(HALF + 1).unwrap().0, "http://b",
+            "the untouched range keeps its owner");
+
+        assert_eq!(state.shard_owners().len(), 2);
+        assert_eq!(state.cluster_version(), 2);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_refused_view_leaves_routing_and_disk_untouched() {
+        let root = temp_root();
+        let state = router_state(&root);
+        let dir = root.to_string_lossy().to_string();
+
+        let holed = ClusterMetadata {
+            version: 50,
+            updated_by: "operator".into(),
+            seeded: false,
+            members: Vec::new(),
+            // Only half the ring: every key above HALF would route nowhere.
+            shards: vec![crate::ring::ShardInfo {
+                start_hash: 0, end_hash: HALF,
+                node_url: "http://c".into(), replica_urls: Vec::new() }],
+        };
+        assert!(matches!(state.adopt_cluster(holed), Adoption::Rejected(_)));
+
+        assert_eq!(state.cluster_version(), 1, "a refused view must not take effect in memory");
+        assert_eq!(state.get_effective_shard_url(HALF + 1).unwrap().0, "http://b",
+            "keys must keep routing where they did before the bad update");
+        assert!(ClusterMetadata::load(&dir).unwrap().map_or(true, |v| v.version == 1),
+            "a refused view must not reach disk, or the next boot adopts what we just rejected");
 
         let _ = fs::remove_dir_all(&root);
     }

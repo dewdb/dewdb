@@ -1,5 +1,6 @@
 //! Background probing of which node answers as primary for each shard.
 
+use crate::cluster::metadata::{Adoption, ClusterMetadata};
 use crate::state::AppState;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -7,40 +8,68 @@ use tracing::{info, warn};
 
 pub const ROUTER_PROBE_INTERVAL_SECS: u64 = 3;
 
-async fn probe_node(client: &reqwest::Client, url: &str) -> Option<(String, u64)> {
+pub struct Probe {
+    pub role: String,
+    pub term: u64,
+    pub cluster_version: u64,
+}
+
+async fn probe_node(client: &reqwest::Client, url: &str) -> Option<Probe> {
     let hb = format!("{}/internal/heartbeat", url);
     let r = client.get(&hb).send().await.ok()?;
     if !r.status().is_success() {
         return None;
     }
     let v = r.json::<serde_json::Value>().await.ok()?;
-    let role = v.get("role").and_then(|x| x.as_str())?.to_string();
-    let term = v.get("term").and_then(|x| x.as_u64()).unwrap_or(0);
-    Some((role, term))
+    Some(Probe {
+        role: v.get("role").and_then(|x| x.as_str())?.to_string(),
+        term: v.get("term").and_then(|x| x.as_u64()).unwrap_or(0),
+        cluster_version: v.get("cluster_version").and_then(|x| x.as_u64()).unwrap_or(0),
+    })
+}
+
+/// Pulls the view a peer advertised. Version-gated by the caller, so a peer that lies about being
+/// ahead costs one request; the adopt path still validates whatever comes back.
+pub async fn fetch_cluster_view(client: &reqwest::Client, url: &str) -> Option<ClusterMetadata> {
+    let r = client.get(&format!("{}/internal/cluster", url)).send().await.ok()?;
+    if !r.status().is_success() {
+        return None;
+    }
+    r.json::<ClusterMetadata>().await.ok()
 }
 
 // Highest term wins: a partitioned old primary must not reclaim traffic.
-fn select_primary(probes: &[(String, Option<(String, u64)>)]) -> Option<String> {
+fn select_primary(probes: &[(String, Option<Probe>)]) -> Option<String> {
     let mut best: Option<(u64, String)> = None;
     for (url, res) in probes {
-        if let Some((role, term)) = res {
-            if role == "primary" && best.as_ref().map_or(true, |(t, _)| *term > *t) {
-                best = Some((*term, url.clone()));
+        if let Some(p) = res {
+            if p.role == "primary" && best.as_ref().map_or(true, |(t, _)| p.term > *t) {
+                best = Some((p.term, url.clone()));
             }
         }
     }
     best.map(|(_, u)| u)
 }
 
+// Whoever is furthest ahead, so one pass converges even when only a replica has heard the update.
+fn best_cluster_source(probes: &[(String, Option<Probe>)], ours: u64) -> Option<String> {
+    probes.iter()
+        .filter_map(|(url, res)| res.as_ref().map(|p| (p.cluster_version, url)))
+        .filter(|(version, _)| *version > ours)
+        .max_by_key(|(version, _)| *version)
+        .map(|(_, url)| url.clone())
+}
+
 pub fn unique_shards(state: &AppState) -> Vec<(String, Vec<String>)> {
+    state.shard_owners()
+}
+
+fn probe_targets(original: &str, replicas: &[String]) -> Vec<String> {
+    let mut candidates = vec![original.to_string()];
+    candidates.extend(replicas.iter().cloned());
     let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for shard in &state.config.shard_map {
-        if seen.insert(shard.node_url.clone()) {
-            out.push((shard.node_url.clone(), shard.replica_urls.clone()));
-        }
-    }
-    out
+    candidates.retain(|c| seen.insert(c.clone()));
+    candidates
 }
 
 pub fn router_probe_task(state: AppState) {
@@ -48,25 +77,25 @@ pub fn router_probe_task(state: AppState) {
         loop {
             tokio::time::sleep(Duration::from_secs(ROUTER_PROBE_INTERVAL_SECS)).await;
 
+            // Collected across the whole sweep so a topology change costs one fetch, not one per shard.
+            let mut seen: Vec<(String, Option<Probe>)> = Vec::new();
+
             for (original, replicas) in unique_shards(&state) {
                 let effective = state.effective_primary(&original);
 
-                if let Some((role, _term)) = probe_node(&state.client, &effective).await {
-                    if role == "primary" {
-                        if effective != original {
-                            state.set_primary_override(&original, &effective);
-                        }
-                        continue;
+                let fast = probe_node(&state.client, &effective).await;
+                let still_primary = fast.as_ref().map_or(false, |p| p.role == "primary");
+                seen.push((effective.clone(), fast));
+
+                if still_primary {
+                    if effective != original {
+                        state.set_primary_override(&original, &effective);
                     }
+                    continue;
                 }
 
-                let mut candidates = vec![original.clone()];
-                candidates.extend(replicas.iter().cloned());
-                candidates.sort();
-                candidates.dedup();
-
                 let mut probes = Vec::new();
-                for c in candidates {
+                for c in probe_targets(&original, &replicas) {
                     let res = probe_node(&state.client, &c).await;
                     probes.push((c, res));
                 }
@@ -86,6 +115,20 @@ pub fn router_probe_task(state: AppState) {
                         warn!(target: "router_probe", "Shard {} has no reachable primary (election in progress?)", original);
                     }
                 }
+
+                seen.extend(probes);
+            }
+
+            if let Some(source) = best_cluster_source(&seen, state.cluster_version()) {
+                if let Some(view) = fetch_cluster_view(&state.client, &source).await {
+                    match state.adopt_cluster(view) {
+                        Adoption::Adopted { from, to } => info!(target: "router_probe",
+                            "Adopted cluster view v{} from {} (was v{})", to, source, from),
+                        Adoption::Rejected(why) => warn!(target: "router_probe",
+                            "Refused cluster view from {}: {}", source, why),
+                        Adoption::Stale { .. } => {},
+                    }
+                }
             }
         }
     });
@@ -95,8 +138,12 @@ pub fn router_probe_task(state: AppState) {
 mod tests {
     use super::*;
 
-    fn probe(url: &str, role: &str, term: u64) -> (String, Option<(String, u64)>) {
-        (url.to_string(), Some((role.to_string(), term)))
+    fn probe(url: &str, role: &str, term: u64) -> (String, Option<Probe>) {
+        (url.to_string(), Some(Probe { role: role.to_string(), term, cluster_version: 0 }))
+    }
+
+    fn at_version(url: &str, cluster_version: u64) -> (String, Option<Probe>) {
+        (url.to_string(), Some(Probe { role: "replica".to_string(), term: 1, cluster_version }))
     }
 
     #[test]
@@ -125,5 +172,22 @@ mod tests {
             ("http://b".to_string(), None),
         ];
         assert_eq!(select_primary(&probes), None);
+    }
+
+    #[test]
+    fn the_cluster_view_is_pulled_from_whoever_is_furthest_ahead() {
+        let probes = vec![
+            at_version("http://a", 4),
+            at_version("http://b", 9),
+            at_version("http://c", 7),
+            ("http://down".to_string(), None),
+        ];
+        assert_eq!(best_cluster_source(&probes, 4).as_deref(), Some("http://b"),
+            "a replica may hear an update before the primary this router is talking to");
+
+        assert_eq!(best_cluster_source(&probes, 9), None,
+            "already current: probing must not turn into a fetch every three seconds");
+        assert_eq!(best_cluster_source(&probes, 20), None, "ahead of every peer");
+        assert_eq!(best_cluster_source(&[], 0), None);
     }
 }

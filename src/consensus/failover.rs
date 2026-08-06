@@ -3,6 +3,8 @@
 use super::election::run_election;
 use super::progress::{ProgressMeta, PROGRESS_FLUSH_INTERVAL_SECS};
 use super::state::{apply_demotion, ReplicationMeta};
+use crate::cluster::metadata::Adoption;
+use crate::cluster::probe::fetch_cluster_view;
 use crate::replication::snapshot::replica_sync_from_primary;
 use crate::state::AppState;
 use crate::util::same_endpoint;
@@ -197,6 +199,22 @@ pub fn progress_flush_task(state: AppState) {
     });
 }
 
+/// Version-gated by the caller. Failing to fetch is not worth logging as an error: the next poll
+/// retries, and the node keeps serving the view it already has.
+async fn follow_cluster_view(state: &AppState, from: &str) {
+    let view = match fetch_cluster_view(&state.client, from).await {
+        Some(v) => v,
+        None => return,
+    };
+    match state.adopt_cluster(view) {
+        Adoption::Adopted { from: was, to } => info!(target: "cluster",
+            "Adopted cluster view v{} from {} (was v{})", to, from, was),
+        Adoption::Rejected(why) => warn!(target: "cluster",
+            "Refused cluster view from {}: {}", from, why),
+        Adoption::Stale { .. } => {},
+    }
+}
+
 pub fn heartbeat_poll_task(state: AppState) {
     tokio::spawn(async move {
         let timeout = Duration::from_secs(state.config.heartbeat_timeout_secs);
@@ -262,6 +280,11 @@ pub fn heartbeat_poll_task(state: AppState) {
                                         "Adopted term {} in memory but could not persist it", t),
                                 }
                             }
+
+                            let advertised = hb.get("cluster_version").and_then(|v| v.as_u64()).unwrap_or(0);
+                            if advertised > state.cluster_version() {
+                                follow_cluster_view(&state, &primary_addr).await;
+                            }
                         }
                     },
                     Ok(r) => {
@@ -313,9 +336,10 @@ fn contact_lost(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::metadata::ClusterMetadata;
     use crate::test_support::{
         leaders, node_by_id, put_doc_at, put_doc_http, read_doc_http, settle_leader, temp_root,
-        three_node_cluster, TestNode,
+        three_node_cluster, wait_for, TestNode,
     };
     use axum::http::StatusCode;
 
@@ -516,6 +540,122 @@ mod tests {
             "a node must resume at the term it last recorded; starting lower would let it \
              grant a second vote in a term it has already voted in");
         assert!(!restarting.is_leader());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn view_of(node: &TestNode) -> ClusterMetadata {
+        node.state.as_ref().unwrap().cluster_view()
+    }
+
+    // A view naming a shard the config never mentioned, so adopting it is unmistakable.
+    fn published_view(version: u64, owner: &str) -> serde_json::Value {
+        serde_json::json!({
+            "version": version,
+            "updated_by": "operator",
+            "members": [{"url": owner, "role": "shard", "shard_role": "primary"}],
+            "shards": [{"start_hash": 0, "end_hash": 0, "node_url": owner, "replica_urls": []}],
+        })
+    }
+
+    async fn wait_for_version(node: &TestNode, want: u64, deadline: Duration) -> bool {
+        wait_for(deadline, || view_of(node).version >= want).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_published_topology_reaches_every_follower() {
+        let root = temp_root();
+        let (n1, n2, n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().unwrap();
+
+        for n in [&n1, &n2, &n3] {
+            assert_eq!(view_of(n).version, 1, "every node seeds at v1 from its own config");
+        }
+
+        let r = client.post(&format!("{}/internal/cluster", n1.url()))
+            .json(&published_view(2, "http://shard-x:9999"))
+            .send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.json::<serde_json::Value>().await.unwrap()["status"], "adopted");
+
+        for n in [&n2, &n3] {
+            assert!(wait_for_version(n, 2, Duration::from_secs(10)).await,
+                "{} never learned about v2; followers poll the leader's heartbeat for the version",
+                n.node_id);
+            assert_eq!(view_of(n).shards[0].node_url, "http://shard-x:9999",
+                "the version must arrive with the view, not on its own");
+        }
+
+        // Re-offering what a node already holds is the steady state of propagation, not an error.
+        let again = client.post(&format!("{}/internal/cluster", n2.url()))
+            .json(&published_view(2, "http://shard-x:9999"))
+            .send().await.unwrap();
+        assert_eq!(again.status(), StatusCode::OK);
+        assert_eq!(again.json::<serde_json::Value>().await.unwrap()["status"], "stale");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_restarted_node_keeps_the_topology_instead_of_re_reading_config() {
+        let root = temp_root();
+        let (n1, n2, mut n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().unwrap();
+
+        client.post(&format!("{}/internal/cluster", n1.url()))
+            .json(&published_view(7, "http://shard-y:9999"))
+            .send().await.unwrap();
+        assert!(wait_for_version(&n3, 7, Duration::from_secs(10)).await, "n3 never reached v7");
+
+        n3.kill();
+        n3.start();
+
+        let after = view_of(&n3);
+        assert_eq!(after.version, 7,
+            "a restart must not rewind the topology to the config seed; the cluster has moved on \
+             and this node would route by a map it already replaced");
+        assert_eq!(after.shards[0].node_url, "http://shard-y:9999");
+        assert_eq!(after.updated_by, "operator");
+
+        // The rest of the cluster is unaffected by one node cycling.
+        assert_eq!(view_of(&n1).version, 7);
+        assert_eq!(view_of(&n2).version, 7);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_malformed_topology_is_refused_without_disturbing_the_cluster() {
+        let root = temp_root();
+        let (n1, n2, n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().unwrap();
+
+        let holed = serde_json::json!({
+            "version": 99,
+            "updated_by": "operator",
+            "members": [],
+            // Half the ring, so keys above the midpoint would route nowhere.
+            "shards": [{"start_hash": 0, "end_hash": 9223372036854775808u64,
+                        "node_url": "http://shard-z:9999", "replica_urls": []}],
+        });
+
+        let r = client.post(&format!("{}/internal/cluster", n1.url())).json(&holed).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY,
+            "a view that would break routing must be refused at the door");
+        assert!(r.json::<serde_json::Value>().await.unwrap()["reason"].as_str().unwrap().contains("uncovered"));
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        for n in [&n1, &n2, &n3] {
+            assert_eq!(view_of(n).version, 1,
+                "{} adopted a refused view; a bad push would otherwise outrank every later fix",
+                n.node_id);
+        }
+
+        // A valid view still lands afterwards, so the refusal did not wedge the version.
+        client.post(&format!("{}/internal/cluster", n1.url()))
+            .json(&published_view(3, "http://shard-ok:9999"))
+            .send().await.unwrap();
+        assert!(wait_for_version(&n2, 3, Duration::from_secs(10)).await);
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -2,6 +2,7 @@
 
 use crate::api::build_app;
 use crate::auth::build_client;
+use crate::cluster::metadata::ClusterMetadata;
 use crate::config::NodeConfig;
 use crate::consensus::{
     heartbeat_poll_task, progress_flush_task, seed_leader_progress, Progress, ReplicationMeta,
@@ -201,6 +202,14 @@ impl TestNode {
                     metrics: Arc::new(Metrics::new()),
                     replication_slots: Arc::new(tokio::sync::Semaphore::new(
                         config.flow_control.max_inflight_requests.max(1))),
+                    cluster: Arc::new(RwLock::new(
+                        ClusterMetadata::load(&config.data_dir)
+                            .expect("unreadable cluster.meta")
+                            .unwrap_or_else(|| {
+                                let seeded = ClusterMetadata::seed_from_config(&config);
+                                let _ = seeded.save(&config.data_dir);
+                                seeded
+                            }))),
                 };
 
                 let app = build_app(&state);
@@ -303,7 +312,7 @@ pub async fn wait_for_doc(client: &reqwest::Client, base: &str, col: &str, key: 
     false
 }
 
-async fn wait_for<F>(deadline: Duration, mut check: F) -> bool
+pub async fn wait_for<F>(deadline: Duration, mut check: F) -> bool
 where
     F: FnMut() -> bool,
 {
