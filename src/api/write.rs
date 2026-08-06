@@ -97,7 +97,8 @@ async fn finish_write(
         return Ok(WriteOutcome { met: true, acks: 1, required: 1, existed });
     }
 
-    let replicas = state.get_replicas();
+    // Quorum set only: a learner acknowledging must never help satisfy a write concern.
+    let replicas = state.voting_replicas();
     let required = required_acks(&wc, replicas.len());
     // From the header, not lsn - 1: the previous LSN usually belongs to another collection.
     let prev_lsn = FrameHeader::parse(&frame).map_or(0, |h| h.prev_lsn);

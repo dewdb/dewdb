@@ -266,11 +266,62 @@ impl AppState {
         }
     }
 
-    pub fn get_replicas(&self) -> Vec<String> {
+    /// The quorum set: who counts toward `w=majority` and the commit index. Config-derived and
+    /// unchanged at runtime -- see `replication_targets` for who actually receives frames.
+    pub fn voting_replicas(&self) -> Vec<String> {
         if let Some(ref repl) = self.replication {
             return repl.read().unwrap().replicas.clone();
         }
         Vec::new()
+    }
+
+    pub fn own_url(&self) -> String {
+        let addr = &self.config.listen_addr;
+        if addr.contains("://") { addr.clone() } else { format!("http://{}", addr) }
+    }
+
+    /// Learners in the live view that named this node as their primary.
+    pub fn learner_replicas(&self) -> Vec<String> {
+        let own = self.own_url();
+        let voting = self.voting_replicas();
+        self.cluster.read().unwrap()
+            .learners_following(&own)
+            .into_iter()
+            .filter(|url| !crate::util::same_endpoint(url, &own))
+            // A node in both sets is already in the quorum; sending twice would double-count it.
+            .filter(|url| !voting.iter().any(|v| crate::util::same_endpoint(v, url)))
+            .collect()
+    }
+
+    /// Everyone who receives frames. A superset of the quorum set: learners are shipped data so
+    /// they can catch up, but never counted, so admitting one cannot move a commit index.
+    pub fn replication_targets(&self) -> Vec<String> {
+        let mut targets = self.voting_replicas();
+        targets.extend(self.learner_replicas());
+        targets
+    }
+
+    pub fn is_voting_replica(&self, url: &str) -> bool {
+        self.voting_replicas().iter().any(|v| crate::util::same_endpoint(v, url))
+    }
+
+    /// Non-voting for either reason: booted that way, or named so by the view.
+    ///
+    /// The config half is what covers a node between boot and admission, when no view has arrived
+    /// and `peers` is empty -- the window in which a majority of one is otherwise reachable. It is
+    /// also why the restriction survives a restart that never reaches the leader.
+    pub fn is_learner(&self) -> bool {
+        self.config.is_learner() || self.view_names_us_learner()
+    }
+
+    /// Admission never promotes: a node booted as a learner stays one for this process's life.
+    /// Turning a learner into a voter moves the quorum, which is commit 44's problem.
+    pub fn can_campaign(&self) -> bool {
+        !self.is_learner()
+    }
+
+    fn view_names_us_learner(&self) -> bool {
+        self.cluster.read().unwrap().is_learner(&self.own_url())
     }
 
     pub fn cluster_view(&self) -> ClusterMetadata {
@@ -303,8 +354,51 @@ impl AppState {
                 tracing::warn!(target: "cluster", error = %e, version = view.version,
                     "Adopted cluster view but could not persist it");
             }
+            self.follow_from_view();
         }
         outcome
+    }
+
+    /// Points a node admitted at runtime at the primary the view assigned it. Without this it has
+    /// no one to poll, so it never hears a commit watermark and everything it is sent stays staged
+    /// and invisible -- replicated, durable, and unreadable.
+    pub fn follow_from_view(&self) {
+        // Read and drop the cluster lock before touching replication: learner_replicas takes them
+        // in the opposite order, and neither may hold both.
+        let follows = {
+            let view = self.cluster.read().unwrap();
+            view.member(&self.own_url())
+                .filter(|m| !m.voting && m.role == "shard")
+                .and_then(|m| m.follows.clone())
+        };
+        let follows = match follows {
+            Some(f) if !crate::util::same_endpoint(&f, &self.own_url()) => f,
+            _ => return,
+        };
+
+        let repl = match self.replication.as_ref() {
+            Some(r) => r,
+            None => return,
+        };
+        let mut g = repl.write().unwrap();
+        if g.is_leader || g.primary_addr.as_deref() == Some(follows.as_str()) {
+            return;
+        }
+        tracing::info!(target: "membership", primary = %follows, "Following the primary named in the cluster view");
+        g.primary_addr = Some(follows);
+        g.last_heartbeat = Some(std::time::Instant::now());
+    }
+
+    /// Gives a newly admitted learner a send cursor so the replication driver picks it up on its
+    /// next tick, instead of waiting for a write to expose the gap.
+    pub fn begin_tracking_learner(&self, url: &str) {
+        let collections = match self.db.as_ref() {
+            Some(db) => db.list_collections().unwrap_or_default(),
+            None => return,
+        };
+        if let Some(repl) = self.replication.as_ref() {
+            repl.write().unwrap().progress.begin_tracking(url, &collections);
+        }
     }
 
     pub fn get_effective_shard_url(&self, hash: u64) -> Option<(String, String, Vec<String>)> {
@@ -406,6 +500,97 @@ mod tests {
 
         let unbounded = AppState::for_admission_test(config_with_bound(&root, 0), db.clone(), true);
         assert!(unbounded.admit_write("t").is_ok(), "0 opts out of the bound");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn admitting_a_learner_never_moves_the_quorum() {
+        use crate::cluster::metadata::{plan_join, JoinRequest};
+        use crate::replication::{parse_write_concern, write_concern::required_acks};
+
+        let root = temp_root();
+        let db = Arc::new(Database::new(&root).unwrap());
+        let mut config: NodeConfig = serde_json::from_value(serde_json::json!({
+            "node_id": "n1", "role": "shard", "shard_role": "primary",
+            "listen_addr": "127.0.0.1:9501",
+            "data_dir": root.to_string_lossy(),
+            "replicas": ["http://127.0.0.1:9502", "http://127.0.0.1:9503"],
+            "peers": ["http://127.0.0.1:9502", "http://127.0.0.1:9503"],
+        })).unwrap();
+        config.flow_control.max_uncommitted_frames = 0;
+
+        let state = AppState::for_admission_test(config, db.clone(), true);
+        state.replication.as_ref().unwrap().write().unwrap().replicas =
+            vec!["http://127.0.0.1:9502".into(), "http://127.0.0.1:9503".into()];
+
+        let majority = parse_write_concern(Some("majority"));
+        let before = required_acks(&majority, state.voting_replicas().len());
+        assert_eq!(before, 2, "two of three");
+        assert_eq!(state.replication_targets().len(), 2);
+
+        let mut req = JoinRequest {
+            url: "http://127.0.0.1:9504".into(), node_id: None, role: None,
+            shard_role: None, follows: None, voting: None,
+        };
+        req.follows = Some("http://127.0.0.1:9501".into());
+        let next = plan_join(&state.cluster_view(), "n1", "http://127.0.0.1:9501", &req).unwrap();
+        assert!(matches!(state.adopt_cluster(next), Adoption::Adopted { .. }));
+
+        assert_eq!(state.voting_replicas().len(), 2,
+            "the quorum set must not grow when a learner joins");
+        assert_eq!(required_acks(&majority, state.voting_replicas().len()), before,
+            "w=majority must still mean the same number of acks, or a learner could satisfy it");
+        assert_eq!(state.learner_replicas(), vec!["http://127.0.0.1:9504".to_string()]);
+        assert_eq!(state.replication_targets().len(), 3,
+            "but the learner must still be shipped frames");
+
+        assert!(!state.is_voting_replica("http://127.0.0.1:9504"),
+            "an ack from here must never be counted");
+        assert!(state.is_voting_replica("http://127.0.0.1:9502"));
+
+        // A learner acking everything must not by itself commit anything.
+        let col = db.get_collection("t").unwrap();
+        let lsn = stage_put(&col, "k", 1);
+        // Stand in for the leader's own fsync landing, which is what note_ack counts as its vote.
+        col.durable_lsn.store(lsn, std::sync::atomic::Ordering::SeqCst);
+
+        state.note_ack("http://127.0.0.1:9504", "t", lsn, state.current_term());
+        assert_eq!(state.committed_lsn("t"), 0,
+            "leader plus a learner is one of three, not a majority");
+
+        state.note_ack("http://127.0.0.1:9502", "t", lsn, state.current_term());
+        assert_eq!(state.committed_lsn("t"), lsn, "leader plus a voter is a majority");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_learner_knows_not_to_stand_for_election() {
+        let root = temp_root();
+        let db = Arc::new(Database::new(&root).unwrap());
+        let config: NodeConfig = serde_json::from_value(serde_json::json!({
+            "node_id": "n4", "role": "shard", "shard_role": "replica",
+            "listen_addr": "127.0.0.1:9504",
+            "data_dir": root.to_string_lossy(),
+        })).unwrap();
+
+        let state = AppState::for_admission_test(config, db, false);
+        assert!(!state.is_learner(),
+            "a node absent from the view keeps its configured behaviour; a view that has not \
+             arrived yet must not silently strip a vote");
+
+        // The node's own seed already lists it as voting, so this replaces that entry rather than
+        // adding a second one -- which is exactly what the join path does.
+        let mut view = state.cluster_view().with_member("operator", crate::cluster::metadata::Member {
+            url: "http://127.0.0.1:9504".into(), node_id: None, role: "shard".into(),
+            shard_role: Some("replica".into()), voting: false, follows: Some("http://127.0.0.1:9501".into()),
+        });
+        view.version = 5;
+        assert!(matches!(state.adopt_cluster(view), Adoption::Adopted { .. }));
+
+        assert!(state.is_learner(),
+            "once the view says non-voting, this node must recognise itself as a learner");
 
         let _ = fs::remove_dir_all(&root);
     }

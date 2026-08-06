@@ -144,6 +144,15 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64) {
         return;
     }
 
+    // Checked here rather than at the poll, so a node told mid-flight still stops. Covers both a
+    // node booted as a learner and one the view has since named non-voting.
+    if !state.can_campaign() {
+        info!(target: "election",
+            "This node is a non-voting member; waiting for the leader rather than standing");
+        adopt_existing_leader(state).await;
+        return;
+    }
+
     if adopt_existing_leader(state).await {
         info!(target: "election", "A leader is already serving; aborting election and following it");
         return;
@@ -268,6 +277,12 @@ pub fn seed_leader_progress(state: &AppState) {
 }
 
 async fn become_leader(state: &AppState, term: u64, candidate_id: &str) {
+    // The caller already refused to campaign, so reaching here means a new path grew that skips
+    // that check. Cheaper to re-test than to discover it as a split brain.
+    if !state.can_campaign() {
+        warn!(target: "election", "Refusing leadership at term {}: this node is non-voting", term);
+        return;
+    }
     {
         let mut repl = state.replication.as_ref().unwrap().write().unwrap();
         if repl.term != term || repl.voted_for.as_deref() != Some(candidate_id) {

@@ -26,6 +26,16 @@ async fn discover_leader(state: &AppState) -> Option<String> {
         }
         peers.extend(g.replicas.iter().cloned());
     }
+    // A node admitted at runtime knows the cluster only through the view; its config names nobody.
+    {
+        let view = state.cluster.read().unwrap();
+        peers.extend(view.members.iter()
+            .filter(|m| m.role == "shard")
+            .map(|m| m.url.clone()));
+        if let Some(follows) = view.member(&state.own_url()).and_then(|m| m.follows.clone()) {
+            peers.push(follows);
+        }
+    }
     peers.retain(|p| !same_endpoint(p, &state.config.listen_addr));
     peers.sort();
     peers.dedup();
@@ -617,9 +627,11 @@ mod tests {
         assert_eq!(after.shards[0].node_url, "http://shard-y:9999");
         assert_eq!(after.updated_by, "operator");
 
-        // The rest of the cluster is unaffected by one node cycling.
-        assert_eq!(view_of(&n1).version, 7);
-        assert_eq!(view_of(&n2).version, 7);
+        // The rest of the cluster is unaffected by one node cycling. n1 took the change directly,
+        // so it is already there; n2 converges on its own schedule and must be waited for.
+        assert_eq!(view_of(&n1).version, 7, "the node that accepted the change applies it inline");
+        assert!(wait_for_version(&n2, 7, Duration::from_secs(10)).await,
+            "n2 never converged; it is at v{}", view_of(&n2).version);
 
         let _ = fs::remove_dir_all(&root);
     }

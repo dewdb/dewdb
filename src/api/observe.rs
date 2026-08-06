@@ -68,7 +68,9 @@ fn replication_metrics(state: &AppState) -> serde_json::Value {
     let widest = state.metrics.max_batch_frames();
 
     if leader {
-        let replicas = state.get_replicas();
+        let voting = state.voting_replicas();
+        let learners = state.learner_replicas();
+        let replicas = state.replication_targets();
         // Per-collection: a replica can be current on one collection and behind on another.
         let tails: Vec<(String, u64)> = {
             let open = db.collections.read().unwrap();
@@ -96,6 +98,9 @@ fn replication_metrics(state: &AppState) -> serde_json::Value {
             "committed_by_collection": committed,
             "last_log_term": db.last_log_term.load(Ordering::SeqCst),
             "replica_count": replicas.len(),
+            // Split out because only the voting count decides what w=majority requires.
+            "voting_replicas": voting.len(),
+            "learners": learners,
             "max_replica_lag": max_lag,
             "repairs": {
                 "gaps": gaps,
@@ -115,6 +120,7 @@ fn replication_metrics(state: &AppState) -> serde_json::Value {
                 "max_inflight_requests": state.config.flow_control.max_inflight_requests,
             },
             "replicas": per_replica.into_iter().map(|(url, (matched, l))| serde_json::json!({
+                "voting": voting.iter().any(|v| crate::util::same_endpoint(v, &url)),
                 "url": url,
                 "matched": matched,
                 "lag": l,

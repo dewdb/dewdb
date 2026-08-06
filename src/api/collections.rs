@@ -77,7 +77,8 @@ pub async fn drop_collection(
     }
 
     let term = state.current_term();
-    let replicas = state.get_replicas();
+    // Learners hold the collection too, so the drop has to reach them.
+    let replicas = state.replication_targets();
 
     let db = state.db.as_ref().unwrap().clone();
     let name = col_name.clone();

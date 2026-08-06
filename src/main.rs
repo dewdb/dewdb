@@ -137,7 +137,10 @@ async fn main() -> io::Result<()> {
         let meta = ReplicationMeta::load(&config.data_dir)
             .expect("Cannot read replication.meta; starting would rewind this node's term and vote");
         // A former leader rejoins as a follower unless solo; the cluster may have moved on.
-        let solo_primary = config.peers.is_empty() && config.shard_role.as_deref() == Some("primary");
+        // A learner is never either: it must not reach a majority of one before it is admitted.
+        let solo_primary = !config.is_learner()
+            && config.peers.is_empty()
+            && config.shard_role.as_deref() == Some("primary");
 
         let (term, is_leader, voted_for) = if let Some(ref m) = meta {
             info!(target: "boot", "Restored replication state: term={}, was_leader={}", m.term, m.is_leader);
@@ -146,7 +149,7 @@ async fn main() -> io::Result<()> {
             }
             (m.term, solo_primary, m.voted_for.clone())
         } else {
-            let is_primary = config.shard_role.as_deref() == Some("primary");
+            let is_primary = !config.is_learner() && config.shard_role.as_deref() == Some("primary");
             info!(target: "boot", "No prior replication state; bootstrapping as {}",
                 if is_primary { "primary" } else { "replica" });
             (0, is_primary, None)
@@ -224,6 +227,8 @@ async fn main() -> io::Result<()> {
     let app = build_app(&state);
 
     if config.role == "shard" {
+        // A node admitted last time comes back knowing only what the durable view says.
+        state.follow_from_view();
         if state.is_leader() {
             seed_leader_progress(&state);
         }

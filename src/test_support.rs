@@ -84,6 +84,9 @@ pub struct TestNode {
     pub replicas: Vec<String>,
     pub primary_addr: Option<String>,
     pub shard_role: String,
+    pub heartbeat_timeout_secs: u64,
+    /// "voter" or "learner". A learner never campaigns, whatever the timeout.
+    pub membership_mode: String,
     pub state: Option<AppState>,
     pub stop: Option<Arc<tokio::sync::Notify>>,
     pub thread: Option<std::thread::JoinHandle<()>>,
@@ -92,6 +95,10 @@ pub struct TestNode {
 // Binding :0 and dropping the listener lets the OS hand the same port to two
 // concurrent callers, so the counter rather than the OS guarantees uniqueness.
 static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(20000);
+
+pub fn next_test_port() -> u16 {
+    free_port()
+}
 
 fn free_port() -> u16 {
     loop {
@@ -110,12 +117,13 @@ fn node_config(n: &TestNode) -> NodeConfig {
         "node_id": n.node_id,
         "role": "shard",
         "shard_role": n.shard_role,
+        "membership_mode": n.membership_mode,
         "listen_addr": n.addr,
         "peers": n.peers,
         "replicas": n.replicas,
         "primary_addr": n.primary_addr,
         "data_dir": n.data_dir.to_string_lossy(),
-        "heartbeat_timeout_secs": 1,
+        "heartbeat_timeout_secs": n.heartbeat_timeout_secs,
         "election_delay_ms": 200,
         "maintenance": { "enabled": false },
     });
@@ -134,6 +142,8 @@ impl TestNode {
             replicas: Vec::new(),
             primary_addr: None,
             shard_role: shard_role.to_string(),
+            heartbeat_timeout_secs: 1,
+            membership_mode: "voter".to_string(),
             state: None,
             stop: None,
             thread: None,
@@ -165,10 +175,13 @@ impl TestNode {
                     Database::with_cache(&config.data_dir, ReadCacheConfig::default()).unwrap());
 
                 let meta = ReplicationMeta::load(&config.data_dir).expect("unreadable replication.meta");
-                let solo = config.peers.is_empty() && config.shard_role.as_deref() == Some("primary");
+                let solo = !config.is_learner()
+                    && config.peers.is_empty()
+                    && config.shard_role.as_deref() == Some("primary");
                 let (term, is_leader, voted_for) = match &meta {
                     Some(m) => (m.term, solo, m.voted_for.clone()),
-                    None => (0, config.shard_role.as_deref() == Some("primary"), None),
+                    None => (0, !config.is_learner()
+                                && config.shard_role.as_deref() == Some("primary"), None),
                 };
                 ReplicationMeta { term, is_leader, voted_for: voted_for.clone() }
                     .save(&config.data_dir)
@@ -213,6 +226,7 @@ impl TestNode {
                 };
 
                 let app = build_app(&state);
+                state.follow_from_view();
                 if state.is_leader() {
                     seed_leader_progress(&state);
                 } else {

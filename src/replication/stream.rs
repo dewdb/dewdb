@@ -41,7 +41,7 @@ pub fn replicate_to_peers(
     lsn: u64,
     prev_lsn: u64,
 ) {
-    let replicas = state.get_replicas();
+    let replicas = state.replication_targets();
     if replicas.is_empty() {
         return;
     }
@@ -144,7 +144,7 @@ pub fn replication_drive_task(state: AppState) {
                 Some(d) => d.clone(),
                 None => return,
             };
-            let replicas = state.get_replicas();
+            let replicas = state.replication_targets();
             if replicas.is_empty() {
                 continue;
             }
@@ -525,7 +525,7 @@ pub async fn replicate_and_await(
     required_acks: usize,
     timeout: Duration,
 ) -> usize {
-    let replicas = state.get_replicas();
+    let replicas = state.replication_targets();
     if replicas.is_empty() || required_acks <= 1 {
         replicate_to_peers(state, collection, frame, term, commit_index, lsn, prev_lsn);
         return 1;
@@ -533,13 +533,17 @@ pub async fn replicate_and_await(
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<bool>(replicas.len());
     for replica_url in replicas {
+        // Learners are shipped the frame on the same path but report `false`: they hold the data
+        // and can be promoted later, yet counting them would let a write concern be met by nodes
+        // outside the quorum, and a leader elected without them would not have their entries.
+        let counts = state.is_voting_replica(&replica_url);
         let state = state.clone();
         let col = collection.clone();
         let frame = frame.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
             let ok = replicate_one_await(&state, &replica_url, &col, &frame, term, commit_index, lsn, prev_lsn).await;
-            let _ = tx.send(ok).await;
+            let _ = tx.send(ok && counts).await;
         });
     }
     drop(tx);

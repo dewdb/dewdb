@@ -107,6 +107,18 @@ impl Progress {
         }
     }
 
+    /// Starts tracking a replica admitted mid-term, at cursor 0 rather than at our tail.
+    /// `reinit_as_leader` assumes at the top and backs off on rejection, which is right for a node
+    /// that was already following; a node we have never sent to holds nothing, and starting at the
+    /// top would leave the driver seeing no gap and shipping nothing until the next write.
+    /// Existing cursors are left alone so a re-add cannot rewind a catch-up in flight.
+    pub fn begin_tracking(&mut self, replica: &str, collections: &[String]) {
+        let per_collection = self.sent_through.entry(replica.to_string()).or_default();
+        for collection in collections {
+            per_collection.entry(collection.clone()).or_insert(0);
+        }
+    }
+
     pub fn cursor_snapshot(&self) -> HashMap<String, HashMap<String, u64>> {
         self.sent_through.clone()
     }

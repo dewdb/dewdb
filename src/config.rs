@@ -18,6 +18,11 @@ pub struct NodeConfig {
     pub shard_map: Vec<ShardInfo>,
     #[serde(default)]
     pub shard_role: Option<String>,
+    /// `voter` (default) or `learner`. A learner never campaigns, even with no peers and no leader
+    /// in sight. It is set in config rather than learned, because the window this closes is exactly
+    /// the one before any cluster view has arrived.
+    #[serde(default = "default_membership_mode")]
+    pub membership_mode: String,
     #[serde(default)]
     pub primary_addr: Option<String>,
     #[serde(default)]
@@ -71,6 +76,9 @@ impl Default for FlowControlConfig {
 }
 
 fn default_data_dir() -> String { "./data".to_string() }
+fn default_membership_mode() -> String { "voter".to_string() }
+
+pub const MEMBERSHIP_LEARNER: &str = "learner";
 
 fn default_heartbeat_timeout() -> u64 { 6 }
 fn default_election_delay() -> u64 { 2000 }
@@ -83,12 +91,17 @@ impl NodeConfig {
         if self.data_dir.trim().is_empty() {
             return Err("data_dir must not be empty".into());
         }
-        if self.role == "shard" {
-            if let Some(ref sr) = self.shard_role {
-                if sr == "replica" && self.primary_addr.is_none() {
-                    return Err("Replica shard requires primary_addr".into());
-                }
-            }
+        // A replica without primary_addr used to be inert and so was rejected at boot. It can now
+        // be told who to follow by a runtime join, which is the whole point of joining one.
+        // config_warnings still flags it, since an unjoined node in that state does nothing.
+
+        if self.membership_mode != "voter" && self.membership_mode != MEMBERSHIP_LEARNER {
+            return Err(format!(
+                "membership_mode must be 'voter' or 'learner', got '{}'", self.membership_mode));
+        }
+        if self.is_learner() && self.shard_role.as_deref() == Some("primary") {
+            return Err("membership_mode 'learner' cannot be combined with shard_role 'primary'; \
+                        a learner is never a leader".to_string());
         }
         self.maintenance.validate()?;
         self.logging.validate()?;
@@ -96,6 +109,9 @@ impl NodeConfig {
         Ok(())
     }
 
+    pub fn is_learner(&self) -> bool {
+        self.membership_mode == MEMBERSHIP_LEARNER
+    }
 }
 
 pub fn config_warnings(cfg: &NodeConfig) -> Vec<String> {
@@ -146,6 +162,23 @@ pub fn config_warnings(cfg: &NodeConfig) -> Vec<String> {
     }
 
     if cfg.role == "shard" {
+        // A node with no peers reaches a majority of one. Left as a voter it will campaign the
+        // moment its timeout expires and elect itself over an empty log, whatever the operator
+        // intended -- a race no timeout setting can win reliably.
+        if !cfg.is_learner()
+            && cfg.peers.is_empty()
+            && cfg.primary_addr.is_none()
+            && cfg.shard_role.as_deref() == Some("replica")
+        {
+            out.push("replica has no primary_addr and no peers, and membership_mode is 'voter'; \
+                      it will elect itself once its heartbeat timeout expires. Set membership_mode \
+                      to 'learner' if this node is meant to join an existing cluster".to_string());
+        }
+        if cfg.is_learner() && !cfg.peers.is_empty() {
+            out.push("membership_mode is 'learner' but peers is set; a learner never campaigns, \
+                      so peers has no effect on it".to_string());
+        }
+
         if cfg.peers.iter().any(|p| same_endpoint(p, &cfg.listen_addr)) {
             out.push(format!(
                 "peers contains this node's own address ({}); peers must list only the other nodes, \
@@ -237,6 +270,48 @@ mod tests {
         let bare = warn_cfg(r#"{"node_id":"r","role":"router","listen_addr":"127.0.0.1:9500",
             "shard_map":[{"start_hash":0,"end_hash":0,"node_url":"http://a"}]}"#);
         assert!(bare.iter().any(|m| m.contains("cannot fail over")), "got {:?}", bare);
+    }
+
+    #[test]
+    fn membership_mode_defaults_to_voter_and_is_checked_at_boot() {
+        let cfg = |json: &str| serde_json::from_str::<NodeConfig>(json).unwrap();
+
+        let default = cfg(r#"{"node_id":"n","role":"shard","listen_addr":"127.0.0.1:1"}"#);
+        assert_eq!(default.membership_mode, "voter",
+            "an existing config must keep behaving exactly as it did");
+        assert!(!default.is_learner());
+        assert!(default.validate().is_ok());
+
+        let learner = cfg(r#"{"node_id":"n","role":"shard","shard_role":"replica",
+            "listen_addr":"127.0.0.1:1","membership_mode":"learner"}"#);
+        assert!(learner.is_learner());
+        assert!(learner.validate().is_ok());
+
+        let typo = cfg(r#"{"node_id":"n","role":"shard","listen_addr":"127.0.0.1:1",
+            "membership_mode":"observer"}"#);
+        assert!(typo.validate().is_err(),
+            "a misspelled mode must fail the boot, not silently fall back to voter");
+
+        let contradiction = cfg(r#"{"node_id":"n","role":"shard","shard_role":"primary",
+            "listen_addr":"127.0.0.1:1","membership_mode":"learner"}"#);
+        assert!(contradiction.validate().is_err(), "a learner is never a primary");
+    }
+
+    #[test]
+    fn a_lone_voter_that_will_elect_itself_is_called_out() {
+        let w = warn_cfg(r#"{"node_id":"n","role":"shard","shard_role":"replica",
+            "listen_addr":"127.0.0.1:9501"}"#);
+        assert!(w.iter().any(|m| m.contains("elect itself") && m.contains("learner")),
+            "the warning must name the fix, not just the symptom: {:?}", w);
+
+        let fixed = warn_cfg(r#"{"node_id":"n","role":"shard","shard_role":"replica",
+            "listen_addr":"127.0.0.1:9501","membership_mode":"learner"}"#);
+        assert!(!fixed.iter().any(|m| m.contains("elect itself")), "got {:?}", fixed);
+
+        let pointless = warn_cfg(r#"{"node_id":"n","role":"shard","shard_role":"replica",
+            "listen_addr":"127.0.0.1:9501","membership_mode":"learner",
+            "peers":["http://127.0.0.1:9502"]}"#);
+        assert!(pointless.iter().any(|m| m.contains("peers has no effect")), "got {:?}", pointless);
     }
 
     #[test]

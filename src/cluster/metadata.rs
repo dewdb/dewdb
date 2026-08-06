@@ -28,6 +28,15 @@ pub struct Member {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_role: Option<String>,
+    /// Counted toward election and commit quorums. Runtime-added nodes are never voting: the view
+    /// converges rather than being agreed, and a quorum computed from disagreeing views can be two
+    /// disjoint majorities. Promoting a learner needs the joint consensus of commit 44.
+    #[serde(default)]
+    pub voting: bool,
+    /// For a learner, the primary whose group it is catching up with. A leader ships frames only to
+    /// learners naming it, so one cluster-wide list can serve several shard groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follows: Option<String>,
 }
 
 /// The whole topology as one versioned value. Replacing it wholesale rather than patching fields
@@ -52,6 +61,7 @@ impl ClusterMetadata {
     /// authority: once version 1 is on disk, later config edits no longer move the cluster.
     pub fn seed_from_config(cfg: &NodeConfig) -> Self {
         let mut members = Vec::new();
+        // Everything config names is a full member: the config quorum is the pre-existing one.
         let mut push = |url: &str, role: &str, shard_role: Option<&str>, node_id: Option<&str>| {
             if url.is_empty() || members.iter().any(|m: &Member| same_url(&m.url, url)) {
                 return;
@@ -61,6 +71,8 @@ impl ClusterMetadata {
                 node_id: node_id.map(str::to_string),
                 role: role.to_string(),
                 shard_role: shard_role.map(str::to_string),
+                voting: role == "shard",
+                follows: None,
             });
         };
 
@@ -176,6 +188,51 @@ impl ClusterMetadata {
         write_atomic(&dir, CLUSTER_FILE, &content)
     }
 
+    pub fn member(&self, url: &str) -> Option<&Member> {
+        self.members.iter().find(|m| same_url(&m.url, url))
+    }
+
+    /// Shard nodes catching up with `primary`, which are exactly the members that receive frames
+    /// but are absent from every quorum computation.
+    pub fn learners_following(&self, primary: &str) -> Vec<String> {
+        self.members.iter()
+            .filter(|m| !m.voting && m.role == "shard")
+            .filter(|m| m.follows.as_deref().map_or(false, |f| same_url(f, primary)))
+            .map(|m| m.url.clone())
+            .collect()
+    }
+
+    /// True only for a node that is present and explicitly non-voting. An unknown node is not a
+    /// learner: a node missing from the view must keep behaving as its config says, or a view that
+    /// has not reached it yet would silently strip its vote.
+    pub fn is_learner(&self, url: &str) -> bool {
+        self.member(url).map_or(false, |m| !m.voting && m.role == "shard")
+    }
+
+    /// Next version of this view with `member` added or replaced. Returns a value rather than
+    /// mutating, so a rejected change never half-applies.
+    pub fn with_member(&self, by: &str, member: Member) -> Self {
+        let mut next = self.clone();
+        next.members.retain(|m| !same_url(&m.url, &member.url));
+        next.members.push(member);
+        next.bump(by);
+        next
+    }
+
+    pub fn without_member(&self, by: &str, url: &str) -> Self {
+        let mut next = self.clone();
+        next.members.retain(|m| !same_url(&m.url, url));
+        next.bump(by);
+        next
+    }
+
+    fn bump(&mut self, by: &str) {
+        self.version += 1;
+        self.updated_by = by.to_string();
+        // The result is a decision, not a guess, however it was derived.
+        self.seeded = false;
+    }
+
     pub fn shard_owners(&self) -> Vec<(String, Vec<String>)> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
@@ -223,6 +280,81 @@ pub fn adopt(current: &mut ClusterMetadata, incoming: ClusterMetadata) -> Adopti
     let to = incoming.version;
     *current = incoming;
     Adoption::Adopted { from, to }
+}
+
+/// What an operator asked for. `voting` is absent by design: it is not the operator's to set.
+#[derive(Deserialize, Debug, Clone)]
+pub struct JoinRequest {
+    pub url: String,
+    #[serde(default)]
+    pub node_id: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub shard_role: Option<String>,
+    #[serde(default)]
+    pub follows: Option<String>,
+    /// Present only so asking for it fails loudly instead of being quietly dropped.
+    #[serde(default)]
+    pub voting: Option<bool>,
+}
+
+/// Builds the next view for a join. `leader_url` is the node accepting the change, and the default
+/// group for a shard that did not name one.
+pub fn plan_join(current: &ClusterMetadata, by: &str, leader_url: &str, req: &JoinRequest)
+    -> Result<ClusterMetadata, String>
+{
+    if req.url.trim().is_empty() {
+        return Err("url is required".to_string());
+    }
+    if req.voting == Some(true) {
+        return Err("a node cannot join as voting; runtime quorum changes need joint consensus \
+                    (commit 44). It joins as a learner and replicates immediately".to_string());
+    }
+    let role = req.role.clone().unwrap_or_else(|| "shard".to_string());
+    if role != "shard" && role != "router" {
+        return Err(format!("unknown role '{}'", role));
+    }
+    if same_url(&req.url, leader_url) {
+        return Err("a leader cannot add itself as a learner".to_string());
+    }
+    // Re-adding a config member as a learner would drop it out of the quorum it is already in.
+    if let Some(existing) = current.member(&req.url) {
+        if existing.voting {
+            return Err(format!(
+                "{} is already a voting member; demoting it would shrink the quorum", req.url));
+        }
+    }
+
+    let member = Member {
+        url: req.url.clone(),
+        node_id: req.node_id.clone(),
+        role: role.clone(),
+        shard_role: req.shard_role.clone().or_else(|| (role == "shard").then(|| "replica".to_string())),
+        voting: false,
+        follows: match role.as_str() {
+            "shard" => Some(req.follows.clone().unwrap_or_else(|| leader_url.to_string())),
+            _ => None,
+        },
+    };
+
+    let next = current.with_member(by, member);
+    next.validate().map(|_| next).map_err(|e| e)
+}
+
+pub fn plan_leave(current: &ClusterMetadata, by: &str, url: &str) -> Result<ClusterMetadata, String> {
+    match current.member(url) {
+        None => Err(format!("{} is not a member", url)),
+        // Losing a voter shrinks every majority it was counted in, and nothing here orders that
+        // against an election already in flight.
+        Some(m) if m.voting => Err(format!(
+            "{} is a voting member; removing it would shrink the quorum, which needs joint \
+             consensus (commit 44)", url)),
+        Some(_) => {
+            let next = current.without_member(by, url);
+            next.validate().map(|_| next).map_err(|e| e)
+        },
+    }
 }
 
 #[cfg(test)]
@@ -303,8 +435,8 @@ mod tests {
 
         let mut dupes = view(99, "n1", vec![]);
         dupes.members = vec![
-            Member { url: "http://a".into(), node_id: None, role: "shard".into(), shard_role: None },
-            Member { url: "http://a/".into(), node_id: None, role: "shard".into(), shard_role: None },
+            Member { url: "http://a".into(), node_id: None, role: "shard".into(), shard_role: None, voting: true, follows: None },
+            Member { url: "http://a/".into(), node_id: None, role: "shard".into(), shard_role: None, voting: true, follows: None },
         ];
         match adopt(&mut current, dupes) {
             Adoption::Rejected(why) => assert!(why.contains("more than once"), "got: {}", why),
@@ -313,7 +445,7 @@ mod tests {
 
         let mut bad_role = view(99, "n1", vec![]);
         bad_role.members = vec![
-            Member { url: "http://a".into(), node_id: None, role: "coordinator".into(), shard_role: None },
+            Member { url: "http://a".into(), node_id: None, role: "coordinator".into(), shard_role: None, voting: true, follows: None },
         ];
         assert!(matches!(adopt(&mut current, bad_role), Adoption::Rejected(_)));
 
@@ -439,6 +571,111 @@ mod tests {
         let mut decided = view(2, "n1", vec![shard(0, 0, "http://b", &[])]);
         assert_eq!(adopt(&mut decided, router_seed), Adoption::Stale { current: 2 },
             "a node restarting into its own config seed must not undo a published view");
+    }
+
+    fn join(url: &str) -> JoinRequest {
+        JoinRequest {
+            url: url.to_string(), node_id: None, role: None,
+            shard_role: None, follows: None, voting: None,
+        }
+    }
+
+    fn cluster_of(voters: &[&str]) -> ClusterMetadata {
+        let mut v = view(1, "n1", vec![]);
+        v.members = voters.iter().map(|u| Member {
+            url: u.to_string(), node_id: None, role: "shard".into(),
+            shard_role: None, voting: true, follows: None,
+        }).collect();
+        v
+    }
+
+    #[test]
+    fn a_node_joins_as_a_learner_and_the_quorum_set_is_untouched() {
+        let current = cluster_of(&["http://n1", "http://n2", "http://n3"]);
+        let next = plan_join(&current, "n1", "http://n1", &join("http://n4")).unwrap();
+
+        assert_eq!(next.version, 2, "a membership change publishes a new version");
+        assert!(!next.seeded, "a decision is not a guess");
+
+        let added = next.member("http://n4").expect("the node must be in the view");
+        assert!(!added.voting, "admitting a voter at runtime can split the quorum");
+        assert_eq!(added.follows.as_deref(), Some("http://n1"), "defaults to the leader that admitted it");
+        assert_eq!(added.shard_role.as_deref(), Some("replica"));
+
+        let voters = next.members.iter().filter(|m| m.voting).count();
+        assert_eq!(voters, 3, "the quorum set must be the same size as before the join");
+        assert_eq!(next.learners_following("http://n1"), vec!["http://n4".to_string()]);
+        assert!(next.is_learner("http://n4"));
+        assert!(!next.is_learner("http://n2"));
+    }
+
+    #[test]
+    fn a_learner_belongs_to_the_group_it_named() {
+        let current = cluster_of(&["http://a", "http://b"]);
+        let mut req = join("http://new");
+        req.follows = Some("http://b".into());
+        let next = plan_join(&current, "a", "http://a", &req).unwrap();
+
+        assert!(next.learners_following("http://a").is_empty(),
+            "a leader must not ship frames to a learner catching up with another group");
+        assert_eq!(next.learners_following("http://b"), vec!["http://new".to_string()]);
+    }
+
+    #[test]
+    fn membership_changes_that_would_move_the_quorum_are_refused() {
+        let current = cluster_of(&["http://n1", "http://n2", "http://n3"]);
+
+        let mut voting = join("http://n4");
+        voting.voting = Some(true);
+        let err = plan_join(&current, "n1", "http://n1", &voting).unwrap_err();
+        assert!(err.contains("joint consensus"), "the refusal must say what would make it safe: {}", err);
+
+        let err = plan_join(&current, "n1", "http://n1", &join("http://n2")).unwrap_err();
+        assert!(err.contains("already a voting member"),
+            "re-adding a voter as a learner would quietly drop it from the quorum: {}", err);
+
+        let err = plan_join(&current, "n1", "http://n1", &join("http://n1")).unwrap_err();
+        assert!(err.contains("itself"), "got: {}", err);
+
+        let err = plan_leave(&current, "n1", "http://n2").unwrap_err();
+        assert!(err.contains("shrink the quorum"), "got: {}", err);
+
+        let err = plan_leave(&current, "n1", "http://nobody").unwrap_err();
+        assert!(err.contains("not a member"), "got: {}", err);
+
+        let mut odd = join("http://n4");
+        odd.role = Some("coordinator".into());
+        assert!(plan_join(&current, "n1", "http://n1", &odd).is_err());
+        assert!(plan_join(&current, "n1", "http://n1", &join("  ")).is_err());
+
+        assert_eq!(current.version, 1, "no refusal may have moved the view");
+    }
+
+    #[test]
+    fn a_learner_can_be_removed_again() {
+        let current = cluster_of(&["http://n1", "http://n2"]);
+        let joined = plan_join(&current, "n1", "http://n1", &join("http://n3")).unwrap();
+        assert_eq!(joined.members.len(), 3);
+
+        let left = plan_leave(&joined, "n1", "http://n3").unwrap();
+        assert_eq!(left.version, 3, "each change is its own version");
+        assert!(left.member("http://n3").is_none());
+        assert!(left.learners_following("http://n1").is_empty());
+        assert_eq!(left.members.iter().filter(|m| m.voting).count(), 2);
+    }
+
+    #[test]
+    fn re_joining_a_learner_updates_it_in_place() {
+        let current = cluster_of(&["http://a", "http://b"]);
+        let once = plan_join(&current, "a", "http://a", &join("http://c")).unwrap();
+
+        let mut moved = join("http://c");
+        moved.follows = Some("http://b".into());
+        let twice = plan_join(&once, "a", "http://a", &moved).unwrap();
+
+        assert_eq!(twice.members.len(), 3, "the same node must not appear twice: {:?}", twice.members);
+        assert_eq!(twice.member("http://c").unwrap().follows.as_deref(), Some("http://b"));
+        twice.validate().expect("a duplicate would have failed validation");
     }
 
     #[test]

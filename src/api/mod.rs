@@ -3,6 +3,7 @@
 pub mod collections;
 pub mod docs;
 pub mod internal;
+pub mod members;
 pub mod middleware;
 pub mod observe;
 pub mod write;
@@ -13,6 +14,7 @@ use internal::{
     cluster_update_handler, cluster_view_handler, heartbeat_handler, internal_drop_handler,
     replicate_handler, resync_handler, snapshot_handler, vote_handler,
 };
+use members::{join_handler, leave_handler};
 use middleware::{auth_middleware, metrics_middleware};
 use observe::{cluster_handler, health_handler, metrics_handler};
 
@@ -25,6 +27,7 @@ pub fn build_app(state: &AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
         .route("/cluster", get(cluster_handler))
+        .route("/cluster/members", post(join_handler).delete(leave_handler))
         .route("/collections", get(list_collections))
         .route("/collections/:name", delete(drop_collection))
         .route("/collections/:name/compact", post(compact_collection))
