@@ -123,6 +123,31 @@ impl Database {
     }
 
     // The one place the watermark may fall: a snapshot can shrink the log.
+    /// Whether anything has ever been written here. Answered from directory entries rather than
+    /// from open collections: a collection that exists on disk but has not been opened yet still
+    /// holds data, and a check that missed it would report an empty node.
+    ///
+    /// A log containing only tombstones counts as data. Deliberately conservative -- this gates a
+    /// change that can make keys unreadable, so the cheap error is a false "populated".
+    pub fn has_any_data(&self) -> io::Result<bool> {
+        for name in self.list_collections()? {
+            let dir = self.root_path.join(&name);
+            let entries = match fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let is_wal = path.file_name().and_then(|s| s.to_str())
+                    .is_some_and(|n| n.starts_with("wal-") && n.ends_with(".log"));
+                if is_wal && fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(true) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     pub fn recompute_durable_lsn(&self) -> io::Result<u64> {
         let mut highest = 0u64;
         for name in self.list_collections()? {

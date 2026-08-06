@@ -6,17 +6,19 @@ pub mod internal;
 pub mod members;
 pub mod middleware;
 pub mod observe;
+pub mod ring;
 pub mod write;
 
 use collections::{compact_collection, drop_collection, list_collections, snapshot_collection};
 use docs::{bulk_create_docs, create_doc, delete_doc, get_doc, list_docs, put_doc, query_docs, update_doc};
 use internal::{
-    cluster_update_handler, cluster_view_handler, heartbeat_handler, internal_drop_handler,
-    replicate_handler, resync_handler, snapshot_handler, vote_handler,
+    cluster_update_handler, cluster_view_handler, data_summary_handler, heartbeat_handler,
+    internal_drop_handler, replicate_handler, resync_handler, snapshot_handler, vote_handler,
 };
 use members::{join_handler, leave_handler};
 use middleware::{auth_middleware, metrics_middleware};
 use observe::{cluster_handler, health_handler, metrics_handler};
+use ring::set_ring_handler;
 
 use crate::state::AppState;
 use axum::routing::{delete, get, post};
@@ -28,6 +30,7 @@ pub fn build_app(state: &AppState) -> Router {
         .route("/metrics", get(metrics_handler))
         .route("/cluster", get(cluster_handler))
         .route("/cluster/members", post(join_handler).delete(leave_handler))
+        .route("/cluster/ring", post(set_ring_handler))
         .route("/collections", get(list_collections))
         .route("/collections/:name", delete(drop_collection))
         .route("/collections/:name/compact", post(compact_collection))
@@ -49,7 +52,8 @@ pub fn build_app(state: &AppState) -> Router {
             .route("/internal/resync", post(resync_handler))
             .route("/internal/vote", post(vote_handler))
             .route("/internal/drop", post(internal_drop_handler))
-            .route("/internal/heartbeat", get(heartbeat_handler));
+            .route("/internal/heartbeat", get(heartbeat_handler))
+            .route("/internal/data-summary", get(data_summary_handler));
     }
 
     app.layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))

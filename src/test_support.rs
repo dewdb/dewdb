@@ -87,6 +87,7 @@ pub struct TestNode {
     pub heartbeat_timeout_secs: u64,
     /// "voter" or "learner". A learner never campaigns, whatever the timeout.
     pub membership_mode: String,
+    pub allow_unsafe_ring_changes: bool,
     pub state: Option<AppState>,
     pub stop: Option<Arc<tokio::sync::Notify>>,
     pub thread: Option<std::thread::JoinHandle<()>>,
@@ -118,6 +119,7 @@ fn node_config(n: &TestNode) -> NodeConfig {
         "role": "shard",
         "shard_role": n.shard_role,
         "membership_mode": n.membership_mode,
+        "allow_unsafe_ring_changes": n.allow_unsafe_ring_changes,
         "listen_addr": n.addr,
         "peers": n.peers,
         "replicas": n.replicas,
@@ -144,6 +146,7 @@ impl TestNode {
             shard_role: shard_role.to_string(),
             heartbeat_timeout_secs: 1,
             membership_mode: "voter".to_string(),
+            allow_unsafe_ring_changes: false,
             state: None,
             stop: None,
             thread: None,
@@ -223,6 +226,7 @@ impl TestNode {
                                 let _ = seeded.save(&config.data_dir);
                                 seeded
                             }))),
+                    ring_cache: Arc::new(std::sync::Mutex::new(Default::default())),
                 };
 
                 let app = build_app(&state);

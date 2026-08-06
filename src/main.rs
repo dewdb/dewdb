@@ -102,6 +102,11 @@ async fn main() -> io::Result<()> {
 
     init_logging(&config.logging, &config.node_id);
 
+    if config.allow_unsafe_ring_changes {
+        warn!(target: "boot", "allow_unsafe_ring_changes is set: a ring change may reassign keys \
+            on a populated cluster, and reassigned keys read as missing until their data is moved");
+    }
+
     for warning in config_warnings(&config) {
         warn!(target: "config", "{}", warning);
     }
@@ -200,6 +205,7 @@ async fn main() -> io::Result<()> {
         replication_slots: Arc::new(tokio::sync::Semaphore::new(
             config.flow_control.max_inflight_requests.max(1))),
         cluster,
+        ring_cache: Arc::new(std::sync::Mutex::new(Default::default())),
     };
 
     if config.shard_role.as_deref() == Some("replica") {

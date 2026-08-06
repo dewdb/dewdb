@@ -1,7 +1,7 @@
 //! Versioned cluster topology: the runtime source of truth for routing and membership.
 
 use crate::config::NodeConfig;
-use crate::ring::{validate_shard_ring, ShardInfo};
+use crate::ring::{validate_shard_ring, HashRing, ShardInfo};
 use crate::util::{endpoint_of, write_atomic};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -52,8 +52,13 @@ pub struct ClusterMetadata {
     pub seeded: bool,
     #[serde(default)]
     pub members: Vec<Member>,
+    /// Explicit ranges. Superseded by `ring` when both are present, and kept rather than cleared so
+    /// a cluster can be published back onto ranges if a ring change goes wrong.
     #[serde(default)]
     pub shards: Vec<ShardInfo>,
+    /// Consistent-hash ownership. Takes precedence over `shards` wherever a key is routed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ring: Option<HashRing>,
 }
 
 impl ClusterMetadata {
@@ -92,6 +97,12 @@ impl ClusterMetadata {
                 push(replica, "shard", Some("replica"), None);
             }
         }
+        for shard in cfg.ring.iter().flat_map(|r| r.shards.iter()) {
+            push(&shard.node_url, "shard", Some("primary"), None);
+            for replica in &shard.replica_urls {
+                push(replica, "shard", Some("replica"), None);
+            }
+        }
 
         Self {
             version: 1,
@@ -99,6 +110,7 @@ impl ClusterMetadata {
             seeded: true,
             members,
             shards: cfg.shard_map.clone(),
+            ring: cfg.ring.clone(),
         }
     }
 
@@ -123,6 +135,10 @@ impl ClusterMetadata {
         if self.version == 0 {
             return Err("cluster metadata version must be at least 1".to_string());
         }
+        if let Some(ring) = &self.ring {
+            ring.validate()?;
+        }
+        // Validated even when a ring supersedes it, so a rollback publish cannot restore a bad map.
         if !self.shards.is_empty() {
             validate_shard_ring(&self.shards)?;
         }
@@ -233,15 +249,32 @@ impl ClusterMetadata {
         self.seeded = false;
     }
 
+    /// Owners in the model actually in force, so fan-out and probing never disagree with routing.
     pub fn shard_owners(&self) -> Vec<(String, Vec<String>)> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
+        if let Some(ring) = &self.ring {
+            for shard in &ring.shards {
+                if seen.insert(shard.node_url.clone()) {
+                    out.push((shard.node_url.clone(), shard.replica_urls.clone()));
+                }
+            }
+            return out;
+        }
         for shard in &self.shards {
             if seen.insert(shard.node_url.clone()) {
                 out.push((shard.node_url.clone(), shard.replica_urls.clone()));
             }
         }
         out
+    }
+
+    /// Next version of this view with `ring` in force.
+    pub fn with_ring(&self, by: &str, ring: HashRing) -> Self {
+        let mut next = self.clone();
+        next.ring = Some(ring);
+        next.bump(by);
+        next
     }
 }
 
@@ -375,7 +408,7 @@ mod tests {
 
     fn view(version: u64, by: &str, shards: Vec<ShardInfo>) -> ClusterMetadata {
         ClusterMetadata {
-            version, updated_by: by.to_string(), seeded: false, members: Vec::new(), shards,
+            version, updated_by: by.to_string(), seeded: false, members: Vec::new(), shards, ring: None,
         }
     }
 

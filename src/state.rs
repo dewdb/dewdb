@@ -4,7 +4,7 @@ use crate::cluster::metadata::{adopt, Adoption, ClusterMetadata};
 use crate::config::NodeConfig;
 use crate::consensus::ReplicationState;
 use crate::metrics::Metrics;
-use crate::ring::shard_owns;
+use crate::ring::{shard_owns, BuiltRing};
 use crate::storage::Database;
 use std::collections::{HashMap, HashSet};
 #[cfg(test)]
@@ -38,6 +38,16 @@ pub struct AppState {
     /// The live topology. Seeded from config on a node's first boot, durable thereafter, and the
     /// only thing the routing path reads -- `config.shard_map` is a bootstrap value, not an authority.
     pub cluster: Arc<RwLock<ClusterMetadata>>,
+    /// Token ring for the current view. Derived, never authoritative: keyed by version so it cannot
+    /// drift from the view it came from, and rebuilt on the first lookup after a change rather than
+    /// on every request.
+    pub ring_cache: Arc<std::sync::Mutex<RingCache>>,
+}
+
+#[derive(Default)]
+pub struct RingCache {
+    version: u64,
+    ring: Option<Arc<BuiltRing>>,
 }
 
 impl AppState {
@@ -225,6 +235,7 @@ impl AppState {
             read_rr: Arc::new(AtomicUsize::new(0)),
             metrics: Arc::new(Metrics::new()),
             cluster: Arc::new(RwLock::new(cluster)),
+            ring_cache: Arc::new(std::sync::Mutex::new(RingCache::default())),
         }
     }
 
@@ -263,6 +274,7 @@ impl AppState {
             read_rr: Arc::new(AtomicUsize::new(0)),
             metrics: Arc::new(Metrics::new()),
             cluster: Arc::new(RwLock::new(cluster)),
+            ring_cache: Arc::new(std::sync::Mutex::new(RingCache::default())),
         }
     }
 
@@ -339,21 +351,35 @@ impl AppState {
 
     /// Persists only what it adopted. A view refused in memory must not reach disk, or the next
     /// boot would come up on a topology this node already rejected.
+    /// Durable before visible. Publishing first left a window in which a node served a topology it
+    /// would forget on restart, so a crash there silently rewound it to the config seed.
     pub fn adopt_cluster(&self, incoming: ClusterMetadata) -> Adoption {
-        let (outcome, to_persist) = {
+        // Decided against the current view first, so the fsync below happens outside every lock.
+        {
+            if let Err(why) = incoming.validate() {
+                return Adoption::Rejected(why);
+            }
+            let current = self.cluster.read().unwrap();
+            if !incoming.supersedes(&current) {
+                return Adoption::Stale { current: current.version };
+            }
+        }
+
+        if let Err(e) = incoming.save(&self.config.data_dir) {
+            // Still adopted: a lost write costs a re-fetch, while refusing would strand this node
+            // on a topology the cluster has already left.
+            tracing::warn!(target: "cluster", error = %e, version = incoming.version,
+                "Could not persist cluster view; adopting it in memory anyway");
+        }
+
+        // Re-checked under the write lock: a newer view may have landed during the write, and that
+        // one wins. `adopt` validates and compares again rather than trusting the decision above.
+        let outcome = {
             let mut current = self.cluster.write().unwrap();
-            let outcome = adopt(&mut current, incoming);
-            let persist = matches!(outcome, Adoption::Adopted { .. }).then(|| current.clone());
-            (outcome, persist)
+            adopt(&mut current, incoming)
         };
 
-        if let Some(view) = to_persist {
-            if let Err(e) = view.save(&self.config.data_dir) {
-                // In-memory adoption stands: a lost write costs a re-fetch, while refusing the
-                // update would leave this node routing by a topology the cluster has left behind.
-                tracing::warn!(target: "cluster", error = %e, version = view.version,
-                    "Adopted cluster view but could not persist it");
-            }
+        if matches!(outcome, Adoption::Adopted { .. }) {
             self.follow_from_view();
         }
         outcome
@@ -401,22 +427,54 @@ impl AppState {
         }
     }
 
+    /// Never holds two locks at once: the version is read and released before the cache is taken,
+    /// so nothing here can deadlock against a concurrent adoption.
+    pub fn built_ring(&self) -> Option<Arc<BuiltRing>> {
+        let version = self.cluster.read().unwrap().version;
+        {
+            let cache = self.ring_cache.lock().unwrap();
+            if cache.version == version {
+                return cache.ring.clone();
+            }
+        }
+        let config = self.cluster.read().unwrap().ring.clone();
+        let built = config.map(|r| Arc::new(r.build()));
+
+        let mut cache = self.ring_cache.lock().unwrap();
+        // A newer version may have landed while we were building; that one wins and rebuilds later.
+        if cache.version <= version {
+            cache.version = version;
+            cache.ring = built.clone();
+        }
+        built
+    }
+
     pub fn get_effective_shard_url(&self, hash: u64) -> Option<(String, String, Vec<String>)> {
+        if let Some(ring) = self.built_ring() {
+            let owner = ring.owner(hash)?;
+            return Some(self.with_override(&owner.node_url, owner.replica_urls.clone()));
+        }
+
         let shards = self.cluster.read().unwrap().shards.clone();
         for shard in &shards {
             if shard_owns(shard, hash) {
-                let mut overrides = self.primary_overrides.lock().unwrap();
-                if let Some(ov) = overrides.get(&shard.node_url) {
-                    if ov.cached_at.elapsed().as_secs() < OVERRIDE_TTL_SECS {
-                        return Some((ov.url.clone(), shard.node_url.clone(), shard.replica_urls.clone()));
-                    } else {
-                        overrides.remove(&shard.node_url);
-                    }
-                }
-                return Some((shard.node_url.clone(), shard.node_url.clone(), shard.replica_urls.clone()));
+                return Some(self.with_override(&shard.node_url, shard.replica_urls.clone()));
             }
         }
         None
+    }
+
+    /// `(where to send now, the configured owner, its replicas)`. Failover is a property of the
+    /// owner, not of how the owner was chosen, so both ownership models come through here.
+    fn with_override(&self, owner: &str, replicas: Vec<String>) -> (String, String, Vec<String>) {
+        let mut overrides = self.primary_overrides.lock().unwrap();
+        if let Some(ov) = overrides.get(owner) {
+            if ov.cached_at.elapsed().as_secs() < OVERRIDE_TTL_SECS {
+                return (ov.url.clone(), owner.to_string(), replicas);
+            }
+            overrides.remove(owner);
+        }
+        (owner.to_string(), owner.to_string(), replicas)
     }
 
     pub fn set_primary_override(&self, original_url: &str, new_url: &str) {
@@ -624,6 +682,7 @@ mod tests {
             version: 2,
             updated_by: "operator".into(),
             seeded: false,
+            ring: None,
             members: Vec::new(),
             shards: vec![
                 crate::ring::ShardInfo {
@@ -661,6 +720,7 @@ mod tests {
             version: 50,
             updated_by: "operator".into(),
             seeded: false,
+            ring: None,
             members: Vec::new(),
             // Only half the ring: every key above HALF would route nowhere.
             shards: vec![crate::ring::ShardInfo {

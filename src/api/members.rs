@@ -18,7 +18,7 @@ pub struct LeaveParams {
 /// Only a leader may publish a membership change. The view converges by version rather than being
 /// agreed, so two writers produce two versions of which one is discarded; one writer per shard
 /// group is the strongest ordering available before joint consensus.
-fn writable(state: &AppState) -> Result<(), axum::response::Response> {
+pub(crate) fn writable(state: &AppState) -> Result<(), axum::response::Response> {
     if !state.is_shard() {
         return Err(err_json(StatusCode::CONFLICT,
             "membership changes must be sent to a shard leader, not a router".to_string()));
@@ -34,7 +34,7 @@ fn writable(state: &AppState) -> Result<(), axum::response::Response> {
     Ok(())
 }
 
-async fn publish(state: &AppState, next: ClusterMetadata) -> Result<u64, axum::response::Response> {
+pub(crate) async fn publish(state: &AppState, next: ClusterMetadata) -> Result<u64, axum::response::Response> {
     match state.adopt_cluster(next) {
         Adoption::Adopted { to, .. } => Ok(to),
         // Our own next version losing means someone else published concurrently.
@@ -44,14 +44,20 @@ async fn publish(state: &AppState, next: ClusterMetadata) -> Result<u64, axum::r
     }
 }
 
-/// Pushes the new view straight at the affected node so it learns its role immediately rather than
-/// after a poll. Best effort: propagation still carries it, this only shortens the window.
-async fn nudge(state: &AppState, url: &str, view: &ClusterMetadata) {
+/// Pushes the new view straight at a node so it learns its role immediately rather than after a
+/// poll. Spawned rather than awaited: the change is already published and durable, and a control
+/// plane write must not hang on whether every node it names happens to be reachable.
+pub(crate) fn nudge(state: &AppState, url: &str, view: &ClusterMetadata) {
+    let client = state.client.clone();
     let endpoint = format!("{}/internal/cluster", url);
-    if let Err(e) = state.client.post(&endpoint).json(view).send().await {
-        warn!(target: "membership", node = %url, error = %e,
-            "Could not hand the new view to the node directly; it will pick it up by polling");
-    }
+    let node = url.to_string();
+    let view = view.clone();
+    tokio::spawn(async move {
+        if let Err(e) = client.post(&endpoint).json(&view).send().await {
+            warn!(target: "membership", node = %node, error = %e,
+                "Could not hand the new view to the node directly; it will pick it up by polling");
+        }
+    });
 }
 
 pub async fn join_handler(
@@ -78,7 +84,7 @@ pub async fn join_handler(
     if follows.as_deref().map_or(false, |f| crate::util::same_endpoint(f, &own)) {
         state.begin_tracking_learner(&req.url);
     }
-    nudge(&state, &req.url, &view).await;
+    nudge(&state, &req.url, &view);
 
     info!(target: "membership", node = %req.url, version, "Admitted as a learner");
     (StatusCode::OK, Json(serde_json::json!({
@@ -114,7 +120,7 @@ pub async fn leave_handler(
     };
 
     // Told last, and only as a courtesy: it is already out of the view we replicate from.
-    nudge(&state, &params.url, &state.cluster_view()).await;
+    nudge(&state, &params.url, &state.cluster_view());
 
     info!(target: "membership", node = %params.url, version, "Removed from the cluster");
     (StatusCode::OK, Json(serde_json::json!({

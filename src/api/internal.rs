@@ -298,6 +298,20 @@ pub async fn cluster_update_handler(
     }
 }
 
+/// Whether this node holds any data. Asked before a ring change reassigns ownership, so it is
+/// computed on demand rather than folded into the heartbeat every follower polls twice a second.
+pub async fn data_summary_handler(
+    State(state): State<AppState>,
+) -> impl axum::response::IntoResponse {
+    // An unreadable data directory answers "populated": the caller is deciding whether it is safe
+    // to move ownership, and not knowing is not the same as knowing there is nothing to lose.
+    let has_data = state.db.as_ref().is_some_and(|db| db.has_any_data().unwrap_or(true));
+    (StatusCode::OK, Json(serde_json::json!({
+        "node_id": state.config.node_id,
+        "has_data": has_data,
+    }))).into_response()
+}
+
 pub async fn heartbeat_handler(
     State(state): State<AppState>,
 ) -> impl axum::response::IntoResponse {

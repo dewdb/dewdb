@@ -3,7 +3,7 @@
 use crate::auth::AuthConfig;
 use crate::logging::LoggingConfig;
 use crate::maintenance::MaintenanceConfig;
-use crate::ring::{validate_shard_ring, ShardInfo};
+use crate::ring::{validate_shard_ring, HashRing, ShardInfo};
 use crate::storage::ReadCacheConfig;
 use crate::util::{endpoint_of, same_endpoint};
 use serde::Deserialize;
@@ -16,6 +16,10 @@ pub struct NodeConfig {
     pub listen_addr: String,
     #[serde(default)]
     pub shard_map: Vec<ShardInfo>,
+    /// Consistent-hash ownership, as an alternative to `shard_map`. A new deployment should use
+    /// this; a running one migrates with POST /cluster/ring rather than a config edit.
+    #[serde(default)]
+    pub ring: Option<HashRing>,
     #[serde(default)]
     pub shard_role: Option<String>,
     /// `voter` (default) or `learner`. A learner never campaigns, even with no peers and no leader
@@ -45,6 +49,11 @@ pub struct NodeConfig {
     pub auth: AuthConfig,
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
+    /// Development only. Lets a ring change that reassigns ownership through on a cluster that
+    /// already holds data, which leaves those keys unreadable at their new owners until commit 38
+    /// moves them. Off by default, and warned about loudly when on.
+    #[serde(default)]
+    pub allow_unsafe_ring_changes: bool,
 }
 
 /// Bounds on how far the leader lets replication fall behind before it stops accepting writes.
@@ -85,7 +94,12 @@ fn default_election_delay() -> u64 { 2000 }
 
 impl NodeConfig {
     pub fn validate(&self) -> Result<(), String> {
-        if self.role == "router" {
+        if let Some(ring) = &self.ring {
+            ring.validate()?;
+            if !self.shard_map.is_empty() {
+                return Err("set either shard_map or ring, not both; ring would silently win".into());
+            }
+        } else if self.role == "router" {
             validate_shard_ring(&self.shard_map)?;
         }
         if self.data_dir.trim().is_empty() {

@@ -273,7 +273,10 @@ pub async fn metrics_handler(
         "version": view.version,
         "updated_by": view.updated_by,
         "members": view.members.len(),
-        "shards": view.shards.len(),
+        // Which ownership model is actually deciding where keys go, not just what is stored.
+        "model": ownership_model(&view),
+        "vnodes": view.ring.as_ref().map(|r| r.vnodes),
+        "shards": view.shard_owners().len(),
     });
 
     let router = if state.config.role == "router" {
@@ -310,6 +313,12 @@ pub async fn metrics_handler(
     }))).into_response()
 }
 
+fn ownership_model(view: &crate::cluster::metadata::ClusterMetadata) -> &'static str {
+    if view.ring.is_some() { "ring" }
+    else if view.shards.is_empty() { "none" }
+    else { "ranges" }
+}
+
 /// The topology as this node currently sees it. Nodes converge rather than agreeing instantly, so
 /// `version` is what tells an operator whether two nodes are answering from the same view.
 pub async fn cluster_handler(
@@ -320,8 +329,14 @@ pub async fn cluster_handler(
         "version": view.version,
         "updated_by": view.updated_by,
         "seen_by": state.config.node_id,
+        "model": ownership_model(&view),
         "members": view.members,
+        "ring": view.ring,
+        // Retained even when a ring supersedes them, so a rollback has something to go back to.
         "shards": view.shards,
+        "owners": view.shard_owners().into_iter()
+            .map(|(url, replicas)| serde_json::json!({"url": url, "replicas": replicas}))
+            .collect::<Vec<_>>(),
     }))).into_response()
 }
 
