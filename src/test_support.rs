@@ -227,6 +227,7 @@ impl TestNode {
                                 seeded
                             }))),
                     ring_cache: Arc::new(std::sync::Mutex::new(Default::default())),
+                    migrations: Arc::new(std::sync::Mutex::new(Default::default())),
                 };
 
                 let app = build_app(&state);

@@ -69,13 +69,15 @@ async fn cluster_holds_data(state: &AppState) -> HasData {
 fn refuse(summary: &serde_json::Value, because: &str) -> axum::response::Response {
     (StatusCode::CONFLICT, Json(serde_json::json!({
         "error": format!(
-            "refusing to reassign ownership: {}. Moving a key's owner without moving its data \
-             makes it unreadable there, and online migration arrives in commit 38", because),
+            "refusing to reassign ownership: {}. This endpoint moves ownership without moving \
+             the data, which would strand those keys. POST /cluster/migrate copies the data \
+             first and flips ownership only once it has landed", because),
         "moved_fraction": summary.get("moved_fraction"),
         "movement_known": summary.get("movement_known"),
         "transfers": summary.get("transfers"),
-        "hint": "use ?dry_run=true to inspect the change, or set allow_unsafe_ring_changes in \
-                 config on the node publishing it (development only)",
+        "hint": "POST /cluster/migrate applies the same target ring safely; ?dry_run=true here \
+                 still inspects it, and allow_unsafe_ring_changes forces it through (development \
+                 only, and leaves the moved keys unreadable)",
     }))).into_response()
 }
 
@@ -128,9 +130,9 @@ pub async fn set_ring_handler(
         }))).into_response();
     }
 
-    // Ownership moves the instant each node adopts, and nothing moves the data with it. Until
-    // commit 38 can carry the data across, that is a deliberate outage of the moved keys, so it is
-    // refused rather than warned about. A change proven to move nothing is always safe.
+    // Ownership moves the instant each node adopts, and this endpoint moves nothing else. That is
+    // a deliberate outage of the moved keys, so it is refused rather than warned about and the
+    // caller is pointed at /cluster/migrate. A change proven to move nothing is always safe.
     let proven_no_op = movement.as_ref().is_some_and(|m| m.moved_fraction == 0.0);
     if !proven_no_op && !state.config.allow_unsafe_ring_changes {
         match cluster_holds_data(&state).await {
@@ -164,8 +166,8 @@ pub async fn set_ring_handler(
         "status": "applied",
         "version": version,
         "applied": summary,
-        "warning": "ownership moved; data is not migrated yet, so reassigned keys read as missing \
-                    until they are moved (commits 38-43)",
+        "warning": "ownership moved without moving data; reassigned keys read as missing at their \
+                    new owner. POST /cluster/migrate is the path that moves the data too",
     }))).into_response()
 }
 
@@ -334,13 +336,14 @@ mod tests {
         assert_eq!(applied["status"], "applied");
         assert_eq!(applied["applied"]["moved_fraction"].as_f64().unwrap(), moved,
             "a dry run that disagrees with the real thing is worse than no dry run");
-        assert!(applied["warning"].as_str().unwrap().contains("not migrated"));
+        assert!(applied["warning"].as_str().unwrap().contains("/cluster/migrate"),
+            "the warning must point at the endpoint that moves the data too");
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Ownership moves on publish; the data does not move until commit 38. So the whole safety
-    /// question is "is there anything to strand", and the gate is built around that one fact.
+    /// Ownership moves on publish; this endpoint moves no data. So the whole safety question is
+    /// "is there anything to strand", and the gate is built around that one fact.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ownership_cannot_be_reassigned_while_the_cluster_holds_data() {
         use crate::test_support::{put_doc_at, three_node_cluster};
@@ -367,7 +370,12 @@ mod tests {
         let (code, body) = post(format!("{}/cluster/ring", n1.url()), two.clone()).await;
         assert_eq!(code, StatusCode::OK, "an empty cluster must accept its first ring: {}", body);
 
-        assert_eq!(put_doc_at(&c, &n1.url(), "t", "k1", 1, "?w=1").await, StatusCode::CREATED);
+        // A key n1 actually owns: writes to a shard are now checked against the ring.
+        let built = HashRing { vnodes: 128, shards: shards(&[&n1.url(), &n2.url()]) }.build();
+        let mine = (0..5000).map(|i| format!("k{}", i))
+            .find(|k| built.owner(hash_key("t", k)).unwrap().node_url == n1.url())
+            .expect("n1 must own some keys");
+        assert_eq!(put_doc_at(&c, &n1.url(), "t", &mine, 1, "?w=1").await, StatusCode::CREATED);
 
         // 2. Inspecting a change is always allowed; it changes nothing.
         let (code, body) = post(format!("{}/cluster/ring?dry_run=true", n1.url()), three.clone()).await;
@@ -383,7 +391,7 @@ mod tests {
         assert_eq!(body["moved_fraction"].as_f64().unwrap(), predicted,
             "the refusal must carry the number the operator was deciding on");
         let err = body["error"].as_str().unwrap();
-        assert!(err.contains("commit 38"), "the refusal must say what unblocks it: {}", err);
+        assert!(err.contains("/cluster/migrate"), "the refusal must name the safe path: {}", err);
         assert!(err.contains("holds data"), "and what triggered it: {}", err);
         assert!(body["hint"].as_str().unwrap().contains("allow_unsafe_ring_changes"));
 
@@ -425,6 +433,7 @@ mod tests {
         };
 
         assert_eq!(apply(one, format!("{}/cluster/ring", solo.url())).await.0, StatusCode::OK);
+        // A one-shard ring means solo owns everything, so any key works here.
         assert_eq!(put_doc_at(&c, &solo.url(), "t", "k1", 1, "?w=1").await, StatusCode::CREATED);
 
         let (code, refused) = apply(two.clone(), format!("{}/cluster/ring", solo.url())).await;

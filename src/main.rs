@@ -206,6 +206,7 @@ async fn main() -> io::Result<()> {
             config.flow_control.max_inflight_requests.max(1))),
         cluster,
         ring_cache: Arc::new(std::sync::Mutex::new(Default::default())),
+        migrations: Arc::new(std::sync::Mutex::new(Default::default())),
     };
 
     if config.shard_role.as_deref() == Some("replica") {

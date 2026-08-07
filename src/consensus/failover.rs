@@ -349,7 +349,7 @@ mod tests {
     use crate::cluster::metadata::ClusterMetadata;
     use crate::test_support::{
         leaders, node_by_id, put_doc_at, put_doc_http, read_doc_http, settle_leader, temp_root,
-        three_node_cluster, wait_for, TestNode,
+        three_node_cluster, wait_for, wait_for_doc, TestNode,
     };
     use axum::http::StatusCode;
 
@@ -366,9 +366,12 @@ mod tests {
         assert_eq!(leaders(&[&n1, &n2, &n3]), vec!["n1".to_string()], "n1 starts as the only leader");
 
         assert_eq!(put_doc_http(&client, &n1.url(), "k1", 1).await, StatusCode::CREATED);
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(read_doc_http(&client, &n2.url(), "k1").await, Some(1), "write replicated to n2");
-        assert_eq!(read_doc_http(&client, &n3.url(), "k1").await, Some(1), "write replicated to n3");
+        // Waited for rather than slept on: at w=1 the write returns before it has replicated, and
+        // a follower publishes it only once a commit watermark reaches it.
+        for node in [&n2, &n3] {
+            assert!(wait_for_doc(&client, &node.url(), "t", "k1", 1, Duration::from_secs(10)).await,
+                "the write never replicated to {}", node.node_id);
+        }
 
         let term_before = n1.term();
         n1.kill();

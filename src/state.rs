@@ -1,6 +1,8 @@
 //! AppState: shared handle to storage, config, replication state, router caches.
 
-use crate::cluster::metadata::{adopt, Adoption, ClusterMetadata};
+use crate::cluster::metadata::{adopt, Adoption, ClusterMetadata, Migration};
+use crate::cluster::migration::MigrationRuns;
+use crate::cluster::ownership::{classify, Ownership};
 use crate::config::NodeConfig;
 use crate::consensus::ReplicationState;
 use crate::metrics::Metrics;
@@ -42,6 +44,9 @@ pub struct AppState {
     /// drift from the view it came from, and rebuilt on the first lookup after a change rather than
     /// on every request.
     pub ring_cache: Arc<std::sync::Mutex<RingCache>>,
+    /// Progress of a handover this node is driving. Runtime only: a half-copied shard is this
+    /// node's business, not a fact the cluster needs to agree on.
+    pub migrations: Arc<std::sync::Mutex<MigrationRuns>>,
 }
 
 #[derive(Default)]
@@ -236,6 +241,7 @@ impl AppState {
             metrics: Arc::new(Metrics::new()),
             cluster: Arc::new(RwLock::new(cluster)),
             ring_cache: Arc::new(std::sync::Mutex::new(RingCache::default())),
+            migrations: Arc::new(std::sync::Mutex::new(MigrationRuns::default())),
         }
     }
 
@@ -275,6 +281,7 @@ impl AppState {
             metrics: Arc::new(Metrics::new()),
             cluster: Arc::new(RwLock::new(cluster)),
             ring_cache: Arc::new(std::sync::Mutex::new(RingCache::default())),
+            migrations: Arc::new(std::sync::Mutex::new(MigrationRuns::default())),
         }
     }
 
@@ -381,8 +388,23 @@ impl AppState {
 
         if matches!(outcome, Adoption::Adopted { .. }) {
             self.follow_from_view();
+            self.react_to_migration();
         }
         outcome
+    }
+
+    /// Every view adoption is a chance for a handover to have started, finished, or been abandoned.
+    /// Driving it from here rather than from the endpoint means a node that learns about a plan by
+    /// propagation participates in it exactly as if it had been told directly.
+    pub fn react_to_migration(&self) {
+        match self.migration() {
+            Some(m) => crate::cluster::migration::ensure_running(self, &m),
+            // The plan is gone: either it landed as a new ring or it was abandoned. The record
+            // stays, because cleanup still needs the list of keys handed over -- and it checks the
+            // ring before acting, so an abandoned plan cannot be mistaken for a completed one.
+            // Writes unfreeze regardless: the freeze is read from the view, not from this record.
+            None => {},
+        }
     }
 
     /// Points a node admitted at runtime at the primary the view assigned it. Without this it has
@@ -447,6 +469,16 @@ impl AppState {
             cache.ring = built.clone();
         }
         built
+    }
+
+    pub fn migration(&self) -> Option<Migration> {
+        self.cluster.read().unwrap().migration.clone()
+    }
+
+    /// Whether this node may hold `key`. `None` where ownership does not apply -- no ring, or this
+    /// node outside it -- which keeps single-shard and range-based clusters unaffected.
+    pub fn ownership(&self, collection: &str, key: &str) -> Option<Ownership> {
+        classify(&self.cluster.read().unwrap(), &self.own_url(), collection, key)
     }
 
     pub fn get_effective_shard_url(&self, hash: u64) -> Option<(String, String, Vec<String>)> {
@@ -683,6 +715,7 @@ mod tests {
             updated_by: "operator".into(),
             seeded: false,
             ring: None,
+            migration: None,
             members: Vec::new(),
             shards: vec![
                 crate::ring::ShardInfo {
@@ -721,6 +754,7 @@ mod tests {
             updated_by: "operator".into(),
             seeded: false,
             ring: None,
+            migration: None,
             members: Vec::new(),
             // Only half the ring: every key above HALF would route nowhere.
             shards: vec![crate::ring::ShardInfo {

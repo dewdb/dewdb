@@ -59,6 +59,19 @@ pub struct ClusterMetadata {
     /// Consistent-hash ownership. Takes precedence over `shards` wherever a key is routed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ring: Option<HashRing>,
+    /// A handover in flight. `ring` stays authoritative for routing throughout; this only says
+    /// where the keys are going, so every node can agree on which keys are in the middle of moving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migration: Option<Migration>,
+}
+
+/// The plan, not the progress. Progress is per node and lives in memory: a half-copied shard is
+/// not a fact about the cluster, and putting it in the view would make every batch a publish.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Migration {
+    pub id: String,
+    pub target: HashRing,
+    pub started_by: String,
 }
 
 impl ClusterMetadata {
@@ -111,6 +124,7 @@ impl ClusterMetadata {
             members,
             shards: cfg.shard_map.clone(),
             ring: cfg.ring.clone(),
+            migration: None,
         }
     }
 
@@ -137,6 +151,12 @@ impl ClusterMetadata {
         }
         if let Some(ring) = &self.ring {
             ring.validate()?;
+        }
+        if let Some(migration) = &self.migration {
+            migration.target.validate().map_err(|e| format!("migration target: {}", e))?;
+            if self.ring.is_none() {
+                return Err("a migration needs a ring to move away from".to_string());
+            }
         }
         // Validated even when a ring supersedes it, so a rollback publish cannot restore a bad map.
         if !self.shards.is_empty() {
@@ -269,10 +289,19 @@ impl ClusterMetadata {
         out
     }
 
-    /// Next version of this view with `ring` in force.
+    /// Next version of this view with `ring` in force. Clears any migration: the ring landing is
+    /// what completing one means, and leaving the plan behind would freeze the keys it named.
     pub fn with_ring(&self, by: &str, ring: HashRing) -> Self {
         let mut next = self.clone();
         next.ring = Some(ring);
+        next.migration = None;
+        next.bump(by);
+        next
+    }
+
+    pub fn with_migration(&self, by: &str, migration: Option<Migration>) -> Self {
+        let mut next = self.clone();
+        next.migration = migration;
         next.bump(by);
         next
     }
@@ -408,7 +437,7 @@ mod tests {
 
     fn view(version: u64, by: &str, shards: Vec<ShardInfo>) -> ClusterMetadata {
         ClusterMetadata {
-            version, updated_by: by.to_string(), seeded: false, members: Vec::new(), shards, ring: None,
+            version, updated_by: by.to_string(), seeded: false, members: Vec::new(), shards, ring: None, migration: None,
         }
     }
 

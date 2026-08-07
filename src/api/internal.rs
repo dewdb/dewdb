@@ -1,6 +1,7 @@
 //! /internal/* endpoints that cluster nodes call on each other.
 
 use crate::cluster::metadata::{Adoption, ClusterMetadata};
+use crate::cluster::migration::MigrateBatch;
 use crate::consensus::{
     decide_vote, heartbeat_poll_task, local_log_tails, LogTail, ReplicationMeta, VoteRequest,
     VoteResponse,
@@ -296,6 +297,90 @@ pub async fn cluster_update_handler(
             }))).into_response()
         },
     }
+}
+
+/// Receives keys handed over by their current owner. Deliberately outside the ownership check: the
+/// point of the batch is that this node does not own these keys yet.
+pub async fn migrate_handler(
+    State(state): State<AppState>,
+    Json(batch): Json<MigrateBatch>,
+) -> impl axum::response::IntoResponse {
+    if !state.is_shard() || !state.is_leader() {
+        return err_json(StatusCode::CONFLICT,
+            "handover batches go to the destination group's leader".to_string());
+    }
+    match state.migration() {
+        Some(m) if m.id == batch.migration_id => {},
+        // Refused rather than absorbed: a batch from a plan we do not hold would write keys that
+        // nothing in our view says are ours, and nothing would ever clean them up.
+        _ => return err_json(StatusCode::CONFLICT, format!(
+            "no migration {} is in progress here", batch.migration_id)),
+    }
+
+    let wc = crate::replication::parse_write_concern(None);
+    let wtimeout = std::time::Duration::from_millis(crate::replication::DEFAULT_WTIMEOUT_MS);
+    let mut written = 0usize;
+    for doc in batch.docs {
+        match crate::api::write::local_write(
+            &state, &batch.collection, doc.key, Some(doc.value), wc, wtimeout).await
+        {
+            Ok(_) => written += 1,
+            Err(resp) => return resp,
+        }
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({"status": "received", "written": written}))).into_response()
+}
+
+pub async fn migration_status_handler(
+    State(state): State<AppState>,
+) -> impl axum::response::IntoResponse {
+    let plan = state.migration();
+    (StatusCode::OK, Json(serde_json::json!({
+        "node_id": state.config.node_id,
+        "migration": plan.as_ref().map(|m| m.id.clone()),
+        "progress": crate::cluster::migration::progress(&state),
+    }))).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct CleanupRequest {
+    pub migration_id: String,
+}
+
+/// Deletes the keys this node handed over, once the flip is visible here. Driven by the coordinator
+/// after the ring lands, never by the source on its own: a node whose view is behind would be
+/// deleting keys it still owns.
+pub async fn migrate_cleanup_handler(
+    State(state): State<AppState>,
+    Json(req): Json<CleanupRequest>,
+) -> impl axum::response::IntoResponse {
+    if state.migration().is_some() {
+        return err_json(StatusCode::CONFLICT,
+            "the handover is still in the view here; ownership has not moved yet".to_string());
+    }
+
+    let handed_over = crate::cluster::migration::handed_over_after_flip(&state, &req.migration_id);
+    let wc = crate::replication::parse_write_concern(None);
+    let wtimeout = std::time::Duration::from_millis(crate::replication::DEFAULT_WTIMEOUT_MS);
+    let mut removed = 0usize;
+
+    for (collection, key) in handed_over {
+        // Re-checked one key at a time against the live view. Anything we do own now is not ours
+        // to delete, whatever the handover recorded.
+        if state.ownership(&collection, &key) == Some(crate::cluster::ownership::Ownership::Ours) {
+            continue;
+        }
+        // Through the write path, not a bare append: a tombstone has to be staged, committed and
+        // applied to disappear from the index, and it has to reach this group's replicas too.
+        if crate::api::write::local_write(&state, &collection, key, None, wc, wtimeout).await.is_ok() {
+            removed += 1;
+        }
+    }
+    crate::cluster::migration::forget(&state);
+
+    info!(target: "migration", id = %req.migration_id, removed, "Cleaned up handed-over keys");
+    (StatusCode::OK, Json(serde_json::json!({"status": "cleaned", "removed": removed}))).into_response()
 }
 
 /// Whether this node holds any data. Asked before a ring change reassigns ownership, so it is

@@ -33,6 +33,34 @@ fn build_forward(client: &reqwest::Client, method: &ForwardMethod, url: &str, bo
     }
 }
 
+/// A shard's reply, buffered. The forward path has to look inside a `409` to see whether it is a
+/// redirect, and a `reqwest::Response` cannot be read twice or rebuilt.
+pub struct ShardReply {
+    pub status: StatusCode,
+    pub body: String,
+}
+
+impl ShardReply {
+    async fn of(r: reqwest::Response) -> Self {
+        Self { status: r.status(), body: r.text().await.unwrap_or_default() }
+    }
+
+    /// `Some(owner)` when the shard is telling us our view is stale rather than answering.
+    fn redirect(&self) -> Option<String> {
+        if self.status != StatusCode::CONFLICT {
+            return None;
+        }
+        serde_json::from_str::<serde_json::Value>(&self.body).ok()
+            .and_then(|b| b.get("owner").and_then(|o| o.as_str().map(str::to_string)))
+    }
+}
+
+pub fn passthrough(reply: ShardReply) -> axum::response::Response {
+    let json: serde_json::Value = serde_json::from_str(&reply.body)
+        .unwrap_or(serde_json::Value::String(reply.body));
+    (reply.status, Json(json)).into_response()
+}
+
 // A shard's 4xx is an answer, not a failure: a PATCH 404 means no document, not a dead node.
 fn authoritative_write_status(s: StatusCode) -> bool {
     s.is_success()
@@ -50,7 +78,7 @@ pub async fn router_forward_write(
     method: ForwardMethod,
     body: Option<&CreateDoc>,
     wc_query: &str,
-) -> Result<reqwest::Response, axum::response::Response> {
+) -> Result<ShardReply, axum::response::Response> {
     let hash = hash_key(col_name, key);
 
     let (effective_url, original_url, replica_urls) = match state.get_effective_shard_url(hash) {
@@ -60,11 +88,26 @@ pub async fn router_forward_write(
 
     let full_url = format!("{}/collections/{}/docs/{}{}", effective_url, col_name, key, wc_query);
     if let Ok(r) = build_forward(&state.client, &method, &full_url, body).send().await {
-        if authoritative_write_status(r.status()) {
+        let reply = ShardReply::of(r).await;
+        // The shard says the key is not its own, which means this router's ring is behind. Its
+        // answer names the owner, so one retry gets the write to the right place instead of
+        // handing the client a conflict it can do nothing about.
+        if let Some(owner) = reply.redirect() {
+            info!(target: "router", key, %owner, "Shard redirected the write; our ring is stale");
+            let retry = format!("{}/collections/{}/docs/{}{}", owner, col_name, key, wc_query);
+            if let Ok(r2) = build_forward(&state.client, &method, &retry, body).send().await {
+                let second = ShardReply::of(r2).await;
+                if authoritative_write_status(second.status) && second.redirect().is_none() {
+                    return Ok(second);
+                }
+            }
+            return Ok(reply);
+        }
+        if authoritative_write_status(reply.status) {
             if effective_url != original_url {
                 state.set_primary_override(&original_url, &effective_url);
             }
-            return Ok(r);
+            return Ok(reply);
         }
     }
 
@@ -80,8 +123,9 @@ pub async fn router_forward_write(
         if latest_url != effective_url {
             let retry_url = format!("{}/collections/{}/docs/{}{}", latest_url, col_name, key, wc_query);
             if let Ok(r) = build_forward(&state.client, &method, &retry_url, body).send().await {
-                if authoritative_write_status(r.status()) {
-                    return Ok(r);
+                let reply = ShardReply::of(r).await;
+                if authoritative_write_status(reply.status) {
+                    return Ok(reply);
                 }
             }
         }
@@ -91,10 +135,11 @@ pub async fn router_forward_write(
     for replica in &replica_urls {
         let fallback_url = format!("{}/collections/{}/docs/{}{}", replica, col_name, key, wc_query);
         if let Ok(r) = build_forward(&state.client, &method, &fallback_url, body).send().await {
-            if authoritative_write_status(r.status()) {
+            let reply = ShardReply::of(r).await;
+            if authoritative_write_status(reply.status) {
                 state.set_primary_override(&original_url, replica);
                 info!(target: "router", "Cached new primary: {} -> {}", original_url, replica);
-                return Ok(r);
+                return Ok(reply);
             }
         }
     }
@@ -208,13 +253,6 @@ pub async fn bulk_router_forward(
     (StatusCode::CREATED, Json(serde_json::json!({"results": ordered}))).into_response()
 }
 
-pub async fn passthrough_json(r: reqwest::Response) -> axum::response::Response {
-    let status = r.status();
-    let body = r.text().await.unwrap_or_default();
-    let json_body: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body));
-    (status, Json(json_body)).into_response()
-}
-
 pub enum ReadPreference {
     Primary,
     Replica,
@@ -267,9 +305,21 @@ pub async fn router_read_doc(state: &AppState, col_name: &str, id: &str, pref: R
     for target in targets {
         let url = format!("{}{}", target, path);
         if let Ok(r) = state.client.get(&url).send().await {
-            let status = r.status();
-            if status.is_success() || status == StatusCode::NOT_FOUND {
-                return passthrough_json(r).await;
+            let reply = ShardReply::of(r).await;
+            // Same redirect as writes. Without it a stale router reads a moved key from its old
+            // owner and gets a 404, which is a wrong answer rather than a visible failure.
+            if let Some(owner) = reply.redirect() {
+                let retry = format!("{}{}", owner, path);
+                if let Ok(r2) = state.client.get(&retry).send().await {
+                    let second = ShardReply::of(r2).await;
+                    if second.status.is_success() || second.status == StatusCode::NOT_FOUND {
+                        return passthrough(second);
+                    }
+                }
+                continue;
+            }
+            if reply.status.is_success() || reply.status == StatusCode::NOT_FOUND {
+                return passthrough(reply);
             }
         }
     }

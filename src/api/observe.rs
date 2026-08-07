@@ -277,6 +277,11 @@ pub async fn metrics_handler(
         "model": ownership_model(&view),
         "vnodes": view.ring.as_ref().map(|r| r.vnodes),
         "shards": view.shard_owners().len(),
+        "migration": view.migration.as_ref().map(|m| serde_json::json!({
+            "id": m.id,
+            "started_by": m.started_by,
+            "local_progress": crate::cluster::migration::progress(&state),
+        })),
     });
 
     let router = if state.config.role == "router" {
@@ -330,6 +335,7 @@ pub async fn cluster_handler(
         "updated_by": view.updated_by,
         "seen_by": state.config.node_id,
         "model": ownership_model(&view),
+        "migration": view.migration,
         "members": view.members,
         "ring": view.ring,
         // Retained even when a ring supersedes them, so a rollback has something to go back to.

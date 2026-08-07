@@ -4,6 +4,7 @@ pub mod collections;
 pub mod docs;
 pub mod internal;
 pub mod members;
+pub mod migrate;
 pub mod middleware;
 pub mod observe;
 pub mod ring;
@@ -13,9 +14,11 @@ use collections::{compact_collection, drop_collection, list_collections, snapsho
 use docs::{bulk_create_docs, create_doc, delete_doc, get_doc, list_docs, put_doc, query_docs, update_doc};
 use internal::{
     cluster_update_handler, cluster_view_handler, data_summary_handler, heartbeat_handler,
-    internal_drop_handler, replicate_handler, resync_handler, snapshot_handler, vote_handler,
+    internal_drop_handler, migrate_cleanup_handler, migrate_handler, migration_status_handler,
+    replicate_handler, resync_handler, snapshot_handler, vote_handler,
 };
 use members::{join_handler, leave_handler};
+use migrate::{abort_migration_handler, migration_status, start_migration_handler};
 use middleware::{auth_middleware, metrics_middleware};
 use observe::{cluster_handler, health_handler, metrics_handler};
 use ring::set_ring_handler;
@@ -31,6 +34,8 @@ pub fn build_app(state: &AppState) -> Router {
         .route("/cluster", get(cluster_handler))
         .route("/cluster/members", post(join_handler).delete(leave_handler))
         .route("/cluster/ring", post(set_ring_handler))
+        .route("/cluster/migrate", post(start_migration_handler)
+            .get(migration_status).delete(abort_migration_handler))
         .route("/collections", get(list_collections))
         .route("/collections/:name", delete(drop_collection))
         .route("/collections/:name/compact", post(compact_collection))
@@ -53,7 +58,10 @@ pub fn build_app(state: &AppState) -> Router {
             .route("/internal/vote", post(vote_handler))
             .route("/internal/drop", post(internal_drop_handler))
             .route("/internal/heartbeat", get(heartbeat_handler))
-            .route("/internal/data-summary", get(data_summary_handler));
+            .route("/internal/data-summary", get(data_summary_handler))
+            .route("/internal/migrate", post(migrate_handler))
+            .route("/internal/migrate-cleanup", post(migrate_cleanup_handler))
+            .route("/internal/migration-status", get(migration_status_handler));
     }
 
     app.layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
