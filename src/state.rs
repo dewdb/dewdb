@@ -56,6 +56,16 @@ pub struct RingCache {
 }
 
 impl AppState {
+    /// Serializes a collection's incoming replication with snapshot installation. Stored in the
+    /// existing repair-lock map under a disjoint key because both are short-lived repair gates.
+    pub fn snapshot_install_lock(&self, collection: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let key = format!("snapshot-install:{}", collection);
+        let mut locks = self.repair_locks.lock().unwrap();
+        locks.entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     pub fn is_leader(&self) -> bool {
         if let Some(ref repl) = self.replication {
             return repl.read().unwrap().is_leader;

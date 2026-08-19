@@ -7,7 +7,7 @@ use crate::consensus::{
     VoteResponse,
 };
 use crate::model::err_json;
-use crate::replication::snapshot::{replica_sync_from_primary, SnapshotFileEntry};
+use crate::replication::snapshot::{replica_sync_from_primary, snapshot_body, SNAPSHOT_CONTENT_TYPE};
 use crate::replication::{DropRequest, ReplicateRequest, ResyncRequest};
 use crate::state::AppState;
 use crate::storage::{FrameHeader, LogEntry, ReplicaApply, HEADER_LEN};
@@ -16,8 +16,6 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
-use std::fs;
-use std::io;
 use std::sync::atomic::Ordering;
 use tracing::{info, warn};
 
@@ -56,20 +54,32 @@ pub async fn replicate_handler(
     State(state): State<AppState>,
     Json(req): Json<ReplicateRequest>,
 ) -> impl axum::response::IntoResponse {
-    if let Some(idx) = req.commit_index {
-        state.note_leader_committed(&req.collection, idx);
-        if let Some(ref repl) = state.replication {
-            let mut r = repl.write().unwrap();
-            r.last_known_primary_position = Some(idx);
-        }
-    }
-
     if !state.is_shard() || state.is_leader() {
         let our_term = state.current_term();
         return (StatusCode::FORBIDDEN, Json(serde_json::json!({
             "status": "not_a_replica",
             "term": our_term,
         }))).into_response();
+    }
+
+    // Marking a resync happens before it waits for this gate. New requests refuse immediately;
+    // requests already inside finish before the snapshot downloads, so no successful ACK can be
+    // discarded by the eventual directory swap.
+    if state.resyncing.lock().unwrap().contains(&req.collection) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Snapshot resync in progress").into_response();
+    }
+    let install_lock = state.snapshot_install_lock(&req.collection);
+    let _install_guard = install_lock.lock().await;
+    if state.resyncing.lock().unwrap().contains(&req.collection) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Snapshot resync in progress").into_response();
+    }
+
+    if let Some(idx) = req.commit_index {
+        state.note_leader_committed(&req.collection, idx);
+        if let Some(ref repl) = state.replication {
+            let mut r = repl.write().unwrap();
+            r.last_known_primary_position = Some(idx);
+        }
     }
 
     let our_term = state.current_term();
@@ -247,8 +257,10 @@ pub async fn resync_handler(
     let client = state.client.clone();
     let repl = state.replication.clone();
     let resyncing = state.resyncing.clone();
+    let install_lock = state.snapshot_install_lock(&col);
 
     tokio::spawn(async move {
+        let _install_guard = install_lock.lock().await;
         if let Err(e) = replica_sync_from_primary(&client, &primary_addr, &db, &col).await {
             warn!(target: "resync", "Failed for '{}': {}", col, e);
         } else {
@@ -502,27 +514,9 @@ pub async fn snapshot_handler(
         Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
 
-    let col_clone = col.clone();
-    let _ = tokio::task::spawn_blocking(move || col_clone.save_index()).await;
-
-    let col_path = col.root_path.clone();
-    let files = match tokio::task::spawn_blocking(move || -> io::Result<Vec<SnapshotFileEntry>> {
-        let mut entries = Vec::new();
-        for dir_entry in fs::read_dir(&col_path)? {
-            let dir_entry = dir_entry?;
-            let path = dir_entry.path();
-            if path.is_file() {
-                let filename = dir_entry.file_name().to_string_lossy().to_string();
-                let data = fs::read(&path)?;
-                entries.push(SnapshotFileEntry { filename, data });
-            }
-        }
-        Ok(entries)
-    }).await {
-        Ok(Ok(entries)) => entries,
-        Ok(Err(e)) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    };
-
-    (StatusCode::OK, Json(files)).into_response()
+    axum::response::Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, SNAPSHOT_CONTENT_TYPE)
+        .body(snapshot_body(col))
+        .unwrap()
 }

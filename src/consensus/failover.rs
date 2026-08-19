@@ -112,9 +112,17 @@ async fn resync_all_from(state: &AppState, leader: &str) {
     names.dedup();
 
     for name in names {
+        let first = state.resyncing.lock().unwrap().insert(name.clone());
+        let install_lock = state.snapshot_install_lock(&name);
+        let _install_guard = install_lock.lock().await;
+        if !first {
+            // Another repair completed while we waited for the same installation gate.
+            continue;
+        }
         if let Err(e) = replica_sync_from_primary(&state.client, leader, &db, &name).await {
             warn!(target: "demote", "resync of '{}' from {} failed: {}", name, leader, e);
         }
+        state.resyncing.lock().unwrap().remove(&name);
     }
 
     if let Err(e) = db.recompute_durable_lsn() {

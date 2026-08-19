@@ -31,6 +31,9 @@ pub struct Collection {
     pub read_pool_counter: AtomicUsize,
     pub released: AtomicBool,
     pub compacting: AtomicBool,
+    /// Serializes operations that need a stable set of WAL files. A streamed snapshot holds this
+    /// for its lifetime; compaction must not retire files from underneath it.
+    pub snapshot_boundary: std::sync::Mutex<()>,
     pub cache: ReadCacheConfig,
     pub inline_bytes: AtomicU64,
     // This collection's fsynced tail, distinct from the database-wide durable_lsn.
@@ -187,6 +190,7 @@ impl Collection {
             read_pool_counter: AtomicUsize::new(0),
             released: AtomicBool::new(false),
             compacting: AtomicBool::new(false),
+            snapshot_boundary: std::sync::Mutex::new(()),
             cache,
             inline_bytes: AtomicU64::new(inline_total),
             durable_lsn: AtomicU64::new(boot_lsn),
@@ -496,31 +500,34 @@ impl Collection {
 
     /// Drains in log order; staged frames can arrive out of order.
     pub fn apply_committed(&self, committed_lsn: u64) -> usize {
-        let ready = {
+        // Keep pending, index and applied_lsn as one observable transition. Snapshot creation takes
+        // these locks in this order, so it sees either the state before this commit or the state
+        // after it, never an updated index paired with an old applied watermark.
+        let (ready_len, advanced) = {
             let mut pending = self.pending.lock().unwrap();
             let mut ready = std::mem::take(&mut *pending);
             *pending = ready.split_off(&(committed_lsn + 1));
-            ready
-        };
-
-        if !ready.is_empty() {
-            let mut index = self.index.write().unwrap();
-            for (_lsn, staged) in ready.iter() {
-                match &staged.entry {
-                    Some(entry) => self.apply_index_put(&mut index, staged.key.clone(), entry.clone()),
-                    None => self.apply_index_remove(&mut index, &staged.key),
+            if !ready.is_empty() {
+                let mut index = self.index.write().unwrap();
+                for (_lsn, staged) in ready.iter() {
+                    match &staged.entry {
+                        Some(entry) => self.apply_index_put(&mut index, staged.key.clone(), entry.clone()),
+                        None => self.apply_index_remove(&mut index, &staged.key),
+                    }
                 }
             }
-        }
 
-        let previous = self.applied_lsn.fetch_max(committed_lsn, Ordering::SeqCst);
-        if committed_lsn > previous {
+            let previous = self.applied_lsn.fetch_max(committed_lsn, Ordering::SeqCst);
+            (ready.len(), committed_lsn > previous)
+        };
+
+        if advanced {
             if let Err(e) = (AppliedMeta { applied_lsn: committed_lsn }).save(&self.root_path) {
                 error!(target: "storage", collection = %self.name, error = %e,
                     "Failed to persist applied watermark; a restart will re-stage these entries");
             }
         }
-        ready.len()
+        ready_len
     }
 
     /// Read-modify-write must read the newest durable value; the committed one drops a racing write.

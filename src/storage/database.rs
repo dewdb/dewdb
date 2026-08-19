@@ -9,7 +9,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 // durable_lsn is fsync progress, not replication; the quorum watermark lives in consensus::Progress.
 pub struct Database {
@@ -22,6 +22,19 @@ pub struct Database {
 }
 
 impl Database {
+    fn open_collection(&self, name: &str) -> io::Result<Arc<Collection>> {
+        let col = Arc::new(Collection::open(
+            name.to_string(),
+            self.root_path.join(name),
+            self.durable_lsn.clone(),
+            self.next_lsn.clone(),
+            self.last_log_term.clone(),
+            self.cache.clone(),
+        )?);
+        Collection::start_commit_task(col.clone());
+        Ok(col)
+    }
+
     pub fn new(path: impl AsRef<std::path::Path>) -> io::Result<Self> {
         Self::with_cache(path, ReadCacheConfig::default())
     }
@@ -56,18 +69,124 @@ impl Database {
             return Ok(col.clone());
         }
 
-        let col_path = self.root_path.join(name);
-        let col = Arc::new(Collection::open(
-            name.to_string(),
-            col_path,
-            self.durable_lsn.clone(),
-            self.next_lsn.clone(),
-            self.last_log_term.clone(),
-            self.cache.clone(),
-        )?);
-        Collection::start_commit_task(col.clone());
+        let col = self.open_collection(name)?;
         collections.insert(name.to_string(), col.clone());
         Ok(col)
+    }
+
+    /// Replaces a collection with a completely received snapshot. The collection-map write lock
+    /// closes the brief swap window to concurrent callers: they either keep an old handle that is
+    /// explicitly released, or wait and receive the newly opened collection.
+    pub fn install_staged_collection(&self, name: &str, staged_path: &std::path::Path) -> io::Result<()> {
+        let expected_staging = self.root_path.join(format!("{}.tmp", name));
+        if staged_path != expected_staging || !staged_path.is_dir() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                "staged snapshot is not the expected collection temporary directory"));
+        }
+
+        let col_path = self.root_path.join(name);
+        let old_path = self.root_path.join(format!("{}.old", name));
+        let mut collections = self.collections.write().unwrap();
+
+        let tombstone = match collections.remove(name) {
+            Some(col) => match col.release_handles() {
+                Ok(path) => Some(path),
+                Err(e) => {
+                    // The old directory has not moved yet. Reopen it so a failed installation does
+                    // not leave a previously live collection permanently absent from the map.
+                    if let Ok(reopened) = self.open_collection(name) {
+                        collections.insert(name.to_string(), reopened);
+                    }
+                    return Err(e);
+                },
+            },
+            None => None,
+        };
+
+        if old_path.exists() {
+            if let Err(e) = remove_dir_with_retry(&old_path) {
+                if col_path.is_dir() {
+                    if let Ok(reopened) = self.open_collection(name) {
+                        collections.insert(name.to_string(), reopened);
+                    }
+                }
+                if let Some(path) = tombstone {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(e);
+            }
+        }
+
+        let had_old = col_path.is_dir();
+        if had_old {
+            if let Err(e) = fs::rename(&col_path, &old_path) {
+                if let Ok(reopened) = self.open_collection(name) {
+                    collections.insert(name.to_string(), reopened);
+                }
+                if let Some(path) = tombstone {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(e);
+            }
+        }
+
+        if let Err(e) = fs::rename(staged_path, &col_path) {
+            let restore = if had_old {
+                fs::rename(&old_path, &col_path)
+                    .and_then(|_| self.open_collection(name))
+                    .map(|col| collections.insert(name.to_string(), col))
+            } else { Ok(None) };
+            if let Some(path) = tombstone {
+                let _ = fs::remove_file(path);
+            }
+            return match restore {
+                Ok(_) => Err(e),
+                Err(restore_error) => Err(io::Error::other(format!(
+                    "snapshot rename failed: {}; restoring old collection also failed: {}",
+                    e, restore_error))),
+            };
+        }
+
+        match self.open_collection(name) {
+            Ok(col) => {
+                collections.insert(name.to_string(), col);
+                if old_path.exists() {
+                    if let Err(e) = remove_dir_with_retry(&old_path) {
+                        warn!(target: "replica_sync", collection = %name, error = %e,
+                            "Installed snapshot but could not remove the previous collection directory");
+                    }
+                }
+                if let Some(path) = tombstone {
+                    let _ = fs::remove_file(path);
+                }
+                Ok(())
+            },
+            Err(install_error) => {
+                // Put the downloaded directory back in staging, then restore and reopen the old
+                // collection. Protocol validation should make this rare, but installation failure
+                // must not destroy the last known-good copy.
+                let moved_bad = fs::rename(&col_path, staged_path).is_ok();
+                if !moved_bad && col_path.exists() {
+                    let _ = remove_dir_with_retry(&col_path);
+                }
+                let restore = if had_old {
+                    fs::rename(&old_path, &col_path)
+                        .and_then(|_| self.open_collection(name))
+                        .map(|col| collections.insert(name.to_string(), col))
+                } else {
+                    Ok(None)
+                };
+                if let Some(path) = tombstone {
+                    let _ = fs::remove_file(path);
+                }
+                match restore {
+                    Ok(_) => Err(install_error),
+                    Err(restore_error) => Err(io::Error::other(format!(
+                        "snapshot open failed: {}; restoring old collection also failed: {}",
+                        install_error, restore_error))),
+                }
+            },
+        }
     }
 
     pub fn list_collections(&self) -> io::Result<Vec<String>> {
@@ -338,6 +457,29 @@ mod tests {
         let fresh = db.get_collection("users").unwrap();
         assert!(fresh.index.read().unwrap().is_empty(), "dropped data must not resurrect on reopen");
         assert!(fresh.get("k").unwrap().is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_that_cannot_open_rolls_back_to_the_live_collection() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let original = db.get_collection("users").unwrap();
+        live_put(&original, "safe", 7);
+        original.enqueue_commit().await.unwrap().unwrap();
+
+        let staged = root.join("users.tmp");
+        fs::create_dir_all(staged.join("wal-00001.log")).unwrap();
+
+        assert!(db.install_staged_collection("users", &staged).is_err(),
+            "a directory masquerading as a WAL must make the staged collection fail to open");
+        let restored = db.get_collection("users").unwrap();
+        assert_eq!(restored.get("safe").unwrap(), Some(serde_json::json!({"v": 7})),
+            "installation failure must reopen the previous directory and preserve its data");
+        assert!(root.join("users").is_dir());
+        assert!(staged.is_dir(), "the rejected snapshot goes back to staging for cleanup");
+        assert!(!root.join("users.old").exists());
 
         let _ = fs::remove_dir_all(&root);
     }
