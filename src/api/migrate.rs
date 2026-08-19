@@ -22,6 +22,11 @@ use uuid::Uuid;
 /// How often the coordinator asks every source whether it is done.
 const POLL_INTERVAL_MS: u64 = 300;
 
+pub(crate) enum MigrationLaunch {
+    Applied { version: u64 },
+    Started { id: String, version: u64, movement: crate::ring::Movement },
+}
+
 pub async fn start_migration_handler(
     State(state): State<AppState>,
     Json(req): Json<RingRequest>,
@@ -31,35 +36,59 @@ pub async fn start_migration_handler(
     }
 
     let current = state.cluster_view();
-    if current.migration.is_some() {
-        return err_json(StatusCode::CONFLICT,
-            "a handover is already in progress; wait for it or DELETE /cluster/migrate".to_string());
-    }
-
     let vnodes = req.vnodes
         .or_else(|| current.ring.as_ref().map(|r| r.vnodes))
         .unwrap_or(DEFAULT_VNODES);
     let target = HashRing { vnodes, shards: req.shards };
+
+    match begin_migration(&state, target).await {
+        Ok(MigrationLaunch::Applied { version }) => (StatusCode::OK, Json(serde_json::json!({
+            "status": "applied", "version": version, "moved_fraction": 0.0,
+            "note": "the target ring owns the same keys, so no data had to move",
+        }))).into_response(),
+        Ok(MigrationLaunch::Started { id, version, movement }) =>
+            (StatusCode::ACCEPTED, Json(serde_json::json!({
+                "status": "migrating",
+                "migration_id": id,
+                "version": version,
+                "moved_fraction": movement.moved_fraction,
+                "transfers": movement.transfers,
+                "note": "keys being moved are read-only until the handover completes; \
+                         watch GET /cluster/migrate",
+            }))).into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// Starts the same copy-before-flip workflow for both an operator request and the automatic
+/// reconciler. Keeping one entry point prevents automatic movement from acquiring weaker safety
+/// rules than an explicit `/cluster/migrate` call.
+pub(crate) async fn begin_migration(
+    state: &AppState,
+    target: HashRing,
+) -> Result<MigrationLaunch, axum::response::Response> {
+    let current = state.cluster_view();
+    if current.migration.is_some() {
+        return Err(err_json(StatusCode::CONFLICT,
+            "a handover is already in progress; wait for it or DELETE /cluster/migrate".to_string()));
+    }
     if let Err(why) = target.validate() {
-        return err_json(StatusCode::UNPROCESSABLE_ENTITY, why);
+        return Err(err_json(StatusCode::UNPROCESSABLE_ENTITY, why));
     }
 
     // Nothing to move means nothing to coordinate: publish the ring and be done.
     let before = match state.built_ring() {
         Some(before) => before,
-        None => return err_json(StatusCode::CONFLICT,
+        None => return Err(err_json(StatusCode::CONFLICT,
             "this node holds no ring to migrate from; publish one with POST /cluster/ring first"
-                .to_string()),
+                .to_string())),
     };
     let movement = keyspace_movement(&before, &target.build());
     if movement.moved_fraction == 0.0 {
         let next = current.with_ring(&state.config.node_id, target);
-        return match publish(&state, next).await {
-            Ok(version) => (StatusCode::OK, Json(serde_json::json!({
-                "status": "applied", "version": version, "moved_fraction": 0.0,
-                "note": "the target ring owns the same keys, so no data had to move",
-            }))).into_response(),
-            Err(resp) => resp,
+        return match publish(state, next).await {
+            Ok(version) => Ok(MigrationLaunch::Applied { version }),
+            Err(resp) => Err(resp),
         };
     }
 
@@ -74,11 +103,11 @@ pub async fn start_migration_handler(
     // Handed out before this node adopts it. Adopting starts our own push immediately, and a
     // destination that has not seen the plan yet refuses the batch -- survivable, since pushes
     // retry, but it costs a backoff on every handover for no reason.
-    broadcast(&state, &next, Some(&target));
+    broadcast(state, &next, Some(&target));
 
-    let version = match publish(&state, next).await {
+    let version = match publish(state, next).await {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return Err(resp),
     };
 
     info!(target: "migration", id = %id, moved = movement.moved_fraction,
@@ -89,15 +118,7 @@ pub async fn start_migration_handler(
         .into_iter().map(|(url, _)| url).collect();
     coordinate(state.clone(), id.clone(), target, sources);
 
-    (StatusCode::ACCEPTED, Json(serde_json::json!({
-        "status": "migrating",
-        "migration_id": id,
-        "version": version,
-        "moved_fraction": movement.moved_fraction,
-        "transfers": movement.transfers,
-        "note": "keys being moved are read-only until the handover completes; \
-                 watch GET /cluster/migrate",
-    }))).into_response()
+    Ok(MigrationLaunch::Started { id, version, movement })
 }
 
 /// Hands the current view to every node the plan touches. `extra` names a ring whose shards are
@@ -124,8 +145,30 @@ fn broadcast(state: &AppState, view: &crate::cluster::metadata::ClusterMetadata,
 
 /// Waits for every source to finish, then publishes the target ring. Runs detached because a
 /// handover outlives any one request, and the plan in the view is what makes that safe to do.
+struct CoordinationGuard {
+    state: AppState,
+    id: String,
+}
+
+impl Drop for CoordinationGuard {
+    fn drop(&mut self) {
+        let mut runs = self.state.migrations.lock().unwrap();
+        if runs.coordinating.as_deref() == Some(&self.id) {
+            runs.coordinating = None;
+        }
+    }
+}
+
 fn coordinate(state: AppState, id: String, target: HashRing, sources: Vec<String>) {
+    {
+        let mut runs = state.migrations.lock().unwrap();
+        if runs.coordinating.as_deref() == Some(&id) {
+            return;
+        }
+        runs.coordinating = Some(id.clone());
+    }
     tokio::spawn(async move {
+        let _guard = CoordinationGuard { state: state.clone(), id: id.clone() };
         loop {
             tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
 
@@ -162,6 +205,18 @@ fn coordinate(state: AppState, id: String, target: HashRing, sources: Vec<String
             return;
         }
     });
+}
+
+/// Recreates the coordinator loop after its process restarts. Sources already restart their own
+/// idempotent copy from the durable plan; this restores the missing "wait, flip, clean up" half.
+pub(crate) fn resume_migration_coordination(state: &AppState) {
+    let plan = match state.migration() {
+        Some(plan) => plan,
+        None => return,
+    };
+    let sources = state.cluster_view().shard_owners()
+        .into_iter().map(|(url, _)| url).collect();
+    coordinate(state.clone(), plan.id, plan.target, sources);
 }
 
 /// Every source, including this node. A source that cannot be asked is not finished.

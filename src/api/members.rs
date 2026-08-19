@@ -60,6 +60,23 @@ pub(crate) fn nudge(state: &AppState, url: &str, view: &ClusterMetadata) {
     });
 }
 
+/// Membership is cluster-wide input to automatic ownership. Push it to every known process and
+/// every current owner, not just the node being added: otherwise a change accepted by one shard
+/// group may never reach the group elected to coordinate the resulting handover.
+fn broadcast(state: &AppState, view: &ClusterMetadata, extra: Option<&str>) {
+    let own = state.own_url();
+    let mut seen = std::collections::HashSet::new();
+    let targets: Vec<String> = view.members.iter().map(|m| m.url.clone())
+        .chain(view.shard_owners().into_iter().map(|(url, _)| url))
+        .chain(extra.into_iter().map(str::to_string))
+        .filter(|url| !crate::util::same_endpoint(url, &own))
+        .filter(|url| seen.insert(crate::util::endpoint_of(url).to_string()))
+        .collect();
+    for target in targets {
+        nudge(state, &target, view);
+    }
+}
+
 pub async fn join_handler(
     State(state): State<AppState>,
     Json(req): Json<JoinRequest>,
@@ -84,7 +101,7 @@ pub async fn join_handler(
     if follows.as_deref().map_or(false, |f| crate::util::same_endpoint(f, &own)) {
         state.begin_tracking_learner(&req.url);
     }
-    nudge(&state, &req.url, &view);
+    broadcast(&state, &view, None);
 
     info!(target: "membership", node = %req.url, version, "Admitted as a learner");
     (StatusCode::OK, Json(serde_json::json!({
@@ -119,8 +136,8 @@ pub async fn leave_handler(
         Err(resp) => return resp,
     };
 
-    // Told last, and only as a courtesy: it is already out of the view we replicate from.
-    nudge(&state, &params.url, &state.cluster_view());
+    // The removed node is included as a courtesy; it is no longer in the view-derived target set.
+    broadcast(&state, &state.cluster_view(), Some(&params.url));
 
     info!(target: "membership", node = %params.url, version, "Removed from the cluster");
     (StatusCode::OK, Json(serde_json::json!({

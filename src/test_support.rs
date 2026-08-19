@@ -232,6 +232,7 @@ impl TestNode {
 
                 let app = build_app(&state);
                 state.follow_from_view();
+                state.react_to_migration();
                 if state.is_leader() {
                     seed_leader_progress(&state);
                 } else {

@@ -1,6 +1,7 @@
 //! Node configuration, boot validation, and non-fatal misconfiguration warnings.
 
 use crate::auth::AuthConfig;
+use crate::cluster::rebalance::RebalanceConfig;
 use crate::logging::LoggingConfig;
 use crate::maintenance::MaintenanceConfig;
 use crate::ring::{validate_shard_ring, HashRing, ShardInfo};
@@ -41,6 +42,8 @@ pub struct NodeConfig {
     pub flow_control: FlowControlConfig,
     #[serde(default)]
     pub maintenance: MaintenanceConfig,
+    #[serde(default)]
+    pub rebalance: RebalanceConfig,
     #[serde(default)]
     pub read_cache: ReadCacheConfig,
     #[serde(default)]
@@ -118,6 +121,10 @@ impl NodeConfig {
                         a learner is never a leader".to_string());
         }
         self.maintenance.validate()?;
+        self.rebalance.validate()?;
+        if self.rebalance.enabled && self.role != "shard" {
+            return Err("automatic rebalancing may only run on shard nodes".to_string());
+        }
         self.logging.validate()?;
         self.auth.validate()?;
         Ok(())

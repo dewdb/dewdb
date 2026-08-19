@@ -11,6 +11,7 @@ pub mod ring;
 pub mod write;
 
 use collections::{compact_collection, drop_collection, list_collections, snapshot_collection};
+use crate::cluster::rebalance::rebalance_status_handler;
 use docs::{bulk_create_docs, create_doc, delete_doc, get_doc, list_docs, put_doc, query_docs, update_doc};
 use internal::{
     cluster_update_handler, cluster_view_handler, data_summary_handler, heartbeat_handler,
@@ -36,6 +37,7 @@ pub fn build_app(state: &AppState) -> Router {
         .route("/cluster/ring", post(set_ring_handler))
         .route("/cluster/migrate", post(start_migration_handler)
             .get(migration_status).delete(abort_migration_handler))
+        .route("/cluster/rebalance", get(rebalance_status_handler))
         .route("/collections", get(list_collections))
         .route("/collections/:name", delete(drop_collection))
         .route("/collections/:name/compact", post(compact_collection))

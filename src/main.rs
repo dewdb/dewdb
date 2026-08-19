@@ -26,6 +26,7 @@ use crate::api::build_app;
 use crate::auth::build_client;
 use crate::cluster::metadata::ClusterMetadata;
 use crate::cluster::probe::{router_probe_task, ROUTER_PROBE_INTERVAL_SECS};
+use crate::cluster::rebalance::rebalance_task;
 use crate::config::{config_warnings, NodeConfig};
 use crate::consensus::{
     heartbeat_poll_task, progress_flush_task, seed_leader_progress, Progress, ReplicationMeta,
@@ -236,11 +237,17 @@ async fn main() -> io::Result<()> {
     if config.role == "shard" {
         // A node admitted last time comes back knowing only what the durable view says.
         state.follow_from_view();
+        state.react_to_migration();
         if state.is_leader() {
             seed_leader_progress(&state);
         }
         progress_flush_task(state.clone());
         replication_drive_task(state.clone());
+        if config.rebalance.enabled {
+            rebalance_task(state.clone(), config.rebalance.clone());
+        } else {
+            info!(target: "rebalance", "Automatic rebalancing disabled by config");
+        }
     }
 
     if config.role == "shard" && !state.is_leader() {
