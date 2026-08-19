@@ -25,8 +25,7 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_SNAPSHOT_FILES: usize = 10_000;
 const MAX_FILENAME_BYTES: usize = 255;
 
-/// The serialized shape is deliberately identical to `IndexSnapshot`, but borrows the map. This
-/// keeps index serialization bounded instead of cloning the whole in-memory index before streaming.
+/// Matches `IndexSnapshot` on the wire without cloning the in-memory map.
 #[derive(Serialize)]
 struct BorrowedIndexSnapshot<'a> {
     last_wal_id: u64,
@@ -84,8 +83,7 @@ impl Write for ChannelWriter {
     }
 }
 
-/// Buffers one logical file into protocol chunks and appends a byte-count/CRC footer. Chunk lengths
-/// are inside the wire stream, independent of the HTTP body's own framing.
+/// Adds protocol chunk lengths and a byte-count/CRC footer independently of HTTP framing.
 struct EntryWriter<'a> {
     wire: &'a mut ChannelWriter,
     buffer: Vec<u8>,
@@ -185,10 +183,8 @@ fn stream_snapshot(
     collection: &Collection,
     sender: tokio::sync::mpsc::Sender<Result<Vec<u8>, io::Error>>,
 ) -> io::Result<()> {
-    // Compaction cannot remove files while the producer holds this boundary. The active WAL is
-    // rotated under the normal WAL/pending/index lock order, giving the stream an immutable prefix.
-    // Only index serialization pauses writes; the network transfer reads frozen WALs while new
-    // writes continue in the next WAL.
+    // Hold the compaction boundary while rotating under the WAL -> pending -> index lock order.
+    // Frozen WALs remain immutable while writes continue in the new active WAL.
     let _boundary = collection
         .snapshot_boundary
         .lock()
@@ -219,8 +215,7 @@ fn stream_snapshot(
         let index = collection.index.read().map_err(|_| lock_error("index"))?;
 
         let persisted = BorrowedIndexSnapshot {
-            // Resume from the beginning. This closes the append-before-stage window: a frame
-            // already in the frozen WAL but not yet in `pending` is replayed above applied_lsn.
+            // Replay above applied_lsn to include frames appended before pending insertion.
             last_wal_id: 0,
             last_offset: 0,
             last_lsn: wal.last_appended_lsn,
@@ -280,8 +275,7 @@ fn stream_snapshot(
     wire.finish()
 }
 
-/// Starts a blocking producer behind a two-chunk channel. Slow clients apply backpressure all the
-/// way to the file reader instead of causing the server to accumulate the collection in memory.
+/// A two-chunk channel backpressures the file producer on slow clients.
 pub fn snapshot_body(collection: Arc<Collection>) -> Body {
     let (sender, receiver) = tokio::sync::mpsc::channel(SNAPSHOT_CHANNEL_DEPTH);
     tokio::task::spawn_blocking(move || {
@@ -676,8 +670,7 @@ mod tests {
         )
         .await;
 
-        // Do not poll the body yet. The two-slot channel fills and leaves the producer blocked on
-        // the simulated slow client after it has rotated to an immutable snapshot WAL.
+        // Leave the body unread so the two-slot channel blocks after WAL rotation.
         let body = snapshot_body(source.clone());
         tokio::time::sleep(Duration::from_millis(100)).await;
         tokio::time::timeout(

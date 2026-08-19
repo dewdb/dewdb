@@ -116,7 +116,6 @@ async fn resync_all_from(state: &AppState, leader: &str) {
         let install_lock = state.snapshot_install_lock(&name);
         let _install_guard = install_lock.lock().await;
         if !first {
-            // Another repair completed while we waited for the same installation gate.
             continue;
         }
         if let Err(e) = replica_sync_from_primary(&state.client, leader, &db, &name).await {

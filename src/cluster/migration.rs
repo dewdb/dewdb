@@ -56,7 +56,7 @@ pub struct MigrationProgress {
 #[derive(Default)]
 pub struct MigrationRuns {
     pub current: Option<MigrationProgress>,
-    /// The handover coordinator is restartable, but only one polling loop should run per process.
+    /// Prevents duplicate coordinator loops after recovery.
     pub coordinating: Option<String>,
 }
 

@@ -62,9 +62,7 @@ pub async fn replicate_handler(
         }))).into_response();
     }
 
-    // Marking a resync happens before it waits for this gate. New requests refuse immediately;
-    // requests already inside finish before the snapshot downloads, so no successful ACK can be
-    // discarded by the eventual directory swap.
+    // Mark before gating so acknowledged in-flight replication drains before snapshot installation.
     if state.resyncing.lock().unwrap().contains(&req.collection) {
         return (StatusCode::SERVICE_UNAVAILABLE, "Snapshot resync in progress").into_response();
     }

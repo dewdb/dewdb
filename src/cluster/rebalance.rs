@@ -1,8 +1,4 @@
-//! Reconciles primary-shard membership with consistent-hash ownership.
-//!
-//! Membership is the desired set and the live ring is the applied set. A stable difference is
-//! handed to the ordinary migration path, which copies before it flips ownership. Replica lists
-//! are deliberately carried forward unchanged; choosing replicas is commit 41's responsibility.
+//! Reconciles primary-shard membership with consistent-hash ownership via safe migrations.
 
 use crate::api::migrate::{begin_migration, resume_migration_coordination, MigrationLaunch};
 use crate::cluster::metadata::ClusterMetadata;
@@ -20,14 +16,12 @@ use tracing::{info, warn};
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct RebalanceConfig {
-    /// Off by default so upgrading cannot reinterpret an incomplete legacy membership list as an
-    /// instruction to remove shards. Enabling it declares runtime membership authoritative.
+    /// Opt-in because legacy membership may omit current shards.
     #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_interval")]
     pub interval_secs: u64,
-    /// A short quiet period coalesces several joins into one migration instead of freezing a new
-    /// slice of keys for every member added by an orchestration rollout.
+    /// Debounces membership churn into one migration.
     #[serde(default = "default_stabilization")]
     pub stabilization_secs: u64,
 }
@@ -58,19 +52,79 @@ impl RebalanceConfig {
     }
 }
 
-/// Builds a deterministic target from members explicitly marked as shard primaries. Existing
-/// replica lists follow their primary; new primaries start empty until placement policies exist.
+fn replica_placements(
+    view: &ClusterMetadata,
+    current: &HashRing,
+    primaries: &[String],
+) -> BTreeMap<String, Vec<String>> {
+    let primary_endpoints: HashSet<&str> = primaries
+        .iter()
+        .map(|url| endpoint_of(url))
+        .collect();
+    let replicas: BTreeMap<&str, _> = view
+        .members
+        .iter()
+        .filter(|member| {
+            member.role == "shard" && member.shard_role.as_deref() == Some("replica")
+        })
+        .map(|member| (endpoint_of(&member.url), member))
+        .collect();
+    let mut placements: BTreeMap<String, Vec<String>> = primaries
+        .iter()
+        .map(|primary| (endpoint_of(primary).to_string(), Vec::new()))
+        .collect();
+
+    for shard in &current.shards {
+        let primary = endpoint_of(&shard.node_url);
+        if !primary_endpoints.contains(primary) {
+            continue;
+        }
+        for replica_url in &shard.replica_urls {
+            let replica = match replicas.get(endpoint_of(replica_url)) {
+                Some(replica) => replica,
+                None => continue,
+            };
+            if replica
+                .follows
+                .as_deref()
+                .is_some_and(|follows| endpoint_of(follows) != primary)
+            {
+                continue;
+            }
+            placements
+                .get_mut(primary)
+                .unwrap()
+                .push(replica.url.clone());
+        }
+    }
+
+    for replica in replicas.values() {
+        let primary = match replica.follows.as_deref() {
+            Some(primary) if primary_endpoints.contains(endpoint_of(primary)) => {
+                endpoint_of(primary)
+            }
+            _ => continue,
+        };
+        placements
+            .get_mut(primary)
+            .unwrap()
+            .push(replica.url.clone());
+    }
+
+    for replicas in placements.values_mut() {
+        replicas.sort_by(|a, b| endpoint_of(a).cmp(endpoint_of(b)));
+        replicas.dedup_by(|a, b| same_endpoint(a, b));
+    }
+    placements
+}
+
+/// Derives stable primary and replica placement from live membership.
 pub fn desired_ring(view: &ClusterMetadata) -> Result<Option<HashRing>, String> {
     let current = match &view.ring {
         Some(ring) => ring,
         None => return Ok(None),
     };
 
-    let replicas: BTreeMap<String, Vec<String>> = current
-        .shards
-        .iter()
-        .map(|s| (endpoint_of(&s.node_url).to_string(), s.replica_urls.clone()))
-        .collect();
     let mut seen = HashSet::new();
     let mut primaries: Vec<String> = view
         .members
@@ -86,6 +140,7 @@ pub fn desired_ring(view: &ClusterMetadata) -> Result<Option<HashRing>, String> 
         );
     }
     primaries.sort_by(|a, b| endpoint_of(a).cmp(endpoint_of(b)));
+    let replicas = replica_placements(view, current, &primaries);
 
     let target = HashRing {
         vnodes: current.vnodes,
@@ -107,16 +162,24 @@ pub fn desired_ring(view: &ClusterMetadata) -> Result<Option<HashRing>, String> 
     Ok(Some(target))
 }
 
-fn target_signature(target: &HashRing) -> Vec<String> {
+fn target_signature(target: &HashRing) -> Vec<(String, Vec<String>)> {
     target
         .shards
         .iter()
-        .map(|s| endpoint_of(&s.node_url).to_string())
+        .map(|shard| {
+            (
+                endpoint_of(&shard.node_url).to_string(),
+                shard
+                    .replica_urls
+                    .iter()
+                    .map(|url| endpoint_of(url).to_string())
+                    .collect(),
+            )
+        })
         .collect()
 }
 
-/// One shard group coordinates a cluster-wide move. The lowest primary endpoint is deterministic;
-/// any of its replicas may take over after failover because they own the same ring entry.
+/// The lowest shard group coordinates; its elected replica may take over.
 fn is_coordinator(state: &AppState, view: &ClusterMetadata) -> bool {
     let first = match view
         .ring
@@ -135,7 +198,7 @@ pub fn rebalance_task(state: AppState, cfg: RebalanceConfig) {
     tokio::spawn(async move {
         info!(target: "rebalance", interval_secs = cfg.interval_secs,
             stabilization_secs = cfg.stabilization_secs, "Automatic rebalancer active");
-        let mut observed: Option<(Vec<String>, Instant)> = None;
+        let mut observed: Option<(Vec<(String, Vec<String>)>, Instant)> = None;
 
         loop {
             tokio::time::sleep(Duration::from_secs(cfg.interval_secs)).await;
@@ -145,8 +208,7 @@ pub fn rebalance_task(state: AppState, cfg: RebalanceConfig) {
 
             let view = state.cluster_view();
             if view.migration.is_some() {
-                // Both halves are idempotent. This is also what lets a source or the coordinator
-                // resume after restarting midway through an automatically initiated move.
+                // Idempotent recovery restarts source copying and coordinator polling.
                 state.react_to_migration();
                 if is_coordinator(&state, &view) {
                     resume_migration_coordination(&state);
@@ -200,7 +262,6 @@ pub fn rebalance_task(state: AppState, cfg: RebalanceConfig) {
     });
 }
 
-/// Read-only visibility into what the controller sees. This does not trigger movement.
 pub async fn rebalance_status_handler(
     State(state): State<AppState>,
 ) -> impl axum::response::IntoResponse {
@@ -236,6 +297,16 @@ pub async fn rebalance_status_handler(
                 .map(|s| &s.node_url).collect::<Vec<_>>()),
             "desired_shards": desired.as_ref().map(|r| r.shards.iter()
                 .map(|s| &s.node_url).collect::<Vec<_>>()),
+            "current_replica_placements": view.ring.as_ref().map(|r| r.shards.iter()
+                .map(|s| serde_json::json!({
+                    "primary": s.node_url,
+                    "replicas": s.replica_urls,
+                })).collect::<Vec<_>>()),
+            "desired_replica_placements": desired.as_ref().map(|r| r.shards.iter()
+                .map(|s| serde_json::json!({
+                    "primary": s.node_url,
+                    "replicas": s.replica_urls,
+                })).collect::<Vec<_>>()),
             "moved_fraction": movement.as_ref().map(|m| m.moved_fraction),
             "transfers": movement.as_ref().map(|m| &m.transfers),
         })),
@@ -321,6 +392,34 @@ mod tests {
             target.shards[1].replica_urls.is_empty(),
             "commit 40 must not invent the placement policy planned for commit 41"
         );
+    }
+
+    #[test]
+    fn follower_affinity_moves_live_replicas_and_drops_departed_ones() {
+        let mut view = view();
+        view.ring.as_mut().unwrap().shards[0].replica_urls = vec![
+            "http://a2".into(),
+            "http://gone".into(),
+        ];
+        view.members
+            .iter_mut()
+            .find(|member| same_endpoint(&member.url, "http://a2"))
+            .unwrap()
+            .follows = Some("http://c".into());
+        view.members.push(Member {
+            url: "http://a3".into(),
+            node_id: None,
+            role: "shard".into(),
+            shard_role: Some("replica".into()),
+            voting: false,
+            follows: Some("http://a".into()),
+        });
+
+        let target = desired_ring(&view).unwrap().unwrap();
+        assert_eq!(target.shards[0].node_url, "http://a");
+        assert_eq!(target.shards[0].replica_urls, vec!["http://a3"]);
+        assert_eq!(target.shards[1].node_url, "http://c");
+        assert_eq!(target.shards[1].replica_urls, vec!["http://a2"]);
     }
 
     #[test]

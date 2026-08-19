@@ -377,8 +377,20 @@ pub fn plan_join(current: &ClusterMetadata, by: &str, leader_url: &str, req: &Jo
     if role != "shard" && role != "router" {
         return Err(format!("unknown role '{}'", role));
     }
+    let shard_role = req
+        .shard_role
+        .clone()
+        .or_else(|| (role == "shard").then(|| "replica".to_string()));
+    if shard_role.as_deref() != Some("replica") && req.follows.is_some() {
+        return Err("only a shard replica may name a primary to follow".to_string());
+    }
     if same_url(&req.url, leader_url) {
         return Err("a leader cannot add itself as a learner".to_string());
+    }
+    if let Some(follows) = req.follows.as_deref() {
+        if same_url(&req.url, follows) {
+            return Err("a replica cannot follow itself".to_string());
+        }
     }
     // Re-adding a config member as a learner would drop it out of the quorum it is already in.
     if let Some(existing) = current.member(&req.url) {
@@ -392,12 +404,10 @@ pub fn plan_join(current: &ClusterMetadata, by: &str, leader_url: &str, req: &Jo
         url: req.url.clone(),
         node_id: req.node_id.clone(),
         role: role.clone(),
-        shard_role: req.shard_role.clone().or_else(|| (role == "shard").then(|| "replica".to_string())),
+        shard_role: shard_role.clone(),
         voting: false,
-        follows: match role.as_str() {
-            "shard" => Some(req.follows.clone().unwrap_or_else(|| leader_url.to_string())),
-            _ => None,
-        },
+        follows: (shard_role.as_deref() == Some("replica"))
+            .then(|| req.follows.clone().unwrap_or_else(|| leader_url.to_string())),
     };
 
     let next = current.with_member(by, member);
@@ -681,6 +691,24 @@ mod tests {
         assert!(next.learners_following("http://a").is_empty(),
             "a leader must not ship frames to a learner catching up with another group");
         assert_eq!(next.learners_following("http://b"), vec!["http://new".to_string()]);
+    }
+
+    #[test]
+    fn only_replicas_may_name_a_primary() {
+        let current = cluster_of(&["http://a", "http://b"]);
+        let mut primary = join("http://new");
+        primary.shard_role = Some("primary".into());
+        primary.follows = Some("http://a".into());
+        assert!(plan_join(&current, "a", "http://a", &primary).is_err());
+
+        let mut router = join("http://router");
+        router.role = Some("router".into());
+        router.follows = Some("http://a".into());
+        assert!(plan_join(&current, "a", "http://a", &router).is_err());
+
+        let mut own_follower = join("http://new");
+        own_follower.follows = Some("http://new".into());
+        assert!(plan_join(&current, "a", "http://a", &own_follower).is_err());
     }
 
     #[test]

@@ -74,9 +74,7 @@ impl Database {
         Ok(col)
     }
 
-    /// Replaces a collection with a completely received snapshot. The collection-map write lock
-    /// closes the brief swap window to concurrent callers: they either keep an old handle that is
-    /// explicitly released, or wait and receive the newly opened collection.
+    /// Holds the collection map write lock across release, directory swap, and reopen.
     pub fn install_staged_collection(&self, name: &str, staged_path: &std::path::Path) -> io::Result<()> {
         let expected_staging = self.root_path.join(format!("{}.tmp", name));
         if staged_path != expected_staging || !staged_path.is_dir() {
@@ -92,8 +90,7 @@ impl Database {
             Some(col) => match col.release_handles() {
                 Ok(path) => Some(path),
                 Err(e) => {
-                    // The old directory has not moved yet. Reopen it so a failed installation does
-                    // not leave a previously live collection permanently absent from the map.
+                    // Reopen the untouched old directory so installation failure leaves it live.
                     if let Ok(reopened) = self.open_collection(name) {
                         collections.insert(name.to_string(), reopened);
                     }
@@ -162,9 +159,7 @@ impl Database {
                 Ok(())
             },
             Err(install_error) => {
-                // Put the downloaded directory back in staging, then restore and reopen the old
-                // collection. Protocol validation should make this rare, but installation failure
-                // must not destroy the last known-good copy.
+                // Restore and reopen the last known-good directory if installation fails.
                 let moved_bad = fs::rename(&col_path, staged_path).is_ok();
                 if !moved_bad && col_path.exists() {
                     let _ = remove_dir_with_retry(&col_path);

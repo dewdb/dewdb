@@ -69,6 +69,32 @@ impl HashRing {
                 return Err(format!("ring lists {} more than once", shard.node_url));
             }
         }
+        let primaries = seen;
+        let mut placed = HashSet::new();
+        for shard in &self.shards {
+            let primary = endpoint_of(&shard.node_url);
+            let mut local = HashSet::new();
+            for replica in &shard.replica_urls {
+                if replica.trim().is_empty() {
+                    return Err(format!("shard {} has an empty replica url", shard.node_url));
+                }
+                let endpoint = endpoint_of(replica);
+                if endpoint == primary {
+                    return Err(format!("shard {} lists itself as a replica", shard.node_url));
+                }
+                if primaries.contains(endpoint) {
+                    return Err(format!("primary {} cannot also be a replica", replica));
+                }
+                if !local.insert(endpoint) {
+                    return Err(format!(
+                        "shard {} lists replica {} more than once",
+                        shard.node_url, replica));
+                }
+                if !placed.insert(endpoint) {
+                    return Err(format!("replica {} is assigned to more than one shard", replica));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -427,6 +453,31 @@ mod consistent_hashing_tests {
         let dupes = ring(&["http://a", "http://a/"]);
         assert!(dupes.validate().unwrap_err().contains("more than once"),
             "the same endpoint twice would double that node's share of the ring");
+    }
+
+    #[test]
+    fn replica_placement_rejects_collocation_and_reuse() {
+        let placed = |a: &[&str], b: &[&str]| HashRing {
+            vnodes: 16,
+            shards: vec![
+                RingShard {
+                    node_url: "http://a".into(),
+                    replica_urls: a.iter().map(|url| url.to_string()).collect(),
+                },
+                RingShard {
+                    node_url: "http://b".into(),
+                    replica_urls: b.iter().map(|url| url.to_string()).collect(),
+                },
+            ],
+        };
+
+        assert!(placed(&["http://a"], &[]).validate().unwrap_err().contains("itself"));
+        assert!(placed(&["http://b"], &[]).validate().unwrap_err().contains("primary"));
+        assert!(placed(&["http://r", "http://r/"], &[])
+            .validate().unwrap_err().contains("more than once"));
+        assert!(placed(&["http://r"], &["https://r/"])
+            .validate().unwrap_err().contains("more than one shard"));
+        assert!(placed(&["http://r1"], &["http://r2"]).validate().is_ok());
     }
 
     #[test]

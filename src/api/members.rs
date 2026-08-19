@@ -60,9 +60,7 @@ pub(crate) fn nudge(state: &AppState, url: &str, view: &ClusterMetadata) {
     });
 }
 
-/// Membership is cluster-wide input to automatic ownership. Push it to every known process and
-/// every current owner, not just the node being added: otherwise a change accepted by one shard
-/// group may never reach the group elected to coordinate the resulting handover.
+/// Broadcasts membership changes to the designated rebalance coordinator and all known nodes.
 fn broadcast(state: &AppState, view: &ClusterMetadata, extra: Option<&str>) {
     let own = state.own_url();
     let mut seen = std::collections::HashSet::new();
@@ -136,7 +134,6 @@ pub async fn leave_handler(
         Err(resp) => return resp,
     };
 
-    // The removed node is included as a courtesy; it is no longer in the view-derived target set.
     broadcast(&state, &state.cluster_view(), Some(&params.url));
 
     info!(target: "membership", node = %params.url, version, "Removed from the cluster");

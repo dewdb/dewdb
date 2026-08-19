@@ -60,9 +60,7 @@ pub async fn start_migration_handler(
     }
 }
 
-/// Starts the same copy-before-flip workflow for both an operator request and the automatic
-/// reconciler. Keeping one entry point prevents automatic movement from acquiring weaker safety
-/// rules than an explicit `/cluster/migrate` call.
+/// Manual and automatic rebalancing share this copy-before-flip safety boundary.
 pub(crate) async fn begin_migration(
     state: &AppState,
     target: HashRing,
@@ -86,6 +84,7 @@ pub(crate) async fn begin_migration(
     let movement = keyspace_movement(&before, &target.build());
     if movement.moved_fraction == 0.0 {
         let next = current.with_ring(&state.config.node_id, target);
+        broadcast(state, &next, next.ring.as_ref());
         return match publish(state, next).await {
             Ok(version) => Ok(MigrationLaunch::Applied { version }),
             Err(resp) => Err(resp),
@@ -132,8 +131,13 @@ fn broadcast(state: &AppState, view: &crate::cluster::metadata::ClusterMetadata,
     let own = state.own_url();
     let mut seen = std::collections::HashSet::new();
 
-    let targets: Vec<String> = view.shard_owners().into_iter().map(|(url, _)| url)
-        .chain(extra.into_iter().flat_map(|r| r.shards.iter().map(|s| s.node_url.clone())))
+    let targets: Vec<String> = view.members.iter().map(|member| member.url.clone())
+        .chain(view.shard_owners().into_iter().flat_map(|(url, replicas)| {
+            std::iter::once(url).chain(replicas)
+        }))
+        .chain(extra.into_iter().flat_map(|ring| ring.shards.iter().flat_map(|shard| {
+            std::iter::once(shard.node_url.clone()).chain(shard.replica_urls.clone())
+        })))
         .filter(|url| !crate::util::same_endpoint(url, &own))
         .filter(|url| seen.insert(crate::util::endpoint_of(url).to_string()))
         .collect();
@@ -207,8 +211,7 @@ fn coordinate(state: AppState, id: String, target: HashRing, sources: Vec<String
     });
 }
 
-/// Recreates the coordinator loop after its process restarts. Sources already restart their own
-/// idempotent copy from the durable plan; this restores the missing "wait, flip, clean up" half.
+/// Restarts coordinator polling for a durable in-flight migration.
 pub(crate) fn resume_migration_coordination(state: &AppState) {
     let plan = match state.migration() {
         Some(plan) => plan,

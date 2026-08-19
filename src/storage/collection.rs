@@ -31,8 +31,7 @@ pub struct Collection {
     pub read_pool_counter: AtomicUsize,
     pub released: AtomicBool,
     pub compacting: AtomicBool,
-    /// Serializes operations that need a stable set of WAL files. A streamed snapshot holds this
-    /// for its lifetime; compaction must not retire files from underneath it.
+    /// Prevents compaction from retiring WAL files during snapshot streaming.
     pub snapshot_boundary: std::sync::Mutex<()>,
     pub cache: ReadCacheConfig,
     pub inline_bytes: AtomicU64,
@@ -500,9 +499,7 @@ impl Collection {
 
     /// Drains in log order; staged frames can arrive out of order.
     pub fn apply_committed(&self, committed_lsn: u64) -> usize {
-        // Keep pending, index and applied_lsn as one observable transition. Snapshot creation takes
-        // these locks in this order, so it sees either the state before this commit or the state
-        // after it, never an updated index paired with an old applied watermark.
+        // The pending -> index order keeps index visibility atomic with the snapshot watermark.
         let (ready_len, advanced) = {
             let mut pending = self.pending.lock().unwrap();
             let mut ready = std::mem::take(&mut *pending);
