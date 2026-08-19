@@ -5,7 +5,7 @@ use crate::cluster::migration::MigrationRuns;
 use crate::cluster::ownership::{classify, Ownership};
 use crate::config::NodeConfig;
 use crate::consensus::ReplicationState;
-use crate::metrics::Metrics;
+use crate::metrics::{Metrics, NodeLoad};
 use crate::ring::{shard_owns, BuiltRing};
 use crate::storage::Database;
 use std::collections::{HashMap, HashSet};
@@ -19,8 +19,31 @@ pub struct PrimaryOverride {
     pub cached_at: std::time::Instant,
 }
 
+pub(crate) struct NodeLoadSample {
+    load: NodeLoad,
+    sampled_at: std::time::Instant,
+}
+
+pub struct RoutedRead {
+    url: String,
+    counts: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+}
+
+impl Drop for RoutedRead {
+    fn drop(&mut self) {
+        let Ok(mut counts) = self.counts.lock() else { return };
+        if let Some(count) = counts.get_mut(&self.url) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.url);
+            }
+        }
+    }
+}
+
 // Cached to avoid re-probing per request; expires to retry the configured primary.
 const OVERRIDE_TTL_SECS: u64 = 30;
+const NODE_LOAD_TTL_SECS: u64 = 10;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -33,6 +56,8 @@ pub struct AppState {
     pub repair_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     pub resyncing: Arc<std::sync::Mutex<HashSet<String>>>,
     pub read_rr: Arc<AtomicUsize>,
+    pub(crate) node_loads: Arc<std::sync::Mutex<HashMap<String, NodeLoadSample>>>,
+    pub(crate) routed_reads: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     pub metrics: Arc<Metrics>,
     /// Node-wide cap on concurrent outbound replication requests. Shared across every write, unlike
     /// a per-call semaphore, which bounds one write's fan-out and nothing else.
@@ -247,6 +272,8 @@ impl AppState {
             repair_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             resyncing: Arc::new(std::sync::Mutex::new(HashSet::new())),
             read_rr: Arc::new(AtomicUsize::new(0)),
+            node_loads: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            routed_reads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             metrics: Arc::new(Metrics::new()),
             cluster: Arc::new(RwLock::new(cluster)),
             ring_cache: Arc::new(std::sync::Mutex::new(RingCache::default())),
@@ -287,6 +314,8 @@ impl AppState {
             repair_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             resyncing: Arc::new(std::sync::Mutex::new(HashSet::new())),
             read_rr: Arc::new(AtomicUsize::new(0)),
+            node_loads: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            routed_reads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             metrics: Arc::new(Metrics::new()),
             cluster: Arc::new(RwLock::new(cluster)),
             ring_cache: Arc::new(std::sync::Mutex::new(RingCache::default())),
@@ -540,6 +569,43 @@ impl AppState {
         }
         original_url.to_string()
     }
+
+    pub fn note_node_load(&self, url: &str, load: NodeLoad) {
+        self.node_loads.lock().unwrap().insert(
+            crate::util::endpoint_of(url).to_string(),
+            NodeLoadSample { load, sampled_at: std::time::Instant::now() },
+        );
+    }
+
+    pub fn clear_node_load(&self, url: &str) {
+        self.node_loads.lock().unwrap().remove(crate::util::endpoint_of(url));
+    }
+
+    pub fn fresh_node_loads(&self) -> HashMap<String, NodeLoad> {
+        let mut samples = self.node_loads.lock().unwrap();
+        samples.retain(|_, sample| sample.sampled_at.elapsed().as_secs() < NODE_LOAD_TTL_SECS);
+        let mut loads: HashMap<String, NodeLoad> = samples
+            .iter()
+            .map(|(url, sample)| (url.clone(), sample.load))
+            .collect();
+        drop(samples);
+
+        for (url, pending) in self.routed_reads.lock().unwrap().iter() {
+            if let Some(load) = loads.get_mut(url) {
+                load.inflight = load.inflight.saturating_add(*pending);
+            }
+        }
+        loads
+    }
+
+    pub fn track_routed_read(&self, url: &str) -> RoutedRead {
+        let url = crate::util::endpoint_of(url).to_string();
+        let mut counts = self.routed_reads.lock().unwrap();
+        let count = counts.entry(url.clone()).or_insert(0);
+        *count = count.saturating_add(1);
+        drop(counts);
+        RoutedRead { url, counts: self.routed_reads.clone() }
+    }
 }
 
 #[cfg(test)]
@@ -706,6 +772,20 @@ mod tests {
                 {"start_hash": 0, "end_hash": HALF, "node_url": "http://a", "replica_urls": ["http://a2"]},
                 {"start_hash": HALF, "end_hash": 0, "node_url": "http://b", "replica_urls": ["http://b2"]}],
         })).unwrap())
+    }
+
+    #[test]
+    fn router_reservations_temporarily_raise_a_nodes_reported_load() {
+        let root = temp_root();
+        let state = router_state(&root);
+        state.note_node_load("http://a", NodeLoad { inflight: 2, latency_ewma_us: 1_000 });
+
+        let routed = state.track_routed_read("http://a/");
+        assert_eq!(state.fresh_node_loads()["a"].inflight, 3);
+
+        drop(routed);
+        assert_eq!(state.fresh_node_loads()["a"].inflight, 2);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

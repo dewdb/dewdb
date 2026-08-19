@@ -5,6 +5,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const LATENCY_BUCKETS_MS: [f64; 11] = [0.5, 1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0];
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NodeLoad {
+    pub inflight: u64,
+    pub latency_ewma_us: u64,
+}
+
 #[derive(Clone, Default)]
 pub struct RouteStats {
     pub count: u64,
@@ -58,6 +64,8 @@ pub struct Metrics {
     pub frames_sent: AtomicU64,
     pub max_batch_frames: AtomicU64,
     pub writes_rejected: AtomicU64,
+    active_requests: AtomicU64,
+    latency_ewma_us: AtomicU64,
 }
 
 impl Metrics {
@@ -72,6 +80,23 @@ impl Metrics {
             frames_sent: AtomicU64::new(0),
             max_batch_frames: AtomicU64::new(0),
             writes_rejected: AtomicU64::new(0),
+            active_requests: AtomicU64::new(0),
+            latency_ewma_us: AtomicU64::new(0),
+        }
+    }
+
+    pub fn begin_request(&self) {
+        self.active_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn end_request(&self) {
+        self.active_requests.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    pub fn node_load(&self) -> NodeLoad {
+        NodeLoad {
+            inflight: self.active_requests.load(Ordering::Relaxed),
+            latency_ewma_us: self.latency_ewma_us.load(Ordering::Relaxed),
         }
     }
 
@@ -125,6 +150,24 @@ impl Metrics {
 
     pub fn observe(&self, key: String, nanos: u64, is_error: bool) {
         self.routes.lock().unwrap().entry(key).or_default().observe(nanos, is_error);
+        let sample = (nanos / 1_000).max(1);
+        let mut previous = self.latency_ewma_us.load(Ordering::Relaxed);
+        loop {
+            let next = if previous == 0 {
+                sample
+            } else {
+                previous.saturating_mul(7).saturating_add(sample) / 8
+            };
+            match self.latency_ewma_us.compare_exchange_weak(
+                previous,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => previous = actual,
+            }
+        }
     }
 
     pub fn uptime_secs(&self) -> u64 {
@@ -181,5 +224,27 @@ mod tests {
         let x = &snap.iter().find(|(k, _)| k == "GET /x").unwrap().1;
         assert_eq!(x.count, 2);
         assert_eq!(x.errors, 1);
+    }
+
+    #[test]
+    fn node_load_tracks_active_requests() {
+        let m = Metrics::new();
+        m.begin_request();
+        m.begin_request();
+        m.observe("GET /x".to_string(), 8_000_000, false);
+
+        assert_eq!(m.node_load(), NodeLoad { inflight: 2, latency_ewma_us: 8_000 });
+
+        m.end_request();
+        m.end_request();
+        assert_eq!(m.node_load().inflight, 0);
+    }
+
+    #[test]
+    fn load_latency_uses_an_ewma() {
+        let m = Metrics::new();
+        m.observe("GET /x".to_string(), 8_000_000, false);
+        m.observe("GET /x".to_string(), 16_000_000, false);
+        assert_eq!(m.node_load().latency_ewma_us, 9_000);
     }
 }

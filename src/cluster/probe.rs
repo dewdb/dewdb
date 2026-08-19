@@ -1,17 +1,20 @@
 //! Background probing of which node answers as primary for each shard.
 
 use crate::cluster::metadata::{Adoption, ClusterMetadata};
+use crate::metrics::NodeLoad;
 use crate::state::AppState;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tracing::{info, warn};
 
 pub const ROUTER_PROBE_INTERVAL_SECS: u64 = 3;
 
+#[derive(Clone)]
 pub struct Probe {
     pub role: String,
     pub term: u64,
     pub cluster_version: u64,
+    pub load: Option<NodeLoad>,
 }
 
 async fn probe_node(client: &reqwest::Client, url: &str) -> Option<Probe> {
@@ -21,10 +24,19 @@ async fn probe_node(client: &reqwest::Client, url: &str) -> Option<Probe> {
         return None;
     }
     let v = r.json::<serde_json::Value>().await.ok()?;
+    parse_probe(&v)
+}
+
+fn parse_probe(v: &serde_json::Value) -> Option<Probe> {
+    let load = v.get("load").and_then(|load| Some(NodeLoad {
+        inflight: load.get("inflight")?.as_u64()?,
+        latency_ewma_us: load.get("latency_ewma_us")?.as_u64()?,
+    }));
     Some(Probe {
         role: v.get("role").and_then(|x| x.as_str())?.to_string(),
         term: v.get("term").and_then(|x| x.as_u64()).unwrap_or(0),
         cluster_version: v.get("cluster_version").and_then(|x| x.as_u64()).unwrap_or(0),
+        load,
     })
 }
 
@@ -77,30 +89,54 @@ pub fn router_probe_task(state: AppState) {
         loop {
             tokio::time::sleep(Duration::from_secs(ROUTER_PROBE_INTERVAL_SECS)).await;
 
-            // Collected across the whole sweep so a topology change costs one fetch, not one per shard.
-            let mut seen: Vec<(String, Option<Probe>)> = Vec::new();
-
-            for (original, replicas) in unique_shards(&state) {
-                let effective = state.effective_primary(&original);
-
-                let fast = probe_node(&state.client, &effective).await;
-                let still_primary = fast.as_ref().map_or(false, |p| p.role == "primary");
-                seen.push((effective.clone(), fast));
-
-                if still_primary {
-                    if effective != original {
-                        state.set_primary_override(&original, &effective);
+            let groups: Vec<(String, Vec<String>, String)> = unique_shards(&state)
+                .into_iter()
+                .map(|(original, replicas)| {
+                    let effective = state.effective_primary(&original);
+                    (original, replicas, effective)
+                })
+                .collect();
+            let mut targets = Vec::new();
+            let mut target_endpoints = HashSet::new();
+            for (original, replicas, effective) in &groups {
+                for url in probe_targets(original, replicas).into_iter().chain([effective.clone()]) {
+                    if target_endpoints.insert(crate::util::endpoint_of(&url).to_string()) {
+                        targets.push(url);
                     }
-                    continue;
                 }
+            }
 
-                let mut probes = Vec::new();
-                for c in probe_targets(&original, &replicas) {
-                    let res = probe_node(&state.client, &c).await;
-                    probes.push((c, res));
+            let client = state.client.clone();
+            let probes = futures::future::join_all(targets.into_iter().map(|url| {
+                let client = client.clone();
+                async move {
+                    let result = probe_node(&client, &url).await;
+                    (url, result)
                 }
+            })).await;
 
-                match select_primary(&probes) {
+            let mut by_endpoint = HashMap::new();
+            for (url, probe) in &probes {
+                match probe.as_ref().and_then(|p| p.load) {
+                    Some(load) => state.note_node_load(url, load),
+                    None => state.clear_node_load(url),
+                }
+                by_endpoint.insert(crate::util::endpoint_of(url).to_string(), probe.clone());
+            }
+
+            for (original, replicas, effective) in groups {
+                let mut candidates = probe_targets(&original, &replicas);
+                if !candidates.iter().any(|url| crate::util::same_endpoint(url, &effective)) {
+                    candidates.push(effective.clone());
+                }
+                let group_probes: Vec<(String, Option<Probe>)> = candidates.into_iter()
+                    .map(|url| {
+                        let probe = by_endpoint.get(crate::util::endpoint_of(&url)).cloned().flatten();
+                        (url, probe)
+                    })
+                    .collect();
+
+                match select_primary(&group_probes) {
                     Some(winner) => {
                         if winner == original {
                             state.clear_primary_override(&original);
@@ -116,10 +152,9 @@ pub fn router_probe_task(state: AppState) {
                     }
                 }
 
-                seen.extend(probes);
             }
 
-            if let Some(source) = best_cluster_source(&seen, state.cluster_version()) {
+            if let Some(source) = best_cluster_source(&probes, state.cluster_version()) {
                 if let Some(view) = fetch_cluster_view(&state.client, &source).await {
                     match state.adopt_cluster(view) {
                         Adoption::Adopted { from, to } => info!(target: "router_probe",
@@ -139,11 +174,15 @@ mod tests {
     use super::*;
 
     fn probe(url: &str, role: &str, term: u64) -> (String, Option<Probe>) {
-        (url.to_string(), Some(Probe { role: role.to_string(), term, cluster_version: 0 }))
+        (url.to_string(), Some(Probe {
+            role: role.to_string(), term, cluster_version: 0, load: None,
+        }))
     }
 
     fn at_version(url: &str, cluster_version: u64) -> (String, Option<Probe>) {
-        (url.to_string(), Some(Probe { role: "replica".to_string(), term: 1, cluster_version }))
+        (url.to_string(), Some(Probe {
+            role: "replica".to_string(), term: 1, cluster_version, load: None,
+        }))
     }
 
     #[test]
@@ -189,5 +228,22 @@ mod tests {
             "already current: probing must not turn into a fetch every three seconds");
         assert_eq!(best_cluster_source(&probes, 20), None, "ahead of every peer");
         assert_eq!(best_cluster_source(&[], 0), None);
+    }
+
+    #[test]
+    fn heartbeat_load_is_optional_during_a_rolling_upgrade() {
+        let old = serde_json::json!({"role": "replica", "term": 2, "cluster_version": 7});
+        assert!(parse_probe(&old).unwrap().load.is_none());
+
+        let current = serde_json::json!({
+            "role": "replica",
+            "term": 2,
+            "cluster_version": 7,
+            "load": {"inflight": 3, "latency_ewma_us": 4500},
+        });
+        assert_eq!(
+            parse_probe(&current).unwrap().load,
+            Some(NodeLoad { inflight: 3, latency_ewma_us: 4_500 }),
+        );
     }
 }

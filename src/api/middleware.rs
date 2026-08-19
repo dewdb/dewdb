@@ -7,6 +7,14 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use tracing::warn;
 
+struct ActiveRequest<'a>(&'a crate::metrics::Metrics);
+
+impl Drop for ActiveRequest<'_> {
+    fn drop(&mut self) {
+        self.0.end_request();
+    }
+}
+
 pub async fn metrics_middleware(
     State(state): State<AppState>,
     req: axum::extract::Request,
@@ -22,6 +30,8 @@ pub async fn metrics_middleware(
     }
 
     let key = format!("{} {}", req.method(), path);
+    state.metrics.begin_request();
+    let _active = ActiveRequest(&state.metrics);
     let started = std::time::Instant::now();
     let response = next.run(req).await;
     let nanos = started.elapsed().as_nanos() as u64;

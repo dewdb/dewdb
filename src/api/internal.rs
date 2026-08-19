@@ -412,6 +412,8 @@ pub async fn heartbeat_handler(
 ) -> impl axum::response::IntoResponse {
     let term = state.current_term();
     let role = if state.is_leader() { "primary" } else { "replica" };
+    let mut load = state.metrics.node_load();
+    load.inflight = load.inflight.saturating_sub(1);
     (StatusCode::OK, Json(serde_json::json!({
         "term": term,
         "role": role,
@@ -420,6 +422,10 @@ pub async fn heartbeat_handler(
         "cluster_version": state.cluster_version(),
         "durable_lsn": state.db.as_ref().map_or(0, |db| db.durable_lsn.load(Ordering::SeqCst)),
         "commit_index": state.max_committed_lsn(),
+        "load": {
+            "inflight": load.inflight,
+            "latency_ewma_us": load.latency_ewma_us,
+        },
         // Followers need this to publish the last entry of an otherwise idle cluster.
         "committed": state.all_committed().into_iter()
             .map(|(k, v)| (k, serde_json::Value::from(v)))

@@ -4,6 +4,7 @@ use crate::model::{err_json, BulkDoc, CreateDoc, QueryPage, QueryParams};
 use crate::query::{decode_cursor, encode_cursor, kway_merge, ShardCursor, SortSpec};
 use crate::json::project;
 use crate::cluster::probe::unique_shards;
+use crate::metrics::NodeLoad;
 use crate::ring::hash_key;
 use crate::state::AppState;
 use axum::http::StatusCode;
@@ -265,7 +266,22 @@ pub fn parse_read_pref(r: Option<&str>) -> ReadPreference {
     }
 }
 
-fn read_targets(pref: &ReadPreference, effective_primary: &str, replicas: &[String], rr: usize) -> Vec<String> {
+fn load_score(load: NodeLoad, unknown_latency_us: u64) -> u64 {
+    let latency = if load.latency_ewma_us == 0 {
+        unknown_latency_us
+    } else {
+        load.latency_ewma_us
+    };
+    load.inflight.saturating_add(1).saturating_mul(latency)
+}
+
+fn read_targets(
+    pref: &ReadPreference,
+    effective_primary: &str,
+    replicas: &[String],
+    rr: usize,
+    loads: &HashMap<String, NodeLoad>,
+) -> Vec<String> {
     let mut targets = Vec::new();
     match pref {
         ReadPreference::Primary => {
@@ -279,9 +295,27 @@ fn read_targets(pref: &ReadPreference, effective_primary: &str, replicas: &[Stri
             if n == 0 {
                 targets.push(effective_primary.to_string());
             } else {
-                for i in 0..n {
-                    targets.push(replicas[(rr + i) % n].clone());
-                }
+                let measured: Vec<u64> = replicas.iter()
+                    .filter_map(|url| loads.get(crate::util::endpoint_of(url)))
+                    .map(|load| load.latency_ewma_us)
+                    .filter(|latency| *latency > 0)
+                    .collect();
+                let unknown_latency_us = if measured.is_empty() {
+                    1_000
+                } else {
+                    measured.iter().fold(0u64, |sum, latency| sum.saturating_add(*latency))
+                        / measured.len() as u64
+                };
+                let mut ranked: Vec<(usize, String)> = (0..n)
+                    .map(|i| (i, replicas[(rr + i) % n].clone()))
+                    .collect();
+                ranked.sort_by_key(|(tie, url)| {
+                    match loads.get(crate::util::endpoint_of(url)) {
+                        Some(load) => (0u8, load_score(*load, unknown_latency_us), *tie),
+                        None => (1u8, 0, *tie),
+                    }
+                });
+                targets.extend(ranked.into_iter().map(|(_, url)| url));
                 targets.push(effective_primary.to_string());
             }
         }
@@ -300,9 +334,11 @@ pub async fn router_read_doc(state: &AppState, col_name: &str, id: &str, pref: R
 
     let path = format!("/collections/{}/docs/{}", col_name, id);
     let rr = state.read_rr.fetch_add(1, Ordering::Relaxed);
-    let targets = read_targets(&pref, &effective, &replicas, rr);
+    let loads = state.fresh_node_loads();
+    let targets = read_targets(&pref, &effective, &replicas, rr, &loads);
 
     for target in targets {
+        let _routed = state.track_routed_read(&target);
         let url = format!("{}{}", target, path);
         if let Ok(r) = state.client.get(&url).send().await {
             let reply = ShardReply::of(r).await;
@@ -322,6 +358,7 @@ pub async fn router_read_doc(state: &AppState, col_name: &str, id: &str, pref: R
                 return passthrough(reply);
             }
         }
+        state.clear_node_load(&target);
     }
 
     (StatusCode::BAD_GATEWAY, "No shard node could serve the read").into_response()
@@ -444,8 +481,10 @@ pub async fn router_query(
 
             let effective = state.effective_primary(&original);
             let rr = state.read_rr.fetch_add(1, Ordering::Relaxed);
-            let targets = read_targets(&pref, &effective, &replicas, rr);
+            let loads = state.fresh_node_loads();
+            let targets = read_targets(&pref, &effective, &replicas, rr, &loads);
             let client = state.client.clone();
+            let route_state = state.clone();
             let col = col_name.to_string();
 
             let mut q: Vec<(String, String)> = vec![("limit".to_string(), per_shard.to_string())];
@@ -457,6 +496,7 @@ pub async fn router_query(
 
             futures.push(tokio::spawn(async move {
                 for target in targets {
+                    let _routed = route_state.track_routed_read(&target);
                     let url = format!("{}/collections/{}/query", target, col);
                     if let Ok(res) = client.get(&url).query(&q).send().await {
                         if res.status().is_success() {
@@ -465,6 +505,7 @@ pub async fn router_query(
                             }
                         }
                     }
+                    route_state.clear_node_load(&target);
                 }
                 (original, None)
             }));
@@ -522,10 +563,14 @@ pub async fn router_query(
 mod tests {
     use super::*;
 
+    fn no_loads() -> HashMap<String, NodeLoad> {
+        HashMap::new()
+    }
+
     #[test]
     fn read_targets_primary_prefers_leader() {
         let replicas = vec!["http://r1".to_string(), "http://r2".to_string()];
-        let t = read_targets(&ReadPreference::Primary, "http://p", &replicas, 0);
+        let t = read_targets(&ReadPreference::Primary, "http://p", &replicas, 0, &no_loads());
         assert_eq!(t, vec!["http://p", "http://r1", "http://r2"]);
     }
 
@@ -533,27 +578,68 @@ mod tests {
     fn read_targets_replica_prefers_replicas_and_spreads() {
         let replicas = vec!["http://r1".to_string(), "http://r2".to_string()];
 
-        let t0 = read_targets(&ReadPreference::Replica, "http://p", &replicas, 0);
+        let t0 = read_targets(&ReadPreference::Replica, "http://p", &replicas, 0, &no_loads());
         assert_eq!(t0, vec!["http://r1", "http://r2", "http://p"]);
 
-        let t1 = read_targets(&ReadPreference::Replica, "http://p", &replicas, 1);
+        let t1 = read_targets(&ReadPreference::Replica, "http://p", &replicas, 1, &no_loads());
         assert_eq!(t1, vec!["http://r2", "http://r1", "http://p"], "round-robin rotates the starting replica");
 
-        let t2 = read_targets(&ReadPreference::Replica, "http://p", &replicas, 2);
+        let t2 = read_targets(&ReadPreference::Replica, "http://p", &replicas, 2, &no_loads());
         assert_eq!(t2, vec!["http://r1", "http://r2", "http://p"], "rotation wraps");
     }
 
     #[test]
     fn read_targets_replica_falls_back_to_primary_when_no_replicas() {
-        let t = read_targets(&ReadPreference::Replica, "http://p", &[], 0);
+        let t = read_targets(&ReadPreference::Replica, "http://p", &[], 0, &no_loads());
         assert_eq!(t, vec!["http://p"]);
     }
 
     #[test]
     fn read_targets_dedupes_when_override_points_at_a_replica() {
         let replicas = vec!["http://r1".to_string(), "http://r2".to_string()];
-        let t = read_targets(&ReadPreference::Primary, "http://r1", &replicas, 0);
+        let t = read_targets(&ReadPreference::Primary, "http://r1", &replicas, 0, &no_loads());
         assert_eq!(t, vec!["http://r1", "http://r2"], "promoted replica isn't tried twice");
+    }
+
+    #[test]
+    fn replica_reads_prefer_the_lowest_estimated_queue_time() {
+        let replicas = vec!["http://busy".to_string(), "http://slow".to_string(), "http://free".to_string()];
+        let loads = HashMap::from([
+            ("busy".to_string(), NodeLoad { inflight: 8, latency_ewma_us: 1_000 }),
+            ("slow".to_string(), NodeLoad { inflight: 0, latency_ewma_us: 20_000 }),
+            ("free".to_string(), NodeLoad { inflight: 0, latency_ewma_us: 2_000 }),
+        ]);
+
+        let targets = read_targets(&ReadPreference::Replica, "http://p", &replicas, 0, &loads);
+        assert_eq!(targets, vec!["http://free", "http://busy", "http://slow", "http://p"]);
+    }
+
+    #[test]
+    fn telemetry_ties_still_rotate() {
+        let replicas = vec!["http://r1".to_string(), "http://r2".to_string()];
+        let loads = HashMap::from([
+            ("r1".to_string(), NodeLoad { inflight: 1, latency_ewma_us: 1_000 }),
+            ("r2".to_string(), NodeLoad { inflight: 1, latency_ewma_us: 1_000 }),
+        ]);
+
+        assert_eq!(
+            read_targets(&ReadPreference::Replica, "http://p", &replicas, 1, &loads),
+            vec!["http://r2", "http://r1", "http://p"],
+        );
+    }
+
+    #[test]
+    fn a_cold_replica_uses_the_groups_measured_latency() {
+        let replicas = vec!["http://warm".to_string(), "http://cold".to_string()];
+        let loads = HashMap::from([
+            ("warm".to_string(), NodeLoad { inflight: 0, latency_ewma_us: 2_000 }),
+            ("cold".to_string(), NodeLoad { inflight: 0, latency_ewma_us: 0 }),
+        ]);
+
+        assert_eq!(
+            read_targets(&ReadPreference::Replica, "http://p", &replicas, 1, &loads),
+            vec!["http://cold", "http://warm", "http://p"],
+        );
     }
 
     #[test]

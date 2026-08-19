@@ -172,6 +172,12 @@ fn render_prometheus(state: &AppState, collections: &[serde_json::Value], replic
     out.push_str("# HELP dewdb_cluster_version Version of the topology this node is serving from.\n# TYPE dewdb_cluster_version gauge\n");
     prometheus_line(&mut out, "dewdb_cluster_version", &format!("node_id=\"{}\"", node), state.cluster_version() as f64);
 
+    let load = state.metrics.node_load();
+    out.push_str("# HELP dewdb_inflight_requests Requests currently executing.\n# TYPE dewdb_inflight_requests gauge\n");
+    prometheus_line(&mut out, "dewdb_inflight_requests", &format!("node_id=\"{}\"", node), load.inflight as f64);
+    out.push_str("# HELP dewdb_request_latency_ewma_ms Recent request latency EWMA.\n# TYPE dewdb_request_latency_ewma_ms gauge\n");
+    prometheus_line(&mut out, "dewdb_request_latency_ewma_ms", &format!("node_id=\"{}\"", node), load.latency_ewma_us as f64 / 1000.0);
+
     out.push_str("# HELP dewdb_collection_documents Live documents per collection.\n# TYPE dewdb_collection_documents gauge\n");
     for c in collections {
         let name = escape_label(c["name"].as_str().unwrap_or(""));
@@ -285,6 +291,13 @@ pub async fn metrics_handler(
     });
 
     let router = if state.config.role == "router" {
+        let load_samples: serde_json::Map<String, serde_json::Value> = state.fresh_node_loads()
+            .into_iter()
+            .map(|(url, load)| (url, serde_json::json!({
+                "inflight": load.inflight,
+                "latency_ewma_ms": load.latency_ewma_us as f64 / 1000.0,
+            })))
+            .collect();
         let shards: Vec<serde_json::Value> = unique_shards(&state).into_iter().map(|(original, replicas)| {
             let effective = state.effective_primary(&original);
             serde_json::json!({
@@ -294,17 +307,22 @@ pub async fn metrics_handler(
                 "replicas": replicas,
             })
         }).collect();
-        serde_json::json!({ "shards": shards })
+        serde_json::json!({ "shards": shards, "load_estimates": load_samples })
     } else {
         serde_json::Value::Null
     };
 
+    let load = state.metrics.node_load();
     (StatusCode::OK, Json(serde_json::json!({
         "node_id": state.config.node_id,
         "role": state.config.role,
         "leader": state.is_leader(),
         "term": state.current_term(),
         "uptime_secs": state.metrics.uptime_secs(),
+        "load": {
+            "inflight": load.inflight,
+            "latency_ewma_ms": load.latency_ewma_us as f64 / 1000.0,
+        },
         "storage": {
             "collections": collections,
             "total_collections": collections.len(),
