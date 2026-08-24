@@ -259,32 +259,41 @@ pub fn heartbeat_poll_task(state: AppState) {
                 match state.client.get(&url).send().await {
                     Ok(r) if r.status().is_success() => {
                         if let Ok(hb) = r.json::<serde_json::Value>().await {
-                            let mut adopted = None;
-                            {
-                                let mut repl = state.replication.as_ref().unwrap().write().unwrap();
-                                repl.last_heartbeat = Some(std::time::Instant::now());
-                                if let Some(idx) = hb.get("commit_index").and_then(|v| v.as_u64()) {
-                                    repl.last_known_primary_position = Some(idx);
-                                }
-                                if let Some(t) = hb.get("term").and_then(|v| v.as_u64()) {
-                                    if t > repl.term {
-                                        repl.term = t;
-                                        repl.voted_for = None;
-                                        adopted = Some(t);
-                                    }
-                                }
-                            }
-                            for (col, lsn) in hb
+                            let their_term = hb.get("term").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let leading = hb.get("role").and_then(|v| v.as_str()) == Some("primary");
+                            let committed: Vec<(String, u64)> = hb
                                 .get("committed")
                                 .and_then(|c| c.as_object())
                                 .map(|m| {
                                     m.iter()
                                         .filter_map(|(k, v)| v.as_u64().map(|l| (k.clone(), l)))
-                                        .collect::<Vec<_>>()
+                                        .collect()
                                 })
-                                .unwrap_or_default()
+                                .unwrap_or_default();
+
+                            let mut adopted = None;
+                            // A watermark is only as good as the term behind it, and a node that
+                            // has been deposed still answers here with the one it last held.
+                            let trusted;
                             {
-                                state.note_leader_committed(&col, lsn);
+                                let mut repl = state.replication.as_ref().unwrap().write().unwrap();
+                                repl.last_heartbeat = Some(std::time::Instant::now());
+                                if their_term > repl.term {
+                                    repl.term = their_term;
+                                    repl.voted_for = None;
+                                    adopted = Some(their_term);
+                                }
+                                trusted = leading && their_term >= repl.term;
+                                if trusted {
+                                    if let Some(idx) = hb.get("commit_index").and_then(|v| v.as_u64()) {
+                                        repl.last_known_primary_position = Some(idx);
+                                    }
+                                }
+                            }
+                            if trusted {
+                                for (col, lsn) in committed {
+                                    state.note_leader_committed(&col, lsn);
+                                }
                             }
 
                             if let Some(t) = adopted {

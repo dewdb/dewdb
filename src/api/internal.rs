@@ -4,8 +4,8 @@ use crate::cluster::metadata::{Adoption, ClusterMetadata};
 use crate::cluster::metadata::MigrationPhase;
 use crate::cluster::migration::{MigrateBatch, MigrateReset};
 use crate::consensus::{
-    decide_vote, heartbeat_poll_task, local_log_tails, LogTail, ReplicationMeta, VoteRequest,
-    VoteResponse,
+    decide_vote, demote, heartbeat_poll_task, local_log_tails, LogTail, ReplicationMeta,
+    VoteRequest, VoteResponse,
 };
 use crate::model::err_json;
 use crate::replication::snapshot::{replica_sync_from_primary, snapshot_body, SNAPSHOT_CONTENT_TYPE};
@@ -55,6 +55,12 @@ pub async fn replicate_handler(
     State(state): State<AppState>,
     Json(req): Json<ReplicateRequest>,
 ) -> impl axum::response::IntoResponse {
+    // A higher term deposes us, and that has to happen before the gate below: refusing there is
+    // what left a deposed leader accepting writes until something else happened to notice.
+    if state.is_leader() && req.term > state.current_term() {
+        demote(&state, req.term).await;
+    }
+
     if !state.is_shard() || state.is_leader() {
         let our_term = state.current_term();
         return (StatusCode::FORBIDDEN, Json(serde_json::json!({
@@ -71,14 +77,6 @@ pub async fn replicate_handler(
     let _install_guard = install_lock.lock().await;
     if state.resyncing.lock().unwrap().contains(&req.collection) {
         return (StatusCode::SERVICE_UNAVAILABLE, "Snapshot resync in progress").into_response();
-    }
-
-    if let Some(idx) = req.commit_index {
-        state.note_leader_committed(&req.collection, idx);
-        if let Some(ref repl) = state.replication {
-            let mut r = repl.write().unwrap();
-            r.last_known_primary_position = Some(idx);
-        }
     }
 
     let our_term = state.current_term();
@@ -109,6 +107,16 @@ pub async fn replicate_handler(
                         "Adopted term {} in memory but could not persist it", t),
                 }
             }
+        }
+    }
+
+    // Only after the term gate: a deposed leader's watermark publishes staged entries that the
+    // current leader may still revoke, and commit-gated visibility is what makes them revocable.
+    if let Some(idx) = req.commit_index {
+        state.note_leader_committed(&req.collection, idx);
+        if let Some(ref repl) = state.replication {
+            let mut r = repl.write().unwrap();
+            r.last_known_primary_position = Some(idx);
         }
     }
 
@@ -552,6 +560,8 @@ pub async fn vote_handler(
 
         if d.term > old_term && was_leader {
             g.is_leader = false;
+            // Standing down by granting a vote is still standing down; same rule as apply_demotion.
+            g.progress.reset();
             restart = !g.heartbeat_running;
             g.heartbeat_running = true;
         }
@@ -610,4 +620,187 @@ pub async fn snapshot_handler(
         .header(axum::http::header::CONTENT_TYPE, SNAPSHOT_CONTENT_TYPE)
         .body(snapshot_body(col))
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{make_frame, next_test_port, put_doc_http, temp_root, TestNode};
+    use std::collections::HashMap;
+    use std::fs;
+
+    async fn heartbeat(node: &TestNode) -> serde_json::Value {
+        reqwest::Client::new()
+            .get(format!("{}/internal/heartbeat", node.url()))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    /// A solo primary, so one `w=1` write is a quorum of one and lands in the commit watermark.
+    async fn leader_with_one_committed_write(root: &std::path::Path) -> TestNode {
+        let mut leader = TestNode::new("solo", next_test_port(), root, "primary");
+        // Long enough that the poll started by standing down cannot re-elect this node mid-test.
+        leader.heartbeat_timeout_secs = 30;
+        leader.start();
+
+        let client = reqwest::Client::new();
+        assert_eq!(put_doc_http(&client, &leader.url(), "k1", 1).await, StatusCode::CREATED);
+
+        let hb = heartbeat(&leader).await;
+        assert_eq!(hb["role"], "primary");
+        assert!(hb["commit_index"].as_u64().unwrap() > 0, "the write is committed and advertised");
+        assert!(hb["committed"]["t"].as_u64().unwrap() > 0);
+        leader
+    }
+
+    fn assert_no_watermark(hb: &serde_json::Value) {
+        assert_eq!(hb["role"], "replica");
+        assert_eq!(hb["commit_index"].as_u64(), Some(0),
+            "evidence gathered in a term this node no longer holds is not a commit watermark");
+        assert_eq!(hb["committed"].as_object().map(|m| m.len()), Some(0),
+            "a follower that still lists per-collection watermarks will publish on them");
+    }
+
+    /// One frame on the wire to `/internal/replicate`, with the request fields and the frame
+    /// header supplied separately so a test can disagree between them on purpose.
+    async fn replicate(
+        node: &TestNode,
+        term: u64,
+        lsn: u64,
+        prev_lsn: u64,
+        commit_index: u64,
+        frame: Vec<u8>,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = ReplicateRequest {
+            collection: "t".to_string(),
+            term,
+            lsn,
+            prev_lsn,
+            commit_index: Some(commit_index),
+            wal_frame: frame,
+            frames: Vec::new(),
+        };
+        let response = reqwest::Client::new()
+            .post(format!("{}/internal/replicate", node.url()))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.json::<serde_json::Value>().await
+            .unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    #[tokio::test]
+    async fn a_stale_leaders_commit_index_cannot_publish_a_staged_entry() {
+        let root = temp_root();
+        let mut replica = TestNode::new("replica", next_test_port(), &root, "replica");
+        replica.membership_mode = "learner".to_string();
+        replica.primary_addr = Some("http://127.0.0.1:1".to_string());
+        replica.start();
+
+        let (status, _) = replicate(&replica, 5, 1, 0, 0, make_frame(5, 1, 0, 0, "k1", 1)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let col = replica.state.as_ref().unwrap()
+            .db.as_ref().unwrap()
+            .get_collection("t").unwrap();
+        assert_eq!(col.pending_len(), 1, "the frame is durable but nothing has committed it");
+        assert!(col.get("k1").unwrap().is_none(), "a staged entry is invisible");
+
+        // A leader deposed back at term 3 claims lsn 1 committed. It may be wrong: the term-5
+        // leader can still revoke that entry, which is the whole point of staging it.
+        let (status, body) = replicate(&replica, 3, 2, 1, 1, make_frame(3, 2, 1, 5, "k2", 2)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["status"], "stale_term");
+
+        assert!(col.get("k1").unwrap().is_none(),
+            "a watermark from a superseded term published an entry the current leader may revoke");
+        assert_eq!(col.pending_len(), 1, "the entry is still staged, not lost");
+
+        replica.kill();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_leader_steps_down_for_a_higher_term_but_not_for_its_own() {
+        let root = temp_root();
+        let mut leader = TestNode::new("solo", next_test_port(), &root, "primary");
+        // Long enough that the poll started by stepping down cannot re-elect this node mid-test.
+        leader.heartbeat_timeout_secs = 30;
+        leader.start();
+        assert!(leader.is_leader(), "a solo primary leads from boot");
+
+        let (status, body) = replicate(&leader, 0, 1, 0, 0, make_frame(0, 1, 0, 0, "k1", 1)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["status"], "not_a_replica");
+        assert!(leader.is_leader(), "a term it already holds is not a demotion");
+
+        let (status, body) = replicate(&leader, 7, 1, 0, 0, make_frame(7, 1, 0, 0, "k1", 1)).await;
+        assert!(!leader.is_leader(),
+            "a higher term deposes a leader; refusing it leaves two leaders serving writes");
+        assert_eq!(leader.term(), 7);
+        assert_eq!(status, StatusCode::OK, "having stepped down, it serves the frame as a follower");
+        assert_eq!(body["status"], "applied");
+
+        let meta = ReplicationMeta::load(&leader.data_dir.to_string_lossy()).unwrap().unwrap();
+        assert_eq!(meta.term, 7);
+        assert!(!meta.is_leader, "the step-down has to survive a restart, or it comes back leading");
+
+        leader.kill();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_deposed_leader_stops_advertising_the_watermark_it_committed() {
+        let root = temp_root();
+        let mut leader = leader_with_one_committed_write(&root).await;
+
+        // The frame itself is refused as divergent -- this node's tail came from the old term.
+        // Standing down happens first and is what the assertions below are about.
+        let _ = replicate(&leader, 9, 1, 0, 0, make_frame(9, 1, 0, 0, "k2", 2)).await;
+        assert!(!leader.is_leader());
+
+        assert_no_watermark(&heartbeat(&leader).await);
+
+        leader.kill();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn granting_a_vote_at_a_higher_term_clears_the_watermark_too() {
+        let root = temp_root();
+        let mut leader = leader_with_one_committed_write(&root).await;
+
+        // Stands down without ever going through demote(), which is why the vote path needs the
+        // same reset rather than relying on apply_demotion to have done it.
+        let vote = VoteRequest {
+            term: 9,
+            candidate_id: "challenger".to_string(),
+            last_lsn: 100,
+            last_term: 9,
+            logs: HashMap::new(),
+        };
+        let response = reqwest::Client::new()
+            .post(format!("{}/internal/vote", leader.url()))
+            .json(&vote)
+            .send()
+            .await
+            .unwrap()
+            .json::<VoteResponse>()
+            .await
+            .unwrap();
+        assert!(response.vote_granted, "a fresher candidate at a higher term wins the vote");
+        assert!(!leader.is_leader());
+
+        assert_no_watermark(&heartbeat(&leader).await);
+
+        leader.kill();
+        let _ = fs::remove_dir_all(&root);
+    }
 }

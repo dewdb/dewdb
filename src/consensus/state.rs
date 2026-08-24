@@ -96,6 +96,9 @@ pub fn apply_demotion(repl: &mut ReplicationState, new_term: u64) -> Option<bool
     repl.term = new_term;
     repl.voted_for = None;
     repl.is_leader = false;
+    // Quorum evidence belongs to the term it was gathered in. Kept, it goes on being served as a
+    // commit watermark by a node that no longer has the standing to have one.
+    repl.progress.reset();
     repl.last_heartbeat = Some(std::time::Instant::now());
     repl.last_replication = None;
     repl.was_receiving_replication = false;
