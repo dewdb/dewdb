@@ -15,7 +15,8 @@ use crate::cluster::rebalance::rebalance_status_handler;
 use docs::{bulk_create_docs, create_doc, delete_doc, get_doc, list_docs, put_doc, query_docs, update_doc};
 use internal::{
     cluster_update_handler, cluster_view_handler, data_summary_handler, heartbeat_handler,
-    internal_drop_handler, migrate_cleanup_handler, migrate_handler, migration_status_handler,
+    internal_drop_handler, migrate_cleanup_handler, migrate_handler, migrate_reset_handler,
+    migration_status_handler,
     replicate_handler, resync_handler, snapshot_handler, vote_handler,
 };
 use members::{join_handler, leave_handler};
@@ -62,6 +63,7 @@ pub fn build_app(state: &AppState) -> Router {
             .route("/internal/heartbeat", get(heartbeat_handler))
             .route("/internal/data-summary", get(data_summary_handler))
             .route("/internal/migrate", post(migrate_handler))
+            .route("/internal/migrate-reset", post(migrate_reset_handler))
             .route("/internal/migrate-cleanup", post(migrate_cleanup_handler))
             .route("/internal/migration-status", get(migration_status_handler));
     }

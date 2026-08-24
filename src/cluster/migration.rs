@@ -1,31 +1,45 @@
-//! Moving keys to their new owners while the cluster keeps serving.
-//!
-//! Every shard drives its own outgoing keys. There is no work queue to coordinate and no single
-//! node whose failure strands the move: a shard that adopts a view naming it as a source starts
-//! pushing, and a shard that restarts mid-move starts again from the top. Pushes are idempotent
-//! (a repeated key is the same value written twice), so restarting costs time, never correctness.
-//!
-//! Writes to a key that is moving are refused for the length of the copy. That is the honest cost
-//! of this design: reads stay available throughout and keys outside the moving set are untouched,
-//! but the moving fraction is briefly read-only. Removing that is commit 43's job, and needs the
-//! source to ship a delta after the freeze rather than freeze for the whole copy.
+//! Online shard handover with a bulk copy and a brief finalization barrier.
+//! Sources drive idempotent batches while cluster metadata coordinates cutover.
 
-use crate::cluster::metadata::Migration;
-use crate::ring::HashRing;
-use crate::ring::hash_key;
+use crate::cluster::metadata::{Migration, MigrationPhase};
+use crate::ring::{hash_key, keyspace_movement, HashRing};
 use crate::state::AppState;
 use crate::util::same_endpoint;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
 
-/// Keys per request. Large enough that a wide migration is not one round trip per key, small
-/// enough that a batch stays well inside the body limits the replication path already lives with.
-const PUSH_BATCH: usize = 128;
+#[derive(Deserialize, Clone, Debug)]
+pub struct DataMovementConfig {
+    #[serde(default = "default_batch_size")]
+    pub batch_size: usize,
+    #[serde(default = "default_batch_delay_ms")]
+    pub batch_delay_ms: u64,
+}
+
+fn default_batch_size() -> usize { 64 }
+fn default_batch_delay_ms() -> u64 { 5 }
+
+impl Default for DataMovementConfig {
+    fn default() -> Self {
+        Self { batch_size: default_batch_size(), batch_delay_ms: default_batch_delay_ms() }
+    }
+}
+
+impl DataMovementConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.batch_size == 0 || self.batch_size > 1024 {
+            return Err("data_movement.batch_size must be between 1 and 1024".to_string());
+        }
+        Ok(())
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct MigrateBatch {
     pub migration_id: String,
+    #[serde(default)]
+    pub phase: MigrationPhase,
     pub collection: String,
     pub docs: Vec<MigrateDoc>,
 }
@@ -36,9 +50,17 @@ pub struct MigrateDoc {
     pub value: serde_json::Value,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct MigrateReset {
+    pub migration_id: String,
+    pub phase: MigrationPhase,
+    pub source: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MigrationProgress {
     pub id: String,
+    pub phase: MigrationPhase,
     /// The ring this handover was for. Cleanup compares it against the live ring: a plan that was
     /// abandoned rather than completed must never be treated as licence to delete.
     #[serde(skip)]
@@ -58,6 +80,7 @@ pub struct MigrationRuns {
     pub current: Option<MigrationProgress>,
     /// Prevents duplicate coordinator loops after recovery.
     pub coordinating: Option<String>,
+    pub completed_resets: HashSet<(String, String)>,
 }
 
 /// Starts the copy for `migration` unless this node is already running it. Called on every view
@@ -65,7 +88,9 @@ pub struct MigrationRuns {
 pub fn ensure_running(state: &AppState, migration: &Migration) {
     {
         let runs = state.migrations.lock().unwrap();
-        if runs.current.as_ref().is_some_and(|p| p.id == migration.id) {
+        if runs.current.as_ref().is_some_and(|p| {
+            p.id == migration.id && p.phase == migration.phase
+        }) {
             return;
         }
     }
@@ -82,21 +107,23 @@ pub fn ensure_running(state: &AppState, migration: &Migration) {
         },
     };
 
-    let total: usize = outgoing.values().map(|v| v.len()).sum();
+    let total: usize = outgoing.values().map(Vec::len).sum();
+    let done = total == 0 && migration.phase == MigrationPhase::Copy;
     {
         let mut runs = state.migrations.lock().unwrap();
         runs.current = Some(MigrationProgress {
             id: migration.id.clone(),
+            phase: migration.phase,
             target: migration.target.clone(),
             pushed: 0,
             total,
-            done: total == 0,
+            done,
             error: None,
             handed_over: Vec::new(),
         });
     }
 
-    if total == 0 {
+    if done {
         info!(target: "migration", id = %migration.id, "Nothing to hand over from this node");
         return;
     }
@@ -116,35 +143,69 @@ async fn push_until_done(state: AppState, migration: Migration) {
 
     loop {
         match state.migration() {
-            Some(m) if m.id == id => {},
+            Some(m) if m.id == id && m.phase == migration.phase => {},
             // Completed by someone else, abandoned, or replaced. Nothing left to push.
             _ => return,
         }
+        if !state.is_leader() {
+            record_error(&state, &id, migration.phase,
+                "leadership changed during migration".to_string());
+            return;
+        }
 
-        // Re-planned each attempt: writes may have landed, and a retry must not ship a stale list.
+        let _write_barrier = if migration.phase == MigrationPhase::Finalizing {
+            Some(state.migration_write_gate.write().await)
+        } else {
+            None
+        };
+        if !state.migration().is_some_and(|m| {
+            m.id == id && m.phase == migration.phase
+        }) {
+            return;
+        }
+
         let outgoing = match plan_outgoing(&state, &migration) {
             Ok(work) => work,
             Err(e) => {
-                record_error(&state, &id, e);
+                record_error(&state, &id, migration.phase, e);
                 backoff(attempt).await;
                 attempt += 1;
                 continue;
             },
         };
 
-        let total: usize = outgoing.values().map(|v| v.len()).sum();
+        let total: usize = outgoing.values().map(Vec::len).sum();
         {
             let mut runs = state.migrations.lock().unwrap();
-            match runs.current.as_mut().filter(|p| p.id == id) {
+            match runs.current.as_mut().filter(|p| {
+                p.id == id && p.phase == migration.phase
+            }) {
                 Some(p) => { p.total = total; p.pushed = 0; },
                 None => return,
             }
         }
 
-        match push_all(&state, &id, outgoing).await {
+        let result = if migration.phase == MigrationPhase::Finalizing {
+            reset_destinations(&state, &migration).await
+        } else {
+            Ok(())
+        };
+        let result = match result {
+            Ok(()) => push_all(&state, &migration, outgoing).await,
+            Err(e) => Err(e),
+        };
+
+        match result {
             Ok(()) => {
+                if !state.is_leader() {
+                    record_error(&state, &id, migration.phase,
+                        "leadership changed during migration".to_string());
+                    return;
+                }
                 let mut runs = state.migrations.lock().unwrap();
-                if let Some(p) = runs.current.as_mut().filter(|p| p.id == id) {
+                if let Some(p) = runs.current.as_mut().filter(|p| {
+                    p.id == id && p.phase == migration.phase
+                }) {
                     p.done = true;
                     p.error = None;
                     info!(target: "migration", id = %id, pushed = p.pushed, "Handover complete");
@@ -153,7 +214,7 @@ async fn push_until_done(state: AppState, migration: Migration) {
             },
             Err(e) => {
                 warn!(target: "migration", id = %id, attempt, error = %e, "Handover attempt failed");
-                record_error(&state, &id, e);
+                record_error(&state, &id, migration.phase, e);
                 backoff(attempt).await;
                 attempt += 1;
             },
@@ -161,9 +222,9 @@ async fn push_until_done(state: AppState, migration: Migration) {
     }
 }
 
-fn record_error(state: &AppState, id: &str, error: String) {
+fn record_error(state: &AppState, id: &str, phase: MigrationPhase, error: String) {
     let mut runs = state.migrations.lock().unwrap();
-    if let Some(p) = runs.current.as_mut().filter(|p| p.id == id) {
+    if let Some(p) = runs.current.as_mut().filter(|p| p.id == id && p.phase == phase) {
         p.done = false;
         p.error = Some(error);
     }
@@ -186,12 +247,8 @@ fn plan_outgoing(state: &AppState, migration: &Migration)
     let target = migration.target.build();
     let own = state.own_url();
 
-    // Our group, not our process: after a failover the answering node is a replica url.
-    let mine = view.ring.as_ref().unwrap().shards.iter()
-        .find(|s| same_endpoint(&s.node_url, &own)
-            || s.replica_urls.iter().any(|r| same_endpoint(r, &own)))
-        .ok_or("this node is not in the ring")?
-        .node_url.clone();
+    let mine = source_group(view.ring.as_ref().unwrap(), &own)
+        .ok_or("this node is not in the ring")?;
 
     let mut out: HashMap<String, Vec<(String, String)>> = HashMap::new();
     for collection in db.list_collections().map_err(|e| e.to_string())? {
@@ -212,9 +269,50 @@ fn plan_outgoing(state: &AppState, migration: &Migration)
     Ok(out)
 }
 
+fn source_group(ring: &HashRing, own: &str) -> Option<String> {
+    ring.shards.iter()
+        .find(|s| same_endpoint(&s.node_url, own)
+            || s.replica_urls.iter().any(|r| same_endpoint(r, own)))
+        .map(|s| s.node_url.clone())
+}
+
+fn destinations(state: &AppState, migration: &Migration) -> Result<Vec<String>, String> {
+    let view = state.cluster_view();
+    let ring = view.ring.as_ref().ok_or("no ring to move away from")?;
+    let mine = source_group(ring, &state.own_url()).ok_or("this node is not in the ring")?;
+    let mut seen = HashSet::new();
+    Ok(keyspace_movement(&ring.build(), &migration.target.build()).transfers.into_iter()
+        .filter(|transfer| same_endpoint(&transfer.from, &mine))
+        .map(|transfer| transfer.to)
+        .filter(|destination| seen.insert(crate::util::endpoint_of(destination).to_string()))
+        .collect())
+}
+
+async fn reset_destinations(state: &AppState, migration: &Migration) -> Result<(), String> {
+    let source = source_group(
+        state.cluster_view().ring.as_ref().ok_or("no ring to move away from")?,
+        &state.own_url(),
+    ).ok_or("this node is not in the ring")?;
+
+    for destination in destinations(state, migration)? {
+        let reset = MigrateReset {
+            migration_id: migration.id.clone(),
+            phase: migration.phase,
+            source: source.clone(),
+        };
+        let url = format!("{}/internal/migrate-reset", destination);
+        let response = state.client.post(&url).json(&reset).send().await
+            .map_err(|e| format!("{} unreachable: {}", destination, e))?;
+        if !response.status().is_success() {
+            return Err(format!("{} refused final reset: {}", destination, response.status()));
+        }
+    }
+    Ok(())
+}
+
 async fn push_all(
     state: &AppState,
-    id: &str,
+    migration: &Migration,
     outgoing: HashMap<String, Vec<(String, String)>>,
 ) -> Result<(), String> {
     let db = state.db.as_ref().ok_or("no database")?.clone();
@@ -228,7 +326,7 @@ async fn push_all(
 
         for (collection, keys) in by_collection {
             let col = db.get_collection(&collection).map_err(|e| e.to_string())?;
-            for chunk in keys.chunks(PUSH_BATCH) {
+            for chunk in keys.chunks(state.config.data_movement.batch_size) {
                 let mut docs = Vec::with_capacity(chunk.len());
                 for key in chunk {
                     // Read committed state only. An uncommitted write may still be revoked by a
@@ -245,7 +343,8 @@ async fn push_all(
 
                 let sent = docs.len();
                 let batch = MigrateBatch {
-                    migration_id: id.to_string(),
+                    migration_id: migration.id.clone(),
+                    phase: migration.phase,
                     collection: collection.clone(),
                     docs,
                 };
@@ -256,18 +355,31 @@ async fn push_all(
                     return Err(format!("{} refused the batch: {}", destination, response.status()));
                 }
 
-                let mut runs = state.migrations.lock().unwrap();
-                if let Some(p) = runs.current.as_mut().filter(|p| p.id == id) {
-                    p.pushed += sent;
-                    for key in chunk {
-                        let entry = (collection.clone(), key.clone());
-                        if !p.handed_over.contains(&entry) {
-                            p.handed_over.push(entry);
+                {
+                    let mut runs = state.migrations.lock().unwrap();
+                    if let Some(p) = runs.current.as_mut().filter(|p| {
+                        p.id == migration.id && p.phase == migration.phase
+                    }) {
+                        p.pushed += sent;
+                        for key in chunk {
+                            let entry = (collection.clone(), key.clone());
+                            if !p.handed_over.contains(&entry) {
+                                p.handed_over.push(entry);
+                            }
                         }
+                    } else {
+                        return Err("migration was replaced while copying".to_string());
                     }
+                }
+
+                if migration.phase == MigrationPhase::Finalizing
+                    || state.config.data_movement.batch_delay_ms == 0
+                {
+                    tokio::task::yield_now().await;
                 } else {
-                    // The plan changed under us -- aborted, or superseded by a newer one.
-                    return Err("migration was replaced while copying".to_string());
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        state.config.data_movement.batch_delay_ms,
+                    )).await;
                 }
             }
         }
@@ -292,6 +404,58 @@ pub fn progress(state: &AppState) -> Option<MigrationProgress> {
     state.migrations.lock().unwrap().current.clone()
 }
 
-pub fn forget(state: &AppState) {
-    state.migrations.lock().unwrap().current = None;
+pub fn reset_completed(state: &AppState, id: &str, source: &str) -> bool {
+    state.migrations.lock().unwrap().completed_resets
+        .contains(&(id.to_string(), crate::util::endpoint_of(source).to_string()))
+}
+
+pub fn mark_reset_completed(state: &AppState, id: &str, source: &str) {
+    state.migrations.lock().unwrap().completed_resets
+        .insert((id.to_string(), crate::util::endpoint_of(source).to_string()));
+}
+
+pub fn forget(state: &AppState, id: &str) {
+    let mut runs = state.migrations.lock().unwrap();
+    if runs.current.as_ref().is_some_and(|current| current.id == id) {
+        runs.current = None;
+    }
+    runs.completed_resets.retain(|(migration_id, _)| migration_id != id);
+    drop(runs);
+
+    let prefix = format!("migration-reset:{}:", id);
+    state.repair_locks.lock().unwrap().retain(|key, _| !key.starts_with(&prefix));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn movement_batches_are_bounded_and_existing_configs_get_defaults() {
+        let default: DataMovementConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(default.batch_size, 64);
+        assert_eq!(default.batch_delay_ms, 5);
+        assert!(default.validate().is_ok());
+
+        let zero: DataMovementConfig = serde_json::from_str(r#"{"batch_size":0}"#).unwrap();
+        assert!(zero.validate().is_err());
+
+        let oversized: DataMovementConfig =
+            serde_json::from_str(r#"{"batch_size":1025}"#).unwrap();
+        assert!(oversized.validate().is_err());
+    }
+
+    #[test]
+    fn legacy_batches_default_to_the_bulk_copy_phase() {
+        let batch: MigrateBatch = serde_json::from_value(serde_json::json!({
+            "migration_id": "m1", "collection": "t", "docs": [],
+        })).unwrap();
+        assert_eq!(batch.phase, MigrationPhase::Copy);
+
+        let migration: Migration = serde_json::from_value(serde_json::json!({
+            "id": "m1", "started_by": "old-node",
+            "target": {"vnodes": 128, "shards": []},
+        })).unwrap();
+        assert_eq!(migration.phase, MigrationPhase::Copy);
+    }
 }

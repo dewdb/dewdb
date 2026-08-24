@@ -1,7 +1,8 @@
 //! /internal/* endpoints that cluster nodes call on each other.
 
 use crate::cluster::metadata::{Adoption, ClusterMetadata};
-use crate::cluster::migration::MigrateBatch;
+use crate::cluster::metadata::MigrationPhase;
+use crate::cluster::migration::{MigrateBatch, MigrateReset};
 use crate::consensus::{
     decide_vote, heartbeat_poll_task, local_log_tails, LogTail, ReplicationMeta, VoteRequest,
     VoteResponse,
@@ -320,7 +321,7 @@ pub async fn migrate_handler(
             "handover batches go to the destination group's leader".to_string());
     }
     match state.migration() {
-        Some(m) if m.id == batch.migration_id => {},
+        Some(m) if m.id == batch.migration_id && m.phase == batch.phase => {},
         // Refused rather than absorbed: a batch from a plan we do not hold would write keys that
         // nothing in our view says are ours, and nothing would ever clean them up.
         _ => return err_json(StatusCode::CONFLICT, format!(
@@ -329,17 +330,103 @@ pub async fn migrate_handler(
 
     let wc = crate::replication::parse_write_concern(None);
     let wtimeout = std::time::Duration::from_millis(crate::replication::DEFAULT_WTIMEOUT_MS);
-    let mut written = 0usize;
-    for doc in batch.docs {
-        match crate::api::write::local_write(
-            &state, &batch.collection, doc.key, Some(doc.value), wc, wtimeout).await
-        {
-            Ok(_) => written += 1,
-            Err(resp) => return resp,
-        }
+    let written = batch.docs.len();
+    let items = batch.docs.into_iter().map(|doc| (doc.key, doc.value)).collect();
+    if let Err(resp) = crate::api::write::local_write_batch(
+        &state, &batch.collection, items, wc, wtimeout,
+    ).await {
+        return resp;
     }
 
     (StatusCode::OK, Json(serde_json::json!({"status": "received", "written": written}))).into_response()
+}
+
+pub async fn migrate_reset_handler(
+    State(state): State<AppState>,
+    Json(req): Json<MigrateReset>,
+) -> impl axum::response::IntoResponse {
+    if !state.is_shard() || !state.is_leader() {
+        return err_json(StatusCode::CONFLICT,
+            "handover resets go to the destination group's leader".to_string());
+    }
+    let migration = match state.migration() {
+        Some(m) if m.id == req.migration_id
+            && m.phase == req.phase
+            && m.phase == MigrationPhase::Finalizing => m,
+        _ => return err_json(StatusCode::CONFLICT, format!(
+            "migration {} is not finalizing here", req.migration_id)),
+    };
+    let reset_lock = state.migration_reset_lock(&req.migration_id, &req.source);
+    let _reset_guard = reset_lock.lock().await;
+    if crate::cluster::migration::reset_completed(&state, &req.migration_id, &req.source) {
+        return (StatusCode::OK, Json(serde_json::json!({
+            "status": "reset", "removed": 0, "repeated": true,
+        }))).into_response();
+    }
+
+    let view = state.cluster_view();
+    let current = match view.ring {
+        Some(ring) => ring.build(),
+        None => return err_json(StatusCode::CONFLICT, "no source ring is active".to_string()),
+    };
+    let target = migration.target.build();
+    let own = state.own_url();
+    let destination = match migration.target.shards.iter().find(|shard| {
+        crate::util::same_endpoint(&shard.node_url, &own)
+            || shard.replica_urls.iter().any(|url| crate::util::same_endpoint(url, &own))
+    }) {
+        Some(shard) => shard.node_url.clone(),
+        None => return err_json(StatusCode::CONFLICT,
+            "this node is not a destination in the target ring".to_string()),
+    };
+    let valid_transfer = crate::ring::keyspace_movement(&current, &target).transfers
+        .iter().any(|transfer| {
+            crate::util::same_endpoint(&transfer.from, &req.source)
+                && crate::util::same_endpoint(&transfer.to, &destination)
+        });
+    if !valid_transfer {
+        return err_json(StatusCode::CONFLICT,
+            "the requested source has no keyspace moving to this destination".to_string());
+    }
+
+    let db = match state.db.as_ref() {
+        Some(db) => db.clone(),
+        None => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "no database".to_string()),
+    };
+    let mut stale = Vec::new();
+    let collections = match db.list_collections() {
+        Ok(names) => names,
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
+    for collection in collections {
+        let col = match db.get_collection(&collection) {
+            Ok(col) => col,
+            Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        };
+        for key in col.range_from(None, None, None) {
+            let hash = crate::ring::hash_key(&collection, &key);
+            let from_source = current.owner(hash)
+                .is_some_and(|owner| crate::util::same_endpoint(&owner.node_url, &req.source));
+            let to_destination = target.owner(hash)
+                .is_some_and(|owner| crate::util::same_endpoint(&owner.node_url, &destination));
+            if from_source && to_destination {
+                stale.push((collection.clone(), key));
+            }
+        }
+    }
+
+    let wc = crate::replication::parse_write_concern(None);
+    let wtimeout = std::time::Duration::from_millis(crate::replication::DEFAULT_WTIMEOUT_MS);
+    let mut removed = 0usize;
+    for (collection, key) in stale {
+        match crate::api::write::local_write(&state, &collection, key, None, wc, wtimeout).await {
+            Ok(_) => removed += 1,
+            Err(resp) => return resp,
+        }
+    }
+    crate::cluster::migration::mark_reset_completed(&state, &req.migration_id, &req.source);
+
+    (StatusCode::OK, Json(serde_json::json!({"status": "reset", "removed": removed}))).into_response()
 }
 
 pub async fn migration_status_handler(
@@ -387,7 +474,7 @@ pub async fn migrate_cleanup_handler(
             removed += 1;
         }
     }
-    crate::cluster::migration::forget(&state);
+    crate::cluster::migration::forget(&state, &req.migration_id);
 
     info!(target: "migration", id = %req.migration_id, removed, "Cleaned up handed-over keys");
     (StatusCode::OK, Json(serde_json::json!({"status": "cleaned", "removed": removed}))).into_response()

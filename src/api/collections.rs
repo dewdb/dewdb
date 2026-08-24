@@ -1,5 +1,6 @@
 //! Collection administration endpoints.
 
+use crate::cluster::metadata::MigrationPhase;
 use crate::cluster::probe::unique_shards;
 use crate::cluster::router::{router_fanout_drop, router_fanout_maintenance};
 use crate::model::err_json;
@@ -74,6 +75,16 @@ pub async fn drop_collection(
 
     if state.is_shard() && !state.is_leader() {
         return (StatusCode::FORBIDDEN, "Replica nodes reject direct writes").into_response();
+    }
+    let _movement_guard = state.migration_write_gate.read().await;
+    if state.migration().is_some_and(|migration| {
+        migration.phase == MigrationPhase::Finalizing
+    }) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "1")],
+            "collection drops pause during migration finalization",
+        ).into_response();
     }
 
     let term = state.current_term();

@@ -72,6 +72,16 @@ pub struct Migration {
     pub id: String,
     pub target: HashRing,
     pub started_by: String,
+    #[serde(default)]
+    pub phase: MigrationPhase,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationPhase {
+    #[default]
+    Copy,
+    Finalizing,
 }
 
 impl ClusterMetadata {

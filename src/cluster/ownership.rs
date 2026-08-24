@@ -5,7 +5,7 @@
 //! shard refusing keys it does not own is what makes that window harmless: the losing router gets
 //! told where to go instead of writing a second copy.
 
-use crate::cluster::metadata::ClusterMetadata;
+use crate::cluster::metadata::{ClusterMetadata, MigrationPhase};
 use crate::ring::{hash_key, RingShard};
 use crate::util::same_endpoint;
 
@@ -50,9 +50,10 @@ pub fn classify(view: &ClusterMetadata, own_url: &str, collection: &str, key: &s
         return Some(Ownership::Elsewhere(owner));
     }
 
-    // Ownership has not moved yet, but it is about to. Accepting the write would put it on the
-    // losing side of a handover that has already been decided.
-    if let Some(migration) = &view.migration {
+    // The final pass requires a stable source before ownership flips.
+    if let Some(migration) = view.migration.as_ref()
+        .filter(|m| m.phase == MigrationPhase::Finalizing)
+    {
         if let Some(next) = migration.target.build().owner(hash) {
             if !same_endpoint(&next.node_url, &mine.node_url) {
                 return Some(Ownership::Moving { to: next.node_url.clone() });
@@ -88,7 +89,7 @@ mod tests {
             shards: Vec::new(),
             ring: r,
             migration: migration.map(|target| Migration {
-                id: "m1".into(), target, started_by: "op".into(),
+                id: "m1".into(), target, started_by: "op".into(), phase: MigrationPhase::Copy,
             }),
         }
     }
@@ -170,10 +171,14 @@ mod tests {
             })
             .expect("a must keep most of its keys");
 
-        let v = view(Some(two), Some(three));
+        let mut v = view(Some(two), Some(three));
+        assert_eq!(classify(&v, "http://a", "t", &moving), Some(Ownership::Ours),
+            "bulk copying must not freeze foreground writes");
+
+        v.migration.as_mut().unwrap().phase = MigrationPhase::Finalizing;
         assert_eq!(classify(&v, "http://a", "t", &moving),
             Some(Ownership::Moving { to: "http://c".into() }),
-            "a write here would land on the node that is about to stop owning the key");
+            "finalization must freeze writes before the last copy");
         assert_eq!(classify(&v, "http://a", "t", &staying), Some(Ownership::Ours),
             "a migration must not stall writes to keys it does not touch");
     }

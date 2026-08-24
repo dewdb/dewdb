@@ -2,6 +2,7 @@
 
 use crate::auth::AuthConfig;
 use crate::cluster::rebalance::RebalanceConfig;
+use crate::cluster::migration::DataMovementConfig;
 use crate::logging::LoggingConfig;
 use crate::maintenance::MaintenanceConfig;
 use crate::ring::{validate_shard_ring, HashRing, ShardInfo};
@@ -44,6 +45,8 @@ pub struct NodeConfig {
     pub maintenance: MaintenanceConfig,
     #[serde(default)]
     pub rebalance: RebalanceConfig,
+    #[serde(default)]
+    pub data_movement: DataMovementConfig,
     #[serde(default)]
     pub read_cache: ReadCacheConfig,
     #[serde(default)]
@@ -122,6 +125,7 @@ impl NodeConfig {
         }
         self.maintenance.validate()?;
         self.rebalance.validate()?;
+        self.data_movement.validate()?;
         if self.rebalance.enabled && self.role != "shard" {
             return Err("automatic rebalancing may only run on shard nodes".to_string());
         }

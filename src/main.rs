@@ -210,6 +210,7 @@ async fn main() -> io::Result<()> {
         cluster,
         ring_cache: Arc::new(std::sync::Mutex::new(Default::default())),
         migrations: Arc::new(std::sync::Mutex::new(Default::default())),
+        migration_write_gate: Arc::new(tokio::sync::RwLock::new(())),
     };
 
     if config.shard_role.as_deref() == Some("replica") {

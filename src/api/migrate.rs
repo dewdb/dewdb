@@ -7,7 +7,7 @@
 
 use crate::api::members::{publish, writable};
 use crate::api::ring::RingRequest;
-use crate::cluster::metadata::Migration;
+use crate::cluster::metadata::{Migration, MigrationPhase};
 use crate::model::err_json;
 use crate::ring::{keyspace_movement, HashRing, DEFAULT_VNODES};
 use crate::state::AppState;
@@ -53,7 +53,7 @@ pub async fn start_migration_handler(
                 "version": version,
                 "moved_fraction": movement.moved_fraction,
                 "transfers": movement.transfers,
-                "note": "keys being moved are read-only until the handover completes; \
+                "note": "bulk copying in the background; writes pause only during finalization; \
                          watch GET /cluster/migrate",
             }))).into_response(),
         Err(resp) => resp,
@@ -96,6 +96,7 @@ pub(crate) async fn begin_migration(
         id: id.clone(),
         target: target.clone(),
         started_by: state.config.node_id.clone(),
+        phase: MigrationPhase::Copy,
     };
     let next = current.with_migration(&state.config.node_id, Some(migration));
 
@@ -110,7 +111,7 @@ pub(crate) async fn begin_migration(
     };
 
     info!(target: "migration", id = %id, moved = movement.moved_fraction,
-        "Handover started; keys that are moving are read-only until it completes");
+        "Background handover started");
     // Captured now: a shard being removed disappears from the owner list the moment the ring
     // lands, and cleanup would then never reach the one node most likely to be holding copies.
     let sources: Vec<String> = state.cluster_view().shard_owners()
@@ -176,16 +177,16 @@ fn coordinate(state: AppState, id: String, target: HashRing, sources: Vec<String
         loop {
             tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
 
-            match state.migration() {
-                Some(m) if m.id == id => {},
+            let migration = match state.migration() {
+                Some(m) if m.id == id => m,
                 // Abandoned, or replaced by something newer. Either way this is not ours to finish.
                 _ => {
                     info!(target: "migration", id = %id, "Handover no longer in the view; stopping");
                     return;
                 },
-            }
+            };
 
-            match sources_finished(&state, &id).await {
+            match sources_finished(&state, &id, migration.phase, &sources).await {
                 Ok(false) => continue,
                 Err(why) => {
                     // Keep waiting rather than abandon: a source that is briefly unreachable is
@@ -194,6 +195,23 @@ fn coordinate(state: AppState, id: String, target: HashRing, sources: Vec<String
                     continue;
                 },
                 Ok(true) => {},
+            }
+
+            if migration.phase == MigrationPhase::Copy {
+                let mut finalizing = migration;
+                finalizing.phase = MigrationPhase::Finalizing;
+                let next = state.cluster_view()
+                    .with_migration(&state.config.node_id, Some(finalizing));
+                match publish(&state, next).await {
+                    Ok(version) => {
+                        info!(target: "migration", id = %id, version,
+                            "Bulk copy complete; finalizing handover");
+                        tell_everyone(&state, Some(&target));
+                    },
+                    Err(_) => warn!(target: "migration", id = %id,
+                        "Could not publish finalization phase; the bulk copy remains active"),
+                }
+                continue;
             }
 
             let next = state.cluster_view().with_ring(&state.config.node_id, target.clone());
@@ -223,15 +241,21 @@ pub(crate) fn resume_migration_coordination(state: &AppState) {
 }
 
 /// Every source, including this node. A source that cannot be asked is not finished.
-async fn sources_finished(state: &AppState, id: &str) -> Result<bool, String> {
+async fn sources_finished(
+    state: &AppState,
+    id: &str,
+    phase: MigrationPhase,
+    sources: &[String],
+) -> Result<bool, String> {
     let own = state.own_url();
-    if let Some(p) = crate::cluster::migration::progress(state) {
-        if p.id == id && !p.done {
+    if sources.iter().any(|source| crate::util::same_endpoint(source, &own)) {
+        let local = crate::cluster::migration::progress(state);
+        if !local.is_some_and(|p| p.id == id && p.phase == phase && p.done) {
             return Ok(false);
         }
     }
 
-    for (owner, _) in state.cluster_view().shard_owners() {
+    for owner in sources {
         if crate::util::same_endpoint(&owner, &own) {
             continue;
         }
@@ -241,10 +265,16 @@ async fn sources_finished(state: &AppState, id: &str) -> Result<bool, String> {
             .json::<serde_json::Value>().await
             .map_err(|e| format!("{}: {}", owner, e))?;
 
-        match body.get("progress").and_then(|p| p.get("done")).and_then(|d| d.as_bool()) {
-            Some(true) => {},
-            // No progress at all means the node has not started, which is not the same as finished.
-            _ => return Ok(false),
+        let progress = body.get("progress");
+        let matches = progress.and_then(|p| p.get("id")).and_then(|v| v.as_str()) == Some(id)
+            && progress.and_then(|p| p.get("phase")).and_then(|v| v.as_str())
+                == Some(match phase {
+                    MigrationPhase::Copy => "copy",
+                    MigrationPhase::Finalizing => "finalizing",
+                })
+            && progress.and_then(|p| p.get("done")).and_then(|v| v.as_bool()) == Some(true);
+        if !matches {
+            return Ok(false);
         }
     }
     Ok(true)
@@ -296,6 +326,7 @@ pub async fn migration_status(
         "migration": plan.map(|m| serde_json::json!({
             "id": m.id,
             "started_by": m.started_by,
+            "phase": m.phase,
             "target": m.target.shards.iter().map(|s| &s.node_url).collect::<Vec<_>>(),
         })),
         "local_progress": crate::cluster::migration::progress(&state),
@@ -333,6 +364,8 @@ pub async fn abort_migration_handler(
 
 #[cfg(test)]
 mod tests {
+    use crate::cluster::metadata::{Adoption, Migration, MigrationPhase};
+    use crate::cluster::migration::{MigrateBatch, MigrateDoc, MigrateReset};
     use crate::ring::{hash_key, HashRing, RingShard};
     use crate::test_support::{next_test_port, temp_root, wait_for, TestNode};
     use axum::http::StatusCode;
@@ -364,9 +397,19 @@ mod tests {
         /// Three independent single-node shards, which is what a sharded deployment is: each is
         /// the leader of its own group, and the ring is what ties them together.
         async fn start(root: &std::path::Path) -> Self {
+            Self::start_with_movement(root, 64, 5).await
+        }
+
+        async fn start_with_movement(
+            root: &std::path::Path,
+            batch_size: usize,
+            batch_delay_ms: u64,
+        ) -> Self {
             let mut nodes: Vec<TestNode> = ["a", "b", "c"].iter()
                 .map(|id| {
                     let mut n = TestNode::new(id, next_test_port(), root, "primary");
+                    n.data_movement_batch_size = batch_size;
+                    n.data_movement_batch_delay_ms = batch_delay_ms;
                     n.start();
                     n
                 })
@@ -472,6 +515,132 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn finalization_carries_updates_and_deletes_written_during_bulk_copy() {
+        let root = temp_root();
+        let cl = Cluster::start_with_movement(&root, 1, 25).await;
+        let (a, b, c) = (cl.a.url(), cl.b.url(), cl.c.url());
+        let two: Vec<&str> = vec![&a, &b];
+        let three: Vec<&str> = vec![&a, &b, &c];
+
+        assert_eq!(cl.post(format!("{}/cluster/ring", a), ring_body(&two)).await.0,
+            StatusCode::OK);
+        for node in [&b, &c] {
+            cl.post(format!("{}/internal/cluster", node),
+                serde_json::to_value(cl.a.state.as_ref().unwrap().cluster_view()).unwrap()).await;
+        }
+
+        let keys: Vec<String> = (0..120).map(|i| format!("k{:03}", i)).collect();
+        for key in &keys {
+            assert_eq!(cl.put(&owner_of(&two, key), key, 1).await, StatusCode::CREATED);
+        }
+
+        let mut from_a: Vec<String> = keys.iter()
+            .filter(|key| owner_of(&two, key) == a && owner_of(&three, key) == c)
+            .cloned().collect();
+        let mut from_b: Vec<String> = keys.iter()
+            .filter(|key| owner_of(&two, key) == b && owner_of(&three, key) == c)
+            .cloned().collect();
+        from_a.sort();
+        from_b.sort();
+        let (source, moving, source_state) = if from_a.len() >= from_b.len() {
+            (&a, from_a, cl.a.state.as_ref().unwrap())
+        } else {
+            (&b, from_b, cl.b.state.as_ref().unwrap())
+        };
+        assert!(moving.len() >= 2, "the test ring must move at least two keys from one source");
+
+        assert_eq!(cl.post(format!("{}/cluster/migrate", a), ring_body(&three)).await.0,
+            StatusCode::ACCEPTED);
+        assert!(wait_for(Duration::from_secs(10), || {
+            crate::cluster::migration::progress(source_state).is_some_and(|progress| {
+                progress.phase == MigrationPhase::Copy && progress.pushed > 0 && !progress.done
+            })
+        }).await, "the bulk copy completed before the test could write concurrently");
+
+        assert_eq!(cl.put(source, &moving[1], 99).await, StatusCode::OK);
+        let deleted = cl.client.delete(&format!("{}/collections/t/docs/{}", source, moving[0]))
+            .send().await.unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK);
+
+        assert!(wait_for(Duration::from_secs(30), || {
+            cl.c.state.as_ref().unwrap().cluster_view().ring
+                .is_some_and(|ring| ring.shards.len() == 3)
+                && cl.c.state.as_ref().unwrap().migration().is_none()
+        }).await, "the handover never completed");
+
+        let updated = cl.client.get(&format!("{}/collections/t/docs/{}", c, moving[1]))
+            .send().await.unwrap();
+        assert_eq!(updated.status(), StatusCode::OK);
+        assert_eq!(updated.json::<serde_json::Value>().await.unwrap()["v"], 99);
+
+        let deleted = cl.client.get(&format!("{}/collections/t/docs/{}", c, moving[0]))
+            .send().await.unwrap();
+        assert_eq!(deleted.status(), StatusCode::NOT_FOUND,
+            "a value deleted after the bulk copy must not reappear at cutover");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replayed_final_reset_cannot_erase_the_completed_copy() {
+        let root = temp_root();
+        let mut node = TestNode::new("c", next_test_port(), &root, "primary");
+        node.start();
+        let c = node.url();
+        let source = "http://source-a";
+        let other = "http://source-b";
+        let current = HashRing { vnodes: 128, shards: shards(&[source, other]) };
+        let target = HashRing { vnodes: 128, shards: shards(&[source, other, &c]) };
+        let key = (0..10_000).map(|i| format!("k{}", i)).find(|key| {
+            let hash = hash_key("t", key);
+            current.build().owner(hash).unwrap().node_url == source
+                && target.build().owner(hash).unwrap().node_url == c
+        }).unwrap();
+
+        let state = node.state.as_ref().unwrap();
+        let mut view = state.cluster_view();
+        view.version += 1;
+        view.seeded = false;
+        view.updated_by = "operator".into();
+        view.ring = Some(current);
+        view.migration = Some(Migration {
+            id: "m1".into(), target, started_by: "operator".into(),
+            phase: MigrationPhase::Finalizing,
+        });
+        assert!(matches!(state.adopt_cluster(view), Adoption::Adopted { .. }));
+
+        let client = reqwest::Client::new();
+        let drop_during_cutover = client.delete(format!("{}/collections/t", c))
+            .send().await.unwrap();
+        assert_eq!(drop_during_cutover.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let reset = MigrateReset {
+            migration_id: "m1".into(), phase: MigrationPhase::Finalizing,
+            source: source.into(),
+        };
+        assert_eq!(client.post(format!("{}/internal/migrate-reset", c)).json(&reset)
+            .send().await.unwrap().status(), StatusCode::OK);
+
+        let batch = MigrateBatch {
+            migration_id: "m1".into(), phase: MigrationPhase::Finalizing,
+            collection: "t".into(),
+            docs: vec![MigrateDoc { key: key.clone(), value: serde_json::json!({"v": 7}) }],
+        };
+        assert_eq!(client.post(format!("{}/internal/migrate", c)).json(&batch)
+            .send().await.unwrap().status(), StatusCode::OK);
+
+        let replay = client.post(format!("{}/internal/migrate-reset", c)).json(&reset)
+            .send().await.unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(replay.json::<serde_json::Value>().await.unwrap()["repeated"], true);
+        assert_eq!(state.db.as_ref().unwrap().get_collection("t").unwrap().get(&key).unwrap(),
+            Some(serde_json::json!({"v": 7})));
+
+        node.kill();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Shrinking is where the tidy-up is easy to get wrong: the departing shard leaves the owner
     /// list the moment the ring lands, so anything driven off the new owners misses it entirely.
     /// Its copies are unreachable while it stays out, but adding it back would resurrect them.
@@ -549,20 +718,20 @@ mod tests {
         assert_eq!(r.status(), StatusCode::OK);
         assert!(cl.a.state.as_ref().unwrap().migration().is_none());
 
-        // Everything is still where it was, and writable again.
+        // Ownership and data stay at the source after an abort.
         for key in &keys {
             let owner = owner_of(&two, key);
             assert_eq!(cl.holder(key).await.as_deref(), Some(owner.as_str()),
                 "abandoning a handover must not move data");
             assert_eq!(cl.put(&owner, key, 2).await, StatusCode::OK,
-                "the freeze must lift when the plan is abandoned");
+                "the source must remain writable after an abort");
         }
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn keys_being_handed_over_are_read_only_and_the_rest_are_not() {
+    async fn bulk_copy_keeps_moving_keys_writable() {
         let root = temp_root();
         let cl = Cluster::start(&root).await;
         let (a, b) = (cl.a.url(), cl.b.url());
@@ -574,7 +743,7 @@ mod tests {
             assert_eq!(cl.put(&owner_of(&two, key), key, 1).await, StatusCode::CREATED);
         }
 
-        // Stall the handover on an unreachable third shard so the frozen state can be observed.
+        // An unreachable destination keeps the migration in its bulk-copy phase.
         let dead = "http://127.0.0.1:9";
         let stalled: Vec<&str> = vec![&a, &b, dead];
         assert_eq!(cl.post(format!("{}/cluster/migrate", a), ring_body(&stalled)).await.0,
@@ -588,12 +757,10 @@ mod tests {
             .find(|k| owner_of(&two, k) == a && owner_of(&stalled, k) == a)
             .expect("a must keep most of its keys");
 
-        let frozen = cl.client.put(&format!("{}/collections/t/docs/{}", a, moving))
+        let moving_write = cl.client.put(&format!("{}/collections/t/docs/{}", a, moving))
             .json(&serde_json::json!({"value": {"v": 2}})).send().await.unwrap();
-        assert_eq!(frozen.status(), StatusCode::SERVICE_UNAVAILABLE,
-            "a key mid-handover must not accept writes at the node that is losing it");
-        assert_eq!(frozen.headers().get("retry-after").map(|v| v.to_str().unwrap()), Some("1"),
-            "the client is being asked to wait, not told it failed");
+        assert_eq!(moving_write.status(), StatusCode::OK,
+            "the bulk copy must not make moving keys read-only");
 
         assert_eq!(cl.put(&a, staying, 2).await, StatusCode::OK,
             "a handover must not freeze keys it does not touch");

@@ -20,9 +20,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 
-/// Refuses a key this node must not hold. `Elsewhere` names the owner so a router on a stale view
-/// can retry rather than write a second copy; `Moving` is a wait, not an error, because the key is
-/// mid-handover and will be writable at its new owner shortly.
+/// Redirects stale owners and retries writes paused by migration finalization.
 fn wrong_owner(state: &AppState, collection: &str, key: &str) -> Option<axum::response::Response> {
     match state.ownership(collection, key)? {
         Ownership::Ours => None,
@@ -77,6 +75,8 @@ pub async fn create_doc(
         };
     }
 
+    let _movement_guard = state.migration_write_gate.read().await;
+
     // The id is ours to choose, so choose one this shard owns rather than refuse the write.
     let id = match own_id(&state, &col_name, id) {
         Some(id) => id,
@@ -117,6 +117,8 @@ pub async fn put_doc(
             Err(resp) => resp,
         };
     }
+
+    let _movement_guard = state.migration_write_gate.read().await;
 
     if let Some(refusal) = wrong_owner(&state, &col_name, &id) {
         return refusal;
@@ -161,6 +163,8 @@ pub async fn bulk_create_docs(
     if state.config.role == "router" {
         return bulk_router_forward(&state, &col_name, payload, &wc_query).await;
     }
+
+    let _movement_guard = state.migration_write_gate.read().await;
 
     let wc = parse_write_concern(wcp.w.as_deref());
     let wtimeout = Duration::from_millis(wcp.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
@@ -257,6 +261,8 @@ pub async fn update_doc(
         };
     }
 
+    let _movement_guard = state.migration_write_gate.read().await;
+
     if let Some(refusal) = wrong_owner(&state, &col_name, &id) {
         return refusal;
     }
@@ -294,6 +300,8 @@ pub async fn delete_doc(
             Err(resp) => resp,
         };
     }
+
+    let _movement_guard = state.migration_write_gate.read().await;
 
     if let Some(refusal) = wrong_owner(&state, &col_name, &id) {
         return refusal;

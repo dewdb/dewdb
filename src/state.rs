@@ -72,6 +72,7 @@ pub struct AppState {
     /// Progress of a handover this node is driving. Runtime only: a half-copied shard is this
     /// node's business, not a fact the cluster needs to agree on.
     pub migrations: Arc<std::sync::Mutex<MigrationRuns>>,
+    pub migration_write_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 #[derive(Default)]
@@ -84,6 +85,14 @@ impl AppState {
     /// Serializes incoming replication with snapshot installation for one collection.
     pub fn snapshot_install_lock(&self, collection: &str) -> Arc<tokio::sync::Mutex<()>> {
         let key = format!("snapshot-install:{}", collection);
+        let mut locks = self.repair_locks.lock().unwrap();
+        locks.entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    pub fn migration_reset_lock(&self, id: &str, source: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let key = format!("migration-reset:{}:{}", id, crate::util::endpoint_of(source));
         let mut locks = self.repair_locks.lock().unwrap();
         locks.entry(key)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -278,6 +287,7 @@ impl AppState {
             cluster: Arc::new(RwLock::new(cluster)),
             ring_cache: Arc::new(std::sync::Mutex::new(RingCache::default())),
             migrations: Arc::new(std::sync::Mutex::new(MigrationRuns::default())),
+            migration_write_gate: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
@@ -320,6 +330,7 @@ impl AppState {
             cluster: Arc::new(RwLock::new(cluster)),
             ring_cache: Arc::new(std::sync::Mutex::new(RingCache::default())),
             migrations: Arc::new(std::sync::Mutex::new(MigrationRuns::default())),
+            migration_write_gate: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 

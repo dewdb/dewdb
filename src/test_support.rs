@@ -88,6 +88,8 @@ pub struct TestNode {
     /// "voter" or "learner". A learner never campaigns, whatever the timeout.
     pub membership_mode: String,
     pub allow_unsafe_ring_changes: bool,
+    pub data_movement_batch_size: usize,
+    pub data_movement_batch_delay_ms: u64,
     pub state: Option<AppState>,
     pub stop: Option<Arc<tokio::sync::Notify>>,
     pub thread: Option<std::thread::JoinHandle<()>>,
@@ -128,6 +130,10 @@ fn node_config(n: &TestNode) -> NodeConfig {
         "heartbeat_timeout_secs": n.heartbeat_timeout_secs,
         "election_delay_ms": 200,
         "maintenance": { "enabled": false },
+        "data_movement": {
+            "batch_size": n.data_movement_batch_size,
+            "batch_delay_ms": n.data_movement_batch_delay_ms,
+        },
     });
     serde_json::from_value(json).unwrap()
 }
@@ -147,6 +153,8 @@ impl TestNode {
             heartbeat_timeout_secs: 1,
             membership_mode: "voter".to_string(),
             allow_unsafe_ring_changes: false,
+            data_movement_batch_size: 64,
+            data_movement_batch_delay_ms: 5,
             state: None,
             stop: None,
             thread: None,
@@ -230,6 +238,7 @@ impl TestNode {
                             }))),
                     ring_cache: Arc::new(std::sync::Mutex::new(Default::default())),
                     migrations: Arc::new(std::sync::Mutex::new(Default::default())),
+                    migration_write_gate: Arc::new(tokio::sync::RwLock::new(())),
                 };
 
                 let app = build_app(&state);
