@@ -54,7 +54,7 @@ pub fn replicate_to_peers(
             let frame = frame.clone();
             let state = state.clone();
             handles.push(tokio::spawn(async move {
-                if stream_backlog_if_behind(&state, &replica_url, &col, prev_lsn).await.is_some() {
+                if stream_backlog_if_behind(&state, &replica_url, &col, prev_lsn, lsn).await.is_some() {
                     return;
                 }
 
@@ -96,7 +96,7 @@ pub fn replicate_to_peers(
                                 state.metrics.note_gap();
                                 warn!(target: "replication", "Replica {} gap at lsn {} (its last_lsn={}), starting repair", replica_url, lsn, last_lsn);
                                 state.rewind_replica(&replica_url, &col, last_lsn);
-                                let _ = repair_replica(state, replica_url.clone(), col, last_lsn, Some(last_term)).await;
+                                let _ = repair_replica(state, replica_url.clone(), col, last_lsn, Some(last_term), 0).await;
                             }
                         }
                     },
@@ -183,7 +183,7 @@ pub fn replication_drive_task(state: AppState) {
                 let state = state.clone();
                 async move {
                     let before = state.sent_through(&replica, &name).unwrap_or(cursor);
-                    let _ = repair_replica(state.clone(), replica.clone(), name.clone(), cursor, None).await;
+                    let _ = repair_replica(state.clone(), replica.clone(), name.clone(), cursor, None, 0).await;
                     // Judged on whether the cursor moved, not on the return value: a repair that
                     // coalesced behind another worker reports false without anything being wrong.
                     let moved = state.sent_through(&replica, &name).unwrap_or(before) > before;
@@ -256,12 +256,15 @@ const REPAIR_PASSES: usize = 8;
 /// `reported_last_term` is `Some` only when the replica told us its tail term, and then the chain is
 /// validated against it so a divergent tail is caught here. `None` means we are driving from our own
 /// cursor, where the predecessor term comes from our own next frame's header.
+///
+/// Returns whether the replica reached `needed_lsn` — its ack for that frame; 0 when discarded.
 async fn repair_replica(
     state: AppState,
     replica_url: String,
     collection: String,
     reported_last_lsn: u64,
     reported_last_term: Option<u64>,
+    needed_lsn: u64,
 ) -> bool {
     let lock = {
         let mut locks = state.repair_locks.lock().unwrap();
@@ -284,11 +287,13 @@ async fn repair_replica(
                 // Past the first pass we are chaining within our own log.
                 after_term = None;
             },
-            Some(_) => return true,
+            Some(_) => break,
             None => return false,
         }
     }
-    true
+    // Running out of passes is not evidence of anything: a replica still short of the frame being
+    // acked must not count toward its write concern.
+    after >= needed_lsn
 }
 
 /// One pass: read what the replica is missing, verify it chains, ship it in batches.
@@ -441,10 +446,12 @@ async fn stream_backlog_if_behind(
     replica_url: &str,
     collection: &str,
     prev_lsn: u64,
+    needed_lsn: u64,
 ) -> Option<bool> {
     match state.sent_through(replica_url, collection) {
         Some(cursor) if cursor < prev_lsn => Some(
-            repair_replica(state.clone(), replica_url.to_string(), collection.to_string(), cursor, None).await,
+            repair_replica(state.clone(), replica_url.to_string(), collection.to_string(), cursor,
+                None, needed_lsn).await,
         ),
         _ => None,
     }
@@ -460,7 +467,7 @@ async fn replicate_one_await(
     lsn: u64,
     prev_lsn: u64,
 ) -> bool {
-    if let Some(caught_up) = stream_backlog_if_behind(state, replica_url, collection, prev_lsn).await {
+    if let Some(caught_up) = stream_backlog_if_behind(state, replica_url, collection, prev_lsn, lsn).await {
         return caught_up;
     }
 
@@ -498,7 +505,8 @@ async fn replicate_one_await(
                 ConflictKind::Gap(last_lsn, last_term) => {
                     state.metrics.note_gap();
                     state.rewind_replica(replica_url, collection, last_lsn);
-                    repair_replica(state.clone(), replica_url.to_string(), collection.to_string(), last_lsn, Some(last_term)).await
+                    repair_replica(state.clone(), replica_url.to_string(), collection.to_string(), last_lsn,
+                        Some(last_term), lsn).await
                 }
             }
         },
@@ -568,11 +576,60 @@ mod tests {
     use super::*;
     use crate::storage::{Database, ReplicaApply};
     use crate::test_support::{
-        idx, make_frame, put_doc_at, put_doc_http, read_doc_http, temp_root, three_node_cluster,
-        wait_for_doc,
+        idx, make_frame, next_test_port, put_doc_at, put_doc_http, read_doc_http, temp_root,
+        three_node_cluster, wait_for_doc, TestNode,
     };
     use std::fs;
+    use std::sync::atomic::AtomicUsize;
 
+    // A peer that applies the head of a batch and reports only that: the case the batch loop's
+    // early break exists for.
+    async fn head_only_apply(
+        axum::extract::State(hits): axum::extract::State<Arc<AtomicUsize>>,
+        axum::Json(req): axum::Json<ReplicateRequest>,
+    ) -> axum::Json<serde_json::Value> {
+        hits.fetch_add(1, Ordering::SeqCst);
+        axum::Json(serde_json::json!({"status": "applied", "lsn": req.lsn}))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_replica_that_never_catches_up_is_not_acked() {
+        let root = temp_root();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let stub_port = next_test_port();
+        let stub = format!("http://127.0.0.1:{}", stub_port);
+
+        let app = axum::Router::new()
+            .route("/internal/replicate", axum::routing::post(head_only_apply))
+            .with_state(hits.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", stub_port)).await.unwrap();
+        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+
+        // Left out of the config on purpose: nothing ships here on its own, so the repair below is
+        // the only traffic and the repair lock is uncontended.
+        let mut leader = TestNode::new("solo", next_test_port(), &root, "primary");
+        leader.start();
+        let state = leader.state.clone().unwrap();
+        let client = reqwest::Client::new();
+        for i in 1..=20 {
+            assert!(put_doc_http(&client, &leader.url(), &format!("k{}", i), i).await.is_success());
+        }
+        let tail = state.db.as_ref().unwrap().get_collection("t").unwrap().last_appended_lsn();
+        assert_eq!(tail, 20);
+
+        let acked = repair_replica(state.clone(), stub, "t".to_string(), 0, None, tail).await;
+        let passes = hits.load(Ordering::SeqCst);
+
+        assert_eq!(passes, REPAIR_PASSES,
+            "the repair should have spent every pass advancing one frame at a time");
+        assert!(!acked,
+            "the replica stopped at lsn {} of {}, but exhausting the passes reported it caught up \
+             and that boolean is the ack this frame counts toward w=majority with",
+            passes, tail);
+
+        leader.kill();
+        let _ = fs::remove_dir_all(&root);
+    }
     #[tokio::test]
     async fn backfill_reads_and_applies_missing_frames() {
         let proot = temp_root();

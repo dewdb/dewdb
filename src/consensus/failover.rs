@@ -54,7 +54,13 @@ async fn discover_leader(state: &AppState) -> Option<String> {
         }
     })).await;
 
-    probes.into_iter().flatten().max_by_key(|(term, _)| *term).map(|(_, url)| url)
+    // A leader behind our own term has already been superseded; following it parks this node on
+    // a watermark it must not apply and holds off the election that would resolve the split.
+    let our_term = state.current_term();
+    probes.into_iter().flatten()
+        .filter(|(term, _)| *term >= our_term)
+        .max_by_key(|(term, _)| *term)
+        .map(|(_, url)| url)
 }
 
 async fn maybe_follow_new_leader(state: &AppState, current_primary: &str) {
@@ -272,12 +278,11 @@ pub fn heartbeat_poll_task(state: AppState) {
                                 .unwrap_or_default();
 
                             let mut adopted = None;
-                            // A watermark is only as good as the term behind it, and a node that
-                            // has been deposed still answers here with the one it last held.
+                            // An answer counts as leader contact only from a node still leading at
+                            // a term we accept: a deposed one keeps answering with the term it held.
                             let trusted;
                             {
                                 let mut repl = state.replication.as_ref().unwrap().write().unwrap();
-                                repl.last_heartbeat = Some(std::time::Instant::now());
                                 if their_term > repl.term {
                                     repl.term = their_term;
                                     repl.voted_for = None;
@@ -285,6 +290,7 @@ pub fn heartbeat_poll_task(state: AppState) {
                                 }
                                 trusted = leading && their_term >= repl.term;
                                 if trusted {
+                                    repl.last_heartbeat = Some(std::time::Instant::now());
                                     if let Some(idx) = hb.get("commit_index").and_then(|v| v.as_u64()) {
                                         repl.last_known_primary_position = Some(idx);
                                     }
@@ -364,8 +370,8 @@ mod tests {
     use super::*;
     use crate::cluster::metadata::ClusterMetadata;
     use crate::test_support::{
-        leaders, node_by_id, put_doc_at, put_doc_http, read_doc_http, settle_leader, temp_root,
-        three_node_cluster, wait_for, wait_for_doc, TestNode,
+        leaders, next_test_port, node_by_id, put_doc_at, put_doc_http, read_doc_http,
+        settle_leader, temp_root, three_node_cluster, wait_for, wait_for_doc, TestNode,
     };
     use axum::http::StatusCode;
 
@@ -763,6 +769,86 @@ mod tests {
             "the most recent of the two signals wins");
     }
 
+    fn primary_of(node: &TestNode) -> Option<String> {
+        node.state.as_ref().unwrap().replication.as_ref().unwrap()
+            .read().unwrap().primary_addr.clone()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_follower_pointed_at_a_replica_stands_for_nothing_and_repoints() {
+        let root = temp_root();
+        let (p1, p2, p3) = (next_test_port(), next_test_port(), next_test_port());
+        let (u1, u2, u3) = (
+            format!("http://127.0.0.1:{}", p1),
+            format!("http://127.0.0.1:{}", p2),
+            format!("http://127.0.0.1:{}", p3),
+        );
+
+        let mut n1 = TestNode::new("n1", p1, &root, "primary");
+        n1.peers = vec![u2.clone(), u3.clone()];
+        n1.replicas = vec![u2.clone(), u3.clone()];
+        let mut n2 = TestNode::new("n2", p2, &root, "replica");
+        n2.peers = vec![u1.clone(), u3.clone()];
+        n2.primary_addr = Some(u1.clone());
+        // Misdirected on purpose: n2 answers every heartbeat, and answers as a replica.
+        let mut n3 = TestNode::new("n3", p3, &root, "replica");
+        n3.peers = vec![u1.clone(), u2.clone()];
+        n3.primary_addr = Some(u2.clone());
+
+        n1.start();
+        n2.start();
+        n3.start();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(leaders(&[&n1, &n2, &n3]), vec!["n1".to_string()]);
+        assert_eq!(primary_of(&n3).as_deref(), Some(u2.as_str()));
+
+        assert!(wait_for(Duration::from_secs(15), || primary_of(&n3).as_deref() == Some(u1.as_str())).await,
+            "n3 still follows {:?}; a 200 from a node that is not leading must not pass for \
+             leader contact, or the timeout that sends it looking never fires",
+            primary_of(&n3));
+
+        assert_eq!(leaders(&[&n1, &n2, &n3]), vec!["n1".to_string()],
+            "finding the real leader is the resolution; campaigning against a healthy one is not");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_follower_ahead_on_term_stops_counting_the_old_leader_as_contact() {
+        let root = temp_root();
+        let (n1, n2, n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().unwrap();
+
+        assert_eq!(leaders(&[&n1, &n2, &n3]), vec!["n1".to_string()]);
+        assert_eq!(put_doc_http(&client, &n1.url(), "k1", 1).await, StatusCode::CREATED);
+        assert!(wait_for_doc(&client, &n3.url(), "t", "k1", 1, Duration::from_secs(10)).await);
+
+        // A candidate that raises n3's term and then goes away. n3 is left above the leader's
+        // term with nothing new to follow, which is the state the leader cannot tell it about.
+        let leader_term = n1.term();
+        let ahead = leader_term + 5;
+        let vote = client.post(&format!("{}/internal/vote", n3.url()))
+            .json(&serde_json::json!({
+                "term": ahead, "candidate_id": "ghost", "last_lsn": 0, "last_term": 0,
+            }))
+            .send().await.unwrap()
+            .json::<serde_json::Value>().await.unwrap();
+        assert_eq!(vote["vote_granted"], false, "a candidate with an empty log must not win");
+        assert!(n3.term() >= ahead, "a denied vote still raises the term");
+        assert_eq!(n1.term(), leader_term, "the leader was never told");
+
+        assert!(wait_for(Duration::from_secs(25), || !n1.is_leader()).await,
+            "n1 leads on at term {} while n3 sits at {}: n3 keeps taking n1's heartbeats as \
+             contact even though it refuses everything else n1 says, so it never campaigns",
+            n1.term(), n3.term());
+
+        let winner = settle_leader(&[&n1, &n2, &n3], Duration::from_secs(25)).await
+            .expect("the cluster must settle on a leader again");
+        assert!(node_by_id(&[&n1, &n2, &n3], &winner).term() > ahead,
+            "the new term must clear the one n3 was stranded at");
+
+        let _ = fs::remove_dir_all(&root);
+    }
     #[test]
     fn a_node_that_never_heard_from_anyone_still_elects() {
         let timeout = Duration::from_secs(3);

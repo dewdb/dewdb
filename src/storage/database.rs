@@ -46,14 +46,32 @@ impl Database {
         if boot_lsn > 0 {
             info!(target: "db", "Restored durable LSN {} from lsn.meta", boot_lsn);
         }
-        Ok(Self {
+        let db = Self {
             root_path,
             cache,
             collections: RwLock::new(HashMap::new()),
             durable_lsn: Arc::new(AtomicU64::new(boot_lsn)),
             next_lsn: Arc::new(AtomicU64::new(boot_lsn)),
             last_log_term: Arc::new(AtomicU64::new(0)),
-        })
+        };
+        db.adopt_collection_tails()?;
+        Ok(db)
+    }
+
+    /// `lsn.meta` records only the committed prefix, so every collection is opened before the first
+    /// LSN is handed out: an unopened tail above that watermark would be allocated a second time.
+    fn adopt_collection_tails(&self) -> io::Result<()> {
+        let names = self.list_collections()?;
+        for name in &names {
+            self.get_collection(name)?;
+        }
+        if !names.is_empty() {
+            info!(target: "db", collections = names.len(),
+                next_lsn = self.next_lsn.load(Ordering::SeqCst),
+                last_log_term = self.last_log_term.load(Ordering::SeqCst),
+                "Adopted collection tails at boot");
+        }
+        Ok(())
     }
 
     pub fn get_collection(&self, name: &str) -> io::Result<Arc<Collection>> {
@@ -308,6 +326,47 @@ mod tests {
     use super::*;
     use crate::test_support::{idx, live_put, temp_root};
 
+    #[tokio::test]
+    async fn a_restart_does_not_reissue_lsns_an_unopened_collection_holds() {
+        let root = temp_root();
+        let tail_of_a;
+
+        {
+            let db = Database::new(&root).unwrap();
+            let a = db.get_collection("a").unwrap();
+            let b = db.get_collection("b").unwrap();
+            live_put(&b, "seed", 0);
+            b.enqueue_commit().await.unwrap().unwrap();
+
+            // Never committed, so lsn.meta stops at b's write and a's tail sits above it. That is
+            // the ordinary state of a log, not a corner case.
+            for i in 0..5 {
+                live_put(&a, &format!("k{}", i), i);
+            }
+            tail_of_a = a.last_appended_lsn();
+            assert_eq!(tail_of_a, 6);
+            assert_eq!(LsnMeta::load(&root).map(|m| m.commit_lsn), Some(1),
+                "the persisted watermark must be behind a's tail or the test proves nothing");
+        }
+
+        let db = Database::new(&root).unwrap();
+        assert_eq!(db.next_lsn.load(Ordering::SeqCst), tail_of_a,
+            "boot must adopt every collection's tail, not just the committed watermark");
+        assert_eq!(db.last_log_term.load(Ordering::SeqCst), 1,
+            "the term of the highest LSN must come back with it; run_election and vote_handler \
+             read it directly and a 0 makes this node look like it holds no log at all");
+
+        // b, the collection that was written last time and is opened first here.
+        let b = db.get_collection("b").unwrap();
+        let (_, _, _, lsn) = b.put("x".to_string(), serde_json::json!({"v": 1}), 1).unwrap();
+
+        assert!(lsn > tail_of_a,
+            "lsn {} was handed to collection b while collection a already holds it: two frames \
+             share an LSN, and the chain, the commit index and every cursor keyed on it disagree",
+            lsn);
+
+        let _ = fs::remove_dir_all(&root);
+    }
     #[tokio::test]
     async fn lsn_is_monotonic_across_restarts() {
         let root = temp_root();

@@ -278,6 +278,15 @@ impl Collection {
         rx
     }
 
+    /// Returns the tail the fsync covers. Sampled under the append lock: a frame landing after the
+    /// sync is page cache only, and counting it durable is what lets a crash lose a committed write.
+    fn sync_wal(&self) -> io::Result<u64> {
+        let wal = self.wal_writer.lock().unwrap();
+        let synced_through = wal.last_appended_lsn;
+        wal.current_wal.sync_data()?;
+        Ok(synced_through)
+    }
+
     pub fn start_commit_task(col: Arc<Collection>) {
         tokio::spawn(async move {
             loop {
@@ -308,16 +317,20 @@ impl Collection {
                 }
 
                 let col_sync = col.clone();
-                let sync_result = tokio::task::spawn_blocking(move || {
-                    let wal = col_sync.wal_writer.lock().unwrap();
-                    wal.current_wal.sync_data()
-                }).await;
+                let sync_result = tokio::task::spawn_blocking(move || col_sync.sync_wal()).await;
 
-                let result = match sync_result {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(e)) => Err(format!("WAL sync failed: {}", e)),
-                    Err(e) => Err(format!("Commit task panicked: {}", e)),
+                let (result, synced_through) = match sync_result {
+                    Ok(Ok(lsn)) => (Ok(()), lsn),
+                    Ok(Err(e)) => (Err(format!("WAL sync failed: {}", e)), 0),
+                    Err(e) => (Err(format!("Commit task panicked: {}", e)), 0),
                 };
+
+                // Ahead of the acks: a waiter reads durable_lsn to count its own write toward the
+                // commit index, and would otherwise read the value from before its fsync.
+                if result.is_ok() {
+                    col.durable_lsn.fetch_max(synced_through, Ordering::SeqCst);
+                    col.db_durable_lsn.fetch_max(synced_through, Ordering::SeqCst);
+                }
 
                 let notifiers: Vec<_> = {
                     let mut q = col.commit_notifiers.lock().unwrap();
@@ -330,10 +343,8 @@ impl Collection {
                     let _ = tx.send(result.clone());
                 }
 
+                // Kept off the ack path: lsn.meta is a boot hint and its write must not add latency.
                 if count > 0 && result.is_ok() {
-                    let last_lsn = { col.wal_writer.lock().unwrap().last_appended_lsn };
-                    col.durable_lsn.fetch_max(last_lsn, Ordering::SeqCst);
-                    col.db_durable_lsn.fetch_max(last_lsn, Ordering::SeqCst);
                     let commit_lsn = col.db_durable_lsn.load(Ordering::SeqCst);
                     let meta = LsnMeta { commit_lsn };
                     if let Err(e) = meta.save(&col.data_root) {
@@ -623,7 +634,7 @@ mod tests {
     use crate::json::merge_patch;
     use crate::storage::Database;
     use crate::storage::HEADER_LEN;
-    use crate::test_support::{idx, live_put, stage_delete, stage_put, temp_root};
+    use crate::test_support::{idx, live_put, stage_delete, stage_put, temp_root, wait_for};
     use crate::util::remove_file_with_retry;
     use std::collections::HashSet;
 
@@ -635,6 +646,69 @@ mod tests {
         col.index.read().unwrap().values().filter(|e| e.inline.is_some()).count()
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_frame_appended_while_the_fsync_runs_is_not_reported_durable() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        // Enough unsynced bytes that the fsync holds the append lock long enough to append into.
+        let filler = "x".repeat(64 * 1024);
+        let mut tail = 0;
+        for i in 0..192 {
+            let (_, _, _, lsn) = col
+                .put(format!("k{:04}", i), serde_json::json!({"v": filler}), 1).unwrap();
+            tail = lsn;
+        }
+
+        let col2 = col.clone();
+        let racer = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while col2.wal_writer.try_lock().is_ok() {
+                if start.elapsed() > Duration::from_secs(5) {
+                    return None;
+                }
+                std::hint::spin_loop();
+            }
+            // Blocked on the lock the fsync holds, so this frame cannot be part of that fsync.
+            let (_, _, _, lsn) = col2.put("late".into(), serde_json::json!({"v": 1}), 1).unwrap();
+            Some(lsn)
+        });
+
+        col.enqueue_commit().await.unwrap().unwrap();
+        let late = racer.join().unwrap()
+            .expect("the fsync never held the append lock; nothing was raced and the test proves nothing");
+
+        assert!(late > tail, "the racing frame must be past the tail the fsync sampled");
+        assert!(wait_for(Duration::from_secs(2), || col.durable_lsn() > 0).await,
+            "the commit reported success but published no watermark at all");
+        assert_eq!(col.durable_lsn(), tail,
+            "durable_lsn reached {} but the fsync covered {}: lsn {} landed after it and is page \
+             cache only, yet it counts toward the leader's own vote and the persisted commit_lsn",
+            col.durable_lsn(), tail, late);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+    #[tokio::test]
+    async fn durable_lsn_only_moves_for_frames_a_commit_actually_synced() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        let first = stage_put(&col, "a", 1);
+        col.enqueue_commit().await.unwrap().unwrap();
+        assert_eq!(col.durable_lsn(), first);
+        assert_eq!(db.durable_lsn.load(Ordering::SeqCst), first);
+
+        let second = stage_put(&col, "b", 2);
+        assert_eq!(col.durable_lsn(), first,
+            "an append with no fsync behind it must not count toward the leader's own quorum vote");
+
+        col.enqueue_commit().await.unwrap().unwrap();
+        assert_eq!(col.durable_lsn(), second);
+
+        let _ = fs::remove_dir_all(&root);
+    }
     #[tokio::test]
     async fn range_from_resumes_exclusively() {
         let root = temp_root();
