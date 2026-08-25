@@ -22,6 +22,30 @@ const REPLICATION_BATCH_FRAMES: usize = 64;
 const DRIVE_MISSES_BEFORE_BACKOFF: u32 = 2;
 const DRIVE_BACKOFF_SHIFT_CAP: u32 = 4;
 
+/// Per `(replica, collection)`, not per replica: collections are independent logs, and one lock
+/// for all of them means every repair but one returns immediately having done nothing.
+/// Prefixed because `repair_locks` is shared with `snapshot-install:` and `migration-reset:`.
+fn repair_lock(state: &AppState, replica_url: &str, collection: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let key = format!("repair:{}|{}", replica_url, collection);
+    let mut locks = state.repair_locks.lock().unwrap();
+    locks.entry(key)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// One verdict per replica per round. A replica is only idle if *none* of its collections moved;
+/// scoring each work item separately counted one round as several misses.
+fn score_replicas(outcomes: Vec<(String, bool)>) -> Vec<(String, bool)> {
+    let mut by_replica: Vec<(String, bool)> = Vec::new();
+    for (replica, moved) in outcomes {
+        match by_replica.iter_mut().find(|(r, _)| *r == replica) {
+            Some((_, seen)) => *seen |= moved,
+            None => by_replica.push((replica, moved)),
+        }
+    }
+    by_replica
+}
+
 /// Ticks to skip after `misses` consecutive rounds that made no progress. Only the periodic driver
 /// backs off; a write still triggers repair immediately, so this delays nothing but the idle case.
 fn drive_backoff_ticks(misses: u32) -> u32 {
@@ -191,7 +215,7 @@ pub fn replication_drive_task(state: AppState) {
                 }
             })).await;
 
-            for (replica, moved) in outcomes {
+            for (replica, moved) in score_replicas(outcomes) {
                 if moved {
                     misses.remove(&replica);
                     skips.remove(&replica);
@@ -266,12 +290,7 @@ async fn repair_replica(
     reported_last_term: Option<u64>,
     needed_lsn: u64,
 ) -> bool {
-    let lock = {
-        let mut locks = state.repair_locks.lock().unwrap();
-        locks.entry(replica_url.clone())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-    };
+    let lock = repair_lock(&state, &replica_url, &collection);
     let _guard = match lock.try_lock() {
         Ok(g) => g,
         Err(_) => return false,
@@ -581,6 +600,60 @@ mod tests {
     };
     use std::fs;
     use std::sync::atomic::AtomicUsize;
+
+    fn repair_state(root: &std::path::Path) -> AppState {
+        let config = serde_json::from_value(serde_json::json!({
+            "node_id": "n1", "role": "shard", "shard_role": "primary",
+            "listen_addr": "127.0.0.1:1", "data_dir": root.to_string_lossy(),
+        })).unwrap();
+        let db = Arc::new(Database::new(root).unwrap());
+        AppState::for_admission_test(config, db, true)
+    }
+
+    /// H5: one lock per replica meant a second collection's repair `try_lock`ed, failed, and
+    /// returned false without sending anything — scored as a miss and paid for with backoff.
+    #[tokio::test]
+    async fn repairs_to_one_replica_do_not_block_each_other_across_collections() {
+        let root = temp_root();
+        let state = repair_state(&root);
+        let replica = "http://127.0.0.1:9502";
+
+        let users = repair_lock(&state, replica, "users");
+        let orders = repair_lock(&state, replica, "orders");
+
+        let _held = users.try_lock().expect("first repair takes its own lock");
+        assert!(orders.try_lock().is_ok(),
+            "a repair on another collection must not wait behind this one: they are separate logs");
+        assert!(users.try_lock().is_err(),
+            "but two repairs of the same log must still coalesce rather than duplicate the stream");
+
+        // repair_locks is a shared namespace; migration cleanup prunes it by prefix.
+        assert!(repair_lock(&state, replica, "users").try_lock().is_err(),
+            "the same pair must resolve to the same lock, not a fresh one each call");
+        let keys: Vec<String> = state.repair_locks.lock().unwrap().keys().cloned().collect();
+        assert!(keys.iter().all(|k| k.starts_with("repair:")),
+            "repair keys must stay in their own namespace: {:?}", keys);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_replica_is_idle_only_when_none_of_its_collections_moved() {
+        let mixed = score_replicas(vec![
+            ("http://r1".into(), false),
+            ("http://r1".into(), true),
+            ("http://r1".into(), false),
+        ]);
+        assert_eq!(mixed, vec![("http://r1".to_string(), true)],
+            "one round is one verdict; three work items counted as three misses before");
+
+        let stalled = score_replicas(vec![("http://r1".into(), false), ("http://r1".into(), false)]);
+        assert_eq!(stalled, vec![("http://r1".to_string(), false)],
+            "a replica making no progress anywhere must still back off");
+
+        let two = score_replicas(vec![("http://r1".into(), true), ("http://r2".into(), false)]);
+        assert_eq!(two, vec![("http://r1".to_string(), true), ("http://r2".to_string(), false)]);
+    }
 
     // A peer that applies the head of a batch and reports only that: the case the batch loop's
     // early break exists for.

@@ -264,9 +264,9 @@ async fn main() -> io::Result<()> {
         router_probe_task(state.clone());
     }
 
-    if let Some(ref database) = state.db {
+    if state.db.is_some() {
         if config.maintenance.enabled {
-            maintenance_task(database.clone(), config.maintenance.clone());
+            maintenance_task(state.clone(), config.maintenance.clone());
         } else {
             info!(target: "boot", "Maintenance scheduler disabled by config");
         }

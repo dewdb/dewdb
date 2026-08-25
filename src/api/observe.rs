@@ -394,7 +394,9 @@ pub async fn health_handler(
         }
     }
 
-    if state.config.role == "router" && state.cluster_view().shards.is_empty() {
+    // shard_owners, not `shards`: the latter is the legacy range map, which a ring cluster leaves
+    // empty by design. Same accessor /cluster reports from, so the two cannot disagree.
+    if state.config.role == "router" && state.shard_owners().is_empty() {
         reasons.push("router has no shards in its cluster view".to_string());
     }
 
@@ -412,4 +414,66 @@ pub async fn health_handler(
         "collections": state.db.as_ref().map_or(0, |db| db.collections.read().unwrap().len()),
         "reasons": reasons,
     }))).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ring::{HashRing, RingShard};
+    use crate::test_support::temp_root;
+
+    fn router(root: &std::path::Path, topology: serde_json::Value) -> AppState {
+        let mut config = serde_json::json!({
+            "node_id": "r1", "role": "router", "listen_addr": "127.0.0.1:1",
+            "data_dir": root.to_string_lossy(),
+        });
+        if let Some(obj) = topology.as_object() {
+            for (k, v) in obj {
+                config[k] = v.clone();
+            }
+        }
+        AppState::for_routing_test(serde_json::from_value(config).unwrap())
+    }
+
+    async fn health_of(state: AppState) -> (StatusCode, serde_json::Value) {
+        let res = health_handler(State(state)).await.into_response();
+        let status = res.status();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    fn ring_config(urls: &[&str]) -> serde_json::Value {
+        let shards = urls.iter()
+            .map(|u| RingShard { node_url: u.to_string(), replica_urls: vec![] })
+            .collect();
+        serde_json::json!({ "ring": HashRing { vnodes: 128, shards } })
+    }
+
+    /// H6: `shards` is the range map, so a ring router reported degraded forever while routing fine.
+    #[tokio::test]
+    async fn a_ring_router_is_healthy() {
+        let root = temp_root();
+
+        let (status, body) = health_of(router(&root, ring_config(&["http://a", "http://b"]))).await;
+        assert_eq!(status, StatusCode::OK, "reasons: {}", body["reasons"]);
+        assert_eq!(body["status"], "ok");
+
+        let ranges = serde_json::json!({
+            "shard_map": [{"start_hash": 0, "end_hash": 0, "node_url": "http://a"}],
+        });
+        let (status, _) = health_of(router(&root, ranges)).await;
+        assert_eq!(status, StatusCode::OK, "a range-mapped router was never the broken case");
+
+        let (status, body) = health_of(router(&root, serde_json::json!({}))).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE,
+            "a router that owns no topology at all is still degraded");
+        assert_eq!(body["reasons"][0], "router has no shards in its cluster view");
+
+        let empty_ring = serde_json::json!({ "ring": HashRing { vnodes: 128, shards: vec![] } });
+        let (status, _) = health_of(router(&root, empty_ring)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE,
+            "a ring with no shards routes nowhere, so it must not read as healthy");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

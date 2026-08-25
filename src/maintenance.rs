@@ -1,6 +1,7 @@
 //! Background compaction and index-snapshot scheduling.
 
-use crate::storage::{Collection, Database, SpaceUsage};
+use crate::state::AppState;
+use crate::storage::{Collection, SpaceUsage};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io;
@@ -53,12 +54,22 @@ impl MaintenanceConfig {
     }
 }
 
-// Both conditions must hold: a mostly-dead but tiny log is not worth rewriting.
-fn should_compact(usage: &SpaceUsage, cfg: &MaintenanceConfig) -> bool {
-    usage.total_bytes >= cfg.compaction_min_wal_bytes && usage.dead_ratio() >= cfg.compaction_dead_ratio
+/// Compaction drops superseded frames, which breaks a replica's chain and forces the leader into a
+/// full snapshot resync on the next repair. Leader-only, on both this path and `/compact`.
+/// A mostly-dead but tiny log is not worth rewriting, so the ratio and the floor must both hold.
+fn should_compact(usage: &SpaceUsage, cfg: &MaintenanceConfig, is_leader: bool) -> bool {
+    is_leader
+        && usage.total_bytes >= cfg.compaction_min_wal_bytes
+        && usage.dead_ratio() >= cfg.compaction_dead_ratio
 }
 
-pub fn maintenance_task(db: Arc<Database>, cfg: MaintenanceConfig) {
+// Index snapshots are not gated: they add a file and remove nothing, and a replica that never
+// snapshots replays every WAL at boot.
+pub fn maintenance_task(state: AppState, cfg: MaintenanceConfig) {
+    let db = match state.db.as_ref() {
+        Some(db) => db.clone(),
+        None => return,
+    };
     tokio::spawn(async move {
         info!(target: "maintenance", interval_secs = cfg.interval_secs,
             dead_ratio = cfg.compaction_dead_ratio, min_wal_bytes = cfg.compaction_min_wal_bytes,
@@ -92,7 +103,7 @@ pub fn maintenance_task(db: Arc<Database>, cfg: MaintenanceConfig) {
                     }
                 };
 
-                let compacted = if should_compact(&usage, &cfg) {
+                let compacted = if should_compact(&usage, &cfg, state.is_leader()) {
                     info!(target: "maintenance", collection = %name, dead_ratio = usage.dead_ratio(),
                         dead_bytes = usage.dead_bytes(), total_bytes = usage.total_bytes,
                         live_keys = usage.live_keys, "Dead-byte threshold reached; compacting");
@@ -162,18 +173,79 @@ mod tests {
         let cfg = maint(0.4, 1000);
 
         let mostly_dead_but_tiny = SpaceUsage { total_bytes: 900, live_bytes: 10, live_keys: 1 };
-        assert!(!should_compact(&mostly_dead_but_tiny, &cfg),
+        assert!(!should_compact(&mostly_dead_but_tiny, &cfg, true),
             "a log under the byte floor must not be compacted no matter how dead it is");
 
         let big_but_fresh = SpaceUsage { total_bytes: 10_000, live_bytes: 9_000, live_keys: 10 };
-        assert!(!should_compact(&big_but_fresh, &cfg), "10% dead is below the 40% threshold");
+        assert!(!should_compact(&big_but_fresh, &cfg, true), "10% dead is below the 40% threshold");
 
         let big_and_dead = SpaceUsage { total_bytes: 10_000, live_bytes: 6_000, live_keys: 10 };
-        assert!(should_compact(&big_and_dead, &cfg), "exactly at the threshold must trigger");
+        assert!(should_compact(&big_and_dead, &cfg, true), "exactly at the threshold must trigger");
 
         let empty = SpaceUsage { total_bytes: 0, live_bytes: 0, live_keys: 0 };
         assert_eq!(empty.dead_ratio(), 0.0, "an empty log must not divide by zero");
-        assert!(!should_compact(&empty, &cfg));
+        assert!(!should_compact(&empty, &cfg, true));
+    }
+
+    #[test]
+    fn a_replica_never_compacts_however_dead_its_log() {
+        let cfg = maint(0.4, 1000);
+        let past_every_threshold = SpaceUsage { total_bytes: 10_000_000, live_bytes: 1, live_keys: 1 };
+
+        assert!(should_compact(&past_every_threshold, &cfg, true));
+        assert!(!should_compact(&past_every_threshold, &cfg, false),
+            "compaction drops superseded frames, which breaks the chain repair streams over");
+    }
+
+    /// The pure decision above can be correct while the loop passes a constant, so this drives the
+    /// real scheduler on a replica and on a leader over the same log.
+    #[tokio::test]
+    async fn the_scheduler_compacts_only_where_it_leads_but_snapshots_everywhere() {
+        use crate::storage::index::INDEX_FILENAME;
+        use crate::storage::Database;
+        use crate::test_support::{live_put, temp_root, wait_for};
+
+        async fn tick(is_leader: bool) -> (u64, bool) {
+            let root = temp_root();
+            let db = Arc::new(Database::new(&root).unwrap());
+            let col = db.get_collection("c").unwrap();
+            for v in 1..=20 {
+                live_put(&col, "a", v);
+            }
+            let churned = col.space_usage().unwrap();
+            assert!(churned.dead_bytes() > 0, "the log must be worth compacting for this to test anything");
+
+            let config: NodeConfig = serde_json::from_value(serde_json::json!({
+                "node_id": "n1", "role": "shard", "shard_role": "primary",
+                "listen_addr": "127.0.0.1:1", "data_dir": root.to_string_lossy(),
+            })).unwrap();
+            let state = crate::state::AppState::for_admission_test(config, db.clone(), is_leader);
+
+            let mut cfg = maint(0.1, 0);
+            cfg.interval_secs = 1;
+            cfg.snapshot_interval_secs = 0;
+            maintenance_task(state, cfg);
+
+            let snapshot = root.join("c").join(INDEX_FILENAME);
+            let probe = col.clone();
+            wait_for(Duration::from_secs(6), || {
+                probe.space_usage().map(|u| u.dead_bytes() == 0).unwrap_or(false) && snapshot.exists()
+            }).await;
+
+            let dead = col.space_usage().unwrap().dead_bytes();
+            let snapshotted = snapshot.exists();
+            let _ = std::fs::remove_dir_all(&root);
+            (dead, snapshotted)
+        }
+
+        let (leader_dead, leader_snapshot) = tick(true).await;
+        assert_eq!(leader_dead, 0, "the leader's scheduler must reclaim the dead bytes");
+        assert!(leader_snapshot);
+
+        let (replica_dead, replica_snapshot) = tick(false).await;
+        assert!(replica_dead > 0, "a replica's scheduler must leave the log alone");
+        assert!(replica_snapshot,
+            "but it must still snapshot, or it replays every WAL at boot for no reason");
     }
 
     #[test]

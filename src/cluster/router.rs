@@ -388,11 +388,17 @@ fn node_result(node: &str, outcome: Option<(StatusCode, serde_json::Value)>) -> 
 }
 
 pub async fn router_fanout_maintenance(state: &AppState, col_name: &str, action: &str) -> axum::response::Response {
+    // Replicas refuse compaction, so sending it to them would report a 403 per replica as a
+    // partial failure. Snapshots are safe everywhere and every node wants its own.
+    let include_replicas = action != "compact";
+
     let mut targets = Vec::new();
     for (original, replicas) in unique_shards(state) {
         targets.push(state.effective_primary(&original));
-        for r in replicas {
-            targets.push(r);
+        if include_replicas {
+            for r in replicas {
+                targets.push(r);
+            }
         }
     }
     targets.sort();
@@ -446,6 +452,12 @@ pub async fn router_fanout_drop(state: &AppState, col_name: &str) -> axum::respo
     (status, Json(serde_json::json!({"shards": results}))).into_response()
 }
 
+// div_ceil, not (limit + n - 1) / n: that form overflows and wraps to 0 on a near-usize::MAX limit.
+fn per_shard_limit(limit: usize, shards: usize, sorted: bool) -> usize {
+    // Full limit per shard when sorted: the top rows may all live on one, and limit/n misorders the merge.
+    if sorted { limit } else { limit.div_ceil(shards.max(1)).max(1) }
+}
+
 pub async fn router_query(
     state: &AppState,
     col_name: &str,
@@ -462,8 +474,7 @@ pub async fn router_query(
         };
         let shards = unique_shards(state);
         let n = shards.len().max(1);
-        // Full limit per shard: the top rows may all live on one, and limit/n would misorder the merge.
-        let per_shard = if sort.is_some() { limit } else { ((limit + n - 1) / n).max(1) };
+        let per_shard = per_shard_limit(limit, n, sort.is_some());
 
         let mut futures = Vec::new();
         for (original, replicas) in shards {
@@ -565,6 +576,18 @@ mod tests {
 
     fn no_loads() -> HashMap<String, NodeLoad> {
         HashMap::new()
+    }
+
+    #[test]
+    fn the_per_shard_limit_never_overflows_or_collapses_to_zero() {
+        assert_eq!(per_shard_limit(10, 3, false), 4, "ceil, so three shards can cover ten rows");
+        assert_eq!(per_shard_limit(10, 3, true), 10, "a sorted merge needs the full limit from each");
+        assert_eq!(per_shard_limit(1, 8, false), 1, "never zero: a shard asked for 0 returns nothing");
+        assert_eq!(per_shard_limit(10, 0, false), 10, "no shards is a division by zero otherwise");
+
+        // (limit + n - 1) wraps here and the old form asked every shard for 0 rows.
+        assert_eq!(per_shard_limit(usize::MAX, 4, false), usize::MAX / 4 + 1);
+        assert_eq!(per_shard_limit(usize::MAX, 1, false), usize::MAX);
     }
 
     #[test]

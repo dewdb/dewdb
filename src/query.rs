@@ -1,6 +1,7 @@
 //! Query semantics: filters, sort keys, cross-shard merge, pagination cursors.
 
 use crate::json::{get_path_value, json_cmp};
+use crate::model::MAX_QUERY_LIMIT;
 use crate::util::base64_bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -56,7 +57,7 @@ pub fn compare_by_sort(a: &serde_json::Value, b: &serde_json::Value, sort: &Sort
 
 pub fn kway_merge(lists: Vec<Vec<serde_json::Value>>, sort: &SortSpec, limit: usize) -> Vec<serde_json::Value> {
     let mut heads = vec![0usize; lists.len()];
-    let mut out = Vec::with_capacity(limit);
+    let mut out = Vec::with_capacity(limit.min(MAX_QUERY_LIMIT));
 
     while out.len() < limit {
         let mut best: Option<usize> = None;
@@ -142,6 +143,16 @@ pub fn matches_filter(doc: &serde_json::Value, filter: &Filter) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_merge_bounded_by_a_huge_limit_allocates_for_what_it_holds() {
+        let lists = vec![vec![serde_json::json!({"n": 1})], vec![serde_json::json!({"n": 2})]];
+        let sort = parse_sort(Some("n:asc")).unwrap();
+
+        // Unfixed this reserves usize::MAX values before reading the first row.
+        let out = kway_merge(lists, &sort, usize::MAX);
+        assert_eq!(out.len(), 2, "the limit still bounds the result, it just cannot bound the capacity");
+    }
 
     #[test]
     fn shard_cursor_round_trips_through_base64() {

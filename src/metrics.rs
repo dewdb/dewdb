@@ -20,15 +20,16 @@ pub struct RouteStats {
 }
 
 impl RouteStats {
+    // Saturating throughout: a counter is never worth an overflow panic in a debug build.
     pub fn observe(&mut self, nanos: u64, is_error: bool) {
-        self.count += 1;
-        self.nanos_total += nanos;
+        self.count = self.count.saturating_add(1);
+        self.nanos_total = self.nanos_total.saturating_add(nanos);
         if is_error {
-            self.errors += 1;
+            self.errors = self.errors.saturating_add(1);
         }
         let ms = nanos as f64 / 1_000_000.0;
         let slot = LATENCY_BUCKETS_MS.iter().position(|b| ms <= *b).unwrap_or(LATENCY_BUCKETS_MS.len());
-        self.buckets[slot] += 1;
+        self.buckets[slot] = self.buckets[slot].saturating_add(1);
     }
 
     pub fn quantile_ms(&self, q: f64) -> f64 {
@@ -38,7 +39,7 @@ impl RouteStats {
         let target = (self.count as f64 * q).ceil() as u64;
         let mut seen = 0u64;
         for (i, n) in self.buckets.iter().enumerate() {
-            seen += n;
+            seen = seen.saturating_add(*n);
             if seen >= target {
                 return LATENCY_BUCKETS_MS.get(i).copied().unwrap_or(f64::INFINITY);
             }
@@ -89,8 +90,11 @@ impl Metrics {
         self.active_requests.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Saturating: an unpaired decrement would wrap to `u64::MAX` inflight, and load-aware
+    /// routing would read this node as infinitely busy for the rest of the process's life.
     pub fn end_request(&self) {
-        self.active_requests.fetch_sub(1, Ordering::Relaxed);
+        let _ = self.active_requests.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+            |n| Some(n.saturating_sub(1)));
     }
 
     pub fn node_load(&self) -> NodeLoad {
@@ -224,6 +228,43 @@ mod tests {
         let x = &snap.iter().find(|(k, _)| k == "GET /x").unwrap().1;
         assert_eq!(x.count, 2);
         assert_eq!(x.errors, 1);
+    }
+
+    /// L9: `+=` on a `u64` counter panics on overflow in a debug build, which is every
+    /// `cargo test` run and any node built without `--release`.
+    #[test]
+    fn a_saturated_route_counter_keeps_serving_instead_of_panicking() {
+        let mut st = RouteStats {
+            count: u64::MAX,
+            errors: u64::MAX,
+            nanos_total: u64::MAX,
+            buckets: [u64::MAX; 12],
+        };
+
+        st.observe(1_000_000, true);
+
+        assert_eq!(st.count, u64::MAX, "a pegged counter stays pegged rather than wrapping to 0");
+        assert_eq!(st.nanos_total, u64::MAX);
+        assert_eq!(st.errors, u64::MAX);
+        assert_eq!(st.buckets[1], u64::MAX);
+
+        // Reading a saturated histogram must not overflow either.
+        assert!(st.quantile_ms(0.99).is_finite() || st.quantile_ms(0.99) == f64::INFINITY);
+        assert!(st.avg_ms() >= 0.0);
+    }
+
+    #[test]
+    fn an_unpaired_end_request_cannot_wrap_the_inflight_count() {
+        let m = Metrics::new();
+        m.end_request();
+
+        assert_eq!(m.node_load().inflight, 0,
+            "wrapping to u64::MAX would read as infinitely busy and take this node out of              load-aware routing for good");
+
+        m.begin_request();
+        m.end_request();
+        m.end_request();
+        assert_eq!(m.node_load().inflight, 0);
     }
 
     #[test]

@@ -131,6 +131,13 @@ pub async fn compact_collection(
         return router_fanout_maintenance(&state, &col_name, "compact").await;
     }
 
+    // Same rule the scheduler applies: compacting a replica breaks the chain repair streams over.
+    if state.is_shard() && !state.is_leader() {
+        return (StatusCode::FORBIDDEN,
+            "Compaction runs on the leader only; a replica's log must stay streamable for repair")
+            .into_response();
+    }
+
     let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
         Ok(c) => c,
         Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -186,5 +193,62 @@ pub async fn snapshot_collection(
         },
         Ok(Err(e)) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::NodeConfig;
+    use crate::storage::Database;
+    use crate::test_support::{live_put, temp_root};
+    use std::sync::Arc;
+
+    async fn node(root: &std::path::Path, is_leader: bool) -> AppState {
+        let db = Arc::new(Database::new(root).unwrap());
+        let col = db.get_collection("c").unwrap();
+        for v in 1..=5 {
+            live_put(&col, "a", v);
+        }
+        let config: NodeConfig = serde_json::from_value(serde_json::json!({
+            "node_id": "n1", "role": "shard", "shard_role": "primary",
+            "listen_addr": "127.0.0.1:1", "data_dir": root.to_string_lossy(),
+        })).unwrap();
+        AppState::for_admission_test(config, db, is_leader)
+    }
+
+    /// H9: any caller could force compaction on a replica, which drops superseded frames and
+    /// leaves the leader no chain to repair from — a full snapshot resync instead.
+    #[tokio::test]
+    async fn a_replica_refuses_compaction_but_still_snapshots() {
+        let root = temp_root();
+
+        let replica = node(&root, false).await;
+        let refused = compact_collection(State(replica.clone()), AxumPath("c".into()))
+            .await.into_response();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert!(replica.db.as_ref().unwrap().get_collection("c").unwrap()
+            .space_usage().unwrap().dead_bytes() > 0, "and the log is untouched, not just the answer");
+
+        let snapshotted = snapshot_collection(State(replica), AxumPath("c".into()))
+            .await.into_response();
+        assert_eq!(snapshotted.status(), StatusCode::OK,
+            "snapshots add a file and remove nothing, so a replica is free to take one");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_leader_still_compacts_on_request() {
+        let root = temp_root();
+        let leader = node(&root, true).await;
+
+        let res = compact_collection(State(leader.clone()), AxumPath("c".into()))
+            .await.into_response();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(leader.db.as_ref().unwrap().get_collection("c").unwrap()
+            .space_usage().unwrap().dead_bytes(), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

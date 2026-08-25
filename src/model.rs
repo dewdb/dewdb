@@ -17,6 +17,12 @@ pub struct BulkDoc {
     pub value: serde_json::Value,
 }
 
+/// Upper bound on `?limit`. A page is preallocated from this number, so an unbounded one is an
+/// allocation the process aborts on rather than a slow query. Callers page with `cursor` instead.
+pub const MAX_QUERY_LIMIT: usize = 10_000;
+
+pub const DEFAULT_QUERY_LIMIT: usize = 100;
+
 #[derive(Deserialize)]
 pub struct QueryParams {
     pub start: Option<String>,

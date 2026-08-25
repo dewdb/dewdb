@@ -136,6 +136,10 @@ impl BuiltRing {
         self.shards.get(self.tokens[at].1 as usize)
     }
 
+    pub fn shards(&self) -> &[RingShard] {
+        &self.shards
+    }
+
     fn owner_url(&self, hash: u64) -> &str {
         self.owner(hash).map_or("", |s| s.node_url.as_str())
     }

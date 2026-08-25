@@ -3,6 +3,7 @@
 use super::frame::LogEntry;
 use super::index::{AppliedMeta, IndexEntry, IndexSnapshot, LsnMeta, ReadCacheConfig, INDEX_FILENAME};
 use super::wal::WalsState;
+use crate::model::MAX_QUERY_LIMIT;
 use crate::query::{matches_filter, Filter};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
@@ -378,7 +379,8 @@ impl Collection {
         filter: &Option<Filter>,
         limit: usize,
     ) -> io::Result<(Vec<serde_json::Value>, Option<String>)> {
-        let mut items = Vec::with_capacity(limit);
+        // Capacity is capped independently of the caller: the vector still grows to `limit`.
+        let mut items = Vec::with_capacity(limit.min(MAX_QUERY_LIMIT));
         let mut last_key: Option<String> = None;
         let mut has_more = false;
 
@@ -644,6 +646,23 @@ mod tests {
 
     fn inline_count(col: &Arc<Collection>) -> usize {
         col.index.read().unwrap().values().filter(|e| e.inline.is_some()).count()
+    }
+
+    #[tokio::test]
+    async fn a_page_asked_for_more_rows_than_exist_allocates_for_what_it_holds() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("t").unwrap();
+        for i in 0..3 {
+            live_put(&col, &format!("k{}", i), i);
+        }
+
+        // Unfixed this reserves usize::MAX values before reading the first key.
+        let (items, cursor) = col.query_page(None, None, None, &None, usize::MAX).unwrap();
+        assert_eq!(items.len(), 3);
+        assert!(cursor.is_none(), "the whole collection fits, so there is no next page");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

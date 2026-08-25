@@ -249,6 +249,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// H2: `classify` used to call `ring.build()` per key, and `migration.target.build()` again
+    /// during a handover, both under the cluster read lock. It now takes rings it cannot build.
+    #[test]
+    fn both_rings_are_cached_together_and_invalidated_together() {
+        use crate::cluster::metadata::{Migration, MigrationPhase};
+        use std::sync::Arc;
+
+        let root = temp_root();
+        let state = router_on_ring(&root, &["http://a", "http://b"]);
+
+        let with_move = state.cluster_view().with_migration("op", Some(Migration {
+            id: "m1".into(), started_by: "op".into(), phase: MigrationPhase::Finalizing,
+            target: HashRing { vnodes: 128, shards: shards(&["http://a", "http://b", "http://c"]) },
+        }));
+        assert!(matches!(state.adopt_cluster(with_move), crate::cluster::metadata::Adoption::Adopted { .. }));
+
+        let view = state.cluster_view();
+        let (ring, target) = state.rings_for(&view);
+        let (ring_again, target_again) = state.rings_for(&view);
+        assert!(Arc::ptr_eq(&ring.unwrap(), &ring_again.unwrap()));
+        assert!(Arc::ptr_eq(target.as_ref().unwrap(), target_again.as_ref().unwrap()),
+            "the migration target is laid out per version too, not per key of a handover");
+        assert!(target_again.unwrap().shards().iter().any(|s| s.node_url == "http://c"),
+            "and it is the target ring, not a second copy of the current one");
+
+        let next = state.cluster_view().with_ring("operator", HashRing {
+            vnodes: 128, shards: shards(&["http://a", "http://b", "http://c"]),
+        });
+        state.adopt_cluster(next);
+        let after = state.cluster_view();
+        let (_, cleared) = state.rings_for(&after);
+        assert!(cleared.is_none(),
+            "with_ring completes the migration, so the stale target must not survive in the cache");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_ring_supersedes_ranges_without_discarding_them() {
         let root = temp_root();

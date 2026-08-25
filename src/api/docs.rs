@@ -6,7 +6,10 @@ use crate::cluster::router::{
     passthrough, ForwardMethod,
 };
 use crate::json::{parse_fields, project};
-use crate::model::{err_json, BulkDoc, CreateDoc, QueryPage, QueryParams, ReadParams};
+use crate::model::{
+    err_json, BulkDoc, CreateDoc, QueryPage, QueryParams, ReadParams, DEFAULT_QUERY_LIMIT,
+    MAX_QUERY_LIMIT,
+};
 use crate::query::{compare_by_sort, matches_filter, parse_sort, Filter};
 use crate::replication::{parse_write_concern, wc_query_string, WriteConcernParams, DEFAULT_WTIMEOUT_MS};
 use crate::cluster::ownership::Ownership;
@@ -350,7 +353,12 @@ pub async fn query_docs(
     Query(params): Query<QueryParams>,
     _req: axum::extract::Request,
 ) -> impl axum::response::IntoResponse {
-    let limit = params.limit.unwrap_or(100).max(1);
+    let limit = match params.limit {
+        Some(n) if n > MAX_QUERY_LIMIT => return err_json(StatusCode::BAD_REQUEST,
+            format!("limit {} exceeds the maximum of {}; page with `cursor`", n, MAX_QUERY_LIMIT)),
+        Some(n) => n.max(1),
+        None => DEFAULT_QUERY_LIMIT,
+    };
     let sort = parse_sort(params.sort.as_deref());
     let fields = parse_fields(params.fields.as_deref());
 
@@ -397,5 +405,37 @@ pub async fn query_docs(
         Ok(Ok((items, next_cursor))) => (StatusCode::OK, Json(QueryPage { items, next_cursor })).into_response(),
         Ok(Err(e)) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::test_support::{put_value, single_node, temp_root};
+    use axum::http::StatusCode;
+
+    /// H1: `Vec::with_capacity(limit)` on a caller-supplied `limit` is an allocation the process
+    /// aborts on, not a panic a handler can catch. The node must survive and answer.
+    #[tokio::test]
+    async fn an_oversized_limit_is_refused_instead_of_killing_the_node() {
+        let root = temp_root();
+        let node = single_node(&root).await;
+        let client = reqwest::Client::new();
+        put_value(&client, &node.url(), "t", "k1", serde_json::json!({"n": 1}), "").await;
+
+        let query = |limit: String| {
+            let c = client.clone();
+            let url = format!("{}/collections/t/query", node.url());
+            async move { c.get(&url).query(&[("limit", limit)]).send().await.map(|r| r.status()) }
+        };
+
+        // A multi-terabyte reservation before the fix.
+        assert_eq!(query("100000000000".into()).await.ok(), Some(StatusCode::BAD_REQUEST));
+        // usize::MAX takes the capacity-overflow path instead.
+        assert_eq!(query(usize::MAX.to_string()).await.ok(), Some(StatusCode::BAD_REQUEST));
+
+        assert_eq!(query("100".into()).await.ok(), Some(StatusCode::OK),
+            "the node is still serving, which is the half of this that the status code cannot show");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

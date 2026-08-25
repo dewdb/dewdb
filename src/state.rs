@@ -79,6 +79,7 @@ pub struct AppState {
 pub struct RingCache {
     version: u64,
     ring: Option<Arc<BuiltRing>>,
+    target: Option<Arc<BuiltRing>>,
 }
 
 impl AppState {
@@ -498,26 +499,31 @@ impl AppState {
         }
     }
 
-    /// Never holds two locks at once: the version is read and released before the cache is taken,
-    /// so nothing here can deadlock against a concurrent adoption.
-    pub fn built_ring(&self) -> Option<Arc<BuiltRing>> {
-        let version = self.cluster.read().unwrap().version;
+    /// Both rings for `view`, laid out once per cluster version. Takes only `ring_cache`, and the
+    /// caller already holds `cluster`, so the two are always acquired in that order.
+    pub(crate) fn rings_for(&self, view: &ClusterMetadata) -> (Option<Arc<BuiltRing>>, Option<Arc<BuiltRing>>) {
         {
             let cache = self.ring_cache.lock().unwrap();
-            if cache.version == version {
-                return cache.ring.clone();
+            if cache.version == view.version {
+                return (cache.ring.clone(), cache.target.clone());
             }
         }
-        let config = self.cluster.read().unwrap().ring.clone();
-        let built = config.map(|r| Arc::new(r.build()));
+        let ring = view.ring.as_ref().map(|r| Arc::new(r.build()));
+        let target = view.migration.as_ref().map(|m| Arc::new(m.target.build()));
 
         let mut cache = self.ring_cache.lock().unwrap();
         // A newer version may have landed while we were building; that one wins and rebuilds later.
-        if cache.version <= version {
-            cache.version = version;
-            cache.ring = built.clone();
+        if cache.version <= view.version {
+            cache.version = view.version;
+            cache.ring = ring.clone();
+            cache.target = target.clone();
         }
-        built
+        (ring, target)
+    }
+
+    pub fn built_ring(&self) -> Option<Arc<BuiltRing>> {
+        let view = self.cluster.read().unwrap();
+        self.rings_for(&view).0
     }
 
     pub fn migration(&self) -> Option<Migration> {
@@ -527,7 +533,11 @@ impl AppState {
     /// Whether this node may hold `key`. `None` where ownership does not apply -- no ring, or this
     /// node outside it -- which keeps single-shard and range-based clusters unaffected.
     pub fn ownership(&self, collection: &str, key: &str) -> Option<Ownership> {
-        classify(&self.cluster.read().unwrap(), &self.own_url(), collection, key)
+        // One acquisition for the view and the rings built from it: a verdict mixing a ring from
+        // one version with a migration from the next would be wrong for the request that saw it.
+        let view = self.cluster.read().unwrap();
+        let (ring, target) = self.rings_for(&view);
+        classify(&view, ring.as_deref()?, target.as_deref(), &self.own_url(), collection, key)
     }
 
     pub fn get_effective_shard_url(&self, hash: u64) -> Option<(String, String, Vec<String>)> {
