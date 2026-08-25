@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tracing::{error, info, warn};
 
-// durable_lsn is fsync progress, not replication; the quorum watermark lives in consensus::Progress.
+// durable_lsn is the highest LSN fsynced in any collection, not a prefix: a lower LSN in another
+// collection can still be unsynced. Replication watermarks live in consensus::Progress.
 pub struct Database {
     pub root_path: PathBuf,
     pub cache: ReadCacheConfig,

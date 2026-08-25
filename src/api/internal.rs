@@ -4,7 +4,7 @@ use crate::cluster::metadata::{Adoption, ClusterMetadata};
 use crate::cluster::metadata::MigrationPhase;
 use crate::cluster::migration::{MigrateBatch, MigrateReset};
 use crate::consensus::{
-    decide_vote, demote, heartbeat_poll_task, local_log_tails, LogTail, ReplicationMeta,
+    decide_vote, demote, heartbeat_poll_task, local_log_tails, log_summary, ReplicationMeta,
     VoteRequest, VoteResponse,
 };
 use crate::model::err_json;
@@ -541,11 +541,9 @@ pub async fn vote_handler(
         None => return (StatusCode::FORBIDDEN, "No replication state").into_response(),
     };
 
-    let my_lsn = state.db.as_ref().map_or(0, |db| db.durable_lsn.load(Ordering::SeqCst));
-    let my_log_term = state.db.as_ref().map_or(0, |db| db.last_log_term.load(Ordering::SeqCst));
     // Collected before the replication lock: local_log_tails reaches the collections lock.
     let my_logs = local_log_tails(&state);
-    let my_summary = LogTail { last_term: my_log_term, last_lsn: my_lsn };
+    let my_summary = log_summary(&state, &my_logs);
 
     let (granted, resp_term, restart_poll, persist) = {
         let mut g = repl.write().unwrap();

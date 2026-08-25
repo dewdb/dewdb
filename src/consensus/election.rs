@@ -75,6 +75,20 @@ pub fn local_log_tails(state: &AppState) -> HashMap<String, LogTail> {
     tails
 }
 
+/// The database-wide `(term, lsn)` pair for peers that predate per-collection `logs`.
+/// Derived from `tails`, never from `durable_lsn`: fsync progress lags the log tail, and a
+/// candidate advertising a stale tail can be elected over a node holding more entries.
+pub fn log_summary(state: &AppState, tails: &HashMap<String, LogTail>) -> LogTail {
+    if let Some(max) = tails.values().copied().max() {
+        return max;
+    }
+    // No tails means no collection could be opened; the shared counters are the only tail left.
+    state.db.as_ref().map_or(LogTail::default(), |db| LogTail {
+        last_term: db.last_log_term.load(Ordering::SeqCst),
+        last_lsn: db.next_lsn.load(Ordering::SeqCst),
+    })
+}
+
 // Cluster size is peers + self; peers must exclude this node or the threshold inflates.
 pub fn majority(cluster_size: usize) -> usize {
     cluster_size / 2 + 1
@@ -158,9 +172,9 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64) {
         return;
     }
 
-    let my_lsn = state.db.as_ref().map_or(0, |db| db.durable_lsn.load(Ordering::SeqCst));
-    let my_log_term = state.db.as_ref().map_or(0, |db| db.last_log_term.load(Ordering::SeqCst));
+    // Order matters: the summary is only as fresh as the collections local_log_tails has opened.
     let my_logs = local_log_tails(state);
+    let my_tail = log_summary(state, &my_logs);
     let candidate_id = state.config.node_id.clone();
 
     let new_term = {
@@ -198,8 +212,8 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64) {
         let req = VoteRequest {
             term: new_term,
             candidate_id: candidate_id.clone(),
-            last_lsn: my_lsn,
-            last_term: my_log_term,
+            last_lsn: my_tail.last_lsn,
+            last_term: my_tail.last_term,
             logs: my_logs.clone(),
         };
         let tx = tx.clone();
@@ -510,6 +524,61 @@ mod tests {
     fn log_tails_order_by_term_before_lsn() {
         assert!(LogTail { last_term: 5, last_lsn: 1 } > LogTail { last_term: 4, last_lsn: 900 },
             "field order in LogTail is the comparison order; reordering it silently inverts this");
+    }
+
+    fn shard_config(root: &std::path::Path) -> crate::config::NodeConfig {
+        serde_json::from_value(serde_json::json!({
+            "node_id": "n1", "role": "shard", "shard_role": "primary",
+            "listen_addr": "127.0.0.1:1",
+            "data_dir": root.to_string_lossy(),
+        })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_summary_is_the_log_tail_not_fsync_progress() {
+        use crate::storage::Database;
+        use std::sync::Arc;
+
+        let root = crate::test_support::temp_root();
+        let db = Arc::new(Database::new(&root).unwrap());
+        let users = db.get_collection("users").unwrap();
+        let orders = db.get_collection("orders").unwrap();
+        users.put("a".into(), serde_json::json!({"v": 1}), 4).unwrap();
+        let tail_lsn = orders.put("b".into(), serde_json::json!({"v": 2}), 7).unwrap().3;
+
+        let state = AppState::for_admission_test(shard_config(&root), db.clone(), true);
+        // What the pre-fix code sampled: fsync progress, which trails every one of those appends.
+        db.durable_lsn.store(0, Ordering::SeqCst);
+
+        let my_logs = local_log_tails(&state);
+        assert_eq!(log_summary(&state, &my_logs), LogTail { last_term: 7, last_lsn: tail_lsn },
+            "the summary must name the newest log tail, not the fsynced prefix, or a candidate              advertises itself as behind and a staler peer wins the vote");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_summary_taken_before_the_tails_misses_a_collection() {
+        use crate::storage::Database;
+        use std::sync::Arc;
+
+        let root = crate::test_support::temp_root();
+        let db = Arc::new(Database::new(&root).unwrap());
+        let state = AppState::for_admission_test(shard_config(&root), db.clone(), true);
+
+        // A collection nothing has opened yet: only local_log_tails reaches it.
+        std::fs::create_dir_all(root.join("late")).unwrap();
+        let stale = log_summary(&state, &HashMap::new());
+
+        let my_logs = local_log_tails(&state);
+        db.get_collection("late").unwrap().put("k".into(), serde_json::json!({"v": 1}), 3).unwrap();
+        let after = log_summary(&state, &local_log_tails(&state));
+
+        assert_eq!(stale, LogTail::default());
+        assert!(my_logs.contains_key("late"), "local_log_tails must open collections on disk");
+        assert!(after > stale, "sampling the summary after the tails is what makes it complete");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
