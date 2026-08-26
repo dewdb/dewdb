@@ -248,6 +248,15 @@ impl ClusterMetadata {
             .collect()
     }
 
+    /// The members a quorum is computed over. Routers never vote, and a learner is shipped frames
+    /// without being counted, so neither belongs here.
+    pub fn voting_shards(&self) -> Vec<String> {
+        self.members.iter()
+            .filter(|m| m.voting && m.role == "shard")
+            .map(|m| m.url.clone())
+            .collect()
+    }
+
     /// True only for a node that is present and explicitly non-voting. An unknown node is not a
     /// learner: a node missing from the view must keep behaving as its config says, or a view that
     /// has not reached it yet would silently strip its vote.

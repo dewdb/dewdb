@@ -166,6 +166,17 @@ impl AppState {
         committed
     }
 
+    /// This leader's own append, which is what lets `advance` commit at that LSN or above.
+    /// Ignored unless we are the leader: only our own term's entries close the Figure 8 window.
+    pub fn note_leader_append(&self, collection: &str, lsn: u64) {
+        if let Some(repl) = self.replication.as_ref() {
+            let mut g = repl.write().unwrap();
+            if g.is_leader {
+                g.progress.note_leader_append(collection, lsn);
+            }
+        }
+    }
+
     /// Where to resume sending to this replica. `None` means we hold no cursor and must probe.
     pub fn sent_through(&self, replica: &str, collection: &str) -> Option<u64> {
         self.replication.as_ref()
@@ -337,6 +348,42 @@ impl AppState {
 
     /// The quorum set: who counts toward `w=majority` and the commit index. Config-derived and
     /// unchanged at runtime -- see `replication_targets` for who actually receives frames.
+    /// Quorum membership, this node included. The live view's voting shards when it is a real view
+    /// that names this node one, and config otherwise: a seed is one node's opinion of the cluster,
+    /// and a published view that forgets `voting` would otherwise strip the quorum to nothing.
+    ///
+    /// Never call while holding the replication lock: `learner_replicas` takes them the other way.
+    pub fn voting_set(&self) -> Vec<String> {
+        let own = self.own_url();
+        {
+            let view = self.cluster.read().unwrap();
+            if !view.seeded {
+                let voters = view.voting_shards();
+                if voters.iter().any(|v| crate::util::same_endpoint(v, &own)) {
+                    return voters;
+                }
+            }
+        }
+
+        // Both halves, not just `peers`: `become_leader` has always taken the commit quorum over the
+        // union, and an election counting fewer nodes than the commit index does is a second leader.
+        let mut out = vec![own];
+        for candidate in self.config.replicas.iter().chain(self.config.peers.iter()) {
+            if !out.iter().any(|u| crate::util::same_endpoint(u, candidate)) {
+                out.push(candidate.clone());
+            }
+        }
+        out
+    }
+
+    /// The quorum membership other than this node: who to ask for votes, and whose acks count.
+    pub fn voting_peers(&self) -> Vec<String> {
+        let own = self.own_url();
+        self.voting_set().into_iter()
+            .filter(|v| !crate::util::same_endpoint(v, &own))
+            .collect()
+    }
+
     pub fn voting_replicas(&self) -> Vec<String> {
         if let Some(ref repl) = self.replication {
             return repl.read().unwrap().replicas.clone();
@@ -632,6 +679,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cluster::metadata::Member;
     use crate::test_support::{stage_put, temp_root};
 
     fn config_with_bound(root: &std::path::Path, bound: usize) -> NodeConfig {
@@ -738,8 +786,10 @@ mod tests {
         // A learner acking everything must not by itself commit anything.
         let col = db.get_collection("t").unwrap();
         let lsn = stage_put(&col, "k", 1);
-        // Stand in for the leader's own fsync landing, which is what note_ack counts as its vote.
+        // Stand in for the leader's own fsync landing, which is what note_ack counts as its vote,
+        // and for the write path recording the append that lets a quorum there commit at all.
         col.durable_lsn.store(lsn, std::sync::atomic::Ordering::SeqCst);
+        state.note_leader_append("t", lsn);
 
         state.note_ack("http://127.0.0.1:9504", "t", lsn, state.current_term());
         assert_eq!(state.committed_lsn("t"), 0,
@@ -781,7 +831,105 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+
+    #[test]
+    fn a_promoted_follower_inherits_the_rest_of_the_cluster_as_its_quorum() {
+        let root = temp_root();
+        let state = shard_state(&root, serde_json::json!(["http://127.0.0.1:9"]),
+            serde_json::json!(["http://127.0.0.1:2", "http://127.0.0.1:3"]));
+
+        assert_eq!(state.voting_peers(), vec![
+            "http://127.0.0.1:9".to_string(),
+            "http://127.0.0.1:2".to_string(),
+            "http://127.0.0.1:3".to_string(),
+        ], "configured replicas come first, peers fill in the rest, and this node is never in it");
+
+        let deduped = shard_state(&root, serde_json::json!(["http://127.0.0.1:2/"]),
+            serde_json::json!(["http://127.0.0.1:2", "http://127.0.0.1:3"]));
+        assert_eq!(deduped.voting_peers().len(), 2,
+            "the same endpoint written differently must not be counted twice");
+
+        let alone = shard_state(&root, serde_json::json!([]), serde_json::json!([]));
+        assert!(alone.voting_peers().is_empty());
+        assert_eq!(alone.voting_set().len(), 1, "a sole node is still its own quorum");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_election_quorum_counts_replicas_the_commit_quorum_already_waits_for() {
+        let root = temp_root();
+        let state = shard_state(&root, serde_json::json!(["http://127.0.0.1:2", "http://127.0.0.1:3"]),
+            serde_json::json!([]));
+
+        assert_eq!(state.voting_set().len(), 3,
+            "counting only `peers` here makes this a majority of one while its writes still              need two acks, so every such node elects itself");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_published_view_replaces_the_configured_quorum() {
+        let root = temp_root();
+        let state = shard_state(&root, serde_json::json!([]),
+            serde_json::json!(["http://127.0.0.1:2", "http://127.0.0.1:3"]));
+
+        let mut view = state.cluster_view();
+        view.members = ["http://127.0.0.1:1", "http://127.0.0.1:2"].iter()
+            .map(|url| voter(url))
+            .collect();
+        view.version = 5;
+        view.seeded = false;
+        assert!(matches!(state.adopt_cluster(view), Adoption::Adopted { .. }));
+
+        assert_eq!(state.voting_set().len(), 2,
+            "an agreed view is what stops two nodes computing different majorities from              their own configs");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_view_that_names_no_voters_leaves_the_quorum_where_it_was() {
+        let root = temp_root();
+        let state = shard_state(&root, serde_json::json!([]),
+            serde_json::json!(["http://127.0.0.1:2", "http://127.0.0.1:3"]));
+
+        // `voting` defaults to false, so a hand-written view omitting it names no voters at all.
+        let mut view = state.cluster_view();
+        view.members = vec![Member {
+            url: "http://shard-x:9999".into(), node_id: None, role: "shard".into(),
+            shard_role: Some("primary".into()), voting: false, follows: None,
+        }];
+        view.version = 5;
+        view.seeded = false;
+        assert!(matches!(state.adopt_cluster(view), Adoption::Adopted { .. }));
+
+        assert_eq!(state.voting_set().len(), 3,
+            "a view that does not name this node a voter must not strip its quorum to nothing");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     const HALF: u64 = 9223372036854775808;
+
+    fn voter(url: &str) -> Member {
+        Member {
+            url: url.to_string(), node_id: None, role: "shard".into(),
+            shard_role: None, voting: true, follows: None,
+        }
+    }
+
+    fn shard_state(root: &std::path::Path, replicas: serde_json::Value, peers: serde_json::Value) -> AppState {
+        AppState::for_routing_test(serde_json::from_value(serde_json::json!({
+            "node_id": "n1",
+            "role": "shard",
+            "shard_role": "primary",
+            "listen_addr": "127.0.0.1:1",
+            "data_dir": root.to_string_lossy(),
+            "replicas": replicas,
+            "peers": peers,
+        })).unwrap())
+    }
 
     fn router_state(root: &std::path::Path) -> AppState {
         AppState::for_routing_test(serde_json::from_value(serde_json::json!({

@@ -7,12 +7,12 @@ use std::time::Duration;
 
 const DIR_REMOVE_ATTEMPTS: usize = 5;
 
-// Configs mix "http://host:port" and "host:port"; without this a node fails to recognise itself.
+/// Node identity: the `host:port` of `url`, with scheme, path, query and fragment cut away.
+/// Configs mix "http://host:port" and "host:port", and one port has one listener, so a scheme
+/// cannot name a second node — a path can, which is why it is cut rather than compared.
 pub fn endpoint_of(url: &str) -> &str {
-    url.trim_end_matches('/')
-        .rsplit("//")
-        .next()
-        .unwrap_or(url)
+    let authority = url.split_once("//").map_or(url, |(_, rest)| rest);
+    authority.split(['/', '?', '#']).next().unwrap_or(authority)
 }
 
 pub fn same_endpoint(a: &str, b: &str) -> bool {
@@ -160,5 +160,24 @@ mod tests {
         assert!(same_endpoint("http://127.0.0.1:9501/", "127.0.0.1:9501"));
         assert!(same_endpoint("https://127.0.0.1:9501", "http://127.0.0.1:9501"));
         assert!(!same_endpoint("http://127.0.0.1:9501", "127.0.0.1:9502"));
+    }
+
+    #[test]
+    fn two_nodes_sharing_a_path_tail_are_not_the_same_node() {
+        assert_eq!(endpoint_of("http://a:1/x//shared"), "a:1");
+        assert!(!same_endpoint("http://a:1/x//shared", "http://b:2/y//shared"),
+            "identity is host:port, not the segment after the last //");
+        assert!(same_endpoint("http://h:1/data", "http://h:1"),
+            "a path names a route on a node, not a different node");
+        assert_eq!(endpoint_of("//h:1"), "h:1");
+        assert_eq!(endpoint_of("h:1?x=1#f"), "h:1");
+    }
+
+    #[test]
+    fn a_well_formed_node_url_still_resolves_exactly_as_before() {
+        // The ring hashes this, so any drift here silently reshuffles an existing cluster.
+        for url in ["http://127.0.0.1:9501", "127.0.0.1:9501", "https://h", "http://h/"] {
+            assert_eq!(endpoint_of(url), url.trim_end_matches('/').rsplit("//").next().unwrap());
+        }
     }
 }

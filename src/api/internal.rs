@@ -532,7 +532,9 @@ pub async fn vote_handler(
     State(state): State<AppState>,
     Json(req): Json<VoteRequest>,
 ) -> impl axum::response::IntoResponse {
-    if !state.is_shard() {
+    // Granting is quorum participation, not just standing. A learner is absent from every
+    // candidate's threshold, so its vote can only push one past a bar that never counted it.
+    if !state.is_shard() || state.is_learner() {
         return (StatusCode::FORBIDDEN, "Not a voting node").into_response();
     }
 

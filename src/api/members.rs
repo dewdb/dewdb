@@ -239,6 +239,13 @@ mod tests {
         assert_eq!(n1.state.as_ref().unwrap().voting_replicas().len(), 2,
             "the quorum set is the same size it was before the join");
 
+        let vote = c.post(&format!("{}/internal/vote", n4.url()))
+            .json(&serde_json::json!({
+                "term": 99, "candidate_id": "someone", "last_lsn": 0, "last_term": 0}))
+            .send().await.unwrap();
+        assert_eq!(vote.status(), StatusCode::FORBIDDEN,
+            "refusing to stand is half of it; a learner no threshold counts must not be able to              push a candidate over one either");
+
         // And it stays a learner across a restart even now that a view names it one.
         n4.kill();
         n4.start();

@@ -77,6 +77,7 @@ async fn local_write_inner(
         Some(col.build_entry(wal_id, offset, &frame[HEADER_LEN..]))
     };
     col.stage(lsn, key.clone(), wal_id, offset, staged);
+    state.note_leader_append(&col.name, lsn);
 
     Ok(PendingWrite { frame, term, lsn, existed, commit: Some(commit) })
 }
@@ -259,6 +260,7 @@ async fn local_write_batch_inner(
     for (key, frame, wal_id, offset, lsn) in &frames {
         let entry = col.build_entry(*wal_id, *offset, &frame[HEADER_LEN..]);
         col.stage(*lsn, key.clone(), *wal_id, *offset, Some(entry));
+        state.note_leader_append(&col.name, *lsn);
     }
 
     Ok(frames.into_iter().zip(existed.into_iter())

@@ -48,6 +48,8 @@ pub struct Progress {
     matched: HashMap<String, HashMap<String, u64>>,
     committed: HashMap<String, u64>,
     sent_through: HashMap<String, HashMap<String, u64>>,
+    /// Per collection, the first LSN this leader appended in its own term.
+    term_floor: HashMap<String, u64>,
 }
 
 impl Progress {
@@ -60,6 +62,7 @@ impl Progress {
         self.matched.clear();
         self.committed.clear();
         self.sent_through.clear();
+        self.term_floor.clear();
     }
 
     /// Exclusive lower bound for the next send: frames after this LSN are what the replica still
@@ -88,15 +91,21 @@ impl Progress {
     /// On winning an election: forget all quorum evidence, and seed each send cursor at our own
     /// tail the way Raft does. A persisted hint may only lower it -- raising it would skip frames
     /// the replica lacks, and the chain check would then have to catch what we should not have sent.
+    ///
+    /// `applied` seeds the watermark at what this node has already published, which a previous
+    /// leader must have committed for it to be published at all. Counting starts from there rather
+    /// than from zero, so promotion does not report a commit index behind its own visible state.
     pub fn reinit_as_leader(
         &mut self,
         replicas: &[String],
         own_tails: &HashMap<String, u64>,
+        applied: &HashMap<String, u64>,
         hints: &HashMap<String, HashMap<String, u64>>,
     ) {
         self.matched.clear();
-        self.committed.clear();
         self.sent_through.clear();
+        self.term_floor.clear();
+        self.committed = applied.iter().map(|(c, lsn)| (c.clone(), *lsn)).collect();
 
         for replica in replicas {
             let per_collection = self.sent_through.entry(replica.clone()).or_default();
@@ -121,6 +130,12 @@ impl Progress {
 
     pub fn cursor_snapshot(&self) -> HashMap<String, HashMap<String, u64>> {
         self.sent_through.clone()
+    }
+
+    /// The leader's own append. Only the first of the term matters, so a later one cannot lower
+    /// the floor and re-open the window it closes.
+    pub fn note_leader_append(&mut self, collection: &str, lsn: u64) {
+        self.term_floor.entry(collection.to_string()).or_insert(lsn);
     }
 
     pub fn observe_ack(&mut self, replica: &str, collection: &str, lsn: u64) {
@@ -153,6 +168,10 @@ impl Progress {
 
     /// Highest LSN a majority holds, counting the leader. Never moves backwards:
     /// a resynced replica can report a lower match than before.
+    ///
+    /// Raft §5.4.2: a majority holding a *prior-term* entry is not proof a later leader will keep
+    /// it, so counting may only commit at or above this leader's own first append. Entries below
+    /// the floor commit indirectly, when a current-term entry above them does.
     pub fn advance(&mut self, collection: &str, leader_durable: u64, replicas: &[String]) -> u64 {
         let mut held: Vec<u64> = Vec::with_capacity(replicas.len() + 1);
         held.push(leader_durable);
@@ -162,8 +181,9 @@ impl Progress {
         held.sort_unstable_by(|a, b| b.cmp(a));
 
         let quorum = held[majority(held.len()) - 1];
+        let floor = self.term_floor.get(collection).copied();
         let slot = self.committed.entry(collection.to_string()).or_insert(0);
-        if quorum > *slot {
+        if floor.is_some_and(|f| quorum >= f) && quorum > *slot {
             *slot = quorum;
         }
         *slot
@@ -181,6 +201,7 @@ mod tests {
     #[test]
     fn a_lone_leader_commits_its_own_writes() {
         let mut p = Progress::new();
+        p.note_leader_append("c", 7);
         assert_eq!(p.advance("c", 7, &[]), 7, "majority of one is itself");
     }
 
@@ -188,6 +209,7 @@ mod tests {
     fn two_of_three_is_a_quorum() {
         let r = urls(2);
         let mut p = Progress::new();
+        p.note_leader_append("c", 10);
 
         assert_eq!(p.advance("c", 10, &r), 0, "leader alone is not a majority of three");
 
@@ -202,6 +224,7 @@ mod tests {
     fn commits_the_highest_lsn_a_majority_holds_not_the_highest_seen() {
         let r = urls(4);
         let mut p = Progress::new();
+        p.note_leader_append("c", 1);
         p.observe_ack(&r[0], "c", 9);
         p.observe_ack(&r[1], "c", 5);
         p.observe_ack(&r[2], "c", 5);
@@ -216,6 +239,7 @@ mod tests {
     fn the_watermark_never_moves_backwards() {
         let r = urls(2);
         let mut p = Progress::new();
+        p.note_leader_append("c", 10);
         p.observe_ack(&r[0], "c", 10);
         assert_eq!(p.advance("c", 10, &r), 10);
 
@@ -228,6 +252,8 @@ mod tests {
     fn collections_commit_independently() {
         let r = urls(2);
         let mut p = Progress::new();
+        p.note_leader_append("alpha", 1);
+        p.note_leader_append("beta", 1);
         p.observe_ack(&r[0], "alpha", 4);
         p.observe_ack(&r[1], "alpha", 4);
 
@@ -236,6 +262,36 @@ mod tests {
             "an ack for alpha must not commit beta, whose frames nobody has");
         assert_eq!(p.committed("alpha"), 4);
         assert_eq!(p.max_committed(), 4);
+    }
+
+    #[test]
+    fn a_majority_holding_a_previous_terms_entry_is_not_enough_to_commit_it() {
+        let r = urls(2);
+        let mut p = Progress::new();
+
+        // Inherited from the last leader: every node holds lsn 5, and none of it is ours.
+        p.observe_ack(&r[0], "c", 5);
+        p.observe_ack(&r[1], "c", 5);
+        assert_eq!(p.advance("c", 5, &r), 0,
+            "a later leader can still overwrite lsn 5, so a majority holding it is not proof");
+
+        // Our own first append of this term. A majority reaching it carries lsn 5 over with it.
+        p.note_leader_append("c", 6);
+        p.observe_ack(&r[0], "c", 6);
+        assert_eq!(p.advance("c", 6, &r), 6,
+            "an entry of this term commits everything below it");
+    }
+
+    #[test]
+    fn promotion_starts_from_what_this_node_has_already_published() {
+        let r = urls(2);
+        let mut p = Progress::new();
+        p.reinit_as_leader(&r, &owned(&[("users", 10)]), &owned(&[("users", 7)]), &HashMap::new());
+
+        assert_eq!(p.committed("users"), 7,
+            "a published entry was committed under the previous leader; re-deriving it by              counting is the Figure 8 hole");
+        assert_eq!(p.advance("users", 10, &r), 7,
+            "and counting still moves nothing until this leader appends something of its own");
     }
 
     #[test]
@@ -260,7 +316,7 @@ mod tests {
     fn a_fresh_leader_seeds_each_cursor_at_its_own_tail() {
         let r = urls(2);
         let mut p = Progress::new();
-        p.reinit_as_leader(&r, &owned(&[("users", 10), ("orders", 4)]), &HashMap::new());
+        p.reinit_as_leader(&r, &owned(&[("users", 10), ("orders", 4)]), &HashMap::new(), &HashMap::new());
 
         assert_eq!(p.sent_through(&r[0], "users"), Some(10));
         assert_eq!(p.sent_through(&r[1], "orders"), Some(4));
@@ -272,12 +328,12 @@ mod tests {
         let r = urls(1);
 
         let mut p = Progress::new();
-        p.reinit_as_leader(&r, &owned(&[("users", 10)]), &hint(&r[0], &[("users", 6)]));
+        p.reinit_as_leader(&r, &owned(&[("users", 10)]), &HashMap::new(), &hint(&r[0], &[("users", 6)]));
         assert_eq!(p.sent_through(&r[0], "users"), Some(6),
             "a lower hint saves probing back down to where the replica actually is");
 
         let mut p = Progress::new();
-        p.reinit_as_leader(&r, &owned(&[("users", 10)]), &hint(&r[0], &[("users", 99)]));
+        p.reinit_as_leader(&r, &owned(&[("users", 10)]), &HashMap::new(), &hint(&r[0], &[("users", 99)]));
         assert_eq!(p.sent_through(&r[0], "users"), Some(10),
             "a hint above our own tail must be clamped; trusting it would skip frames \
              the replica lacks and leave the chain check to catch what we should not have sent");
@@ -288,11 +344,13 @@ mod tests {
         let r = urls(2);
         let mut p = Progress::new();
 
+        p.note_leader_append("users", 10);
         p.observe_ack(&r[0], "users", 10);
         p.observe_ack(&r[1], "users", 10);
         assert_eq!(p.advance("users", 10, &r), 10);
 
-        p.reinit_as_leader(&r, &owned(&[("users", 10)]), &hint(&r[0], &[("users", 10)]));
+        p.reinit_as_leader(&r, &owned(&[("users", 10)]), &HashMap::new(), &hint(&r[0], &[("users", 10)]));
+        p.note_leader_append("users", 10);
 
         assert_eq!(p.matched(&r[0], "users"), 0, "a new term starts with no match evidence");
         assert_eq!(p.committed("users"), 0);

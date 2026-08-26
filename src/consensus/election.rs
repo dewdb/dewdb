@@ -45,19 +45,6 @@ pub struct VoteDecision {
 }
 
 // A promoted follower with no configured replicas would accept writes and replicate them nowhere.
-fn leader_replica_set(configured: &[String], peers: &[String], listen_addr: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for candidate in configured.iter().chain(peers.iter()) {
-        if same_endpoint(candidate, listen_addr) {
-            continue;
-        }
-        if !out.iter().any(|existing| same_endpoint(existing, candidate)) {
-            out.push(candidate.clone());
-        }
-    }
-    out
-}
-
 // Opens every collection on disk: one we have not opened yet still holds entries we could lose.
 // Takes the collections lock, so never call this while holding the replication lock.
 pub fn local_log_tails(state: &AppState) -> HashMap<String, LogTail> {
@@ -192,17 +179,15 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64) {
         return;
     }
 
-    let peers = state.config.peers.clone();
-    let cluster_size = peers.len() + 1;
-    let needed = majority(cluster_size);
-    info!(target: "election", "Node {} standing for term {} ({} peers, need {} votes)", candidate_id, new_term, peers.len(), needed);
+    let voters = state.voting_set();
+    let needed = majority(voters.len());
+    let own = state.own_url();
+    let peers: Vec<String> = voters.into_iter().filter(|v| !same_endpoint(v, &own)).collect();
+    info!(target: "election", "Node {} standing for term {} ({} voters, need {} votes)", candidate_id, new_term, peers.len() + 1, needed);
 
     if peers.is_empty() {
-        if needed <= 1 {
-            become_leader(state, new_term, &candidate_id).await;
-        } else {
-            warn!(target: "election", "No peers configured; cannot form a majority. Set 'peers' in config for automatic failover.");
-        }
+        // Sole voter, so the self-vote already is the majority.
+        become_leader(state, new_term, &candidate_id).await;
         return;
     }
 
@@ -276,17 +261,22 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64) {
 /// Seeds every replica's send cursor from our own log, lowered by any persisted hint.
 /// Also used at boot by a node configured as primary, which never runs an election.
 pub fn seed_leader_progress(state: &AppState) {
-    // Both reach the collections lock, so they are gathered before the replication lock.
+    // All three reach the collections lock, so they are gathered before the replication lock.
     let own_tails: HashMap<String, u64> = local_log_tails(state)
         .into_iter()
         .map(|(name, tail)| (name, tail.last_lsn))
         .collect();
+    let applied: HashMap<String, u64> = state.db.as_ref()
+        .map(|db| own_tails.keys()
+            .filter_map(|name| db.get_collection(name).ok().map(|c| (name.clone(), c.applied_lsn())))
+            .collect())
+        .unwrap_or_default();
     let hints = ProgressMeta::load(&state.config.data_dir).sent_through;
 
     if let Some(repl) = state.replication.as_ref() {
         let mut g = repl.write().unwrap();
         let replicas = g.replicas.clone();
-        g.progress.reinit_as_leader(&replicas, &own_tails, &hints);
+        g.progress.reinit_as_leader(&replicas, &own_tails, &applied, &hints);
     }
 }
 
@@ -297,6 +287,9 @@ async fn become_leader(state: &AppState, term: u64, candidate_id: &str) {
         warn!(target: "election", "Refusing leadership at term {}: this node is non-voting", term);
         return;
     }
+    // Sampled before the replication lock, which `voting_peers` must never be called under. Same
+    // set the election counted, so the commit quorum cannot end up narrower than the vote was.
+    let quorum_peers = state.voting_peers();
     {
         let mut repl = state.replication.as_ref().unwrap().write().unwrap();
         if repl.term != term || repl.voted_for.as_deref() != Some(candidate_id) {
@@ -306,11 +299,7 @@ async fn become_leader(state: &AppState, term: u64, candidate_id: &str) {
         repl.is_leader = true;
         repl.heartbeat_running = false;
         repl.primary_addr = None;
-        repl.replicas = leader_replica_set(
-            &state.config.replicas,
-            &state.config.peers,
-            &state.config.listen_addr,
-        );
+        repl.replicas = quorum_peers;
     }
     seed_leader_progress(state);
     // Term and self-vote are already durable; losing only is_leader rejoins as a follower.
@@ -581,26 +570,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    #[test]
-    fn a_promoted_follower_inherits_the_rest_of_the_cluster_as_replicas() {
-        let peers = vec!["http://127.0.0.1:2".to_string(), "http://127.0.0.1:3".to_string()];
-
-        let promoted = leader_replica_set(&[], &peers, "127.0.0.1:2");
-        assert_eq!(promoted, vec!["http://127.0.0.1:3".to_string()],
-            "a follower with no configured replicas must adopt its peers, minus itself, \
-             or it would accept writes and replicate them nowhere");
-
-        let configured = vec!["http://127.0.0.1:9".to_string()];
-        let merged = leader_replica_set(&configured, &peers, "127.0.0.1:1");
-        assert_eq!(merged, vec![
-            "http://127.0.0.1:9".to_string(),
-            "http://127.0.0.1:2".to_string(),
-            "http://127.0.0.1:3".to_string(),
-        ], "configured replicas come first, peers fill in the rest");
-
-        let deduped = leader_replica_set(&["http://127.0.0.1:2/".to_string()], &peers, "127.0.0.1:1");
-        assert_eq!(deduped.len(), 2, "the same endpoint written differently must not be duplicated");
-
-        assert!(leader_replica_set(&[], &[], "127.0.0.1:1").is_empty());
-    }
 }
