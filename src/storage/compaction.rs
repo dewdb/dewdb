@@ -2,7 +2,7 @@
 
 use super::collection::Collection;
 use super::frame::{LogEntry, HEADER_LEN, MAX_RECORD_SIZE};
-use super::index::{IndexEntry, INDEX_FILENAME};
+use super::index::IndexEntry;
 use crate::util::remove_file_with_retry;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -118,6 +118,10 @@ impl Collection {
         let final_path = self.root_path.join(format!("wal-{:05}.log", compact_id));
         fs::rename(&compact_path, &final_path)?;
 
+        // Sampled before the index lock: `apply_committed` takes pending first, and inverting that
+        // here deadlocks. A frame staged into a frozen WAL is uncommitted, so its WAL must survive.
+        let retire = self.pending_floor().map_or(true, |(wal_id, _)| wal_id > frozen_through);
+
         let mut remapped = 0usize;
         let mut superseded = 0usize;
         {
@@ -136,17 +140,28 @@ impl Collection {
                 }
             }
 
-            let _ = fs::remove_file(self.root_path.join(INDEX_FILENAME));
+            // Published under the index lock: past this point no reader can resolve a key into a
+            // frozen WAL, so only handles taken before it are still outstanding.
+            if retire {
+                self.retired_through.fetch_max(frozen_through, Ordering::SeqCst);
+            }
+        }
 
-            self.read_pool.lock().unwrap().clear();
+        // The pivot. Until it lands the previous snapshot plus the intact frozen WALs still describe
+        // the collection; once it names a resume point above them, boot skips them by id and a
+        // failed unlink is wasted disk rather than a key coming back from the dead.
+        self.save_index()?;
 
-            self.remove_wals_through(frozen_through)?;
+        let mut orphaned = 0usize;
+        if retire {
+            self.drain_read_pool(frozen_through);
+            orphaned = self.remove_wals_through(frozen_through)?;
         }
 
         self.commit_signal.notify_one();
 
         info!(target: "compaction", collection = %self.name, relocated = remapped, superseded,
-            "Compaction complete");
+            retired = retire, orphaned, "Compaction complete");
         Ok(())
     }
 
@@ -207,7 +222,10 @@ impl Collection {
         Ok(relocated)
     }
 
-    fn remove_wals_through(&self, frozen_through: u64) -> io::Result<()> {
+    /// Returns how many obsolete WALs could not be unlinked. Safe to leave behind: the snapshot
+    /// written before this call already puts boot's resume point past them.
+    fn remove_wals_through(&self, frozen_through: u64) -> io::Result<usize> {
+        let mut orphaned = 0usize;
         for entry in fs::read_dir(&self.root_path)? {
             let entry = entry?;
             let name = entry.file_name();
@@ -221,13 +239,14 @@ impl Collection {
             match name[4..name.len() - 4].parse::<u64>() {
                 Ok(id) if id <= frozen_through => {
                     if let Err(e) = remove_file_with_retry(&entry.path()) {
+                        orphaned += 1;
                         warn!(target: "compaction", collection = %self.name, file = %name, error = %e, "Could not remove obsolete WAL");
                     }
                 },
                 _ => {}
             }
         }
-        Ok(())
+        Ok(orphaned)
     }
 
 }
@@ -235,6 +254,7 @@ impl Collection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::index::{IndexSnapshot, INDEX_FILENAME};
     use crate::storage::Database;
     use crate::test_support::{live_put, temp_root};
     use std::path::Path;
@@ -440,6 +460,63 @@ mod tests {
         let col2 = db2.get_collection("c").unwrap();
         assert_eq!(col2.get("keep").unwrap(), Some(serde_json::json!({"v": 1})));
         assert!(col2.get("gone").unwrap().is_none(), "a tombstoned key must not come back after compaction + replay");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_frozen_wal_that_outlives_compaction_cannot_resurrect_a_deleted_key() {
+        let root = temp_root();
+        let col_dir = root.join("c");
+
+        {
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("c").unwrap();
+
+            live_put(&col, "keep", 1);
+            live_put(&col, "gone", 2);
+            col.enqueue_commit().await.unwrap().unwrap();
+            col.compact().unwrap();
+
+            // The surviving copy of the Put, as a failed unlink would leave it behind.
+            let put_wal = col_dir.join(format!("wal-{:05}.log", wal_ids_on_disk(&col_dir)[0]));
+            let orphan = (put_wal.clone(), fs::read(&put_wal).unwrap());
+
+            col.delete("gone".into(), 1).unwrap();
+            col.index.write().unwrap().remove("gone");
+            col.enqueue_commit().await.unwrap().unwrap();
+            col.compact().unwrap();
+
+            assert!(!orphan.0.exists(), "the second compaction must have retired the first output");
+            fs::write(&orphan.0, &orphan.1).unwrap();
+        }
+
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+        assert_eq!(col.get("keep").unwrap(), Some(serde_json::json!({"v": 1})));
+        assert!(col.get("gone").unwrap().is_none(),
+            "a WAL compaction failed to unlink must not put a tombstoned key back");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn compaction_leaves_a_snapshot_that_resumes_past_the_wals_it_retired() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        live_put(&col, "k", 1);
+        col.enqueue_commit().await.unwrap().unwrap();
+
+        let frozen_through = col.wal_writer.lock().unwrap().current_wal_id;
+        col.compact().unwrap();
+
+        let file = File::open(col.root_path.join(INDEX_FILENAME))
+            .expect("compaction must leave a snapshot, not unlink the one it had");
+        let snapshot: IndexSnapshot = bincode::deserialize_from(file).unwrap();
+        assert!(snapshot.last_wal_id > frozen_through,
+            "boot must resume above the retired WALs, or it replays whatever survived them");
 
         let _ = fs::remove_dir_all(&root);
     }

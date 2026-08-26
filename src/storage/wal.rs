@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tracing::warn;
 
 const WAL_ROTATION_LIMIT: u64 = 50 * 1024 * 1024;
+const DRAIN_ATTEMPTS: usize = 5;
 
 pub struct WalsState {
     pub current_wal: File,
@@ -280,7 +281,12 @@ impl Collection {
         Ok(ReplicaApply::Applied { wal_id, offset, lsn: header.lsn })
     }
 
+    /// Frames in `(after_lsn, up_to_lsn]`, LSN-ordered and deduplicated. Refuses to return a set with
+    /// a hole in it: the caller cannot tell a compaction race from a genuine loss, and `chain_prefix`
+    /// turns either into a full snapshot resync.
     pub fn read_frames_after(&self, after_lsn: u64, up_to_lsn: u64) -> io::Result<Vec<(u64, Vec<u8>)>> {
+        let retired = self.retired_through.load(Ordering::SeqCst);
+
         let mut wal_files: Vec<(u64, PathBuf)> = Vec::new();
         for entry in fs::read_dir(&self.root_path)? {
             let entry = entry?;
@@ -288,20 +294,29 @@ impl Collection {
             if let Some(fname) = path.file_name().and_then(|s| s.to_str()) {
                 if fname.starts_with("wal-") && fname.ends_with(".log") {
                     let id_part = &fname[4..fname.len() - 4];
-                    if let Ok(id) = id_part.parse::<u64>() {
-                        wal_files.push((id, path));
+                    match id_part.parse::<u64>() {
+                        // A retired WAL holds only frames the compacted one already carries, so
+                        // scanning one an unlink left behind emits every LSN in it twice.
+                        Ok(id) if id > retired => wal_files.push((id, path)),
+                        _ => {},
                     }
                 }
             }
         }
         wal_files.sort_by_key(|(id, _)| *id);
 
-        let mut out = Vec::new();
-        for (_id, path) in wal_files {
+        // Only the WAL being appended to may end mid-frame; anywhere else that is a hole.
+        let active = wal_files.last().map_or(0, |(id, _)| *id);
+
+        let mut out: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        for (id, path) in wal_files {
             let mut file = match File::open(&path) {
                 Ok(f) => f,
-                Err(_) => continue,
+                Err(e) => return Err(gapped_scan(&self.name, format!("WAL {} vanished mid-scan: {}", id, e))),
             };
+            let file_len = file.metadata()?.len();
+            let mut offset = 0u64;
+
             loop {
                 let mut header = [0u8; HEADER_LEN];
                 if file.read_exact(&mut header).is_err() {
@@ -312,7 +327,6 @@ impl Collection {
                     None => break,
                 };
                 let len = parsed.len as usize;
-                let lsn = parsed.lsn;
 
                 if len == 0 || len as u64 > MAX_RECORD_SIZE {
                     break;
@@ -327,18 +341,37 @@ impl Collection {
                     break;
                 }
 
-                if lsn > after_lsn && lsn <= up_to_lsn {
+                offset += (HEADER_LEN + len) as u64;
+
+                if parsed.lsn > after_lsn && parsed.lsn <= up_to_lsn {
                     let mut frame = Vec::with_capacity(HEADER_LEN + len);
                     frame.extend_from_slice(&header);
                     frame.extend_from_slice(&payload);
-                    out.push((lsn, frame));
+                    // Highest WAL id wins: a relocated copy supersedes the frozen original.
+                    out.insert(parsed.lsn, frame);
                 }
             }
+
+            if offset < file_len && id != active {
+                return Err(gapped_scan(&self.name,
+                    format!("WAL {} stops at {} of {} bytes", id, offset, file_len)));
+            }
         }
-        Ok(out)
+
+        // Cheaper than holding `snapshot_boundary` for the whole scan, which would serialise every
+        // repair on a collection behind one another.
+        if self.retired_through.load(Ordering::SeqCst) != retired {
+            return Err(gapped_scan(&self.name, "a compaction retired WALs mid-scan".to_string()));
+        }
+
+        Ok(out.into_iter().collect())
     }
 
     fn wal_reader(&self, wal_id: u64) -> io::Result<Arc<std::sync::Mutex<File>>> {
+        if wal_id <= self.retired_through.load(Ordering::SeqCst) {
+            return Err(io::Error::new(io::ErrorKind::NotFound,
+                format!("WAL {} was retired by compaction", wal_id)));
+        }
         let mut pool = self.read_pool.lock().unwrap();
         let counter = self.read_pool_counter.fetch_add(1, Ordering::Relaxed);
         if let Some(handles) = pool.get_mut(&wal_id) {
@@ -353,20 +386,59 @@ impl Collection {
         Ok(handles[counter % READ_POOL_HANDLES].clone())
     }
 
-    pub fn read_frame_payload(&self, wal_id: u64, offset: u64) -> io::Result<Vec<u8>> {
+    /// Retires every pooled handle for a WAL id at or below `through` and waits for in-flight
+    /// readers to drop theirs. Windows will not unlink a file that any handle still holds open.
+    pub fn drain_read_pool(&self, through: u64) {
+        let retired: Vec<Arc<std::sync::Mutex<File>>> = {
+            let mut pool = self.read_pool.lock().unwrap();
+            let ids: Vec<u64> = pool.keys().copied().filter(|id| *id <= through).collect();
+            ids.iter().filter_map(|id| pool.remove(id)).flatten().collect()
+        };
+        for attempt in 0..DRAIN_ATTEMPTS {
+            if retired.iter().all(|h| Arc::strong_count(h) == 1) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20 * (attempt + 1) as u64));
+        }
+        warn!(target: "storage", collection = %self.name, through,
+            "Read handles still in flight after drain; retired WALs may not unlink");
+    }
+
+    /// `expected_len` is what the index recorded for this frame. A disagreeing length or a failed
+    /// CRC means the offset no longer names that frame, so the bytes are refused, not returned.
+    pub fn read_frame_payload(&self, wal_id: u64, offset: u64, expected_len: u32) -> io::Result<Vec<u8>> {
         let file_arc = self.wal_reader(wal_id)?;
         let mut file = file_arc.lock().unwrap();
         file.seek(SeekFrom::Start(offset))?;
 
         let mut header = [0u8; HEADER_LEN];
         file.read_exact(&mut header)?;
-        let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+        let parsed = FrameHeader::parse(&header)
+            .ok_or_else(|| bad_frame(wal_id, offset, "unparseable header"))?;
 
-        let mut payload = vec![0u8; len];
+        if parsed.len != expected_len || parsed.len == 0 || parsed.len as u64 > MAX_RECORD_SIZE {
+            return Err(bad_frame(wal_id, offset, "frame length disagrees with the index"));
+        }
+
+        let mut payload = vec![0u8; parsed.len as usize];
         file.read_exact(&mut payload)?;
+
+        if !parsed.payload_valid(&payload) {
+            return Err(bad_frame(wal_id, offset, "payload failed its CRC"));
+        }
         Ok(payload)
     }
 
+}
+
+fn gapped_scan(collection: &str, why: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData,
+        format!("Frame scan of '{}' would be gapped: {}", collection, why))
+}
+
+fn bad_frame(wal_id: u64, offset: u64, why: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData,
+        format!("WAL {} offset {}: {}", wal_id, offset, why))
 }
 
 #[cfg(test)]
@@ -374,7 +446,7 @@ mod tests {
     use super::*;
     use crate::storage::frame::MAX_RECORD_SIZE;
     use crate::storage::Database;
-    use crate::test_support::{idx, make_frame, temp_root};
+    use crate::test_support::{disk_put, idx, live_put, make_frame, temp_root};
     use std::io::Write;
     use std::sync::atomic::Ordering;
 
@@ -445,6 +517,128 @@ mod tests {
             col3.index.write().unwrap().insert("key_post_corrupt".to_string(), idx(&f, wal_id, offset));
         }
         assert!(col3.get("key_post_corrupt").unwrap().is_some(), "Writes should continue after recovery");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_read_refuses_a_frame_that_is_not_the_one_the_index_recorded() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        let (wal_id, off_a, len) = disk_put(&col, "a", "a");
+        let (_, off_b, _) = disk_put(&col, "b", "b");
+        col.enqueue_commit().await.unwrap().unwrap();
+
+        // b's payload spliced over a's: same length, still valid JSON, wrong document.
+        let path = col.root_path.join(format!("wal-{:05}.log", wal_id));
+        let mut f = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let mut payload_b = vec![0u8; len as usize];
+        f.seek(SeekFrom::Start(off_b + HEADER_LEN as u64)).unwrap();
+        f.read_exact(&mut payload_b).unwrap();
+        f.seek(SeekFrom::Start(off_a + HEADER_LEN as u64)).unwrap();
+        f.write_all(&payload_b).unwrap();
+        drop(f);
+
+        col.drain_read_pool(u64::MAX);
+
+        let err = col.get("a").expect_err("a frame failing its CRC must not be served as a value");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_drain_waits_for_a_reader_that_still_holds_a_handle() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        disk_put(&col, "a", "a");
+        assert!(col.get("a").unwrap().is_some(), "the read must warm the pool");
+
+        let held = col.read_pool.lock().unwrap().values().next().unwrap()[0].clone();
+
+        let started = std::time::Instant::now();
+        col.drain_read_pool(u64::MAX);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(100),
+            "a drain that returns while a reader holds a handle has drained nothing");
+        assert!(col.read_pool.lock().unwrap().is_empty());
+
+        drop(held);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_wal_a_failed_unlink_left_behind_does_not_duplicate_relocated_frames() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        for i in 1..=3 {
+            live_put(&col, &format!("k{}", i), i);
+        }
+        col.enqueue_commit().await.unwrap().unwrap();
+
+        let frozen = col.root_path.join(format!("wal-{:05}.log",
+            col.wal_writer.lock().unwrap().current_wal_id));
+        let orphan = fs::read(&frozen).unwrap();
+
+        col.compact().unwrap();
+        assert!(!frozen.exists());
+        fs::write(&frozen, &orphan).unwrap();
+
+        let frames = col.read_frames_after(0, 3).unwrap();
+        let lsns: Vec<u64> = frames.iter().map(|(lsn, _)| *lsn).collect();
+        assert_eq!(lsns, vec![1, 2, 3],
+            "a frame relocated by compaction must be reported once, not once per surviving copy");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_scan_refuses_to_report_a_wal_that_stops_mid_frame() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        for i in 1..=3 {
+            live_put(&col, &format!("k{}", i), i);
+        }
+        col.enqueue_commit().await.unwrap().unwrap();
+        col.compact().unwrap();
+
+        // The compacted WAL, which is frozen: nothing appends to it, so a short read is a hole.
+        let compacted = col.root_path.join(format!("wal-{:05}.log", col.retired_through
+            .load(Ordering::SeqCst) + 1));
+        let len = compacted.metadata().unwrap().len();
+        OpenOptions::new().write(true).open(&compacted).unwrap().set_len(len - 5).unwrap();
+
+        let err = col.read_frames_after(0, 3)
+            .expect_err("a scan that cannot read a frozen WAL out must not report a short set");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_partial_frame_at_the_tail_of_the_active_wal_is_still_tolerated() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        for i in 1..=3 {
+            live_put(&col, &format!("k{}", i), i);
+        }
+        col.enqueue_commit().await.unwrap().unwrap();
+
+        let active = col.root_path.join(format!("wal-{:05}.log",
+            col.wal_writer.lock().unwrap().current_wal_id));
+        OpenOptions::new().append(true).open(&active).unwrap().write_all(&[0u8; 7]).unwrap();
+
+        let frames = col.read_frames_after(0, 3).unwrap();
+        assert_eq!(frames.len(), 3, "an append caught in flight must not fail the scan");
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -18,6 +18,10 @@ const KEY_LOCK_STRIPES: usize = 64;
 pub const READ_POOL_HANDLES: usize = 4;
 const COMMIT_BATCH_THRESHOLD: usize = 32;
 const COMMIT_INTERVAL_MS: u64 = 5;
+const READ_RESOLVE_ATTEMPTS: usize = 3;
+
+/// A frame's `(wal_id, offset, len)` as the index records it.
+type Located = (u64, u64, u32);
 
 pub struct Collection {
     pub name: String,
@@ -30,6 +34,9 @@ pub struct Collection {
     pub commit_signal: Arc<tokio::sync::Notify>,
     pub read_pool: std::sync::Mutex<HashMap<u64, Vec<Arc<std::sync::Mutex<File>>>>>,
     pub read_pool_counter: AtomicUsize,
+    /// Highest WAL id compaction has retired. Set once the index no longer points below it, so a
+    /// location at or under this id is stale and must be re-resolved rather than read.
+    pub retired_through: AtomicU64,
     pub released: AtomicBool,
     pub compacting: AtomicBool,
     /// Prevents compaction from retiring WAL files during snapshot streaming.
@@ -188,6 +195,7 @@ impl Collection {
             commit_signal: Arc::new(tokio::sync::Notify::new()),
             read_pool: std::sync::Mutex::new(HashMap::new()),
             read_pool_counter: AtomicUsize::new(0),
+            retired_through: AtomicU64::new(0),
             released: AtomicBool::new(false),
             compacting: AtomicBool::new(false),
             snapshot_boundary: std::sync::Mutex::new(()),
@@ -424,26 +432,50 @@ impl Collection {
         match &entry.inline {
             Some(payload) => Ok(Self::value_from_payload(payload)),
             None => {
-                let payload = self.read_frame_payload(entry.wal_id, entry.offset)?;
+                let payload = self.read_frame_payload(entry.wal_id, entry.offset, entry.len)?;
                 Ok(Self::value_from_payload(&payload))
             }
         }
     }
 
-    pub fn get(&self, key: &str) -> io::Result<Option<serde_json::Value>> {
-        let located = {
+    /// Compaction remaps the index before it retires a WAL, so a location that fails validation or
+    /// lost its file is stale by definition: re-resolve and retry. An unmoved location is a real error.
+    fn read_located(&self, key: &str, at: Located) -> io::Result<Option<serde_json::Value>> {
+        let mut at = at;
+        for _ in 0..READ_RESOLVE_ATTEMPTS {
+            let err = match self.read_frame_payload(at.0, at.1, at.2) {
+                Ok(payload) => return Ok(Self::value_from_payload(&payload)),
+                Err(e) => e,
+            };
             let index = self.index.read().unwrap();
             match index.get(key) {
                 None => return Ok(None),
                 Some(entry) => match &entry.inline {
                     Some(payload) => return Ok(Self::value_from_payload(payload)),
-                    None => (entry.wal_id, entry.offset),
+                    None if (entry.wal_id, entry.offset, entry.len) != at => {
+                        at = (entry.wal_id, entry.offset, entry.len);
+                    },
+                    None => return Err(err),
+                },
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::InvalidData,
+            format!("Key '{}' kept moving while being read", key)))
+    }
+
+    pub fn get(&self, key: &str) -> io::Result<Option<serde_json::Value>> {
+        let at = {
+            let index = self.index.read().unwrap();
+            match index.get(key) {
+                None => return Ok(None),
+                Some(entry) => match &entry.inline {
+                    Some(payload) => return Ok(Self::value_from_payload(payload)),
+                    None => (entry.wal_id, entry.offset, entry.len),
                 },
             }
         };
 
-        let payload = self.read_frame_payload(located.0, located.1)?;
-        Ok(Self::value_from_payload(&payload))
+        self.read_located(key, at)
     }
 
     pub fn list_all(&self) -> io::Result<Vec<serde_json::Value>> {
@@ -459,14 +491,13 @@ impl Collection {
                             resolved.push(v);
                         }
                     },
-                    None => pending.push((key.clone(), entry.wal_id, entry.offset)),
+                    None => pending.push((key.clone(), (entry.wal_id, entry.offset, entry.len))),
                 }
             }
         }
 
-        for (_key, wal_id, offset) in pending {
-            let payload = self.read_frame_payload(wal_id, offset)?;
-            if let Some(v) = Self::value_from_payload(&payload) {
+        for (key, at) in pending {
+            if let Some(v) = self.read_located(&key, at)? {
                 resolved.push(v);
             }
         }
@@ -621,7 +652,7 @@ impl Collection {
         }
 
         self.commit_signal.notify_one();
-        self.read_pool.lock().unwrap().clear();
+        self.drain_read_pool(u64::MAX);
         self.pending.lock().unwrap().clear();
         self.index.write().unwrap().clear();
 
@@ -636,12 +667,33 @@ mod tests {
     use crate::json::merge_patch;
     use crate::storage::Database;
     use crate::storage::HEADER_LEN;
-    use crate::test_support::{idx, live_put, stage_delete, stage_put, temp_root, wait_for};
+    use crate::test_support::{disk_put, idx, live_put, stage_delete, stage_put, temp_root, wait_for};
     use crate::util::remove_file_with_retry;
     use std::collections::HashSet;
 
     fn cache_cfg(max_value: u32, budget: u64) -> ReadCacheConfig {
         ReadCacheConfig { inline_max_value_bytes: max_value, inline_budget_bytes: budget }
+    }
+
+    #[tokio::test]
+    async fn a_read_that_captured_its_location_before_a_compaction_still_finds_the_key() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        let stale = disk_put(&col, "a", "a");
+        disk_put(&col, "b", "b");
+        col.enqueue_commit().await.unwrap().unwrap();
+
+        col.compact().unwrap();
+        assert!(col.retired_through.load(Ordering::SeqCst) >= stale.0,
+            "compaction must retire the WAL the location names");
+
+        let value = col.read_located("a", stale).unwrap()
+            .expect("a location retired mid-read must be re-resolved, not dropped");
+        assert_eq!(value["v"], "a".repeat(600));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn inline_count(col: &Arc<Collection>) -> usize {

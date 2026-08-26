@@ -69,6 +69,18 @@ pub fn stage_delete(col: &Arc<Collection>, key: &str) -> u64 {
     lsn
 }
 
+/// A value too large for the inline cache, so reads must go back to the WAL.
+pub fn disk_put(col: &Arc<Collection>, key: &str, fill: &str) -> (u64, u64, u32) {
+    let value = serde_json::json!({"v": fill.repeat(600)});
+    let (f, wal_id, offset, _) = col.put(key.into(), value, 1).unwrap();
+    let entry = col.build_entry(wal_id, offset, &f[HEADER_LEN..]);
+    assert!(entry.inline.is_none(), "the value must be too large to inline");
+    let len = entry.len;
+    let mut index = col.index.write().unwrap();
+    col.apply_index_put(&mut index, key.into(), entry);
+    (wal_id, offset, len)
+}
+
 pub fn live_put(col: &Arc<Collection>, key: &str, v: i64) {
     let (f, w, o, _) = col.put(key.into(), serde_json::json!({"v": v}), 1).unwrap();
     let entry = col.build_entry(w, o, &f[HEADER_LEN..]);

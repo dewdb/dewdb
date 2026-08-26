@@ -206,7 +206,6 @@ fn stream_snapshot(
             .map_err(|_| lock_error("WAL"))?;
         wal.current_wal.sync_data()?;
         let frozen_through = wal.current_wal_id;
-        let next_wal_id = frozen_through + 1;
 
         let _pending = collection
             .pending
@@ -236,38 +235,50 @@ fn stream_snapshot(
         .map_err(io::Error::other)?;
         applied_file.sync_all()?;
 
-        let next_path = collection
-            .root_path
-            .join(format!("wal-{:05}.log", next_wal_id));
-        let next_wal = OpenOptions::new()
-            .create_new(true)
-            .append(true)
-            .read(true)
-            .open(next_path)?;
-        wal.current_wal = next_wal;
-        wal.current_wal_id = next_wal_id;
-        wal.current_wal_size = 0;
-        frozen_through
+        // Rotation is what makes the streamed set immutable, and an active WAL with nothing appended
+        // to it already is: a run of requests on an idle leader then costs no files. Not below id 2,
+        // where there is no earlier WAL and the receiver refuses a snapshot carrying none.
+        if wal.current_wal_size == 0 && frozen_through > 1 {
+            frozen_through - 1
+        } else {
+            // An id already on disk fails `create_new` and takes the whole transfer down with it.
+            let mut next_wal_id = frozen_through + 1;
+            let mut next_path = collection.root_path.join(format!("wal-{:05}.log", next_wal_id));
+            while next_path.exists() {
+                next_wal_id += 1;
+                next_path = collection.root_path.join(format!("wal-{:05}.log", next_wal_id));
+            }
+            let next_wal = OpenOptions::new()
+                .create_new(true)
+                .append(true)
+                .read(true)
+                .open(next_path)?;
+            wal.current_wal = next_wal;
+            wal.current_wal_id = next_wal_id;
+            wal.current_wal_size = 0;
+            frozen_through
+        }
     };
 
     let mut wal_files = Vec::new();
     for entry in fs::read_dir(&collection.root_path)? {
         let entry = entry?;
         let filename = entry.file_name().to_string_lossy().to_string();
-        if entry.file_type()?.is_file()
-            && wal_id_from_filename(&filename).is_some_and(|id| id <= frozen_through)
-        {
-            wal_files.push((filename, entry.path()));
+        if entry.file_type()?.is_file() {
+            if let Some(id) = wal_id_from_filename(&filename).filter(|id| *id <= frozen_through) {
+                wal_files.push((id, filename, entry.path()));
+            }
         }
     }
-    wal_files.sort_by(|a, b| a.0.cmp(&b.0));
+    // By parsed id: `{:05}` stops padding at 99999, and wal-100000 sorts before wal-99999 by name.
+    wal_files.sort_by_key(|(id, _, _)| *id);
 
     let mut wire = ChannelWriter::new(sender);
     wire.write_all(SNAPSHOT_MAGIC)?;
     stream_file(&mut wire, INDEX_FILENAME, &spool_index)?;
     stream_file(&mut wire, "applied.meta", &spool_applied)?;
 
-    for (filename, path) in wal_files {
+    for (_, filename, path) in wal_files {
         stream_file(&mut wire, &filename, &path)?;
     }
 
@@ -541,6 +552,103 @@ mod tests {
         let stream = futures::stream::iter(vec![Ok::<_, io::Error>(Cursor::new(bytes))]);
         let mut reader = StreamReader::new(stream);
         receive_snapshot(&mut reader, target).await
+    }
+
+    /// Entry names in the order the stream carries them, which `receive_snapshot` discards.
+    fn streamed_names(wire: &[u8]) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut i = SNAPSHOT_MAGIC.len();
+        while wire[i] == 1 {
+            i += 1;
+            let name_len = u16::from_le_bytes(wire[i..i + 2].try_into().unwrap()) as usize;
+            i += 2;
+            names.push(String::from_utf8(wire[i..i + name_len].to_vec()).unwrap());
+            i += name_len;
+            loop {
+                let chunk = u32::from_le_bytes(wire[i..i + 4].try_into().unwrap()) as usize;
+                i += 4;
+                if chunk == 0 {
+                    break;
+                }
+                i += chunk;
+            }
+            i += 12;
+        }
+        names
+    }
+
+    fn wal_ids_on_disk(root: &Path) -> Vec<u64> {
+        let mut ids: Vec<u64> = fs::read_dir(root).unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| wal_id_from_filename(&e.file_name().to_string_lossy()))
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[tokio::test]
+    async fn wal_files_stream_in_id_order_once_the_padding_runs_out() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        for id in [99999u64, 100000] {
+            fs::write(col.root_path.join(format!("wal-{:05}.log", id)), b"").unwrap();
+        }
+        {
+            // Reaching these ids for real would take 5 TB of WAL; the scan is what is under test.
+            let mut wal = col.wal_writer.lock().unwrap();
+            wal.current_wal_id = 100001;
+            wal.current_wal_size = 0;
+        }
+
+        let names = streamed_names(&collect_snapshot(col).await);
+        let wals: Vec<&String> = names.iter().filter(|n| is_wal_filename(n)).collect();
+        assert_eq!(wals, ["wal-00001.log", "wal-99999.log", "wal-100000.log"],
+            "sorting by name puts wal-100000 before wal-99999");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn an_idle_leader_does_not_burn_a_wal_per_snapshot_request() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        live_put(&col, "k", 1);
+        col.enqueue_commit().await.unwrap().unwrap();
+
+        collect_snapshot(col.clone()).await;
+        let settled = wal_ids_on_disk(&col.root_path);
+
+        collect_snapshot(col.clone()).await;
+        collect_snapshot(col.clone()).await;
+        assert_eq!(wal_ids_on_disk(&col.root_path), settled,
+            "a request answered from an untouched active WAL must not rotate");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_still_serves_when_the_next_wal_id_is_already_taken() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        live_put(&col, "k", 1);
+        col.enqueue_commit().await.unwrap().unwrap();
+
+        let taken = col.wal_writer.lock().unwrap().current_wal_id + 1;
+        fs::write(col.root_path.join(format!("wal-{:05}.log", taken)), b"").unwrap();
+
+        let wire = collect_snapshot(col.clone()).await;
+        let staged = root.join("staged");
+        fs::create_dir_all(&staged).unwrap();
+        decode_bytes(wire, &staged).await
+            .expect("a leftover file at the next id must not take the transfer down with it");
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
