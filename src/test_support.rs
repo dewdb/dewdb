@@ -11,7 +11,8 @@ use crate::consensus::{
 use crate::metrics::Metrics;
 use crate::state::AppState;
 use crate::storage::index::IndexEntry;
-use crate::storage::{Collection, Database, FrameHeader, LogEntry, ReadCacheConfig, HEADER_LEN};
+use crate::storage::frame::{LogEntry, HEADER_LEN};
+use crate::storage::{Collection, Database, FrameHeader, ReadCacheConfig};
 use axum::http::StatusCode;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -55,37 +56,27 @@ pub fn make_frame(term: u64, lsn: u64, prev_lsn: u64, prev_term: u64, key: &str,
     frame
 }
 
-/// Mirrors the leader write path: durable but uncommitted.
+/// Mirrors the leader write path: durable but uncommitted. The append stages it.
 pub fn stage_put(col: &Arc<Collection>, key: &str, v: i64) -> u64 {
-    let (frame, wal_id, offset, lsn) = col.put(key.into(), serde_json::json!({"v": v}), 1).unwrap();
-    let entry = col.build_entry(wal_id, offset, &frame[HEADER_LEN..]);
-    col.stage(lsn, key.to_string(), wal_id, offset, Some(entry));
-    lsn
+    col.put(key.into(), serde_json::json!({"v": v}), 1).unwrap().3
 }
 
 pub fn stage_delete(col: &Arc<Collection>, key: &str) -> u64 {
-    let (_frame, wal_id, offset, lsn) = col.delete(key.into(), 1).unwrap();
-    col.stage(lsn, key.to_string(), wal_id, offset, None);
-    lsn
+    col.delete(key.into(), 1).unwrap().3
 }
 
 /// A value too large for the inline cache, so reads must go back to the WAL.
 pub fn disk_put(col: &Arc<Collection>, key: &str, fill: &str) -> (u64, u64, u32) {
     let value = serde_json::json!({"v": fill.repeat(600)});
-    let (f, wal_id, offset, _) = col.put(key.into(), value, 1).unwrap();
-    let entry = col.build_entry(wal_id, offset, &f[HEADER_LEN..]);
-    assert!(entry.inline.is_none(), "the value must be too large to inline");
-    let len = entry.len;
-    let mut index = col.index.write().unwrap();
-    col.apply_index_put(&mut index, key.into(), entry);
-    (wal_id, offset, len)
+    let (f, wal_id, offset, lsn) = col.put(key.into(), value, 1).unwrap();
+    col.apply_committed(lsn);
+    assert!(col.index.read().unwrap()[key].inline.is_none(),
+        "the value must be too large to inline");
+    (wal_id, offset, (f.len() - HEADER_LEN) as u32)
 }
 
 pub fn live_put(col: &Arc<Collection>, key: &str, v: i64) {
-    let (f, w, o, _) = col.put(key.into(), serde_json::json!({"v": v}), 1).unwrap();
-    let entry = col.build_entry(w, o, &f[HEADER_LEN..]);
-    let mut index = col.index.write().unwrap();
-    col.apply_index_put(&mut index, key.into(), entry);
+    col.apply_committed(stage_put(col, key, v));
 }
 
 pub struct TestNode {

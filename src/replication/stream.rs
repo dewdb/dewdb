@@ -595,8 +595,8 @@ mod tests {
     use super::*;
     use crate::storage::{Database, ReplicaApply};
     use crate::test_support::{
-        idx, make_frame, next_test_port, put_doc_at, put_doc_http, read_doc_http, temp_root,
-        three_node_cluster, wait_for_doc, TestNode,
+        live_put, make_frame, next_test_port, put_doc_at, put_doc_http, read_doc_http,
+        temp_root, three_node_cluster, wait_for_doc, TestNode,
     };
     use std::fs;
     use std::sync::atomic::AtomicUsize;
@@ -710,10 +710,12 @@ mod tests {
 
         let pdb = Database::new(&proot).unwrap();
         let pcol = pdb.get_collection("c").unwrap();
+        let mut last = 0;
         for i in 1..=5 {
-            let _ = pcol.put(format!("k{}", i), serde_json::json!({"i": i}), 1).unwrap();
+            last = pcol.put(format!("k{}", i), serde_json::json!({"i": i}), 1).unwrap().3;
         }
         pcol.enqueue_commit().await.unwrap().unwrap();
+        pcol.apply_committed(last);
         assert_eq!(pdb.durable_lsn.load(Ordering::SeqCst), 5);
 
         let all = chain_prefix(0, 0, pcol.read_frames_after(0, 5).unwrap());
@@ -742,6 +744,7 @@ mod tests {
         }
 
         rcol.enqueue_commit().await.unwrap().unwrap();
+        rcol.apply_committed(5);
         drop(rcol);
         drop(rdb);
 
@@ -762,12 +765,10 @@ mod tests {
         let db = Database::new(&root).unwrap();
         let col = db.get_collection("c").unwrap();
 
-        let _ = col.put("a".into(), serde_json::json!({"v": 1}), 1).unwrap();
-        let _ = col.put("a".into(), serde_json::json!({"v": 2}), 1).unwrap();
-        let (f, w, o, _) = col.put("a".into(), serde_json::json!({"v": 3}), 1).unwrap();
-        col.index.write().unwrap().insert("a".into(), idx(&f, w, o));
-        let (f2, w2, o2, _) = col.put("b".into(), serde_json::json!({"v": 9}), 1).unwrap();
-        col.index.write().unwrap().insert("b".into(), idx(&f2, w2, o2));
+        for v in [1, 2, 3] {
+            live_put(&col, "a", v);
+        }
+        live_put(&col, "b", 9);
         col.enqueue_commit().await.unwrap().unwrap();
         assert_eq!(db.durable_lsn.load(Ordering::SeqCst), 4);
 

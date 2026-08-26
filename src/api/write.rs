@@ -6,7 +6,7 @@ use crate::replication::WriteConcern;
 use crate::replication::write_concern::required_acks;
 use crate::json::merge_patch;
 use crate::state::AppState;
-use crate::storage::{Collection, FrameHeader, HEADER_LEN};
+use crate::storage::{Collection, FrameHeader};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use std::io;
@@ -48,7 +48,6 @@ async fn local_write_inner(
 ) -> Result<PendingWrite, axum::response::Response> {
     let col_clone = col.clone();
     let key_clone = key.clone();
-    let is_delete = value.is_none();
     let term = state.current_term();
     // Sampled under the key lock: created/replaced must reflect this write, not a racing one.
     let existed = col.exists(&key);
@@ -60,23 +59,13 @@ async fn local_write_inner(
         }
     }).await;
 
-    let (frame, wal_id, offset, lsn) = match write_res {
+    let (frame, _wal_id, _offset, lsn) = match write_res {
         Ok(Ok(t)) => t,
         Ok(Err(e)) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
         Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     };
 
     let commit = col.enqueue_commit();
-
-    // Staged before the fsync is awaited, and still under the caller's key lock: a patch that takes
-    // the same lock next must see this write, or it merges onto a stale document and drops it.
-    // Publishing is unaffected, since only the commit index releases a staged entry.
-    let staged = if is_delete {
-        None
-    } else {
-        Some(col.build_entry(wal_id, offset, &frame[HEADER_LEN..]))
-    };
-    col.stage(lsn, key.clone(), wal_id, offset, staged);
     state.note_leader_append(&col.name, lsn);
 
     Ok(PendingWrite { frame, term, lsn, existed, commit: Some(commit) })
@@ -257,9 +246,7 @@ async fn local_write_batch_inner(
         Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
 
-    for (key, frame, wal_id, offset, lsn) in &frames {
-        let entry = col.build_entry(*wal_id, *offset, &frame[HEADER_LEN..]);
-        col.stage(*lsn, key.clone(), *wal_id, *offset, Some(entry));
+    for (_key, _frame, _wal_id, _offset, lsn) in &frames {
         state.note_leader_append(&col.name, *lsn);
     }
 

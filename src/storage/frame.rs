@@ -67,7 +67,7 @@ pub enum LogEntry {
 
 #[derive(Debug)]
 pub enum ReplicaApply {
-    Applied { wal_id: u64, offset: u64, lsn: u64 },
+    Applied { lsn: u64 },
     Duplicate { last_lsn: u64 },
     Gap { last_lsn: u64, last_term: u64 },
     Divergent { last_lsn: u64, last_term: u64 },

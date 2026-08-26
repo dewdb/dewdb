@@ -78,6 +78,12 @@ impl Collection {
         let (frozen_index, frozen_through, compact_id) = {
             let mut wal = self.wal_writer.lock().unwrap();
 
+            // Re-checked under the append lock, which is what makes it authoritative: appends stage
+            // while holding it, so nothing can land in the WAL about to be frozen after this point.
+            if self.pending_len() > 0 {
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "Uncommitted frames pending"));
+            }
+
             wal.current_wal.sync_data()?;
 
             let frozen_through = wal.current_wal_id;
@@ -447,11 +453,11 @@ mod tests {
             live_put(&col, "keep", 1);
             live_put(&col, "gone", 2);
 
-            col.delete("gone".into(), 1).unwrap();
-            col.index.write().unwrap().remove("gone");
+            let lsn = col.delete("gone".into(), 1).unwrap().3;
+            col.enqueue_commit().await.unwrap().unwrap();
+            col.apply_committed(lsn);
 
             col.compact().unwrap();
-            col.enqueue_commit().await.unwrap().unwrap();
 
             assert!(col.get("gone").unwrap().is_none());
         }
@@ -482,9 +488,9 @@ mod tests {
             let put_wal = col_dir.join(format!("wal-{:05}.log", wal_ids_on_disk(&col_dir)[0]));
             let orphan = (put_wal.clone(), fs::read(&put_wal).unwrap());
 
-            col.delete("gone".into(), 1).unwrap();
-            col.index.write().unwrap().remove("gone");
+            let lsn = col.delete("gone".into(), 1).unwrap().3;
             col.enqueue_commit().await.unwrap().unwrap();
+            col.apply_committed(lsn);
             col.compact().unwrap();
 
             assert!(!orphan.0.exists(), "the second compaction must have retired the first output");

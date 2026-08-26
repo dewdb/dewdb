@@ -157,6 +157,7 @@ impl Collection {
 
         let frame_len = HEADER_LEN as u64 + len;
 
+        self.record_watermark_once();
         let mut wal = self.wal_writer.lock().unwrap();
 
         if self.released.load(Ordering::SeqCst) {
@@ -202,6 +203,7 @@ impl Collection {
         wal.last_appended_term = term;
         self.db_last_log_term.store(term, Ordering::SeqCst);
 
+        self.stage_appended(lsn, &entry, wal_id, offset, &json_bytes);
         drop(wal);
 
         Ok((frame, wal_id, offset, lsn))
@@ -222,11 +224,12 @@ impl Collection {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "CRC mismatch on replicated frame"));
         }
 
-        let _entry: LogEntry = serde_json::from_slice(payload)
+        let entry: LogEntry = serde_json::from_slice(payload)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         let frame_len = (HEADER_LEN + len) as u64;
 
+        self.record_watermark_once();
         let mut wal = self.wal_writer.lock().unwrap();
 
         if self.released.load(Ordering::SeqCst) {
@@ -278,7 +281,9 @@ impl Collection {
         self.db_next_lsn.fetch_max(header.lsn, Ordering::SeqCst);
         self.db_last_log_term.store(header.term, Ordering::SeqCst);
 
-        Ok(ReplicaApply::Applied { wal_id, offset, lsn: header.lsn })
+        self.stage_appended(header.lsn, &entry, wal_id, offset, payload);
+
+        Ok(ReplicaApply::Applied { lsn: header.lsn })
     }
 
     /// Frames in `(after_lsn, up_to_lsn]`, LSN-ordered and deduplicated. Refuses to return a set with
@@ -446,7 +451,7 @@ mod tests {
     use super::*;
     use crate::storage::frame::MAX_RECORD_SIZE;
     use crate::storage::Database;
-    use crate::test_support::{disk_put, idx, live_put, make_frame, temp_root};
+    use crate::test_support::{disk_put, live_put, make_frame, temp_root};
     use std::io::Write;
     use std::sync::atomic::Ordering;
 
@@ -458,10 +463,12 @@ mod tests {
             let db = Database::new(&root).unwrap();
             let col = db.get_collection("test_durability").unwrap();
 
+            let mut last = 0;
             for i in 0..100 {
-                let _ = col.put(format!("key:{}", i), serde_json::json!({"n": i}), 1).unwrap();
+                last = col.put(format!("key:{}", i), serde_json::json!({"n": i}), 1).unwrap().3;
             }
             col.enqueue_commit().await.unwrap().unwrap();
+            col.apply_committed(last);
         }
 
         let db2 = Database::new(&root).unwrap();
@@ -483,9 +490,9 @@ mod tests {
         let res = col2.put("huge_key".to_string(), serde_json::json!({"data": huge_str}), 1);
         assert!(res.is_err(), "Should reject a record that exceeds MAX_RECORD_SIZE");
 
-        if let Ok((f, wal_id, offset, _lsn)) = col2.put("key_pre_corrupt".to_string(), serde_json::json!({"valid": true}), 1) {
+        if let Ok((_, _, _, lsn)) = col2.put("key_pre_corrupt".to_string(), serde_json::json!({"valid": true}), 1) {
             col2.enqueue_commit().await.unwrap().unwrap();
-            col2.index.write().unwrap().insert("key_pre_corrupt".to_string(), idx(&f, wal_id, offset));
+            col2.apply_committed(lsn);
         }
 
         let active_wal_path = {
@@ -512,9 +519,9 @@ mod tests {
 
         assert!(col3.get("key_pre_corrupt").unwrap().is_some(), "key_pre_corrupt should survive corruption after it");
 
-        if let Ok((f, wal_id, offset, _lsn)) = col3.put("key_post_corrupt".to_string(), serde_json::json!({"valid": true}), 1) {
+        if let Ok((_, _, _, lsn)) = col3.put("key_post_corrupt".to_string(), serde_json::json!({"valid": true}), 1) {
             col3.enqueue_commit().await.unwrap().unwrap();
-            col3.index.write().unwrap().insert("key_post_corrupt".to_string(), idx(&f, wal_id, offset));
+            col3.apply_committed(lsn);
         }
         assert!(col3.get("key_post_corrupt").unwrap().is_some(), "Writes should continue after recovery");
 
@@ -644,6 +651,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_appended_frame_is_accounted_for_before_the_append_returns() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        col.put("k".into(), serde_json::json!({"v": 1}), 1).unwrap();
+
+        assert_eq!(col.pending_len(), 1,
+            "a frame the caller has not staged yet is in neither the index nor pending, and              nothing compaction checks can see it");
+        assert!(col.compact().is_err(),
+            "so compaction must refuse rather than retire the WAL holding an in-flight write");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_replicated_frame_is_accounted_for_before_the_apply_returns() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        col.append_raw_frame(&make_frame(1, 1, 0, 0, "k", 1)).unwrap();
+
+        assert_eq!(col.pending_len(), 1, "the replica path closes the same window");
+        assert!(col.compact().is_err());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
     async fn frames_carry_term_and_lsn_in_header() {
         let root = temp_root();
         let db = Database::new(&root).unwrap();
@@ -701,6 +738,7 @@ mod tests {
         }
 
         rcol.enqueue_commit().await.unwrap().unwrap();
+        rcol.apply_committed(3);
         drop(rcol);
         drop(rdb);
 
@@ -754,6 +792,8 @@ mod tests {
 
         ra.enqueue_commit().await.unwrap().unwrap();
         rb.enqueue_commit().await.unwrap().unwrap();
+        ra.apply_committed(3);
+        rb.apply_committed(4);
         drop(ra);
         drop(rb);
         drop(rdb);

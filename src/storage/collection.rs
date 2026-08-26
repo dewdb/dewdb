@@ -518,9 +518,25 @@ impl Collection {
     }
 
     /// `entry` is None for a delete; keyed by LSN to drain in log order.
-    pub fn stage(&self, lsn: u64, key: String, wal_id: u64, offset: u64, entry: Option<IndexEntry>) {
-        // First stage marks this collection consensus-managed. Without the watermark now, a restart
-        // before the first commit would apply-all and publish unacknowledged entries.
+    /// Staged under the append lock rather than by the caller: between an append and a separate
+    /// stage the frame is on disk and in neither the index nor `pending`, and a compaction retiring
+    /// its WAL would lose a write whose client is still waiting on the fsync. There is deliberately
+    /// no public way to stage, so no append path can grow that window back.
+    pub(super) fn stage_appended(&self, lsn: u64, entry: &LogEntry, wal_id: u64, offset: u64, payload: &[u8]) {
+        let staged = match entry {
+            LogEntry::Put { key, .. } => StagedApply {
+                key: key.clone(), wal_id, offset,
+                entry: Some(self.build_entry(wal_id, offset, payload)),
+            },
+            LogEntry::Del { key, .. } => StagedApply { key: key.clone(), wal_id, offset, entry: None },
+        };
+        self.pending.lock().unwrap().insert(lsn, staged);
+    }
+
+    /// First stage marks this collection consensus-managed. Without the watermark, a restart before
+    /// the first commit would apply-all and publish unacknowledged entries. Kept off the append lock:
+    /// it writes a file, and holding the writer for that would stall every other writer.
+    pub(super) fn record_watermark_once(&self) {
         if !self.watermark_recorded.swap(true, Ordering::SeqCst) {
             let applied_lsn = self.applied_lsn();
             if let Err(e) = (AppliedMeta { applied_lsn }).save(&self.root_path) {
@@ -529,10 +545,6 @@ impl Collection {
                 self.watermark_recorded.store(false, Ordering::SeqCst);
             }
         }
-        self.pending
-            .lock()
-            .unwrap()
-            .insert(lsn, StagedApply { key, wal_id, offset, entry });
     }
 
     /// Position of the oldest frame the index does not yet reflect.
@@ -665,8 +677,8 @@ impl Collection {
 mod tests {
     use super::*;
     use crate::json::merge_patch;
+    use crate::storage::frame::HEADER_LEN;
     use crate::storage::Database;
-    use crate::storage::HEADER_LEN;
     use crate::test_support::{disk_put, idx, live_put, stage_delete, stage_put, temp_root, wait_for};
     use crate::util::remove_file_with_retry;
     use std::collections::HashSet;
@@ -856,18 +868,18 @@ mod tests {
         let db = Database::new(&root).unwrap();
         let col = db.get_collection("c").unwrap();
 
-        let (f, w, o, _) = col.put(
+        let lsn = col.put(
             "d1".into(),
             serde_json::json!({"name": "alpha", "tags": ["x", "y"], "meta": {"v": 1, "owner": "latha"}}),
             1,
-        ).unwrap();
-        col.index.write().unwrap().insert("d1".into(), idx(&f, w, o));
+        ).unwrap().3;
+        col.apply_committed(lsn);
 
         let mut doc = col.get("d1").unwrap().unwrap();
         merge_patch(&mut doc, &serde_json::json!({"meta": {"v": 2}, "tags": null, "status": "live"}));
-        let (f2, w2, o2, _) = col.put("d1".into(), doc, 1).unwrap();
-        col.index.write().unwrap().insert("d1".into(), idx(&f2, w2, o2));
+        let lsn2 = col.put("d1".into(), doc, 1).unwrap().3;
         col.enqueue_commit().await.unwrap().unwrap();
+        col.apply_committed(lsn2);
 
         drop(col);
         drop(db);

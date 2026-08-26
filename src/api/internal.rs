@@ -11,7 +11,7 @@ use crate::model::err_json;
 use crate::replication::snapshot::{replica_sync_from_primary, snapshot_body, SNAPSHOT_CONTENT_TYPE};
 use crate::replication::{DropRequest, ReplicateRequest, ResyncRequest};
 use crate::state::AppState;
-use crate::storage::{FrameHeader, LogEntry, ReplicaApply, HEADER_LEN};
+use crate::storage::{FrameHeader, ReplicaApply};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -148,23 +148,12 @@ pub async fn replicate_handler(
     // Appends run to the first refusal, then one fsync covers the whole accepted run. Per-frame
     // syncing here is what made catch-up cost a disk flush per entry.
     let appended = tokio::task::spawn_blocking(move || {
-        let mut staged: Vec<(u64, String, u64, u64, Option<Vec<u8>>)> = Vec::new();
         let mut highest_applied = 0u64;
         let mut refusal = None;
 
         for frame in &batch {
             match col_clone.append_raw_frame(frame) {
-                Ok(ReplicaApply::Applied { wal_id, offset, lsn }) => {
-                    highest_applied = highest_applied.max(lsn);
-                    let payload = if frame.len() > HEADER_LEN { &frame[HEADER_LEN..] } else { &[][..] };
-                    match serde_json::from_slice::<LogEntry>(payload) {
-                        Ok(LogEntry::Put { key, .. }) => {
-                            staged.push((lsn, key, wal_id, offset, Some(payload.to_vec())))
-                        },
-                        Ok(LogEntry::Del { key, .. }) => staged.push((lsn, key, wal_id, offset, None)),
-                        Err(_) => {},
-                    }
-                },
+                Ok(ReplicaApply::Applied { lsn, .. }) => highest_applied = highest_applied.max(lsn),
                 // Already held: keep going, later entries in the batch may still be new.
                 Ok(ReplicaApply::Duplicate { .. }) => continue,
                 Ok(other) => {
@@ -177,25 +166,19 @@ pub async fn replicate_handler(
                 },
             }
         }
-        (highest_applied, staged, refusal)
+        (highest_applied, refusal)
     }).await;
 
-    let (highest, staged, refusal) = match appended {
+    let (highest, refusal) = match appended {
         Ok(v) => v,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
 
-    // Keyed on what was appended, not on what parsed: an unparseable payload is still on disk
-    // and still needs the sync before we report it durable.
     if highest > 0 {
         match col.enqueue_commit().await {
             Ok(Ok(())) => {},
             Ok(Err(e)) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        }
-        for (lsn, key, wal_id, offset, payload) in staged {
-            let entry = payload.map(|p| col.build_entry(wal_id, offset, &p));
-            col.stage(lsn, key, wal_id, offset, entry);
         }
         // The leader's watermark trails this frame by a message; visibility waits for the next one.
         col.apply_committed(state.committed_hint(&req.collection));

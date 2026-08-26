@@ -509,7 +509,6 @@ pub async fn replica_sync_from_primary(
 mod tests {
     use super::*;
     use crate::replication::ReplicateRequest;
-    use crate::storage::FrameHeader;
     use crate::test_support::{TestNode, live_put, make_frame, next_test_port, temp_root};
     use futures::StreamExt;
     use std::io::Cursor;
@@ -519,12 +518,7 @@ mod tests {
         key: &str,
         value: serde_json::Value,
     ) -> u64 {
-        let (frame, wal_id, offset, lsn) = collection.put(key.to_string(), value, 1).unwrap();
-        let header = FrameHeader::parse(&frame).unwrap();
-        let payload =
-            &frame[crate::storage::HEADER_LEN..crate::storage::HEADER_LEN + header.len as usize];
-        let entry = collection.build_entry(wal_id, offset, payload);
-        collection.stage(lsn, key.to_string(), wal_id, offset, Some(entry));
+        let lsn = collection.put(key.to_string(), value, 1).unwrap().3;
         collection.enqueue_commit().await.unwrap().unwrap();
         collection.apply_committed(lsn);
         lsn

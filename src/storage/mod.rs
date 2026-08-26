@@ -10,5 +10,5 @@ pub mod wal;
 pub use collection::Collection;
 pub use compaction::SpaceUsage;
 pub use database::Database;
-pub use frame::{FrameHeader, LogEntry, ReplicaApply, HEADER_LEN};
+pub use frame::{FrameHeader, ReplicaApply};
 pub use index::ReadCacheConfig;
