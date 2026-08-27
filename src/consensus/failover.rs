@@ -9,12 +9,12 @@ use crate::replication::snapshot::replica_sync_from_primary;
 use crate::state::AppState;
 use crate::util::same_endpoint;
 use std::collections::HashMap;
-use std::fs;
 use std::time::Duration;
 use tracing::{info, warn};
 
 const HEARTBEAT_POLL_INTERVAL_MS: u64 = 500;
 const PEER_PROBE_TIMEOUT_MS: u64 = 400;
+const BOOT_DISCOVERY_RETRY_MS: u64 = 300;
 
 async fn discover_leader(state: &AppState) -> Option<String> {
     let mut peers: Vec<String> = state.config.replicas.clone();
@@ -102,20 +102,15 @@ async fn resync_all_from(state: &AppState, leader: &str) {
         None => return,
     };
 
-    let mut names: Vec<String> = { db.collections.read().unwrap().keys().cloned().collect() };
-    if let Ok(entries) = fs::read_dir(&db.root_path) {
-        for e in entries.flatten() {
-            if e.path().is_dir() {
-                if let Some(n) = e.file_name().to_str() {
-                    if !n.contains('.') {
-                        names.push(n.to_string());
-                    }
-                }
-            }
-        }
-    }
-    names.sort();
-    names.dedup();
+    // A raw directory walk cannot tell `<col>.tmp` / `<col>.old` staging leftovers from a dotted
+    // collection name; list_collections filters on the suffix and merges the open collections in.
+    let names = match db.list_collections() {
+        Ok(n) => n,
+        Err(e) => {
+            warn!(target: "demote", error = %e, "could not enumerate collections to resync");
+            return;
+        },
+    };
 
     for name in names {
         let first = state.resyncing.lock().unwrap().insert(name.clone());
@@ -133,6 +128,38 @@ async fn resync_all_from(state: &AppState, leader: &str) {
     if let Err(e) = db.recompute_durable_lsn() {
         warn!(target: "demote", "could not recompute durable LSN after resync: {}", e);
     }
+}
+
+/// Boot-time catch-up for a configured replica. `config.primary_addr` is a bootstrap seed, not a
+/// fact: it can name a leader deposed while this node was down, and installing that node's snapshot
+/// would adopt a superseded log over local state.
+pub async fn boot_resync(state: &AppState) {
+    if state.db.is_none() || state.replication.is_none() {
+        return;
+    }
+
+    let deadline = std::time::Instant::now()
+        + Duration::from_secs(state.config.heartbeat_timeout_secs);
+    loop {
+        if let Some(leader) = discover_leader(state).await {
+            {
+                let mut g = state.replication.as_ref().unwrap().write().unwrap();
+                g.primary_addr = Some(leader.clone());
+                g.last_heartbeat = Some(std::time::Instant::now());
+            }
+            info!(target: "boot", "Syncing from current leader {}", leader);
+            resync_all_from(state, &leader).await;
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(BOOT_DISCOVERY_RETRY_MS)).await;
+    }
+
+    // Local state is kept rather than overwritten from an unverified source; the heartbeat poll
+    // follows the leader once one answers, and the replicate path repairs any gap it finds.
+    warn!(target: "boot", "No leader answered during boot; keeping local state unsynced");
 }
 
 pub async fn demote(state: &AppState, new_term: u64) {
@@ -369,11 +396,94 @@ fn contact_lost(
 mod tests {
     use super::*;
     use crate::cluster::metadata::ClusterMetadata;
+    use crate::storage::Database;
     use crate::test_support::{
-        leaders, next_test_port, node_by_id, put_doc_at, put_doc_http, read_doc_http,
+        leaders, live_put, next_test_port, node_by_id, put_doc_at, put_doc_http, read_doc_http,
         settle_leader, temp_root, three_node_cluster, wait_for, wait_for_doc, TestNode,
     };
     use axum::http::StatusCode;
+    use std::fs;
+
+    /// A replica that already holds a superseded copy, which is the only state boot sync can damage.
+    async fn stale_replica(root: &std::path::Path, id: &str, col: &str, peers: Vec<String>,
+        configured_primary: String) -> TestNode
+    {
+        let mut node = TestNode::new(id, next_test_port(), root, "replica");
+        node.peers = peers;
+        node.primary_addr = Some(configured_primary);
+        // Long enough that the heartbeat watchdog cannot repair what boot sync is being tested on.
+        node.heartbeat_timeout_secs = 30;
+
+        let db = Database::new(&node.data_dir).unwrap();
+        let c = db.get_collection(col).unwrap();
+        live_put(&c, "k1", 99);
+        c.enqueue_commit().await.unwrap().unwrap();
+        db.force_commit_all();
+        let tombstone = db.release_collection(col).unwrap();
+        drop(db);
+        if let Some(path) = tombstone {
+            let _ = fs::remove_file(path);
+        }
+
+        node
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn boot_sync_installs_the_current_leaders_snapshot_not_the_configured_primarys() {
+        let root = temp_root();
+        let (n1, mut n2, n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().unwrap();
+
+        assert_eq!(leaders(&[&n1, &n2, &n3]), vec!["n1".to_string()], "n1 starts as the only leader");
+        assert_eq!(
+            put_doc_at(&client, &n1.url(), "t", "k1", 1, "?w=majority&wtimeout=4000").await,
+            StatusCode::CREATED);
+
+        // config.primary_addr names n2, which is not the leader and is not even running.
+        n2.kill();
+        let mut n4 = stale_replica(&root, "n4", "t",
+            vec![n1.url(), n2.url(), n3.url()], n2.url()).await;
+        n4.start();
+
+        let state = n4.state.clone().unwrap();
+        boot_resync(&state).await;
+
+        assert_eq!(
+            state.replication.as_ref().unwrap().read().unwrap().primary_addr,
+            Some(n1.url()),
+            "boot sync must follow the leader it discovered, not the address config seeded");
+        assert!(wait_for_doc(&client, &n4.url(), "t", "k1", 1, Duration::from_secs(3)).await,
+            "the stale local copy must be replaced by the current leader's snapshot");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn boot_sync_resyncs_dotted_collection_names() {
+        let root = temp_root();
+        let (n1, n2, n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().unwrap();
+
+        assert_eq!(leaders(&[&n1, &n2, &n3]), vec!["n1".to_string()]);
+        assert_eq!(
+            put_doc_at(&client, &n1.url(), "app.events", "k1", 1, "?w=majority&wtimeout=4000").await,
+            StatusCode::CREATED);
+
+        let mut n4 = stale_replica(&root, "n4", "app.events", vec![n1.url()], n1.url()).await;
+        // What a resync interrupted mid-install leaves behind.
+        fs::create_dir_all(n4.data_dir.join("app.events.tmp")).unwrap();
+        fs::create_dir_all(n4.data_dir.join("app.events.old")).unwrap();
+        n4.start();
+
+        boot_resync(&n4.state.clone().unwrap()).await;
+
+        assert!(wait_for_doc(&client, &n4.url(), "app.events", "k1", 1, Duration::from_secs(3)).await,
+            "a dotted collection name must not be filtered out of the resync set");
+        assert!(!n4.data_dir.join("app.events.old").exists(),
+            "staging leftovers must be cleared, not resynced as collections of their own");
+
+        let _ = fs::remove_dir_all(&root);
+    }
 
     fn ago(ms: u64) -> std::time::Instant {
         std::time::Instant::now() - Duration::from_millis(ms)

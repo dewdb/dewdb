@@ -29,13 +29,12 @@ use crate::cluster::probe::{router_probe_task, ROUTER_PROBE_INTERVAL_SECS};
 use crate::cluster::rebalance::rebalance_task;
 use crate::config::{config_warnings, NodeConfig};
 use crate::consensus::{
-    heartbeat_poll_task, progress_flush_task, seed_leader_progress, Progress, ReplicationMeta,
-    ReplicationState,
+    boot_resync, heartbeat_poll_task, progress_flush_task, seed_leader_progress, Progress,
+    ReplicationMeta, ReplicationState,
 };
 use crate::logging::init_logging;
 use crate::maintenance::maintenance_task;
 use crate::metrics::Metrics;
-use crate::replication::snapshot::replica_sync_from_primary;
 use crate::replication::stream::replication_drive_task;
 use crate::state::AppState;
 use crate::storage::Database;
@@ -214,25 +213,7 @@ async fn main() -> io::Result<()> {
     };
 
     if config.shard_role.as_deref() == Some("replica") {
-        if let (Some(primary_addr), Some(db)) = (&config.primary_addr, &db) {
-            info!(target: "replica", "Performing full sync from primary: {}", primary_addr);
-
-            if let Ok(entries) = fs::read_dir(&config.data_dir) {
-                for entry in entries.flatten() {
-                    if entry.path().is_dir() {
-                        if let Some(name) = entry.file_name().to_str() {
-                            if let Err(e) = replica_sync_from_primary(&client, primary_addr, db, name).await {
-                                warn!(target: "replica", "Sync failed for '{}': {}", name, e);
-                            }
-                        }
-                    }
-                }
-            }
-
-            if let Err(e) = db.recompute_durable_lsn() {
-                warn!(target: "replica", "Could not recompute durable LSN after boot sync: {}", e);
-            }
-        }
+        boot_resync(&state).await;
     }
 
     let app = build_app(&state);
