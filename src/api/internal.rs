@@ -408,16 +408,17 @@ pub async fn migrate_reset_handler(
             Ok(col) => col,
             Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         };
-        for key in col.range_from(None, None, None) {
-            let hash = crate::ring::hash_key(&collection, &key);
+        col.for_each_key(None, None, None, |key| {
+            let hash = crate::ring::hash_key(&collection, key);
             let from_source = current.owner(hash)
                 .is_some_and(|owner| crate::util::same_endpoint(&owner.node_url, &req.source));
             let to_destination = target.owner(hash)
                 .is_some_and(|owner| crate::util::same_endpoint(&owner.node_url, &destination));
             if from_source && to_destination {
-                stale.push((collection.clone(), key));
+                stale.push((collection.clone(), key.to_string()));
             }
-        }
+            true
+        });
     }
 
     let (wc, wtimeout) = handover_write_concern();

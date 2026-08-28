@@ -19,6 +19,9 @@ pub const READ_POOL_HANDLES: usize = 4;
 const COMMIT_BATCH_THRESHOLD: usize = 32;
 const COMMIT_INTERVAL_MS: u64 = 5;
 const READ_RESOLVE_ATTEMPTS: usize = 3;
+/// Keys cloned per index-lock acquisition by the chunked walk. Large enough that a scan is not
+/// dominated by lock traffic, small enough that no caller pins a whole keyspace in memory.
+const SCAN_CHUNK: usize = 1024;
 
 /// A frame's `(wal_id, offset, len)` as the index records it.
 type Located = (u64, u64, u32);
@@ -364,7 +367,15 @@ impl Collection {
         });
     }
 
-    pub fn range_from(&self, after: Option<&str>, start: Option<&str>, end: Option<&str>) -> Vec<String> {
+    /// At most `limit` keys from the range, in order. The index lock is held for that many key
+    /// clones and no more, which is what lets a caller walk a large keyspace without holding one.
+    pub fn range_page(
+        &self,
+        after: Option<&str>,
+        start: Option<&str>,
+        end: Option<&str>,
+        limit: usize,
+    ) -> Vec<String> {
         let index = self.index.read().unwrap();
 
         let start_bound = if let Some(a) = after {
@@ -376,7 +387,61 @@ impl Collection {
         };
         let end_bound = end.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Included);
 
-        index.range::<str, _>((start_bound, end_bound)).map(|(k, _)| k.clone()).collect()
+        index.range::<str, _>((start_bound, end_bound))
+            .take(limit)
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    pub fn range_from(&self, after: Option<&str>, start: Option<&str>, end: Option<&str>) -> Vec<String> {
+        self.range_page(after, start, end, usize::MAX)
+    }
+
+    /// Walks the range in `SCAN_CHUNK` slices, releasing the index lock between them. `visit`
+    /// returns `false` to stop early.
+    ///
+    /// Deliberately not a snapshot: a key written between chunks may or may not be seen. Every
+    /// caller either re-runs to convergence (handover planning, which does) or is already
+    /// cursor-paginated (query), and the alternative is a clone of the whole keyspace held under
+    /// the index lock while the caller does IO against it.
+    pub fn try_for_each_key<E, F>(
+        &self,
+        after: Option<&str>,
+        start: Option<&str>,
+        end: Option<&str>,
+        mut visit: F,
+    ) -> Result<(), E>
+    where
+        F: FnMut(&str) -> Result<bool, E>,
+    {
+        let mut cursor: Option<String> = after.map(str::to_string);
+        loop {
+            let chunk = self.range_page(cursor.as_deref(), start, end, SCAN_CHUNK);
+            if chunk.is_empty() {
+                return Ok(());
+            }
+            cursor = chunk.last().cloned();
+            for key in &chunk {
+                if !visit(key)? {
+                    return Ok(());
+                }
+            }
+            if chunk.len() < SCAN_CHUNK {
+                return Ok(());
+            }
+        }
+    }
+
+    pub fn for_each_key<F>(
+        &self,
+        after: Option<&str>,
+        start: Option<&str>,
+        end: Option<&str>,
+        mut visit: F,
+    ) where
+        F: FnMut(&str) -> bool,
+    {
+        let _ = self.try_for_each_key::<(), _>(after, start, end, |key| Ok(visit(key)));
     }
 
     pub fn query_page(
@@ -392,30 +457,31 @@ impl Collection {
         let mut last_key: Option<String> = None;
         let mut has_more = false;
 
-        for key in self.range_from(after, start, end).into_iter() {
+        self.try_for_each_key::<io::Error, _>(after, start, end, |key| {
             if items.len() >= limit {
                 match filter {
                     None => {
                         has_more = true;
-                        break;
+                        return Ok(false);
                     },
                     Some(f) => {
-                        if let Some(val) = self.get(&key)? {
+                        if let Some(val) = self.get(key)? {
                             if matches_filter(&val, f) {
                                 has_more = true;
-                                break;
+                                return Ok(false);
                             }
                         }
                     }
                 }
-            } else if let Some(val) = self.get(&key)? {
+            } else if let Some(val) = self.get(key)? {
                 let matched = filter.as_ref().map_or(true, |f| matches_filter(&val, f));
                 if matched {
                     items.push(val);
-                    last_key = Some(key.clone());
+                    last_key = Some(key.to_string());
                 }
             }
-        }
+            Ok(true)
+        })?;
 
         let next_cursor = if has_more { last_key } else { None };
         Ok((items, next_cursor))
@@ -807,6 +873,54 @@ mod tests {
 
         let exclusive: Vec<String> = col.range_from(Some("b"), None, None);
         assert_eq!(exclusive, vec!["c", "d"], "cursor resumes strictly after the key");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_chunked_walk_matches_the_unbounded_one_across_its_own_boundary() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        let total = SCAN_CHUNK + 7;
+        for i in 0..total {
+            live_put(&col, &format!("k{:06}", i), i as i64);
+        }
+
+        assert_eq!(col.range_page(None, None, None, 3).len(), 3, "a slice is bounded by its limit");
+        assert_eq!(col.range_page(None, None, None, total * 2).len(), total,
+            "and by the range when that is smaller");
+
+        let mut walked = Vec::new();
+        col.for_each_key(None, None, None, |key| {
+            walked.push(key.to_string());
+            true
+        });
+        let whole = col.range_from(None, None, None);
+        // Length first: a boundary bug is off by a chunk, and comparing 1031 keys to say so
+        // buries the number that identifies it.
+        assert_eq!(walked.len(), whole.len(),
+            "the walk must see every key exactly once across the chunk boundary");
+        assert_eq!(walked, whole, "and in the same order as the unbounded form");
+
+        let mut visits = 0;
+        col.for_each_key(None, None, None, |_| {
+            visits += 1;
+            visits < 5
+        });
+        assert_eq!(visits, 5, "returning false stops the walk without draining the chunk");
+
+        let after = walked[SCAN_CHUNK - 1].clone();
+        assert_eq!(col.range_page(Some(&after), None, None, 2), walked[SCAN_CHUNK..SCAN_CHUNK + 2],
+            "resuming from the last key of a chunk is exclusive, or the boundary key repeats");
+
+        // Through the query path, whose page has to span two chunks to be answered at all.
+        let (page, cursor) = col.query_page(None, None, None, &None, total - 2).unwrap();
+        assert_eq!(page.len(), total - 2);
+        let (rest, done) = col.query_page(cursor.as_deref(), None, None, &None, 10).unwrap();
+        assert_eq!(rest.len(), 2, "the tail past the boundary must still be reachable");
+        assert!(done.is_none());
 
         let _ = fs::remove_dir_all(&root);
     }

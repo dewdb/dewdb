@@ -237,11 +237,14 @@ async fn push_until_done(state: AppState, migration: Migration) {
             return;
         }
 
-        let _write_barrier = if migration.phase == MigrationPhase::Finalizing {
-            Some(state.migration_write_gate.write().await)
-        } else {
-            None
-        };
+        // Taken and dropped, not held: what the barrier has to close is the window where a write
+        // decided it owned a key under the pre-finalizing view and has not appended yet. Draining
+        // those settles it -- every write that starts after this sees `Ownership::Moving` and is
+        // refused, so the scan and the round trips below cannot be overtaken. Holding it across
+        // them instead blocks every write on the node for the length of a keyspace scan.
+        if migration.phase == MigrationPhase::Finalizing {
+            drop(state.migration_write_gate.write().await);
+        }
         if !state.migration().is_some_and(|m| {
             m.id == id && m.phase == migration.phase
         }) {
@@ -340,18 +343,19 @@ fn plan_outgoing(state: &AppState, migration: &Migration)
     let mut out: HashMap<String, Vec<(String, String)>> = HashMap::new();
     for collection in db.list_collections().map_err(|e| e.to_string())? {
         let col = db.get_collection(&collection).map_err(|e| e.to_string())?;
-        for key in col.range_from(None, None, None) {
-            let hash = hash_key(&collection, &key);
+        col.for_each_key(None, None, None, |key| {
+            let hash = hash_key(&collection, key);
             let now = ring.owner(hash).map(|s| s.node_url.as_str()).unwrap_or_default();
-            if !same_endpoint(now, &mine) {
-                continue;
+            if same_endpoint(now, &mine) {
+                if let Some(next) = target.owner(hash)
+                    .filter(|s| !same_endpoint(&s.node_url, &mine))
+                {
+                    out.entry(next.node_url.clone()).or_default()
+                        .push((collection.clone(), key.to_string()));
+                }
             }
-            let next = match target.owner(hash) {
-                Some(s) if !same_endpoint(&s.node_url, &mine) => s.node_url.clone(),
-                _ => continue,
-            };
-            out.entry(next).or_default().push((collection.clone(), key));
-        }
+            true
+        });
     }
     Ok(out)
 }

@@ -651,6 +651,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Finalization has to freeze the keys that are moving. It does not have to freeze the node:
+    /// the barrier exists to drain writes that decided ownership under the previous view, which is
+    /// an instant, not the length of a keyspace scan plus every round trip in the pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn writes_the_handover_is_not_moving_keep_going_through_finalization() {
+        let root = temp_root();
+        let cl = Cluster::start_with_movement(&root, 1, 40).await;
+        let (a, b, c) = (cl.a.url(), cl.b.url(), cl.c.url());
+        let two: Vec<&str> = vec![&a, &b];
+        let three: Vec<&str> = vec![&a, &b, &c];
+
+        assert_eq!(cl.post(format!("{}/cluster/ring", a), ring_body(&two)).await.0, StatusCode::OK);
+        for node in [&b, &c] {
+            cl.post(format!("{}/internal/cluster", node),
+                serde_json::to_value(cl.a.state.as_ref().unwrap().cluster_view()).unwrap()).await;
+        }
+
+        let keys: Vec<String> = (0..300).map(|i| format!("k{:03}", i)).collect();
+        for key in &keys {
+            assert_eq!(cl.put(&owner_of(&two, key), key, 1).await, StatusCode::CREATED);
+        }
+
+        // The source with more to hand over, so its finalize pass is the long one.
+        let moving_from = |shard: &str| keys.iter()
+            .filter(|key| owner_of(&two, key) == shard && owner_of(&three, key) == c).count();
+        let (source, source_state) = if moving_from(&a) >= moving_from(&b) {
+            (&a, cl.a.state.as_ref().unwrap())
+        } else {
+            (&b, cl.b.state.as_ref().unwrap())
+        };
+        assert!(moving_from(source) >= 20, "the pass has to be long enough to write during");
+        let kept = keys.iter()
+            .find(|key| owner_of(&two, key) == *source && owner_of(&three, key) == *source)
+            .expect("the source must keep at least one key to write to")
+            .clone();
+
+        assert_eq!(cl.post(format!("{}/cluster/migrate", a), ring_body(&three)).await.0,
+            StatusCode::ACCEPTED);
+        assert!(wait_for(Duration::from_secs(30), || {
+            crate::cluster::migration::progress(source_state)
+                .is_some_and(|p| p.phase == MigrationPhase::Finalizing)
+        }).await, "finalization never started");
+
+        // Counted rather than timed: a barrier held across the pass lets exactly one write through,
+        // the one that was already blocked on it when the pass ended.
+        let mut wrote = 0usize;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while crate::cluster::migration::progress(source_state)
+            .is_some_and(|p| p.phase == MigrationPhase::Finalizing && !p.done)
+        {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            if cl.client.put(format!("{}/collections/t/docs/{}", source, kept))
+                .json(&serde_json::json!({"value": {"v": 2}}))
+                .send().await.is_ok_and(|r| r.status() == StatusCode::OK)
+            {
+                wrote += 1;
+            }
+        }
+
+        // ~180 in practice; a held barrier lets through only the couple already waiting on it
+        assert!(wrote >= 25,
+            "only {} write(s) landed during finalization; the write barrier is being held across \
+             the whole pass, so every client on this node is blocked for its duration", wrote);
+
+        assert!(wait_for(Duration::from_secs(60), || {
+            cl.a.state.as_ref().unwrap().migration().is_none()
+                && cl.a.state.as_ref().unwrap().cluster_view().ring
+                    .is_some_and(|ring| ring.shards.len() == 3)
+        }).await, "the handover never completed");
+
+        assert_eq!(cl.holder(&kept).await.as_deref(), Some(source.as_str()),
+            "a key the plan never moved must still be where it was");
+        for key in keys.iter().filter(|key| owner_of(&three, key) == c) {
+            assert_eq!(cl.holder(key).await.as_deref(), Some(c.as_str()),
+                "key {} was reassigned but never arrived", key);
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_replayed_final_reset_cannot_erase_the_completed_copy() {
         let root = temp_root();
