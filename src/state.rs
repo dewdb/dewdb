@@ -627,6 +627,17 @@ impl AppState {
         self.primary_overrides.lock().unwrap().remove(original_url);
     }
 
+    /// The cached answer only, with no fallback to `original_url`. Callers that probe on a miss
+    /// need to tell "nothing known" apart from "the configured owner still leads".
+    pub fn cached_primary(&self, original_url: &str) -> Option<String> {
+        let mut overrides = self.primary_overrides.lock().unwrap();
+        match overrides.get(original_url) {
+            Some(ov) if ov.cached_at.elapsed().as_secs() < OVERRIDE_TTL_SECS => Some(ov.url.clone()),
+            Some(_) => { overrides.remove(original_url); None },
+            None => None,
+        }
+    }
+
     pub fn effective_primary(&self, original_url: &str) -> String {
         let mut overrides = self.primary_overrides.lock().unwrap();
         if let Some(ov) = overrides.get(original_url) {

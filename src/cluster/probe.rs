@@ -17,7 +17,7 @@ pub struct Probe {
     pub load: Option<NodeLoad>,
 }
 
-async fn probe_node(client: &reqwest::Client, url: &str) -> Option<Probe> {
+pub(crate) async fn probe_node(client: &reqwest::Client, url: &str) -> Option<Probe> {
     let hb = format!("{}/internal/heartbeat", url);
     let r = client.get(&hb).send().await.ok()?;
     if !r.status().is_success() {
@@ -51,7 +51,7 @@ pub async fn fetch_cluster_view(client: &reqwest::Client, url: &str) -> Option<C
 }
 
 // Highest term wins: a partitioned old primary must not reclaim traffic.
-fn select_primary(probes: &[(String, Option<Probe>)]) -> Option<String> {
+pub(crate) fn select_primary(probes: &[(String, Option<Probe>)]) -> Option<String> {
     let mut best: Option<(u64, String)> = None;
     for (url, res) in probes {
         if let Some(p) = res {

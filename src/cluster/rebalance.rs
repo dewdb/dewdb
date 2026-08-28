@@ -180,7 +180,7 @@ fn target_signature(target: &HashRing) -> Vec<(String, Vec<String>)> {
 }
 
 /// The lowest shard group coordinates; its elected replica may take over.
-fn is_coordinator(state: &AppState, view: &ClusterMetadata) -> bool {
+pub(crate) fn is_coordinator(state: &AppState, view: &ClusterMetadata) -> bool {
     let first = match view
         .ring
         .as_ref()

@@ -3,6 +3,7 @@
 use crate::api::build_app;
 use crate::auth::build_client;
 use crate::cluster::metadata::ClusterMetadata;
+use crate::cluster::migration::MigrationRuns;
 use crate::config::NodeConfig;
 use crate::consensus::{
     heartbeat_poll_task, progress_flush_task, seed_leader_progress, Progress, ReplicationMeta,
@@ -240,7 +241,7 @@ impl TestNode {
                                 seeded
                             }))),
                     ring_cache: Arc::new(std::sync::Mutex::new(Default::default())),
-                    migrations: Arc::new(std::sync::Mutex::new(Default::default())),
+                    migrations: Arc::new(std::sync::Mutex::new(MigrationRuns::restored(&config.data_dir))),
                     migration_write_gate: Arc::new(tokio::sync::RwLock::new(())),
                 };
 

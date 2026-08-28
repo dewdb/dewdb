@@ -310,6 +310,17 @@ async fn become_leader(state: &AppState, term: u64, candidate_id: &str) {
     }
     info!(target: "election", "*** WON election: PROMOTED to primary at term {} ***", term);
     info!(target: "election", "Node {} is now accepting writes", candidate_id);
+
+    // A handover in flight is the new leader's to run: the deposed node's copy stopped with it, and
+    // the coordinator polls this group, not that node. The rebalancer does the same on its tick,
+    // but it is off by default, so promotion cannot rely on it.
+    let view = state.cluster_view();
+    if view.migration.is_some() {
+        state.react_to_migration();
+        if crate::cluster::rebalance::is_coordinator(state, &view) {
+            crate::api::migrate::resume_migration_coordination(state);
+        }
+    }
 }
 
 #[cfg(test)]

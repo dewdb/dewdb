@@ -4,10 +4,15 @@
 use crate::cluster::metadata::{Migration, MigrationPhase};
 use crate::ring::{hash_key, keyspace_movement, HashRing};
 use crate::state::AppState;
-use crate::util::same_endpoint;
+use crate::util::{same_endpoint, write_atomic};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io;
+use std::path::Path;
 use tracing::{info, warn};
+
+const MIGRATION_FILE: &str = "migration.meta";
 
 #[derive(Deserialize, Clone, Debug)]
 pub struct DataMovementConfig {
@@ -72,7 +77,7 @@ pub struct MigrationProgress {
     /// Keys handed over, so cleanup after the flip deletes exactly what moved rather than
     /// re-deriving the set from a ring that may have changed again.
     #[serde(skip)]
-    pub handed_over: Vec<(String, String)>,
+    pub handed_over: HashSet<(String, String)>,
 }
 
 #[derive(Default)]
@@ -80,7 +85,85 @@ pub struct MigrationRuns {
     pub current: Option<MigrationProgress>,
     /// Prevents duplicate coordinator loops after recovery.
     pub coordinating: Option<String>,
+    /// Sources the coordinator here is still waiting on. Published so a stalled handover is
+    /// visible through the API rather than only in this node's logs.
+    pub waiting_on: Vec<String>,
     pub completed_resets: HashSet<(String, String)>,
+}
+
+impl MigrationRuns {
+    pub fn restored(data_dir: &str) -> Self {
+        let meta = MigrationMeta::load(data_dir);
+        Self {
+            current: meta.completed.map(|c| MigrationProgress {
+                id: c.id,
+                phase: c.phase,
+                target: c.target,
+                pushed: c.handed_over.len(),
+                total: c.handed_over.len(),
+                done: true,
+                error: None,
+                handed_over: c.handed_over,
+            }),
+            coordinating: None,
+            waiting_on: Vec::new(),
+            completed_resets: meta.completed_resets,
+        }
+    }
+}
+
+/// The part of a handover that has to outlive the process: what this node handed over, and which
+/// sources it has already reset for. Both drive a deletion, and a lost record leaves a stale copy
+/// that shadows the live one if the node comes back into the ring.
+#[derive(Serialize, Deserialize, Default)]
+pub struct MigrationMeta {
+    pub completed: Option<CompletedHandover>,
+    #[serde(default)]
+    pub completed_resets: HashSet<(String, String)>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct CompletedHandover {
+    pub id: String,
+    pub phase: MigrationPhase,
+    pub target: HashRing,
+    pub handed_over: HashSet<(String, String)>,
+}
+
+impl MigrationMeta {
+    pub fn load(data_dir: &str) -> Self {
+        fs::read(Path::new(data_dir).join(MIGRATION_FILE))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, data_dir: &str) -> io::Result<()> {
+        let bytes = serde_json::to_vec(self).map_err(io::Error::other)?;
+        write_atomic(Path::new(data_dir), MIGRATION_FILE, &bytes)
+    }
+}
+
+/// Written when a phase finishes, not per batch: an unfinished record is never read back, since a
+/// restart mid-copy re-plans from the view. Restoring one would be worse than losing it, because
+/// `ensure_running` reads a matching id and phase as already running and would not restart.
+fn persist(state: &AppState) {
+    let meta = {
+        let runs = state.migrations.lock().unwrap();
+        MigrationMeta {
+            completed: runs.current.as_ref().filter(|p| p.done).map(|p| CompletedHandover {
+                id: p.id.clone(),
+                phase: p.phase,
+                target: p.target.clone(),
+                handed_over: p.handed_over.clone(),
+            }),
+            completed_resets: runs.completed_resets.clone(),
+        }
+    };
+    if let Err(e) = meta.save(&state.config.data_dir) {
+        warn!(target: "migration", error = %e,
+            "Could not persist handover bookkeeping; a restart before cleanup strands the copies");
+    }
 }
 
 /// Starts the copy for `migration` unless this node is already running it. Called on every view
@@ -119,11 +202,12 @@ pub fn ensure_running(state: &AppState, migration: &Migration) {
             total,
             done,
             error: None,
-            handed_over: Vec::new(),
+            handed_over: HashSet::new(),
         });
     }
 
     if done {
+        persist(state);
         info!(target: "migration", id = %migration.id, "Nothing to hand over from this node");
         return;
     }
@@ -202,14 +286,17 @@ async fn push_until_done(state: AppState, migration: Migration) {
                         "leadership changed during migration".to_string());
                     return;
                 }
-                let mut runs = state.migrations.lock().unwrap();
-                if let Some(p) = runs.current.as_mut().filter(|p| {
-                    p.id == id && p.phase == migration.phase
-                }) {
-                    p.done = true;
-                    p.error = None;
-                    info!(target: "migration", id = %id, pushed = p.pushed, "Handover complete");
+                {
+                    let mut runs = state.migrations.lock().unwrap();
+                    if let Some(p) = runs.current.as_mut().filter(|p| {
+                        p.id == id && p.phase == migration.phase
+                    }) {
+                        p.done = true;
+                        p.error = None;
+                        info!(target: "migration", id = %id, pushed = p.pushed, "Handover complete");
+                    }
                 }
+                persist(&state);
                 return;
             },
             Err(e) => {
@@ -362,10 +449,7 @@ async fn push_all(
                     }) {
                         p.pushed += sent;
                         for key in chunk {
-                            let entry = (collection.clone(), key.clone());
-                            if !p.handed_over.contains(&entry) {
-                                p.handed_over.push(entry);
-                            }
+                            p.handed_over.insert((collection.clone(), key.clone()));
                         }
                     } else {
                         return Err("migration was replaced while copying".to_string());
@@ -390,7 +474,7 @@ async fn push_all(
 /// Keys this node handed over, but only once the ring it was handing them over *for* is the ring
 /// actually in force. An abandoned plan leaves the same record behind, and acting on it would
 /// delete keys this node still owns.
-pub fn handed_over_after_flip(state: &AppState, id: &str) -> Vec<(String, String)> {
+pub fn handed_over_after_flip(state: &AppState, id: &str) -> HashSet<(String, String)> {
     let live = state.cluster_view().ring;
     let runs = state.migrations.lock().unwrap();
     runs.current.as_ref()
@@ -412,6 +496,7 @@ pub fn reset_completed(state: &AppState, id: &str, source: &str) -> bool {
 pub fn mark_reset_completed(state: &AppState, id: &str, source: &str) {
     state.migrations.lock().unwrap().completed_resets
         .insert((id.to_string(), crate::util::endpoint_of(source).to_string()));
+    persist(state);
 }
 
 pub fn forget(state: &AppState, id: &str) {
@@ -424,6 +509,8 @@ pub fn forget(state: &AppState, id: &str) {
 
     let prefix = format!("migration-reset:{}:", id);
     state.repair_locks.lock().unwrap().retain(|key, _| !key.starts_with(&prefix));
+
+    persist(state);
 }
 
 #[cfg(test)]
@@ -443,6 +530,43 @@ mod tests {
         let oversized: DataMovementConfig =
             serde_json::from_str(r#"{"batch_size":1025}"#).unwrap();
         assert!(oversized.validate().is_err());
+    }
+
+    #[test]
+    fn a_completed_handover_round_trips_through_disk() {
+        let dir = crate::test_support::temp_root();
+        let root = dir.to_string_lossy().to_string();
+
+        assert!(MigrationRuns::restored(&root).current.is_none(),
+            "no file means no handover to finish, not an error");
+
+        let target = HashRing { vnodes: 128, shards: Vec::new() };
+        MigrationMeta {
+            completed: Some(CompletedHandover {
+                id: "m1".into(),
+                phase: MigrationPhase::Finalizing,
+                target: target.clone(),
+                handed_over: HashSet::from([
+                    ("t".to_string(), "k1".to_string()),
+                    ("t".to_string(), "k2".to_string()),
+                ]),
+            }),
+            completed_resets: HashSet::from([("m1".to_string(), "127.0.0.1:1".to_string())]),
+        }.save(&root).unwrap();
+
+        let runs = MigrationRuns::restored(&root);
+        let current = runs.current.expect("a completed handover must come back");
+        assert_eq!(current.id, "m1");
+        assert_eq!(current.phase, MigrationPhase::Finalizing);
+        assert_eq!(current.target, target,
+            "cleanup compares this against the live ring before deleting anything");
+        assert!(current.done, "only a finished handover is ever written, so it is done by definition");
+        assert_eq!(current.handed_over.len(), 2);
+        assert!(current.handed_over.contains(&("t".to_string(), "k2".to_string())));
+        assert!(runs.completed_resets.contains(&("m1".to_string(), "127.0.0.1:1".to_string())));
+        assert!(runs.coordinating.is_none(), "a coordinator loop is per process, never restored");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

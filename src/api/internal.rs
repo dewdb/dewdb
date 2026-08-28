@@ -301,6 +301,16 @@ pub async fn cluster_update_handler(
     }
 }
 
+/// Handover writes are the one place `w=1` is a data-loss bug rather than a latency choice: the
+/// source deletes what the destination acknowledged, so an ack only one node holds is a promise
+/// nothing can keep. A group with no replicas still needs one ack, so this costs nothing there.
+fn handover_write_concern() -> (crate::replication::WriteConcern, std::time::Duration) {
+    (
+        crate::replication::WriteConcern::Majority,
+        std::time::Duration::from_millis(crate::replication::DEFAULT_WTIMEOUT_MS),
+    )
+}
+
 /// Receives keys handed over by their current owner. Deliberately outside the ownership check: the
 /// point of the batch is that this node does not own these keys yet.
 pub async fn migrate_handler(
@@ -319,14 +329,18 @@ pub async fn migrate_handler(
             "no migration {} is in progress here", batch.migration_id)),
     }
 
-    let wc = crate::replication::parse_write_concern(None);
-    let wtimeout = std::time::Duration::from_millis(crate::replication::DEFAULT_WTIMEOUT_MS);
+    let (wc, wtimeout) = handover_write_concern();
     let written = batch.docs.len();
     let items = batch.docs.into_iter().map(|doc| (doc.key, doc.value)).collect();
-    if let Err(resp) = crate::api::write::local_write_batch(
+    let outcomes = match crate::api::write::local_write_batch(
         &state, &batch.collection, items, wc, wtimeout,
     ).await {
-        return resp;
+        Ok(outcomes) => outcomes,
+        Err(resp) => return resp,
+    };
+    if let Some(short) = outcomes.iter().find(|outcome| !outcome.met) {
+        return err_json(StatusCode::SERVICE_UNAVAILABLE, format!(
+            "handover batch reached {} of {} nodes", short.acks, short.required));
     }
 
     (StatusCode::OK, Json(serde_json::json!({"status": "received", "written": written}))).into_response()
@@ -406,12 +420,15 @@ pub async fn migrate_reset_handler(
         }
     }
 
-    let wc = crate::replication::parse_write_concern(None);
-    let wtimeout = std::time::Duration::from_millis(crate::replication::DEFAULT_WTIMEOUT_MS);
+    let (wc, wtimeout) = handover_write_concern();
     let mut removed = 0usize;
     for (collection, key) in stale {
         match crate::api::write::local_write(&state, &collection, key, None, wc, wtimeout).await {
-            Ok(_) => removed += 1,
+            Ok(outcome) if outcome.met => removed += 1,
+            // Marking the reset complete over a tombstone one node holds would let the copy it was
+            // meant to clear come back with the next leader.
+            Ok(outcome) => return err_json(StatusCode::SERVICE_UNAVAILABLE, format!(
+                "reset tombstone reached {} of {} nodes", outcome.acks, outcome.required)),
             Err(resp) => return resp,
         }
     }
@@ -449,9 +466,9 @@ pub async fn migrate_cleanup_handler(
     }
 
     let handed_over = crate::cluster::migration::handed_over_after_flip(&state, &req.migration_id);
-    let wc = crate::replication::parse_write_concern(None);
-    let wtimeout = std::time::Duration::from_millis(crate::replication::DEFAULT_WTIMEOUT_MS);
+    let (wc, wtimeout) = handover_write_concern();
     let mut removed = 0usize;
+    let mut short = 0usize;
 
     for (collection, key) in handed_over {
         // Re-checked one key at a time against the live view. Anything we do own now is not ours
@@ -461,14 +478,28 @@ pub async fn migrate_cleanup_handler(
         }
         // Through the write path, not a bare append: a tombstone has to be staged, committed and
         // applied to disappear from the index, and it has to reach this group's replicas too.
-        if crate::api::write::local_write(&state, &collection, key, None, wc, wtimeout).await.is_ok() {
-            removed += 1;
+        match crate::api::write::local_write(&state, &collection, key, None, wc, wtimeout).await {
+            Ok(outcome) if outcome.met => removed += 1,
+            _ => short += 1,
         }
     }
-    crate::cluster::migration::forget(&state, &req.migration_id);
 
-    info!(target: "migration", id = %req.migration_id, removed, "Cleaned up handed-over keys");
-    (StatusCode::OK, Json(serde_json::json!({"status": "cleaned", "removed": removed}))).into_response()
+    // The record survives a partial cleanup so a later call can finish it. Forgetting here leaves
+    // a tombstone this group's quorum does not hold, and a replica elected without it still has
+    // the key.
+    if short == 0 {
+        crate::cluster::migration::forget(&state, &req.migration_id);
+        info!(target: "migration", id = %req.migration_id, removed, "Cleaned up handed-over keys");
+        return (StatusCode::OK, Json(serde_json::json!({
+            "status": "cleaned", "removed": removed,
+        }))).into_response();
+    }
+
+    warn!(target: "migration", id = %req.migration_id, removed, pending = short,
+        "Cleanup left keys behind; their tombstones did not reach a quorum here");
+    (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+        "status": "partial", "removed": removed, "pending": short,
+    }))).into_response()
 }
 
 /// Whether this node holds any data. Asked before a ring change reassigns ownership, so it is

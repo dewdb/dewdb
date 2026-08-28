@@ -25,6 +25,7 @@ mod test_support;
 use crate::api::build_app;
 use crate::auth::build_client;
 use crate::cluster::metadata::ClusterMetadata;
+use crate::cluster::migration::MigrationRuns;
 use crate::cluster::probe::{router_probe_task, ROUTER_PROBE_INTERVAL_SECS};
 use crate::cluster::rebalance::rebalance_task;
 use crate::config::{config_warnings, NodeConfig};
@@ -208,7 +209,7 @@ async fn main() -> io::Result<()> {
             config.flow_control.max_inflight_requests.max(1))),
         cluster,
         ring_cache: Arc::new(std::sync::Mutex::new(Default::default())),
-        migrations: Arc::new(std::sync::Mutex::new(Default::default())),
+        migrations: Arc::new(std::sync::Mutex::new(MigrationRuns::restored(&config.data_dir))),
         migration_write_gate: Arc::new(tokio::sync::RwLock::new(())),
     };
 
