@@ -358,7 +358,15 @@ impl AppState {
         {
             let view = self.cluster.read().unwrap();
             if !view.seeded {
-                let voters = view.voting_shards();
+                // Narrowed to this node's shard group before counting: `voting_shards` is the flat
+                // member list, and a majority taken over it spans groups that share no log.
+                let voters = match (view.shard_group(&own), view.groups_known()) {
+                    (Some(group), _) => view.voting_shards().into_iter()
+                        .filter(|v| group.iter().any(|g| crate::util::same_endpoint(g, v)))
+                        .collect(),
+                    (None, false) => view.voting_shards(),
+                    (None, true) => Vec::new(),
+                };
                 if voters.iter().any(|v| crate::util::same_endpoint(v, &own)) {
                     return voters;
                 }
@@ -745,6 +753,56 @@ mod tests {
 
         let unbounded = AppState::for_admission_test(config_with_bound(&root, 0), db.clone(), true);
         assert!(unbounded.admit_write("t").is_ok(), "0 opts out of the bound");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn the_quorum_is_this_nodes_shard_group_not_every_shard_in_the_cluster() {
+        use crate::ring::{HashRing, RingShard};
+
+        let root = temp_root();
+        let db = Arc::new(Database::new(&root).unwrap());
+        let config: NodeConfig = serde_json::from_value(serde_json::json!({
+            "node_id": "b1", "role": "shard", "shard_role": "primary",
+            "listen_addr": "127.0.0.1:9601",
+            "data_dir": root.to_string_lossy(),
+            "replicas": ["http://127.0.0.1:9602", "http://127.0.0.1:9603"],
+            "peers": ["http://127.0.0.1:9602", "http://127.0.0.1:9603"],
+        })).unwrap();
+        let state = AppState::for_admission_test(config, db, true);
+
+        let mut view = state.cluster_view();
+        view.version += 1;
+        view.seeded = false;
+        view.updated_by = "operator".into();
+        // Another shard's nodes are members and voters too: the list has no shard affinity.
+        for url in ["http://127.0.0.1:9701", "http://127.0.0.1:9702"] {
+            view.members.push(Member {
+                url: url.into(), node_id: None, role: "shard".into(),
+                shard_role: None, voting: true, follows: None,
+            });
+        }
+        view.ring = Some(HashRing { vnodes: 128, shards: vec![
+            RingShard {
+                node_url: "http://127.0.0.1:9601".into(),
+                replica_urls: vec!["http://127.0.0.1:9602".into(), "http://127.0.0.1:9603".into()],
+            },
+            RingShard {
+                node_url: "http://127.0.0.1:9701".into(),
+                replica_urls: vec!["http://127.0.0.1:9702".into()],
+            },
+        ]});
+        assert!(matches!(state.adopt_cluster(view), Adoption::Adopted { .. }));
+
+        let mut voters = state.voting_set();
+        voters.sort();
+        assert_eq!(voters, vec![
+            "http://127.0.0.1:9601".to_string(),
+            "http://127.0.0.1:9602".to_string(),
+            "http://127.0.0.1:9603".to_string(),
+        ], "counting all five makes an election need three votes from a group that has three \
+            nodes, and become_leader would replicate this group's frames into the other one");
 
         let _ = fs::remove_dir_all(&root);
     }

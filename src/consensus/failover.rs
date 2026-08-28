@@ -27,12 +27,20 @@ async fn discover_leader(state: &AppState) -> Option<String> {
         peers.extend(g.replicas.iter().cloned());
     }
     // A node admitted at runtime knows the cluster only through the view; its config names nobody.
+    // Scoped to this node's own shard group: `members` spans every group, and a follower that
+    // adopts another group's primary resyncs its whole database from a log it shares nothing with.
     {
+        let own = state.own_url();
         let view = state.cluster.read().unwrap();
-        peers.extend(view.members.iter()
-            .filter(|m| m.role == "shard")
-            .map(|m| m.url.clone()));
-        if let Some(follows) = view.member(&state.own_url()).and_then(|m| m.follows.clone()) {
+        match view.shard_group(&own) {
+            Some(group) => peers.extend(group),
+            None if !view.groups_known() => peers.extend(view.members.iter()
+                .filter(|m| m.role == "shard")
+                .map(|m| m.url.clone())),
+            // The view records groups and puts this node in none of them. Config is all it has.
+            None => {},
+        }
+        if let Some(follows) = view.member(&own).and_then(|m| m.follows.clone()) {
             peers.push(follows);
         }
     }
@@ -397,6 +405,7 @@ mod tests {
     use super::*;
     use crate::cluster::metadata::ClusterMetadata;
     use crate::storage::Database;
+    use crate::ring::{hash_key, HashRing, RingShard};
     use crate::test_support::{
         leaders, live_put, next_test_port, node_by_id, put_doc_at, put_doc_http, read_doc_http,
         settle_leader, temp_root, three_node_cluster, wait_for, wait_for_doc, TestNode,
@@ -426,6 +435,102 @@ mod tests {
         }
 
         node
+    }
+
+    /// Every shard node sits in one flat member list, so "who might be my leader" read from it is
+    /// the whole cluster. A group that adopts a foreign primary never elects one of its own, and
+    /// resyncs its database from a log it shares nothing with.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_leaderless_group_elects_its_own_rather_than_following_another_shard() {
+        let root = temp_root();
+        let ports: Vec<u16> = (0..4).map(|_| next_test_port()).collect();
+        let urls: Vec<String> = ports.iter()
+            .map(|port| format!("http://127.0.0.1:{}", port)).collect();
+        let (other, b1, b2, b3) = (urls[0].clone(), urls[1].clone(), urls[2].clone(), urls[3].clone());
+
+        // A shard of its own, and the node that publishes the ring -- so its seeded member list is
+        // the one everybody adopts, and it names nobody in the other group.
+        let mut other_node = TestNode::new("other", ports[0], &root, "primary");
+        other_node.start();
+
+        let mut group: Vec<TestNode> = ["b1", "b2", "b3"].iter().enumerate()
+            .map(|(i, id)| {
+                let mut node = TestNode::new(
+                    id, ports[i + 1], &root, if i == 0 { "primary" } else { "replica" });
+                node.peers = urls[1..].iter().filter(|u| *u != &urls[i + 1]).cloned().collect();
+                if i == 0 {
+                    node.replicas = vec![b2.clone(), b3.clone()];
+                } else {
+                    node.primary_addr = Some(b1.clone());
+                }
+                node.start();
+                node
+            })
+            .collect();
+        let b3_node = group.pop().unwrap();
+        let b2_node = group.pop().unwrap();
+        let mut b1_node = group.pop().unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+        let ring = HashRing {
+            vnodes: 128,
+            shards: vec![
+                RingShard { node_url: other.clone(), replica_urls: Vec::new() },
+                RingShard { node_url: b1.clone(), replica_urls: vec![b2.clone(), b3.clone()] },
+            ],
+        };
+        assert_eq!(client.post(format!("{}/cluster/ring", other))
+            .json(&serde_json::json!({"shards": ring.shards}))
+            .send().await.unwrap().status(), StatusCode::OK);
+        let view = serde_json::to_value(other_node.state.as_ref().unwrap().cluster_view()).unwrap();
+        for node in [&b1, &b2, &b3] {
+            client.post(format!("{}/internal/cluster", node)).json(&view).send().await.unwrap();
+        }
+        assert_eq!(
+            b2_node.state.as_ref().unwrap().cluster_view().members.len(), 1,
+            "the premise: the adopted member list names only the other shard's node");
+
+        let built = ring.build();
+        let key = (0..1000).map(|i| format!("k{}", i))
+            .find(|key| built.owner(hash_key("t", key)).unwrap().node_url == b1)
+            .expect("the ring must give this group some keyspace");
+        assert_eq!(put_doc_at(&client, &b1, "t", &key, 7, "?w=majority&wtimeout=4000").await,
+            StatusCode::CREATED);
+        for member in [&b2, &b3] {
+            assert!(wait_for_doc(&client, member, "t", &key, 7, Duration::from_secs(10)).await,
+                "{} never received the group's write", member);
+        }
+
+        b1_node.kill();
+
+        let winner = settle_leader(&[&b2_node, &b3_node], Duration::from_secs(20)).await
+            .expect("the group must elect one of its own when its leader dies");
+
+        for node in [&b2_node, &b3_node] {
+            let following = node.state.as_ref().unwrap()
+                .replication.as_ref().unwrap().read().unwrap().primary_addr.clone();
+            assert!(!following.as_deref().is_some_and(|url| url == other),
+                "{} took another shard's primary for its own", node.node_id);
+        }
+
+        let leader = node_by_id(&[&b2_node, &b3_node], &winner);
+        assert_eq!(read_doc_at_col(&client, &leader.url(), "t", &key).await, Some(7),
+            "the group's data must survive; a resync from another shard replaces it wholesale");
+
+        drop((other_node, b2_node, b3_node));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    async fn read_doc_at_col(client: &reqwest::Client, base: &str, col: &str, key: &str)
+        -> Option<i64>
+    {
+        let r = client.get(format!("{}/collections/{}/docs/{}", base, col, key))
+            .send().await.ok()?;
+        if !r.status().is_success() {
+            return None;
+        }
+        r.json::<serde_json::Value>().await.ok()?.get("v")?.as_i64()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

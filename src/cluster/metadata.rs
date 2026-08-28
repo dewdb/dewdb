@@ -308,6 +308,39 @@ impl ClusterMetadata {
         out
     }
 
+    /// Whether this view records shard groups at all. Neither model present means one group, and
+    /// then every shard member is in it -- which is what a single-group deployment looks like.
+    pub fn groups_known(&self) -> bool {
+        self.ring.is_some() || !self.shards.is_empty()
+    }
+
+    /// The nodes sharing a shard group with `url`, `url` included. `members` is one flat list
+    /// across every group and `Member` carries no shard affinity, so the ring (or the legacy shard
+    /// map) is the only record of who belongs with whom.
+    ///
+    /// `None` when nothing in force names this node: either no groups are recorded, or one is and
+    /// this node is outside all of them. The two cases are different and `groups_known` tells them
+    /// apart -- callers must not treat the second as licence to fall back to the whole cluster.
+    pub fn shard_group(&self, url: &str) -> Option<Vec<String>> {
+        let groups = self.shard_owners();
+        let names = |group: &(String, Vec<String>), who: &str| {
+            same_url(&group.0, who) || group.1.iter().any(|replica| same_url(replica, who))
+        };
+        // A learner is not in the ring; the primary it follows is what places it in a group.
+        let anchor = match self.member(url).and_then(|m| m.follows.clone()) {
+            Some(follows) if !groups.iter().any(|group| names(group, url)) => follows,
+            _ => url.to_string(),
+        };
+
+        groups.into_iter()
+            .find(|group| names(group, &anchor))
+            .map(|(node_url, replicas)| {
+                let mut out = vec![node_url];
+                out.extend(replicas);
+                out
+            })
+    }
+
     /// Next version of this view with `ring` in force. Clears any migration: the ring landing is
     /// what completing one means, and leaving the plan behind would freeze the keys it named.
     pub fn with_ring(&self, by: &str, ring: HashRing) -> Self {
@@ -472,6 +505,45 @@ mod tests {
 
     fn cfg(json: serde_json::Value) -> NodeConfig {
         serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn a_shard_group_comes_from_the_ring_never_from_the_member_list() {
+        use crate::ring::{HashRing, RingShard};
+
+        let group = |url: &str, replicas: &[&str]| RingShard {
+            node_url: url.to_string(),
+            replica_urls: replicas.iter().map(|r| r.to_string()).collect(),
+        };
+        let member = |url: &str, follows: Option<&str>| Member {
+            url: url.to_string(), node_id: None, role: "shard".to_string(),
+            shard_role: None, voting: follows.is_none(),
+            follows: follows.map(str::to_string),
+        };
+
+        let mut v = view(2, "op", Vec::new());
+        // Every node in one flat list, which is what the member list always is.
+        v.members = ["http://a", "http://b1", "http://b2", "http://b3"]
+            .iter().map(|u| member(u, None)).collect();
+        v.members.push(member("http://learner", Some("http://b1")));
+
+        assert!(!v.groups_known(), "no ring and no shard map is one group, not zero");
+        assert_eq!(v.shard_group("http://b2"), None);
+
+        v.ring = Some(HashRing {
+            vnodes: 128,
+            shards: vec![group("http://a", &[]), group("http://b1", &["http://b2", "http://b3"])],
+        });
+
+        assert!(v.groups_known());
+        assert_eq!(v.shard_group("http://a"), Some(vec!["http://a".to_string()]));
+        assert_eq!(v.shard_group("http://b2"), Some(vec![
+            "http://b1".to_string(), "http://b2".to_string(), "http://b3".to_string(),
+        ]), "a replica's group is the shard that names it, not every shard node in the cluster");
+        assert_eq!(v.shard_group("http://learner"), v.shard_group("http://b1"),
+            "a learner is not in the ring; the primary it follows is what places it");
+        assert_eq!(v.shard_group("http://nobody"), None,
+            "a node no shard names has no group -- which is not the same as having them all");
     }
 
     #[test]
