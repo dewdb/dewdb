@@ -84,6 +84,61 @@ pub fn kway_merge(lists: Vec<Vec<serde_json::Value>>, sort: &SortSpec, limit: us
     out
 }
 
+/// Operators `matches_filter` implements. Anything else is a client error, not a silent no-op.
+const SUPPORTED_OPS: [&str; 6] = ["$gt", "$gte", "$lt", "$lte", "$ne", "$in"];
+
+fn is_operator_object(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+    map.keys().any(|k| k.starts_with('$'))
+}
+
+pub fn parse_filter(s: &str) -> Result<Filter, String> {
+    let filter: Filter = serde_json::from_str(s)
+        .map_err(|e| format!("filter must be a JSON object: {}", e))?;
+    validate_filter(&filter)?;
+    Ok(filter)
+}
+
+/// Every condition `matches_filter` sees has been through here, so it never meets an operator it
+/// cannot evaluate and never has to guess whether an object is a comparison or a literal.
+fn validate_filter(filter: &Filter) -> Result<(), String> {
+    for (field, cond) in &filter.fields {
+        if field.starts_with('$') {
+            return Err(format!("unsupported top-level operator `{}`", field));
+        }
+
+        let map = match cond.as_object() {
+            Some(m) => m,
+            None => continue,
+        };
+        let ops = map.keys().filter(|k| k.starts_with('$')).count();
+        if ops == 0 {
+            continue;
+        }
+        if ops != map.len() {
+            return Err(format!("condition on `{}` mixes operators with literal keys", field));
+        }
+
+        for (op, operand) in map {
+            if !SUPPORTED_OPS.contains(&op.as_str()) {
+                return Err(format!(
+                    "unsupported operator `{}` on `{}`; supported: {}",
+                    op, field, SUPPORTED_OPS.join(", ")
+                ));
+            }
+            match op.as_str() {
+                "$in" if !operand.is_array() => {
+                    return Err(format!("`$in` on `{}` requires an array", field));
+                },
+                "$gt" | "$gte" | "$lt" | "$lte" if !operand.is_number() => {
+                    return Err(format!("`{}` on `{}` requires a number", op, field));
+                },
+                _ => {},
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn matches_filter(doc: &serde_json::Value, filter: &Filter) -> bool {
     for (k, cond) in &filter.fields {
         let val = match get_path_value(doc, k) {
@@ -91,9 +146,7 @@ pub fn matches_filter(doc: &serde_json::Value, filter: &Filter) -> bool {
             None => return false,
         };
 
-        if cond.is_object() {
-            let cmp = cond.as_object().unwrap();
-
+        if let Some(cmp) = cond.as_object().filter(|m| is_operator_object(m)) {
             if let Some(gt) = cmp.get("$gt") {
                 if !val.as_f64().zip(gt.as_f64()).map_or(false, |(a,b)| a > b) {
                     return false;
@@ -125,16 +178,13 @@ pub fn matches_filter(doc: &serde_json::Value, filter: &Filter) -> bool {
             }
 
             if let Some(in_arr) = cmp.get("$in") {
-                if let Some(arr) = in_arr.as_array() {
-                    if !arr.contains(val) {
-                        return false;
-                    }
+                match in_arr.as_array() {
+                    Some(arr) if arr.contains(val) => {},
+                    _ => return false,
                 }
             }
-        } else {
-            if val != cond {
-                return false;
-            }
+        } else if val != cond {
+            return false;
         }
     }
     true
@@ -198,6 +248,50 @@ mod tests {
         let merged = kway_merge(vec![l1, l2, l3], &sort, 5);
         let ns: Vec<i64> = merged.iter().map(|v| v["n"].as_i64().unwrap()).collect();
         assert_eq!(ns, vec![1, 2, 3, 4, 5], "globally sorted, bounded to limit");
+    }
+
+    /// M1: an object condition with no operators is an equality test, not "has this field".
+    #[test]
+    fn a_literal_object_condition_compares_by_value() {
+        use serde_json::json;
+        let f = parse_filter(r#"{"meta": {"v": 1}}"#).expect("a literal object is a valid condition");
+
+        assert!(matches_filter(&json!({"meta": {"v": 1}}), &f));
+        assert!(!matches_filter(&json!({"meta": {"v": 2}}), &f), "unfixed this matched");
+        assert!(!matches_filter(&json!({"meta": {}}), &f), "unfixed this matched");
+    }
+
+    #[test]
+    fn unusable_conditions_are_rejected_not_skipped() {
+        assert!(parse_filter(r#"{"a": {"$exists": true}}"#).is_err(), "unknown operator");
+        assert!(parse_filter(r#"{"a": {"$regex": "x"}}"#).is_err(), "unknown operator");
+        assert!(parse_filter(r#"{"a": {"$in": 3}}"#).is_err(), "$in wants an array");
+        assert!(parse_filter(r#"{"a": {"$gt": "b"}}"#).is_err(), "range operators are numeric");
+        assert!(parse_filter(r#"{"a": {"$gt": 1, "unit": "kg"}}"#).is_err(), "operators mixed with literals");
+        assert!(parse_filter(r#"{"$or": [{"a": 1}]}"#).is_err(), "no top-level operators");
+        assert!(parse_filter("[1,2]").is_err(), "not an object");
+        assert!(parse_filter("{").is_err(), "not JSON");
+    }
+
+    #[test]
+    fn supported_conditions_still_parse_and_match() {
+        use serde_json::json;
+        let f = parse_filter(r#"{"n": {"$gte": 2, "$lt": 5}, "tag": {"$in": ["a", "b"]}, "s": {"$ne": "x"}}"#)
+            .expect("all supported");
+
+        assert!(matches_filter(&json!({"n": 3, "tag": "b", "s": "y"}), &f));
+        assert!(!matches_filter(&json!({"n": 5, "tag": "b", "s": "y"}), &f));
+        assert!(!matches_filter(&json!({"n": 3, "tag": "c", "s": "y"}), &f));
+        assert!(!matches_filter(&json!({"n": 3, "tag": "b", "s": "x"}), &f));
+        assert!(!matches_filter(&json!({"n": 3, "tag": "b"}), &f), "a missing field cannot match");
+    }
+
+    /// The operand is an array, so a non-array document value can only match element-wise.
+    #[test]
+    fn in_rejects_a_value_that_is_not_a_member() {
+        use serde_json::json;
+        let f = parse_filter(r#"{"tag": {"$in": []}}"#).unwrap();
+        assert!(!matches_filter(&json!({"tag": "a"}), &f));
     }
 
     #[test]

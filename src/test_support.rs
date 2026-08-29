@@ -84,6 +84,10 @@ pub struct TestNode {
     pub node_id: String,
     pub addr: String,
     pub data_dir: PathBuf,
+    /// "shard" or "router". A router gets no storage and no replication state, as in `main`.
+    pub role: String,
+    /// Router only: the ranges it routes, as `(owner, replicas)`.
+    pub shard_map: Vec<(String, Vec<String>)>,
     pub peers: Vec<String>,
     pub replicas: Vec<String>,
     pub primary_addr: Option<String>,
@@ -120,10 +124,24 @@ fn free_port() -> u16 {
 }
 
 fn node_config(n: &TestNode) -> NodeConfig {
+    // One range per owner, splitting the hash space evenly, so a router needs only the owner list.
+    // The last range ends at 0, which is how a ring wraps; a lone owner is the whole ring.
+    let owners = n.shard_map.len().max(1) as u128;
+    let span = (1u128 << 64) / owners;
+    let shard_map: Vec<serde_json::Value> = n.shard_map.iter().enumerate()
+        .map(|(i, (owner, replicas))| serde_json::json!({
+            "start_hash": (span * i as u128) as u64,
+            "end_hash": if i + 1 == n.shard_map.len() { 0u64 } else { (span * (i as u128 + 1)) as u64 },
+            "node_url": owner,
+            "replica_urls": replicas,
+        }))
+        .collect();
+
     let json = serde_json::json!({
         "node_id": n.node_id,
-        "role": "shard",
-        "shard_role": n.shard_role,
+        "role": n.role,
+        "shard_map": shard_map,
+        "shard_role": if n.role == "router" { serde_json::Value::Null } else { serde_json::json!(n.shard_role) },
         "membership_mode": n.membership_mode,
         "allow_unsafe_ring_changes": n.allow_unsafe_ring_changes,
         "listen_addr": n.addr,
@@ -150,6 +168,8 @@ impl TestNode {
             node_id: node_id.to_string(),
             addr: format!("127.0.0.1:{}", port),
             data_dir,
+            role: "shard".to_string(),
+            shard_map: Vec::new(),
             peers: Vec::new(),
             replicas: Vec::new(),
             primary_addr: None,
@@ -186,8 +206,9 @@ impl TestNode {
                 .unwrap();
 
             rt.block_on(async move {
-                let db = Arc::new(
-                    Database::with_cache(&config.data_dir, ReadCacheConfig::default()).unwrap());
+                let is_router = config.role == "router";
+                let db = (!is_router).then(|| Arc::new(
+                    Database::with_cache(&config.data_dir, ReadCacheConfig::default()).unwrap()));
 
                 let meta = ReplicationMeta::load(&config.data_dir).expect("unreadable replication.meta");
                 let solo = !config.is_learner()
@@ -198,9 +219,11 @@ impl TestNode {
                     None => (0, !config.is_learner()
                                 && config.shard_role.as_deref() == Some("primary"), None),
                 };
-                ReplicationMeta { term, is_leader, voted_for: voted_for.clone() }
-                    .save(&config.data_dir)
-                    .expect("could not persist replication state");
+                if !is_router {
+                    ReplicationMeta { term, is_leader, voted_for: voted_for.clone() }
+                        .save(&config.data_dir)
+                        .expect("could not persist replication state");
+                }
 
                 let replication = Arc::new(RwLock::new(ReplicationState {
                     term,
@@ -218,10 +241,10 @@ impl TestNode {
                 }));
 
                 let state = AppState {
-                    db: Some(db),
+                    db,
                     config: Arc::new(config.clone()),
                     client: build_client(&config.auth),
-                    replication: Some(replication),
+                    replication: (!is_router).then_some(replication),
                     primary_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),
                     shard_failover_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
                     repair_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -246,15 +269,19 @@ impl TestNode {
                 };
 
                 let app = build_app(&state);
-                state.follow_from_view();
-                state.react_to_migration();
-                if state.is_leader() {
-                    seed_leader_progress(&state);
+                if is_router {
+                    crate::cluster::probe::router_probe_task(state.clone());
                 } else {
-                    heartbeat_poll_task(state.clone());
+                    state.follow_from_view();
+                    state.react_to_migration();
+                    if state.is_leader() {
+                        seed_leader_progress(&state);
+                    } else {
+                        heartbeat_poll_task(state.clone());
+                    }
+                    progress_flush_task(state.clone());
+                    crate::replication::stream::replication_drive_task(state.clone());
                 }
-                progress_flush_task(state.clone());
-                crate::replication::stream::replication_drive_task(state.clone());
 
                 let listener = bind_with_retry(&addr).await;
                 tokio::spawn(async move {
@@ -400,6 +427,16 @@ pub async fn single_node(root: &Path) -> TestNode {
     n.start();
     tokio::time::sleep(Duration::from_millis(200)).await;
     n
+}
+
+/// A router in front of one shard group. Its own data dir holds only `cluster.meta`.
+pub async fn router_for(root: &Path, owner: &str, replicas: &[String]) -> TestNode {
+    let mut r = TestNode::new("router", free_port(), root, "primary");
+    r.role = "router".to_string();
+    r.shard_map = vec![(owner.to_string(), replicas.to_vec())];
+    r.start();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    r
 }
 
 pub async fn get_raw(client: &reqwest::Client, base: &str, col: &str, key: &str) -> bool {

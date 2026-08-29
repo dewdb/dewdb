@@ -255,15 +255,40 @@ pub async fn bulk_router_forward(
 }
 
 pub enum ReadPreference {
+    /// Explicitly asked for. A node that is not the leader refuses instead of answering.
     Primary,
     Replica,
+    /// Nothing asked for: leader first, replicas after, no guarantee either way.
+    Any,
 }
 
-pub fn parse_read_pref(r: Option<&str>) -> ReadPreference {
+pub fn parse_read_pref(r: Option<&str>) -> Result<ReadPreference, String> {
     match r {
-        Some("replica") => ReadPreference::Replica,
-        _ => ReadPreference::Primary,
+        None => Ok(ReadPreference::Any),
+        Some("primary") => Ok(ReadPreference::Primary),
+        Some("replica") => Ok(ReadPreference::Replica),
+        Some(other) => Err(format!("unknown read preference `{}`; use `primary` or `replica`", other)),
     }
+}
+
+/// Forwarded so the node that answers is the one enforcing it; the router's view of who leads can
+/// be stale, and its candidate list stays as it was so a promoted replica is still found.
+fn forwarded_read_pref(pref: &ReadPreference) -> Option<&'static str> {
+    match pref {
+        ReadPreference::Primary => Some("primary"),
+        _ => None,
+    }
+}
+
+/// 503, not 502: the read is not wrong, it is unavailable until the shard has a leader again.
+fn no_primary_response() -> axum::response::Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::RETRY_AFTER, "1")],
+        Json(serde_json::json!({
+            "error": "no reachable primary for this shard; retry, or ask for read=replica",
+        })),
+    ).into_response()
 }
 
 fn load_score(load: NodeLoad, unknown_latency_us: u64) -> u64 {
@@ -284,7 +309,7 @@ fn read_targets(
 ) -> Vec<String> {
     let mut targets = Vec::new();
     match pref {
-        ReadPreference::Primary => {
+        ReadPreference::Primary | ReadPreference::Any => {
             targets.push(effective_primary.to_string());
             for r in replicas {
                 targets.push(r.clone());
@@ -332,10 +357,14 @@ pub async fn router_read_doc(state: &AppState, col_name: &str, id: &str, pref: R
         None => return (StatusCode::BAD_REQUEST, "Key not owned by any shard").into_response(),
     };
 
-    let path = format!("/collections/{}/docs/{}", col_name, id);
+    let path = match forwarded_read_pref(&pref) {
+        Some(v) => format!("/collections/{}/docs/{}?read={}", col_name, id, v),
+        None => format!("/collections/{}/docs/{}", col_name, id),
+    };
     let rr = state.read_rr.fetch_add(1, Ordering::Relaxed);
     let loads = state.fresh_node_loads();
     let targets = read_targets(&pref, &effective, &replicas, rr, &loads);
+    let mut refused = false;
 
     for target in targets {
         let _routed = state.track_routed_read(&target);
@@ -357,10 +386,16 @@ pub async fn router_read_doc(state: &AppState, col_name: &str, id: &str, pref: R
             if reply.status.is_success() || reply.status == StatusCode::NOT_FOUND {
                 return passthrough(reply);
             }
+            if reply.status == StatusCode::SERVICE_UNAVAILABLE && forwarded_read_pref(&pref).is_some() {
+                refused = true;
+            }
         }
         state.clear_node_load(&target);
     }
 
+    if refused {
+        return no_primary_response();
+    }
     (StatusCode::BAD_GATEWAY, "No shard node could serve the read").into_response()
 }
 
@@ -458,6 +493,13 @@ fn per_shard_limit(limit: usize, shards: usize, sorted: bool) -> usize {
     if sorted { limit } else { limit.div_ceil(shards.max(1)).max(1) }
 }
 
+enum ShardQueryOutcome {
+    Page(QueryPage),
+    /// Every candidate refused a `read=primary` query. Distinct from `Failed`: the shard is up.
+    NoPrimary,
+    Failed,
+}
+
 pub async fn router_query(
     state: &AppState,
     col_name: &str,
@@ -465,8 +507,9 @@ pub async fn router_query(
     limit: usize,
     sort: &Option<SortSpec>,
     fields: &[String],
+    pref: ReadPreference,
 ) -> axum::response::Response {
-        let pref = parse_read_pref(params.read.as_deref());
+        let primary_only = forwarded_read_pref(&pref).is_some();
         let incoming = if sort.is_none() {
             params.cursor.as_deref().and_then(decode_cursor)
         } else {
@@ -504,21 +547,26 @@ pub async fn router_query(
             if let Some(f) = &params.filter { q.push(("filter".to_string(), f.clone())); }
             if let Some(s) = &params.sort { q.push(("sort".to_string(), s.clone())); }
             if let Some(a) = &after { q.push(("cursor".to_string(), a.clone())); }
+            if let Some(v) = forwarded_read_pref(&pref) { q.push(("read".to_string(), v.to_string())); }
 
             futures.push(tokio::spawn(async move {
+                let mut refused = false;
                 for target in targets {
                     let _routed = route_state.track_routed_read(&target);
                     let url = format!("{}/collections/{}/query", target, col);
                     if let Ok(res) = client.get(&url).query(&q).send().await {
                         if res.status().is_success() {
                             if let Ok(page) = res.json::<QueryPage>().await {
-                                return (original, Some(page));
+                                return (original, ShardQueryOutcome::Page(page));
                             }
+                        } else if res.status() == StatusCode::SERVICE_UNAVAILABLE && primary_only {
+                            refused = true;
                         }
                     }
                     route_state.clear_node_load(&target);
                 }
-                (original, None)
+                let outcome = if refused { ShardQueryOutcome::NoPrimary } else { ShardQueryOutcome::Failed };
+                (original, outcome)
             }));
         }
 
@@ -527,13 +575,14 @@ pub async fn router_query(
         if let Some(sort) = &sort {
             let mut lists = Vec::new();
             for res in joined {
-                let (_original, page) = match res {
+                let (_original, outcome) = match res {
                     Ok(t) => t,
                     Err(_) => return (StatusCode::BAD_GATEWAY, "Shard query task failed").into_response(),
                 };
-                match page {
-                    Some(p) => lists.push(p.items),
-                    None => return (StatusCode::BAD_GATEWAY, "Shard query failed").into_response(),
+                match outcome {
+                    ShardQueryOutcome::Page(p) => lists.push(p.items),
+                    ShardQueryOutcome::NoPrimary => return no_primary_response(),
+                    ShardQueryOutcome::Failed => return (StatusCode::BAD_GATEWAY, "Shard query failed").into_response(),
                 }
             }
             let merged = kway_merge(lists, sort, limit);
@@ -544,12 +593,12 @@ pub async fn router_query(
         let mut merged = Vec::new();
         let mut positions = BTreeMap::new();
         for res in joined {
-            let (original, page) = match res {
+            let (original, outcome) = match res {
                 Ok(t) => t,
                 Err(_) => return (StatusCode::BAD_GATEWAY, "Shard query task failed").into_response(),
             };
-            match page {
-                Some(p) => {
+            match outcome {
+                ShardQueryOutcome::Page(p) => {
                     for item in p.items {
                         merged.push(project(&item, fields));
                     }
@@ -557,7 +606,8 @@ pub async fn router_query(
                         positions.insert(original, k);
                     }
                 },
-                None => return (StatusCode::BAD_GATEWAY, "Shard query failed").into_response(),
+                ShardQueryOutcome::NoPrimary => return no_primary_response(),
+                ShardQueryOutcome::Failed => return (StatusCode::BAD_GATEWAY, "Shard query failed").into_response(),
             }
         }
 
@@ -665,12 +715,36 @@ mod tests {
         );
     }
 
+    /// M4: an unasked-for preference and an explicit `primary` used to be the same value, so the
+    /// guarantee could not be enforced without also refusing every read that never asked for it.
     #[test]
-    fn parse_read_pref_defaults_to_primary() {
-        assert!(matches!(parse_read_pref(None), ReadPreference::Primary));
-        assert!(matches!(parse_read_pref(Some("primary")), ReadPreference::Primary));
-        assert!(matches!(parse_read_pref(Some("garbage")), ReadPreference::Primary));
-        assert!(matches!(parse_read_pref(Some("replica")), ReadPreference::Replica));
+    fn a_read_preference_is_distinguishable_from_no_preference() {
+        assert!(matches!(parse_read_pref(None), Ok(ReadPreference::Any)));
+        assert!(matches!(parse_read_pref(Some("primary")), Ok(ReadPreference::Primary)));
+        assert!(matches!(parse_read_pref(Some("replica")), Ok(ReadPreference::Replica)));
+
+        // Unfixed, `read=Primary` and `read=preimary` both silently meant primary.
+        assert!(parse_read_pref(Some("garbage")).is_err());
+        assert!(parse_read_pref(Some("Primary")).is_err());
+        assert!(parse_read_pref(Some("")).is_err());
+    }
+
+    #[test]
+    fn only_an_explicit_primary_read_is_forwarded_for_enforcement() {
+        assert_eq!(forwarded_read_pref(&ReadPreference::Primary), Some("primary"));
+        assert_eq!(forwarded_read_pref(&ReadPreference::Any), None, "no preference forwards nothing");
+        assert_eq!(forwarded_read_pref(&ReadPreference::Replica), None);
+    }
+
+    /// The candidate list is unchanged by M4 — a promoted replica still has to be findable. What
+    /// changed is that each candidate is asked to prove it leads before its answer is used.
+    #[test]
+    fn read_targets_no_preference_matches_primary_preferred_order() {
+        let replicas = vec!["http://r1".to_string(), "http://r2".to_string()];
+        assert_eq!(
+            read_targets(&ReadPreference::Any, "http://p", &replicas, 0, &no_loads()),
+            read_targets(&ReadPreference::Primary, "http://p", &replicas, 0, &no_loads()),
+        );
     }
 
     #[test]

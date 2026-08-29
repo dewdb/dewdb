@@ -255,6 +255,16 @@ impl Collection {
         self.index.read().unwrap().contains_key(key)
     }
 
+    /// created/replaced has to be decided against the newest durable state, like
+    /// `get_including_staged`: the committed index alone calls a replace a create.
+    pub fn exists_including_staged(&self, key: &str) -> bool {
+        let staged = {
+            let pending = self.pending.lock().unwrap();
+            pending.values().rev().find(|s| s.key == key).map(|s| s.entry.is_some())
+        };
+        staged.unwrap_or_else(|| self.exists(key))
+    }
+
     fn current_timestamp() -> u64 {
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
     }
@@ -1269,6 +1279,31 @@ mod tests {
         assert!(col.get("k").unwrap().is_none());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// M5: created/replaced is decided before the write lands, so the check has to see the staged
+    /// tail the committed index does not.
+    #[tokio::test]
+    async fn the_existence_check_behind_created_or_replaced_sees_the_staged_tail() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        let put = stage_put(&col, "k", 1);
+        assert!(!col.exists("k"), "committed reads must not see an uncommitted write");
+        assert!(col.exists_including_staged("k"), "unfixed this called a replace a create");
+
+        col.apply_committed(put);
+        assert!(col.exists_including_staged("k"));
+
+        let del = stage_delete(&col, "k");
+        assert!(col.exists("k"), "the delete has not committed");
+        assert!(!col.exists_including_staged("k"), "a staged delete is the newest durable state");
+
+        col.apply_committed(del);
+        assert!(!col.exists_including_staged("k"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

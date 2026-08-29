@@ -3,14 +3,14 @@
 use super::write::{local_patch, local_write, local_write_batch};
 use crate::cluster::router::{
     parse_read_pref, router_forward_write, router_read_doc, router_query, bulk_router_forward,
-    passthrough, ForwardMethod,
+    passthrough, ForwardMethod, ReadPreference,
 };
 use crate::json::{parse_fields, project};
 use crate::model::{
     err_json, BulkDoc, CreateDoc, QueryPage, QueryParams, ReadParams, DEFAULT_QUERY_LIMIT,
     MAX_QUERY_LIMIT,
 };
-use crate::query::{compare_by_sort, matches_filter, parse_sort, Filter};
+use crate::query::{compare_by_sort, matches_filter, parse_filter, parse_sort};
 use crate::replication::{parse_write_concern, wc_query_string, WriteConcernParams, DEFAULT_WTIMEOUT_MS};
 use crate::cluster::ownership::Ownership;
 use crate::state::AppState;
@@ -56,6 +56,21 @@ fn own_id(state: &AppState, collection: &str, first: String) -> Option<String> {
         }
     }
     None
+}
+
+/// `read=primary` is a guarantee, not a hint: a node that does not lead refuses rather than
+/// answering from a log it may be behind on. The router forwards the preference for this check.
+fn not_the_primary(state: &AppState, pref: &ReadPreference) -> Option<axum::response::Response> {
+    if !matches!(pref, ReadPreference::Primary) || !state.is_shard() || state.is_leader() {
+        return None;
+    }
+    Some((
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::RETRY_AFTER, "1")],
+        Json(serde_json::json!({
+            "error": "this node is not the primary; retry, or ask for read=replica",
+        })),
+    ).into_response())
 }
 
 pub async fn create_doc(
@@ -213,9 +228,17 @@ pub async fn get_doc(
     AxumPath((col_name, id)): AxumPath<(String, String)>,
     Query(rp): Query<ReadParams>,
 ) -> impl axum::response::IntoResponse {
+    let pref = match parse_read_pref(rp.read.as_deref()) {
+        Ok(p) => p,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
+    };
+
     if state.config.role == "router" {
-        let pref = parse_read_pref(rp.read.as_deref());
         return router_read_doc(&state, &col_name, &id, pref).await;
+    }
+
+    if let Some(refusal) = not_the_primary(&state, &pref) {
+        return refusal;
     }
 
     // Only a wrong owner redirects. A key mid-handover still reads correctly here: the source is
@@ -361,9 +384,21 @@ pub async fn query_docs(
     };
     let sort = parse_sort(params.sort.as_deref());
     let fields = parse_fields(params.fields.as_deref());
+    let filter_obj = match params.filter.as_deref().map(parse_filter).transpose() {
+        Ok(f) => f,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
+    };
+    let pref = match parse_read_pref(params.read.as_deref()) {
+        Ok(p) => p,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
+    };
 
     if state.config.role == "router" {
-        return router_query(&state, &col_name, &params, limit, &sort, &fields).await;
+        return router_query(&state, &col_name, &params, limit, &sort, &fields, pref).await;
+    }
+
+    if let Some(refusal) = not_the_primary(&state, &pref) {
+        return refusal;
     }
 
     let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
@@ -372,9 +407,6 @@ pub async fn query_docs(
     };
 
     let col_clone = col.clone();
-    let filter_obj: Option<Filter> = params.filter
-        .as_ref()
-        .and_then(|f| serde_json::from_str::<Filter>(f).ok());
     let after = params.cursor.clone();
     let start = params.start.clone();
     let end = params.end.clone();
@@ -410,8 +442,141 @@ pub async fn query_docs(
 
 #[cfg(test)]
 mod tests {
-    use crate::test_support::{put_value, single_node, temp_root};
+    use crate::test_support::{
+        node_by_id, put_value, router_for, single_node, temp_root, three_node_cluster, wait_for,
+    };
     use axum::http::StatusCode;
+    use std::time::Duration;
+
+    /// M4: `read=primary` used to be satisfiable by any replica that answered first — the router
+    /// listed them as fallbacks and a shard never checked the preference at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_primary_read_is_never_answered_by_a_follower() {
+        let root = temp_root();
+        let (n1, n2, n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::new();
+
+        let doc = format!("{}/collections/t/docs/k", n1.url());
+        assert!(client.put(&format!("{}?w=majority&wtimeout=4000", doc))
+            .json(&serde_json::json!({"value": {"v": 1}})).send().await.unwrap().status().is_success());
+
+        let follower = node_by_id(&[&n2, &n3], if n2.is_leader() { "n3" } else { "n2" });
+        assert!(!follower.is_leader());
+        assert!(wait_for(Duration::from_secs(10), || {
+            follower.state.as_ref().unwrap().db.as_ref().unwrap()
+                .get_collection("t").map(|c| c.exists("k")).unwrap_or(false)
+        }).await, "the follower must hold the key, or this proves nothing about the refusal");
+
+        let read = |base: String, q: &'static str| {
+            let c = client.clone();
+            async move { c.get(&format!("{}/collections/t/docs/k{}", base, q)).send().await.unwrap().status() }
+        };
+
+        assert_eq!(read(follower.url(), "").await, StatusCode::OK,
+            "an unspecified preference still reads from wherever it was sent");
+        assert_eq!(read(follower.url(), "?read=replica").await, StatusCode::OK);
+        assert_eq!(read(follower.url(), "?read=primary").await, StatusCode::SERVICE_UNAVAILABLE,
+            "unfixed the follower served this as if it were the primary");
+        assert_eq!(read(n1.url(), "?read=primary").await, StatusCode::OK, "the leader still answers");
+
+        // Same on /query, which reaches the check by a different path.
+        let q = |base: String, q: &'static str| {
+            let c = client.clone();
+            async move { c.get(&format!("{}/collections/t/query{}", base, q)).send().await.unwrap().status() }
+        };
+        assert_eq!(q(follower.url(), "?read=primary").await, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(q(follower.url(), "").await, StatusCode::OK);
+
+        // A preference nobody implements is refused rather than quietly downgraded to primary.
+        assert_eq!(read(n1.url(), "?read=Primary").await, StatusCode::BAD_REQUEST);
+        assert_eq!(q(n1.url(), "?read=nearest").await, StatusCode::BAD_REQUEST);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The router half: it still lists replicas so a promoted one is found, so the guarantee holds
+    /// only because the preference travels with the request and the answering node enforces it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_router_reports_no_primary_rather_than_reading_a_replica() {
+        let root = temp_root();
+        let (mut n1, n2, n3) = three_node_cluster(&root).await;
+        let replicas = vec![n2.url(), n3.url()];
+        let router = router_for(&root, &n1.url(), &replicas).await;
+        let client = reqwest::Client::new();
+
+        let doc = format!("{}/collections/t/docs/k", n1.url());
+        assert!(client.put(&format!("{}?w=majority&wtimeout=4000", doc))
+            .json(&serde_json::json!({"value": {"v": 1}})).send().await.unwrap().status().is_success());
+
+        let via_router = |q: &'static str| {
+            let (c, base) = (client.clone(), router.url());
+            async move { c.get(&format!("{}/collections/t/docs/k{}", base, q)).send().await.unwrap().status() }
+        };
+        assert_eq!(via_router("?read=primary").await, StatusCode::OK);
+
+        // Both followers must have applied it, not merely staged it, or the replica read below is
+        // a 404 for reasons that have nothing to do with the preference.
+        for follower in [&n2, &n3] {
+            assert!(wait_for(Duration::from_secs(15), || {
+                follower.state.as_ref().unwrap().db.as_ref().unwrap()
+                    .get_collection("t").map(|c| c.exists("k")).unwrap_or(false)
+            }).await, "a follower never applied the write");
+        }
+
+        // The leader is gone and the followers have not elected yet: the fallback list is exactly
+        // what used to turn this into a silent stale read.
+        n1.kill();
+        assert_eq!(via_router("?read=primary").await, StatusCode::SERVICE_UNAVAILABLE,
+            "unfixed the router served a follower's copy here");
+        assert_eq!(via_router("?read=replica").await, StatusCode::OK,
+            "a client that accepts a replica read still gets one");
+
+        // Once a follower wins the election it is a primary, and the same read succeeds again.
+        assert!(wait_for(Duration::from_secs(20), || n2.is_leader() || n3.is_leader()).await,
+            "no election, so the recovery half is untested");
+
+        let mut recovered = false;
+        for _ in 0..40 {
+            if via_router("?read=primary").await.is_success() {
+                recovered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert!(recovered, "the router never found the new primary");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M1: a filter the engine cannot evaluate is a client error. Before the fix it was dropped and
+    /// the query answered as if no filter had been sent.
+    #[tokio::test]
+    async fn a_filter_the_engine_cannot_evaluate_is_refused() {
+        let root = temp_root();
+        let node = single_node(&root).await;
+        let client = reqwest::Client::new();
+        put_value(&client, &node.url(), "t", "k1", serde_json::json!({"n": 1}), "").await;
+        put_value(&client, &node.url(), "t", "k2", serde_json::json!({"meta": {"v": 1}}), "").await;
+        put_value(&client, &node.url(), "t", "k3", serde_json::json!({"meta": {"v": 2}}), "").await;
+
+        let query = |filter: &'static str| {
+            let c = client.clone();
+            let url = format!("{}/collections/t/query", node.url());
+            async move { c.get(&url).query(&[("filter", filter)]).send().await.unwrap() }
+        };
+
+        for bad in [r#"{"n": {"$exists": true}}"#, r#"{"n": {"$in": 1}}"#, r#"{"$or": []}"#, "not json"] {
+            assert_eq!(query(bad).await.status(), StatusCode::BAD_REQUEST, "filter {} must be refused", bad);
+        }
+
+        let res = query(r#"{"meta": {"v": 1}}"#).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let page: serde_json::Value = res.json().await.unwrap();
+        assert_eq!(page["items"].as_array().map(|a| a.len()), Some(1),
+            "a literal object matches by value, not by the field merely being present");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// H1: `Vec::with_capacity(limit)` on a caller-supplied `limit` is an allocation the process
     /// aborts on, not a panic a handler can catch. The node must survive and answer.

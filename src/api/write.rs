@@ -9,6 +9,7 @@ use crate::state::AppState;
 use crate::storage::{Collection, FrameHeader};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -50,7 +51,8 @@ async fn local_write_inner(
     let key_clone = key.clone();
     let term = state.current_term();
     // Sampled under the key lock: created/replaced must reflect this write, not a racing one.
-    let existed = col.exists(&key);
+    // Staged included, so a replace of a key whose previous write has not committed is not a create.
+    let existed = col.exists_including_staged(&key);
 
     let write_res = tokio::task::spawn_blocking(move || {
         match value {
@@ -222,7 +224,12 @@ async fn local_write_batch_inner(
     items: Vec<(String, serde_json::Value)>,
 ) -> Result<Vec<PendingWrite>, axum::response::Response> {
     let term = state.current_term();
-    let existed: Vec<bool> = items.iter().map(|(key, _)| col.exists(key)).collect();
+    // A key repeated inside one batch is replaced by its second write, and the pre-batch state
+    // cannot show that: every sample here is taken before the first `put`.
+    let mut batched: HashSet<&str> = HashSet::new();
+    let existed: Vec<bool> = items.iter()
+        .map(|(key, _)| !batched.insert(key.as_str()) || col.exists_including_staged(key))
+        .collect();
 
     let col_clone = col.clone();
     let write_res = tokio::task::spawn_blocking(move || {
@@ -288,4 +295,50 @@ pub async fn local_write_batch(
     futures::future::join_all(
         pending.into_iter().map(|p| finish_write(state, col_name, p, wc, wtimeout))
     ).await.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::test_support::{temp_root, three_node_cluster};
+    use axum::http::StatusCode;
+    use std::time::Duration;
+
+    /// M5: `existed` was sampled from the committed index, so with the quorum down — every write
+    /// durable and none of them committed — a replace and a delete both reported nothing was there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn created_or_replaced_is_decided_against_the_uncommitted_tail() {
+        let root = temp_root();
+        let (n1, mut n2, mut n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::new();
+
+        n2.kill();
+        n3.kill();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let url = format!("{}/collections/t/docs/k?w=majority&wtimeout=1000", n1.url());
+        let write = |body: Option<serde_json::Value>| {
+            let (c, url) = (client.clone(), url.clone());
+            async move {
+                let r = match body {
+                    Some(v) => c.put(&url).json(&serde_json::json!({"value": v})).send().await,
+                    None => c.delete(&url).send().await,
+                }.unwrap();
+                let status = r.status();
+                (status, r.json::<serde_json::Value>().await.unwrap())
+            }
+        };
+
+        let (status, body) = write(Some(serde_json::json!({"v": 1}))).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "no quorum, so the write is staged: {}", body);
+        assert_eq!(body["status"], "created");
+
+        let (status, body) = write(Some(serde_json::json!({"v": 2}))).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(body["status"], "replaced", "unfixed this reported a second create: {}", body);
+
+        let (_status, body) = write(None).await;
+        assert_eq!(body["existed"], true, "unfixed this deleted a key it said was not there: {}", body);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
