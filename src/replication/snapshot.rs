@@ -200,6 +200,19 @@ fn stream_snapshot(
     let spool_applied = spool.0.join("applied.meta");
 
     let frozen_through = {
+        // Rotation would put a WAL id in a directory an install has replaced, and a released
+        // handle has an empty index -- serving from one ships a snapshot that describes nothing.
+        let _rewriting = collection
+            .rewriting
+            .lock()
+            .map_err(|_| lock_error("collection rewrite"))?;
+        if collection.released.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "collection handle is no longer active",
+            ));
+        }
+
         let mut wal = collection
             .wal_writer
             .lock()
@@ -432,7 +445,11 @@ async fn receive_snapshot<R: AsyncRead + Unpin>(
     Ok(file_count)
 }
 
-fn validate_staged_snapshot(target: &Path) -> io::Result<()> {
+/// An install replaces rather than merges, so one stopping below `local_applied` -- this node's own
+/// watermark -- would retract entries a quorum committed on our ack. A legitimate leader holds every
+/// committed entry and so never sends one; divergent local frames are uncommitted and below the
+/// watermark, which is why comparing watermarks and not tails still allows a divergence repair.
+fn validate_staged_snapshot(target: &Path, local_applied: u64) -> io::Result<()> {
     let index: IndexSnapshot = bincode::deserialize_from(File::open(target.join(INDEX_FILENAME))?)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let applied: AppliedMeta = serde_json::from_reader(File::open(target.join("applied.meta"))?)
@@ -441,6 +458,15 @@ fn validate_staged_snapshot(target: &Path) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "snapshot applied watermark is beyond its WAL tail",
+        ));
+    }
+    if applied.applied_lsn < local_applied {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "snapshot stops at applied lsn {} but this node has already published {}",
+                applied.applied_lsn, local_applied
+            ),
         ));
     }
     Ok(())
@@ -487,10 +513,15 @@ pub async fn replica_sync_from_primary(
         }
     };
 
+    // Stable across the transfer, not merely current: the caller holds the install lock and
+    // `resyncing` sheds replication for this collection, so nothing can apply while we stream.
+    let local_applied = db.existing_collection(collection_name).map_or(0, |c| c.applied_lsn());
+
     let verify_path = target.clone();
-    if let Err(e) = tokio::task::spawn_blocking(move || validate_staged_snapshot(&verify_path))
-        .await
-        .map_err(|e| format!("Snapshot validation task failed: {}", e))?
+    if let Err(e) =
+        tokio::task::spawn_blocking(move || validate_staged_snapshot(&verify_path, local_applied))
+            .await
+            .map_err(|e| format!("Snapshot validation task failed: {}", e))?
     {
         let _ = remove_dir_with_retry(&target);
         return Err(format!("Snapshot validation failed: {}", e));
@@ -683,7 +714,7 @@ mod tests {
             count >= 3,
             "index, applied watermark and WAL must all be separate entries"
         );
-        validate_staged_snapshot(&staged).unwrap();
+        validate_staged_snapshot(&staged, 0).unwrap();
         replica_db
             .install_staged_collection("events", &staged)
             .unwrap();
@@ -759,6 +790,148 @@ mod tests {
         );
 
         server.abort();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The source is a node that was leader and no longer is: its log stops below what this node
+    /// has already published, and installing it would retract entries a quorum committed.
+    #[tokio::test]
+    async fn a_snapshot_that_stops_below_our_watermark_is_refused() {
+        let root = temp_root();
+        let source_db = Database::new(root.join("source")).unwrap();
+        let source = source_db.get_collection("events").unwrap();
+        committed_put(&source, "stale", serde_json::json!({"v": 1})).await;
+        let wire = collect_snapshot(source).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/internal/snapshot",
+            axum::routing::get({
+                let wire = wire.clone();
+                move || {
+                    let wire = wire.clone();
+                    async move { (axum::http::StatusCode::OK, wire) }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let replica_db = Database::new(root.join("replica")).unwrap();
+        let local = replica_db.get_collection("events").unwrap();
+        for i in 0..3 {
+            committed_put(&local, &format!("k{}", i), serde_json::json!({"v": i})).await;
+        }
+        let published = local.applied_lsn();
+        assert!(published > 1, "the fixture must put this node ahead of the snapshot");
+
+        let error = replica_sync_from_primary(
+            &reqwest::Client::new(),
+            &format!("http://{}", address),
+            &replica_db,
+            "events",
+        )
+        .await
+        .expect_err("a snapshot behind our own watermark must not install");
+        assert!(error.contains("already published"), "unexpected refusal: {}", error);
+
+        let still_live = replica_db.get_collection("events").unwrap();
+        for i in 0..3 {
+            assert_eq!(still_live.get(&format!("k{}", i)).unwrap(), Some(serde_json::json!({"v": i})),
+                "a refused install must leave every published entry readable");
+        }
+        assert!(still_live.get("stale").unwrap().is_none());
+        assert_eq!(still_live.applied_lsn(), published);
+        assert!(!replica_db.root_path.join("events.tmp").exists());
+
+        server.abort();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Maintenance holds an `Arc` across the install that replaces the directory under it: a
+    /// compaction allowed to finish publishes an empty index and retires the installed WALs.
+    #[tokio::test]
+    async fn a_compaction_holding_the_old_handle_cannot_finish_onto_an_installed_snapshot() {
+        let root = temp_root();
+        let source_db = Database::new(root.join("source")).unwrap();
+        let source = source_db.get_collection("events").unwrap();
+        for i in 0..4 {
+            committed_put(&source, &format!("k{}", i), serde_json::json!({"v": i})).await;
+        }
+        let wire = collect_snapshot(source).await;
+
+        let replica_db = Database::new(root.join("replica")).unwrap();
+        let previous = replica_db.get_collection("events").unwrap();
+        live_put(&previous, "obsolete", -1);
+        previous.enqueue_commit().await.unwrap().unwrap();
+
+        let staged = replica_db.root_path.join("events.tmp");
+        fs::create_dir_all(&staged).unwrap();
+        decode_bytes(wire, &staged).await.unwrap();
+        replica_db.install_staged_collection("events", &staged).unwrap();
+
+        let installed = replica_db.root_path.join("events");
+        let wals_before = wal_ids_on_disk(&installed);
+        let index_before = fs::read(installed.join(INDEX_FILENAME)).unwrap();
+
+        let error = previous.compact().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound,
+            "a handle the install released must refuse compaction outright");
+        assert_eq!(wal_ids_on_disk(&installed), wals_before,
+            "the refused compaction must not rotate or retire the installed WALs");
+        assert_eq!(fs::read(installed.join(INDEX_FILENAME)).unwrap(), index_before,
+            "nor overwrite the installed index with the released handle's empty one");
+
+        let restored = replica_db.get_collection("events").unwrap();
+        for i in 0..4 {
+            assert_eq!(restored.get(&format!("k{}", i)).unwrap(), Some(serde_json::json!({"v": i})));
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The boot resync enumerates names off disk, and `adopt_collection_tails` has opened every one
+    /// of them, so the watermark an install is measured against survives a restart with the log.
+    #[tokio::test]
+    async fn the_watermark_a_stale_snapshot_is_measured_against_survives_a_restart() {
+        let root = temp_root();
+        let published = {
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("events").unwrap();
+            committed_put(&col, "k", serde_json::json!({"v": 1})).await;
+            col.applied_lsn()
+        };
+        assert!(published > 0);
+
+        let reopened = Database::new(&root).unwrap();
+        assert_eq!(reopened.existing_collection("events").unwrap().applied_lsn(), published,
+            "a collection reopened at boot still has a watermark an install must clear");
+        assert!(reopened.existing_collection("absent").is_none(),
+            "and probing a name we have never held must not create it");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_at_our_own_watermark_still_installs() {
+        let root = temp_root();
+        let source_db = Database::new(root.join("source")).unwrap();
+        let source = source_db.get_collection("events").unwrap();
+        committed_put(&source, "fresh", serde_json::json!({"v": 1})).await;
+        let wire = collect_snapshot(source.clone()).await;
+
+        let replica_db = Database::new(root.join("replica")).unwrap();
+        let local = replica_db.get_collection("events").unwrap();
+        committed_put(&local, "diverged", serde_json::json!({"v": 9})).await;
+        assert_eq!(local.applied_lsn(), source.applied_lsn(),
+            "the fixture must sit exactly at the snapshot's watermark, not below it");
+
+        let staged = replica_db.root_path.join("events.tmp");
+        fs::create_dir_all(&staged).unwrap();
+        decode_bytes(wire, &staged).await.unwrap();
+        validate_staged_snapshot(&staged, local.applied_lsn())
+            .expect("equal watermarks are not a regression; only a lower one is");
+
         let _ = fs::remove_dir_all(&root);
     }
 

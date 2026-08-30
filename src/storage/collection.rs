@@ -49,6 +49,9 @@ pub struct Collection {
     pub compacting: AtomicBool,
     /// Prevents compaction from retiring WAL files during snapshot streaming.
     pub snapshot_boundary: std::sync::Mutex<()>,
+    /// Held while this directory is being rewritten: compaction's publish-and-retire, snapshot
+    /// rotation, and the handle release an install starts with. All three resolve `root_path`.
+    pub rewriting: std::sync::Mutex<()>,
     pub cache: ReadCacheConfig,
     pub inline_bytes: AtomicU64,
     // This collection's fsynced tail, distinct from the database-wide durable_lsn.
@@ -236,6 +239,7 @@ impl Collection {
             committed_config: std::sync::Mutex::new(committed_config),
             compacting: AtomicBool::new(false),
             snapshot_boundary: std::sync::Mutex::new(()),
+            rewriting: std::sync::Mutex::new(()),
             cache,
             inline_bytes: AtomicU64::new(inline_total),
             durable_lsn: AtomicU64::new(boot_lsn),
@@ -880,6 +884,11 @@ impl Collection {
 
     // Windows will not delete an open file; the writer is parked on a throwaway tombstone first.
     pub fn release_handles(&self) -> io::Result<PathBuf> {
+        // Waits out a compaction already past its own release check; it publishes and retires
+        // inside this lock, so what it touches is still the directory it started on.
+        let _rewriting = self.rewriting.lock().map_err(|_| {
+            io::Error::other("collection rewrite lock is poisoned")
+        })?;
         self.released.store(true, Ordering::SeqCst);
 
         let tombstone = self.data_root.join(format!(".released-{}.wal", self.name));

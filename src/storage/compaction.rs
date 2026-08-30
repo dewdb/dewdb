@@ -68,6 +68,9 @@ impl Collection {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "Compaction already in progress"));
         }
         let _guard = CompactionGuard { flag: &self.compacting };
+        if self.released.load(Ordering::SeqCst) {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "Collection handle is no longer active"));
+        }
         let _snapshot_boundary = self.snapshot_boundary.try_lock()
             .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "Snapshot transfer in progress"))?;
         // Uncommitted frames are absent from the index; retiring their WAL would lose them.
@@ -82,6 +85,11 @@ impl Collection {
             // while holding it, so nothing can land in the WAL about to be frozen after this point.
             if self.pending_len() > 0 {
                 return Err(io::Error::new(io::ErrorKind::WouldBlock, "Uncommitted frames pending"));
+            }
+            // Re-checked here too so a release cannot land between the entry check and the
+            // rotation, which would leave a WAL id behind in a directory about to be replaced.
+            if self.released.load(Ordering::SeqCst) {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "Collection handle is no longer active"));
             }
 
             wal.current_wal.sync_data()?;
@@ -120,6 +128,15 @@ impl Collection {
                 return Err(e);
             }
         };
+
+        // Every step below changes what is on disk, and an install can swap the directory out from
+        // under them: `rewriting` holds it still, `released` says it is already gone.
+        let _rewriting = self.rewriting.lock()
+            .map_err(|_| io::Error::other("collection rewrite lock is poisoned"))?;
+        if self.released.load(Ordering::SeqCst) {
+            let _ = fs::remove_file(&compact_path);
+            return Err(io::Error::new(io::ErrorKind::NotFound, "Collection handle is no longer active"));
+        }
 
         let final_path = self.root_path.join(format!("wal-{:05}.log", compact_id));
         fs::rename(&compact_path, &final_path)?;
@@ -532,6 +549,35 @@ mod tests {
         assert_eq!(col.get("keep").unwrap(), Some(serde_json::json!({"v": 1})));
         assert!(col.get("gone").unwrap().is_none(),
             "a WAL compaction failed to unlink must not put a tombstoned key back");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The flag only covers a release landing before compaction's last check. The lock covers one
+    /// landing after it, while the rename, the remap and the index snapshot are still in flight.
+    #[tokio::test]
+    async fn a_release_waits_for_a_compaction_that_is_already_publishing() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+        live_put(&col, "a", 1);
+
+        let publishing = col.rewriting.lock().unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let releasing = col.clone();
+        let thread = std::thread::spawn(move || {
+            let _ = tx.send(releasing.release_handles().is_ok());
+        });
+
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(),
+            "a release that proceeds here installs over files compaction is still writing");
+        assert!(!col.released.load(Ordering::SeqCst), "and it must not have flagged the handle yet");
+
+        drop(publishing);
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+            "once the publish is done the release must go through");
+        thread.join().unwrap();
 
         let _ = fs::remove_dir_all(&root);
     }
