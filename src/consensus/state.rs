@@ -1,7 +1,8 @@
 //! Durable term/vote state and the demotion transition.
 
 use super::progress::Progress;
-use crate::util::write_atomic;
+use crate::storage::frame::Configuration;
+use crate::util::{same_endpoint, write_atomic};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -40,6 +41,28 @@ pub struct ReplicationState {
     pub progress: Progress,
     // Follower side: the commit watermark the leader last told us, per collection.
     pub leader_committed: HashMap<String, u64>,
+    /// The newest configuration in the config log, once that log has one. `None` means no
+    /// configuration entry exists anywhere in this group and the view-derived voting set still
+    /// speaks; see `AppState::quorum_config`.
+    pub configuration: Option<Configuration>,
+}
+
+impl ReplicationState {
+    /// The quorum to decide against, held under the same lock as the evidence. Falling back to
+    /// `replicas` keeps a cluster that has never reconfigured on exactly the set `become_leader`
+    /// counted, rather than reaching for the cluster view with this lock held.
+    pub fn quorum(&self, own_url: &str) -> Configuration {
+        if let Some(config) = &self.configuration {
+            return config.clone();
+        }
+        let mut voters = vec![own_url.to_string()];
+        for replica in &self.replicas {
+            if !voters.iter().any(|v| same_endpoint(v, replica)) {
+                voters.push(replica.clone());
+            }
+        }
+        Configuration::simple(voters)
+    }
 }
 
 impl ReplicationMeta {
@@ -233,6 +256,7 @@ mod tests {
             last_known_primary_position: None,
             progress: Progress::new(),
             leader_committed: HashMap::new(),
+            configuration: None,
         }
     }
 

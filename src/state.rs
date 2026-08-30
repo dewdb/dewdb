@@ -4,9 +4,11 @@ use crate::cluster::metadata::{adopt, Adoption, ClusterMetadata, Migration};
 use crate::cluster::migration::MigrationRuns;
 use crate::cluster::ownership::{classify, Ownership};
 use crate::config::NodeConfig;
+use crate::consensus::config::CONFIG_LOG;
 use crate::consensus::ReplicationState;
 use crate::metrics::{Metrics, NodeLoad};
 use crate::ring::{shard_owns, BuiltRing};
+use crate::storage::frame::Configuration;
 use crate::storage::Database;
 use std::collections::{HashMap, HashSet};
 #[cfg(test)]
@@ -151,6 +153,7 @@ impl AppState {
             .as_ref()
             .and_then(|db| db.get_collection(collection).ok())
             .map_or(0, |col| col.durable_lsn());
+        let own = self.own_url();
 
         let committed = {
             let mut g = repl.write().unwrap();
@@ -158,8 +161,8 @@ impl AppState {
             if !g.is_leader || ack_term != g.term {
                 g.progress.committed(collection)
             } else {
-                let replicas = g.replicas.clone();
-                g.progress.advance(collection, leader_durable, &replicas)
+                let quorum = g.quorum(&own);
+                g.progress.advance(collection, &own, leader_durable, &quorum)
             }
         };
         self.apply_committed(collection, committed);
@@ -229,13 +232,14 @@ impl AppState {
             Some(r) => r,
             None => return 0,
         };
+        let own = self.own_url();
         let committed = {
             let mut g = repl.write().unwrap();
             if !g.is_leader {
                 g.progress.committed(collection)
             } else {
-                let replicas = g.replicas.clone();
-                g.progress.advance(collection, durable_lsn, &replicas)
+                let quorum = g.quorum(&own);
+                g.progress.advance(collection, &own, durable_lsn, &quorum)
             }
         };
         self.apply_committed(collection, committed);
@@ -276,6 +280,9 @@ impl AppState {
         }
         if let Some(col) = self.db.as_ref().and_then(|db| db.get_collection(collection).ok()) {
             col.apply_committed(committed);
+        }
+        if collection == CONFIG_LOG {
+            self.refresh_configuration();
         }
     }
 
@@ -326,6 +333,7 @@ impl AppState {
                 last_known_primary_position: None,
                 progress: Progress::new(),
                 leader_committed: HashMap::new(),
+                configuration: None,
             }))),
             replication_slots: Arc::new(tokio::sync::Semaphore::new(
                 config.flow_control.max_inflight_requests.max(1))),
@@ -346,14 +354,64 @@ impl AppState {
         }
     }
 
-    /// The quorum set: who counts toward `w=majority` and the commit index. Config-derived and
-    /// unchanged at runtime -- see `replication_targets` for who actually receives frames.
-    /// Quorum membership, this node included. The live view's voting shards when it is a real view
-    /// that names this node one, and config otherwise: a seed is one node's opinion of the cluster,
-    /// and a published view that forgets `voting` would otherwise strip the quorum to nothing.
+    /// The quorum every decision is taken against: the newest configuration in the config log once
+    /// that log has one, and the view-derived voting set until then. A cluster that has never
+    /// reconfigured therefore behaves exactly as it did before configuration entries existed.
     ///
-    /// Never call while holding the replication lock: `learner_replicas` takes them the other way.
-    pub fn voting_set(&self) -> Vec<String> {
+    /// Never call while holding the replication lock: the fallback reaches the cluster view, and
+    /// `learner_replicas` takes those two the other way round.
+    pub fn quorum_config(&self) -> Configuration {
+        if let Some(repl) = self.replication.as_ref() {
+            let installed = repl.read().unwrap().configuration.clone();
+            if let Some(config) = installed {
+                return config;
+            }
+        }
+        Configuration::simple(self.view_voting_set())
+    }
+
+    /// Installs the configuration in force, returning whether it changed. A leader's replica list
+    /// moves with it: a member of the outgoing half still decides, so it must still be sent frames.
+    pub fn install_configuration(&self, config: Configuration) -> bool {
+        let repl = match self.replication.as_ref() {
+            Some(r) => r,
+            None => return false,
+        };
+        let own = self.own_url();
+        let mut g = repl.write().unwrap();
+        if g.configuration.as_ref() == Some(&config) {
+            return false;
+        }
+        g.replicas = config.members().into_iter()
+            .filter(|m| !crate::util::same_endpoint(m, &own))
+            .collect();
+        g.configuration = Some(config);
+        true
+    }
+
+    /// Re-reads the configuration in force from the config log. Every path a configuration entry
+    /// can arrive on has to call this -- a leader's own append, a replica's apply, a commit, a
+    /// snapshot install, boot -- because the entry takes effect where it lands, not where it commits.
+    ///
+    /// A log with no configuration in it never uninstalls one: a resync that has not delivered the
+    /// entry yet is indistinguishable from a group that never had it, and only one of those is safe.
+    pub fn refresh_configuration(&self) {
+        let latest = self.db.as_ref()
+            .and_then(|db| db.existing_collection(CONFIG_LOG))
+            .and_then(|col| col.latest_config());
+        let Some(config) = latest else { return };
+
+        if self.install_configuration(config.clone()) {
+            tracing::info!(target: "membership", voters = ?config.voters, outgoing = ?config.outgoing,
+                "Configuration in force");
+        }
+    }
+
+    /// Quorum membership, this node included, derived from the view. The live view's voting shards
+    /// when it is a real view that names this node one, and config otherwise: a seed is one node's
+    /// opinion of the cluster, and a published view that forgets `voting` would otherwise strip the
+    /// quorum to nothing.
+    fn view_voting_set(&self) -> Vec<String> {
         let own = self.own_url();
         {
             let view = self.cluster.read().unwrap();
@@ -382,6 +440,12 @@ impl AppState {
             }
         }
         out
+    }
+
+    /// Everyone in the quorum, this node included. Both halves while a change is in flight: the
+    /// outgoing half still votes and still has to hold entries, so it is still asked and still sent.
+    pub fn voting_set(&self) -> Vec<String> {
+        self.quorum_config().members()
     }
 
     /// The quorum membership other than this node: who to ask for votes, and whose acks count.
@@ -438,10 +502,25 @@ impl AppState {
         self.config.is_learner() || self.view_names_us_learner()
     }
 
-    /// Admission never promotes: a node booted as a learner stays one for this process's life.
-    /// Turning a learner into a voter moves the quorum, which is commit 44's problem.
-    pub fn can_campaign(&self) -> bool {
-        !self.is_learner()
+    /// Whether this node is in the quorum, which is one question and not two: standing for election
+    /// and granting a vote are the same right, and a node that has one and not the other either
+    /// cannot be elected by the set counting it or can push a candidate past a bar it is absent from.
+    ///
+    /// A configuration decides it outright when there is one, in both directions: it reached this
+    /// node through the log, which means a quorum agreed to it, and that is the authority the
+    /// config-and-view rule below was standing in for.
+    ///
+    /// Without one, admission never promotes -- a node booted as a learner stays one for this
+    /// process's life. That covers the window between boot and admission, where no view has arrived
+    /// and `peers` is empty, so a majority of one is otherwise reachable. A node in that window has
+    /// no configuration entry either, so the two rules never disagree.
+    pub fn in_quorum(&self) -> bool {
+        let installed = self.replication.as_ref()
+            .and_then(|r| r.read().unwrap().configuration.clone());
+        match installed {
+            Some(config) => config.contains(&self.own_url()),
+            None => !self.is_learner(),
+        }
     }
 
     fn view_names_us_learner(&self) -> bool {
@@ -459,6 +538,13 @@ impl AppState {
     /// Shard owners in the live view, deduped: one node may own several ranges.
     pub fn shard_owners(&self) -> Vec<(String, Vec<String>)> {
         self.cluster.read().unwrap().shard_owners()
+    }
+
+    /// Owners and the fingerprint of the partitioning they came from, under one read. Sampling them
+    /// separately can stamp a cursor with a version the page it describes was not served from.
+    pub fn partitioning(&self) -> (u64, Vec<(String, Vec<String>)>) {
+        let view = self.cluster.read().unwrap();
+        (view.partition_fingerprint(), view.shard_owners())
     }
 
     /// Persists only what it adopted. A view refused in memory must not reach disk, or the next

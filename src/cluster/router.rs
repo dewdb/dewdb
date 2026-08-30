@@ -1,10 +1,11 @@
 //! Request forwarding, shard failover, and cross-shard fan-out.
 
 use crate::model::{err_json, BulkDoc, CreateDoc, QueryPage, QueryParams};
-use crate::query::{decode_cursor, encode_cursor, kway_merge, ShardCursor, SortSpec};
+use crate::query::{decode_cursor, encode_cursor, kway_merge, sort_value, ShardCursor, SortCursor, SortSpec, SortedRow};
 use crate::json::project;
 use crate::cluster::probe::unique_shards;
 use crate::metrics::NodeLoad;
+use crate::replication::write_concern::{wc_query_string, WriteConcernParams};
 use crate::ring::hash_key;
 use crate::state::AppState;
 use axum::http::StatusCode;
@@ -280,6 +281,17 @@ fn forwarded_read_pref(pref: &ReadPreference) -> Option<&'static str> {
     }
 }
 
+/// 409, not 400: the cursor was well formed and correct when it was issued. A key that changed
+/// owners mid-scan sits behind a position that never covered it, and no amount of adapting the
+/// positions recovers it — the scan has to start again. A sorted scan is not affected: its cursor
+/// is a position in the sort order, which every shard answers the same way.
+fn stale_ring_response() -> axum::response::Response {
+    err_json(
+        StatusCode::CONFLICT,
+        "cursor was issued against a different shard layout; restart the scan".to_string(),
+    )
+}
+
 /// 503, not 502: the read is not wrong, it is unavailable until the shard has a leader again.
 fn no_primary_response() -> axum::response::Response {
     (
@@ -455,10 +467,16 @@ pub async fn router_fanout_maintenance(state: &AppState, col_name: &str, action:
     (status, Json(serde_json::json!({"nodes": results}))).into_response()
 }
 
-pub async fn router_fanout_drop(state: &AppState, col_name: &str) -> axum::response::Response {
+pub async fn router_fanout_drop(
+    state: &AppState,
+    col_name: &str,
+    params: &WriteConcernParams,
+) -> axum::response::Response {
+    let query = wc_query_string(params);
     let results = futures::future::join_all(unique_shards(state).into_iter().map(|(original, replicas)| {
         let state = state.clone();
         let col_name = col_name.to_string();
+        let query = query.clone();
         async move {
             let effective = state.effective_primary(&original);
             let mut candidates = vec![effective.clone()];
@@ -468,7 +486,7 @@ pub async fn router_fanout_drop(state: &AppState, col_name: &str) -> axum::respo
             candidates.extend(replicas.into_iter().filter(|r| *r != effective));
 
             for node in candidates {
-                let url = format!("{}/collections/{}", node, col_name);
+                let url = format!("{}/collections/{}{}", node, col_name, query);
                 if let Some((status, body)) = admin_call(&state.client, false, &url).await {
                     if authoritative_write_status(status) {
                         if node != original {
@@ -487,10 +505,20 @@ pub async fn router_fanout_drop(state: &AppState, col_name: &str) -> axum::respo
     (status, Json(serde_json::json!({"shards": results}))).into_response()
 }
 
-// div_ceil, not (limit + n - 1) / n: that form overflows and wraps to 0 on a near-usize::MAX limit.
-fn per_shard_limit(limit: usize, shards: usize, sorted: bool) -> usize {
-    // Full limit per shard when sorted: the top rows may all live on one, and limit/n misorders the merge.
-    if sorted { limit } else { limit.div_ceil(shards.max(1)).max(1) }
+/// Rows to ask each shard for, summing to exactly `limit`: `limit / n` each and one more to the
+/// first `limit % n`. A share that rounded up instead let the page exceed `limit`, and trimming it
+/// afterwards would strand the trimmed rows behind the cursor their shard already moved past.
+///
+/// Shares are allocated over the shards still in the scan, not every shard in the ring, or a
+/// drained shard would keep its share and a `limit` smaller than the ring would never reach the
+/// shards behind it.
+fn shard_shares(limit: usize, shards: usize) -> Vec<usize> {
+    if shards == 0 {
+        return Vec::new();
+    }
+    let base = limit / shards;
+    let extra = limit % shards;
+    (0..shards).map(|i| base + usize::from(i < extra)).collect()
 }
 
 enum ShardQueryOutcome {
@@ -510,28 +538,58 @@ pub async fn router_query(
     pref: ReadPreference,
 ) -> axum::response::Response {
         let primary_only = forwarded_read_pref(&pref).is_some();
-        let incoming = if sort.is_none() {
-            params.cursor.as_deref().and_then(decode_cursor)
+        let incoming: Option<ShardCursor> = if sort.is_none() {
+            match params.cursor.as_deref() {
+                Some(c) => match decode_cursor(c) {
+                    Some(c) => Some(c),
+                    None => return err_json(StatusCode::BAD_REQUEST,
+                        "cursor does not belong to this query".to_string()),
+                },
+                None => None,
+            }
         } else {
             None
         };
-        let shards = unique_shards(state);
-        let n = shards.len().max(1);
-        let per_shard = per_shard_limit(limit, n, sort.is_some());
+        let (ring, owners) = state.partitioning();
+        if let Some(c) = &incoming {
+            if c.ring != ring {
+                return stale_ring_response();
+            }
+        }
 
-        let mut futures = Vec::new();
-        for (original, replicas) in shards {
-            let after: Option<String> = if sort.is_some() {
-                None
-            } else {
-                match &incoming {
+        // Drained shards drop out here rather than in the loop: they must not hold a share.
+        let active: Vec<(String, Vec<String>, Option<String>)> = owners.into_iter()
+            .filter_map(|(original, replicas)| {
+                // `incoming` is already None for a sorted query, which does not paginate.
+                let after = match &incoming {
                     Some(c) => match c.positions.get(&original) {
-                        Some(k) => Some(k.clone()),
-                        None => continue,
+                        Some(pos) => pos.clone(),
+                        None => return None,
                     },
                     None => None,
-                }
-            };
+                };
+                Some((original, replicas, after))
+            })
+            .collect();
+
+        let sorted = sort.is_some();
+        // The merge needs keys for a sorted page whether or not the client wanted them back.
+        let want_keys = params.keys.unwrap_or(false);
+        let shares = if sorted {
+            // The top rows may all live on one shard, so a share of limit/n would misorder the merge.
+            vec![limit; active.len()]
+        } else {
+            shard_shares(limit, active.len())
+        };
+
+        // Carried, not dropped: a shard this page had no rows to spend on resumes on the next one.
+        let mut positions: BTreeMap<String, Option<String>> = BTreeMap::new();
+        let mut futures = Vec::new();
+        for ((original, replicas, after), per_shard) in active.into_iter().zip(shares) {
+            if per_shard == 0 {
+                positions.insert(original, after);
+                continue;
+            }
 
             let effective = state.effective_primary(&original);
             let rr = state.read_rr.fetch_add(1, Ordering::Relaxed);
@@ -548,6 +606,13 @@ pub async fn router_query(
             if let Some(s) = &params.sort { q.push(("sort".to_string(), s.clone())); }
             if let Some(a) = &after { q.push(("cursor".to_string(), a.clone())); }
             if let Some(v) = forwarded_read_pref(&pref) { q.push(("read".to_string(), v.to_string())); }
+            if sorted || want_keys {
+                q.push(("keys".to_string(), "true".to_string()));
+            }
+            if sorted {
+                // One position covers every shard, so it is forwarded untouched rather than split.
+                if let Some(c) = &params.cursor { q.push(("cursor".to_string(), c.clone())); }
+            }
 
             futures.push(tokio::spawn(async move {
                 let mut refused = false;
@@ -574,24 +639,45 @@ pub async fn router_query(
 
         if let Some(sort) = &sort {
             let mut lists = Vec::new();
+            let mut received = 0usize;
+            let mut shard_has_more = false;
             for res in joined {
                 let (_original, outcome) = match res {
                     Ok(t) => t,
                     Err(_) => return (StatusCode::BAD_GATEWAY, "Shard query task failed").into_response(),
                 };
                 match outcome {
-                    ShardQueryOutcome::Page(p) => lists.push(p.items),
+                    ShardQueryOutcome::Page(p) => {
+                        if p.keys.len() != p.items.len() {
+                            return (StatusCode::BAD_GATEWAY, "Shard returned a sorted page without keys").into_response();
+                        }
+                        shard_has_more |= p.next_cursor.is_some();
+                        received += p.items.len();
+                        lists.push(p.keys.into_iter().zip(p.items)
+                            .map(|(key, value)| SortedRow { key, value })
+                            .collect::<Vec<_>>());
+                    },
                     ShardQueryOutcome::NoPrimary => return no_primary_response(),
                     ShardQueryOutcome::Failed => return (StatusCode::BAD_GATEWAY, "Shard query failed").into_response(),
                 }
             }
+
             let merged = kway_merge(lists, sort, limit);
-            let items: Vec<serde_json::Value> = merged.iter().map(|v| project(v, fields)).collect();
-            return (StatusCode::OK, Json(QueryPage { items, next_cursor: None })).into_response();
+            // Rows this page did not reach are either past a shard's own page or past the merge cut.
+            let next_cursor = match merged.last() {
+                Some(last) if shard_has_more || received > merged.len() => Some(encode_cursor(&SortCursor {
+                    value: sort_value(&last.value, sort).clone(),
+                    key: last.key.clone(),
+                })),
+                _ => None,
+            };
+            let keys = if want_keys { merged.iter().map(|r| r.key.clone()).collect() } else { Vec::new() };
+            let items: Vec<serde_json::Value> = merged.iter().map(|r| project(&r.value, fields)).collect();
+            return (StatusCode::OK, Json(QueryPage { items, next_cursor, keys })).into_response();
         }
 
         let mut merged = Vec::new();
-        let mut positions = BTreeMap::new();
+        let mut keys = Vec::new();
         for res in joined {
             let (original, outcome) = match res {
                 Ok(t) => t,
@@ -602,8 +688,10 @@ pub async fn router_query(
                     for item in p.items {
                         merged.push(project(&item, fields));
                     }
+                    keys.extend(p.keys);
+
                     if let Some(k) = p.next_cursor {
-                        positions.insert(original, k);
+                        positions.insert(original, Some(k));
                     }
                 },
                 ShardQueryOutcome::NoPrimary => return no_primary_response(),
@@ -614,10 +702,10 @@ pub async fn router_query(
         let next_cursor = if positions.is_empty() {
             None
         } else {
-            Some(encode_cursor(&ShardCursor { positions }))
+            Some(encode_cursor(&ShardCursor { ring, positions }))
         };
 
-        return (StatusCode::OK, Json(QueryPage { items: merged, next_cursor })).into_response();
+        return (StatusCode::OK, Json(QueryPage { items: merged, next_cursor, keys })).into_response();
 }
 
 #[cfg(test)]
@@ -628,16 +716,29 @@ mod tests {
         HashMap::new()
     }
 
+    /// M3: `ceil(limit/n)` per shard summed to more than `limit`, and the fan-out concatenated the
+    /// pages without trimming. Shares that sum to `limit` make the trim unnecessary, which is the
+    /// point: a trimmed row is stranded behind the cursor its shard already returned.
     #[test]
-    fn the_per_shard_limit_never_overflows_or_collapses_to_zero() {
-        assert_eq!(per_shard_limit(10, 3, false), 4, "ceil, so three shards can cover ten rows");
-        assert_eq!(per_shard_limit(10, 3, true), 10, "a sorted merge needs the full limit from each");
-        assert_eq!(per_shard_limit(1, 8, false), 1, "never zero: a shard asked for 0 returns nothing");
-        assert_eq!(per_shard_limit(10, 0, false), 10, "no shards is a division by zero otherwise");
+    fn shard_shares_sum_to_the_limit() {
+        assert_eq!(shard_shares(10, 3), vec![4, 3, 3], "ten over three, not four each");
+        assert_eq!(shard_shares(9, 3), vec![3, 3, 3]);
+        assert_eq!(shard_shares(100, 1), vec![100]);
+        assert_eq!(shard_shares(5, 0), Vec::<usize>::new(), "no shards is a division by zero otherwise");
 
-        // (limit + n - 1) wraps here and the old form asked every shard for 0 rows.
-        assert_eq!(per_shard_limit(usize::MAX, 4, false), usize::MAX / 4 + 1);
-        assert_eq!(per_shard_limit(usize::MAX, 1, false), usize::MAX);
+        // Fewer rows than shards: the tail gets nothing this page and is carried to the next.
+        assert_eq!(shard_shares(1, 3), vec![1, 0, 0]);
+        assert_eq!(shard_shares(2, 3), vec![1, 1, 0]);
+        assert_eq!(shard_shares(0, 3), vec![0, 0, 0]);
+
+        for (limit, shards) in [(10, 3), (1, 8), (7, 7), (0, 4), (usize::MAX, 4), (usize::MAX, 1)] {
+            let shares = shard_shares(limit, shards);
+            assert_eq!(shares.len(), shards);
+            assert_eq!(shares.iter().fold(0usize, |a, s| a.saturating_add(*s)), limit,
+                "{} rows over {} shards", limit, shards);
+            assert!(shares.iter().max().unwrap_or(&0) - shares.iter().min().unwrap_or(&0) <= 1,
+                "shares differ by at most one row");
+        }
     }
 
     #[test]

@@ -3,13 +3,14 @@
 use crate::cluster::metadata::{Adoption, ClusterMetadata};
 use crate::cluster::metadata::MigrationPhase;
 use crate::cluster::migration::{MigrateBatch, MigrateReset};
+use crate::consensus::config::CONFIG_LOG;
 use crate::consensus::{
     decide_vote, demote, heartbeat_poll_task, local_log_tails, log_summary, ReplicationMeta,
     VoteRequest, VoteResponse,
 };
 use crate::model::err_json;
 use crate::replication::snapshot::{replica_sync_from_primary, snapshot_body, SNAPSHOT_CONTENT_TYPE};
-use crate::replication::{DropRequest, ReplicateRequest, ResyncRequest};
+use crate::replication::{ReplicateRequest, ResyncRequest};
 use crate::state::AppState;
 use crate::storage::{FrameHeader, ReplicaApply};
 use axum::extract::{Query, State};
@@ -19,37 +20,6 @@ use axum::Json;
 use serde::Deserialize;
 use std::sync::atomic::Ordering;
 use tracing::{info, warn};
-
-pub async fn internal_drop_handler(
-    State(state): State<AppState>,
-    Json(req): Json<DropRequest>,
-) -> impl axum::response::IntoResponse {
-    if !state.is_shard() || state.is_leader() {
-        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
-            "status": "not_a_replica",
-            "term": state.current_term(),
-        }))).into_response();
-    }
-
-    let our_term = state.current_term();
-    if req.term < our_term {
-        return (StatusCode::CONFLICT, Json(serde_json::json!({
-            "status": "stale_term",
-            "term": our_term,
-        }))).into_response();
-    }
-
-    let db = state.db.as_ref().unwrap().clone();
-    let name = req.collection.clone();
-    match tokio::task::spawn_blocking(move || db.drop_collection(&name)).await {
-        Ok(Ok(existed)) => {
-            info!(target: "replica", "Dropped collection '{}' on primary's instruction", req.collection);
-            (StatusCode::OK, Json(serde_json::json!({"status": "dropped", "existed": existed}))).into_response()
-        },
-        Ok(Err(e)) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    }
-}
 
 pub async fn replicate_handler(
     State(state): State<AppState>,
@@ -182,6 +152,11 @@ pub async fn replicate_handler(
         }
         // The leader's watermark trails this frame by a message; visibility waits for the next one.
         col.apply_committed(state.committed_hint(&req.collection));
+        // Except a configuration, which is in force where it lands: a replica that waited for the
+        // commit would be answering the vote that decides it with the membership it replaces.
+        if req.collection == CONFIG_LOG {
+            state.refresh_configuration();
+        }
     }
 
     if let Some(ref repl) = state.replication {
@@ -262,6 +237,9 @@ pub async fn resync_handler(
             if let Err(e) = db.recompute_durable_lsn() {
                 warn!(target: "resync", "could not recompute durable LSN for '{}': {}", col, e);
             }
+            // A snapshot install replaces applied.meta wholesale, so it can install, replace or
+            // withdraw a configuration entry this node was deciding against.
+            state.refresh_configuration();
         }
         resyncing.lock().unwrap().remove(&col);
     });
@@ -547,9 +525,9 @@ pub async fn vote_handler(
     State(state): State<AppState>,
     Json(req): Json<VoteRequest>,
 ) -> impl axum::response::IntoResponse {
-    // Granting is quorum participation, not just standing. A learner is absent from every
-    // candidate's threshold, so its vote can only push one past a bar that never counted it.
-    if !state.is_shard() || state.is_learner() {
+    // Granting is quorum participation, not just standing, so it takes the same predicate the
+    // candidate side does: a node absent from every threshold can only push a candidate past one.
+    if !state.is_shard() || !state.in_quorum() {
         return (StatusCode::FORBIDDEN, "Not a voting node").into_response();
     }
 
@@ -561,13 +539,14 @@ pub async fn vote_handler(
     // Collected before the replication lock: local_log_tails reaches the collections lock.
     let my_logs = local_log_tails(&state);
     let my_summary = log_summary(&state, &my_logs);
+    let my_config = repl.read().unwrap().configuration.clone();
 
     let (granted, resp_term, restart_poll, persist) = {
         let mut g = repl.write().unwrap();
         let was_leader = g.is_leader;
         let old_term = g.term;
 
-        let d = decide_vote(g.term, &g.voted_for, &my_logs, my_summary, &req);
+        let d = decide_vote(g.term, &g.voted_for, &my_logs, my_summary, my_config.as_ref(), &req);
 
         let mut restart = false;
         g.term = d.term;
@@ -640,7 +619,9 @@ pub async fn snapshot_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{make_frame, next_test_port, put_doc_http, temp_root, TestNode};
+    use crate::test_support::{
+        make_drop_frame, make_frame, next_test_port, put_doc_http, temp_root, TestNode,
+    };
     use std::collections::HashMap;
     use std::fs;
 
@@ -771,6 +752,43 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// M9b: `/internal/drop` refused before it read the term, so a deposed leader kept the
+    /// collection the real leader had dropped, and a follower taking a drop from a higher term
+    /// applied it without adopting that term. The drop is a log entry now, so the term rules that
+    /// already govern every other entry govern it too.
+    #[tokio::test]
+    async fn a_leader_steps_down_for_a_drop_from_a_higher_term() {
+        let root = temp_root();
+        let mut leader = TestNode::new("solo", next_test_port(), &root, "primary");
+        leader.heartbeat_timeout_secs = 30;
+        leader.start();
+        assert!(leader.is_leader());
+
+        let client = reqwest::Client::new();
+        assert_eq!(put_doc_http(&client, &leader.url(), "k1", 1).await, StatusCode::CREATED);
+
+        let db = leader.state.as_ref().unwrap().db.as_ref().unwrap().clone();
+        let col = db.get_collection("t").unwrap();
+        let (prev_term, prev_lsn) = col.last_appended();
+
+        let (status, body) = replicate(
+            &leader, 9, prev_lsn + 1, prev_lsn, prev_lsn + 1,
+            make_drop_frame(9, prev_lsn + 1, prev_lsn, prev_term),
+        ).await;
+
+        assert!(!leader.is_leader(), "a drop from a higher term deposes a leader like any entry");
+        assert_eq!(leader.term(), 9, "and the term is adopted, not just the payload");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "applied");
+
+        assert!(col.is_dropped());
+        assert!(col.get("k1").unwrap().is_none(), "the drop takes every key below it");
+        assert!(db.live_collections().unwrap().is_empty());
+
+        leader.kill();
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn a_deposed_leader_stops_advertising_the_watermark_it_committed() {
         let root = temp_root();
@@ -800,6 +818,7 @@ mod tests {
             last_lsn: 100,
             last_term: 9,
             logs: HashMap::new(),
+            candidate_url: None,
         };
         let response = reqwest::Client::new()
             .post(format!("{}/internal/vote", leader.url()))

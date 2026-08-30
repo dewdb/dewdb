@@ -1,17 +1,21 @@
 //! Collection administration endpoints.
 
+use crate::api::write::local_drop;
 use crate::cluster::metadata::MigrationPhase;
 use crate::cluster::probe::unique_shards;
 use crate::cluster::router::{router_fanout_drop, router_fanout_maintenance};
 use crate::model::err_json;
-use crate::replication::DropRequest;
+use crate::replication::write_concern::{
+    parse_write_concern, WriteConcernParams, DEFAULT_WTIMEOUT_MS,
+};
 use crate::state::AppState;
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use std::collections::HashSet;
 use std::io;
+use std::time::Duration;
 use tracing::info;
 
 pub async fn list_collections(
@@ -58,7 +62,7 @@ pub async fn list_collections(
     }
 
     let db = state.db.as_ref().unwrap().clone();
-    match tokio::task::spawn_blocking(move || db.list_collections()).await {
+    match tokio::task::spawn_blocking(move || db.live_collections()).await {
         Ok(Ok(names)) => (StatusCode::OK, Json(serde_json::json!({"collections": names}))).into_response(),
         Ok(Err(e)) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -68,9 +72,10 @@ pub async fn list_collections(
 pub async fn drop_collection(
     State(state): State<AppState>,
     AxumPath(col_name): AxumPath<String>,
+    Query(params): Query<WriteConcernParams>,
 ) -> impl axum::response::IntoResponse {
     if state.config.role == "router" {
-        return router_fanout_drop(&state, &col_name).await;
+        return router_fanout_drop(&state, &col_name, &params).await;
     }
 
     if state.is_shard() && !state.is_leader() {
@@ -87,39 +92,43 @@ pub async fn drop_collection(
         ).into_response();
     }
 
-    let term = state.current_term();
-    // Learners hold the collection too, so the drop has to reach them.
-    let replicas = state.replication_targets();
-
     let db = state.db.as_ref().unwrap().clone();
     let name = col_name.clone();
-    let existed = match tokio::task::spawn_blocking(move || db.drop_collection(&name)).await {
-        Ok(Ok(e)) => e,
+    let present = match tokio::task::spawn_blocking(move || db.live_collections()).await {
+        Ok(Ok(names)) => names.iter().any(|n| *n == name),
         Ok(Err(e)) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
 
-    let acks = futures::future::join_all(replicas.iter().map(|replica| {
-        let client = state.client.clone();
-        let url = format!("{}/internal/drop", replica);
-        let req = DropRequest { collection: col_name.clone(), term };
-        async move {
-            match client.post(&url).json(&req).send().await {
-                Ok(r) if r.status().is_success() => true,
-                _ => false,
-            }
-        }
-    })).await;
+    // Nothing to log: appending a drop here would create the collection in order to tombstone it.
+    if !present {
+        return (StatusCode::OK, Json(serde_json::json!({
+            "collection": col_name,
+            "status": "dropped",
+            "existed": false,
+        }))).into_response();
+    }
 
-    let replicated = acks.iter().filter(|ok| **ok).count();
-    info!(target: "admin", collection = %col_name, acked = replicated, replicas = replicas.len(), "Collection dropped");
+    let wc = parse_write_concern(params.w.as_deref());
+    let wtimeout = Duration::from_millis(params.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
 
-    (StatusCode::OK, Json(serde_json::json!({
+    let outcome = match local_drop(&state, &col_name, wc, wtimeout).await {
+        Ok(o) => o,
+        Err(response) => return response,
+    };
+
+    info!(target: "admin", collection = %col_name, acks = outcome.acks,
+        required = outcome.required, "Collection dropped");
+
+    // 202 on a short quorum, as writes answer: the drop is durable and staged, and it applies
+    // wherever it commits. Reporting 200 would promise a removal a later leader can still revoke.
+    let status = if outcome.met { StatusCode::OK } else { StatusCode::ACCEPTED };
+    (status, Json(serde_json::json!({
         "collection": col_name,
-        "status": "dropped",
-        "existed": existed,
-        "replicas_acked": replicated,
-        "replicas": replicas.len(),
+        "status": if outcome.met { "dropped" } else { "staged" },
+        "existed": true,
+        "acks": outcome.acks,
+        "required": outcome.required,
     }))).into_response()
 }
 
@@ -201,8 +210,11 @@ mod tests {
     use super::*;
     use crate::config::NodeConfig;
     use crate::storage::Database;
-    use crate::test_support::{live_put, temp_root};
+    use crate::test_support::{
+        live_put, put_doc_http, temp_root, three_node_cluster, wait_for, wait_for_doc, TestNode,
+    };
     use std::sync::Arc;
+    use std::time::Duration;
 
     async fn node(root: &std::path::Path, is_leader: bool) -> AppState {
         let db = Arc::new(Database::new(root).unwrap());
@@ -235,6 +247,97 @@ mod tests {
         assert_eq!(snapshotted.status(), StatusCode::OK,
             "snapshots add a file and remove nothing, so a replica is free to take one");
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    async fn collections_on(client: &reqwest::Client, base: &str) -> Option<Vec<String>> {
+        let r = client.get(format!("{}/collections", base)).send().await.ok()?;
+        let body = r.json::<serde_json::Value>().await.ok()?;
+        Some(body["collections"].as_array()?.iter()
+            .filter_map(|v| v.as_str().map(str::to_string)).collect())
+    }
+
+    fn collections_of(node: &TestNode) -> Option<Vec<String>> {
+        node.state.as_ref()?.db.as_ref()?.live_collections().ok()
+    }
+
+    async fn drop_via(client: &reqwest::Client, base: &str, query: &str) -> (StatusCode, serde_json::Value) {
+        let r = client.delete(format!("{}/collections/t{}", base, query)).send().await.unwrap();
+        let status = r.status();
+        (status, r.json::<serde_json::Value>().await.unwrap_or(serde_json::Value::Null))
+    }
+
+    /// M9: the drop fanned out best-effort and was in no log, so a replica that was down for it
+    /// came back still holding the collection and nothing on the leader could tell it otherwise.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_replica_that_was_down_for_the_drop_picks_it_up_from_the_log() {
+        let root = temp_root();
+        let (n1, _n2, mut n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::new();
+
+        assert_eq!(put_doc_http(&client, &n1.url(), "k", 1).await, StatusCode::CREATED);
+        assert!(wait_for(Duration::from_secs(10), || {
+            collections_of(&n3).map_or(false, |c| c.contains(&"t".to_string()))
+        }).await, "the replica has to hold the collection before it can miss its drop");
+
+        n3.kill();
+
+        let (status, body) = drop_via(&client, &n1.url(), "?w=majority&wtimeout=3000").await;
+        assert_eq!(status, StatusCode::OK, "n1 and n2 are a majority of three: {}", body);
+        assert_eq!(body["existed"], true);
+        assert_eq!(collections_on(&client, &n1.url()).await.unwrap(), Vec::<String>::new(),
+            "the tombstone still holds the log, but a client must not see a dropped collection");
+
+        n3.start();
+        assert!(wait_for(Duration::from_secs(20), || {
+            collections_of(&n3).map_or(false, |c| c.is_empty())
+        }).await, "unfixed the drop reached n3 once, missed it, and was never retried");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M9: with the drop outside the commit index it applied locally whatever the quorum did.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_drop_that_misses_its_quorum_is_staged_not_applied() {
+        let root = temp_root();
+        let (n1, mut n2, mut n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::new();
+
+        assert_eq!(put_doc_http(&client, &n1.url(), "k", 1).await, StatusCode::CREATED);
+        assert!(wait_for_doc(&client, &n1.url(), "t", "k", 1, Duration::from_secs(10)).await,
+            "the write has to commit while the quorum is up, or the drop is not what hides it");
+
+        n2.kill();
+        n3.kill();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let (status, body) = drop_via(&client, &n1.url(), "?w=majority&wtimeout=1000").await;
+        assert_eq!(status, StatusCode::ACCEPTED, "no quorum, so the drop is durable but not applied: {}", body);
+        assert_eq!(body["status"], "staged");
+
+        assert_eq!(collections_of(&n1).unwrap(), vec!["t".to_string()],
+            "unfixed the collection was already gone here while the quorum knew nothing about it");
+        assert_eq!(
+            client.get(format!("{}/collections/t/docs/k", n1.url())).send().await.unwrap().status(),
+            StatusCode::OK,
+            "an uncommitted drop must not hide committed data");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn dropping_a_collection_that_is_not_there_writes_nothing() {
+        let root = temp_root();
+        let mut node = crate::test_support::single_node(&root).await;
+        let client = reqwest::Client::new();
+
+        let (status, body) = drop_via(&client, &node.url(), "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["existed"], false);
+        assert_eq!(collections_of(&node).unwrap(), Vec::<String>::new(),
+            "a drop of nothing must not create the collection in order to tombstone it");
+
+        node.kill();
         let _ = std::fs::remove_dir_all(&root);
     }
 

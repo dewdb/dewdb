@@ -40,12 +40,6 @@ mod base64_frames {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct DropRequest {
-    pub collection: String,
-    pub term: u64,
-}
-
-#[derive(Serialize, Deserialize)]
 pub struct ResyncRequest {
     pub collection: String,
 }

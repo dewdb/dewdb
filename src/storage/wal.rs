@@ -1,7 +1,7 @@
 //! WAL append, replicated-frame apply, boot replay, and frame read-back.
 
-use super::collection::{Collection, StagedApply, READ_POOL_HANDLES};
-use super::frame::{FrameHeader, LogEntry, ReplicaApply, HEADER_LEN, MAX_RECORD_SIZE};
+use super::collection::{Collection, StagedApply, StagedEffect, READ_POOL_HANDLES};
+use super::frame::{Configuration, FrameHeader, LogEntry, ReplicaApply, HEADER_LEN, MAX_RECORD_SIZE};
 use super::index::{IndexEntry, ReadCacheConfig};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -32,6 +32,8 @@ impl Collection {
         applied_through: u64,
         cache: &ReadCacheConfig,
         inline_used: &mut u64,
+        dropped: &mut bool,
+        config: &mut Option<Configuration>,
     ) -> io::Result<(u64, u64)> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         let file_len = file.metadata()?.len();
@@ -80,23 +82,21 @@ impl Collection {
             if let Ok(entry) = serde_json::from_slice::<LogEntry>(&payload) {
                 if lsn > applied_through {
                     // Uncommitted at the last shutdown: keep it durable but unpublished.
-                    let staged = match entry {
+                    let effect = match entry {
                         LogEntry::Put { key, .. } => {
                             let inline = if len <= cache.inline_max_value_bytes {
                                 Some(payload.clone().into_boxed_slice())
                             } else {
                                 None
                             };
-                            StagedApply {
-                                key,
-                                wal_id,
-                                offset,
-                                entry: Some(IndexEntry { wal_id, offset, len, inline }),
-                            }
+                            StagedEffect::Put { key, entry: IndexEntry { wal_id, offset, len, inline } }
                         },
-                        LogEntry::Del { key, .. } => StagedApply { key, wal_id, offset, entry: None },
+                        LogEntry::Del { key, .. } => StagedEffect::Remove { key },
+                        LogEntry::Barrier { .. } => StagedEffect::Nothing,
+                        LogEntry::Drop { .. } => StagedEffect::Clear,
+                        LogEntry::Config { config, .. } => StagedEffect::Configure(config),
                     };
-                    pending.insert(lsn, staged);
+                    pending.insert(lsn, StagedApply { wal_id, offset, effect });
                     if lsn > max_lsn {
                         max_lsn = lsn;
                         max_term = term;
@@ -118,12 +118,24 @@ impl Collection {
                         if let Some(old) = index.insert(key, IndexEntry { wal_id, offset, len: len as u32, inline }) {
                             *inline_used -= old.inline_bytes();
                         }
+                        *dropped = false;
                     },
                     LogEntry::Del { key, .. } => {
                         if let Some(old) = index.remove(&key) {
                             *inline_used -= old.inline_bytes();
                         }
-                    }
+                        *dropped = false;
+                    },
+                    // Already committed and it applies nothing; it still carries the tail LSN below.
+                    LogEntry::Barrier { .. } => {},
+                    // Replay is in append order, so everything below it is already in `index`.
+                    LogEntry::Drop { .. } => {
+                        index.clear();
+                        *inline_used = 0;
+                        *dropped = true;
+                    },
+                    // Append order again: the last one below the watermark is the committed one.
+                    LogEntry::Config { config: c, .. } => *config = Some(c),
                 }
                 if lsn > max_lsn {
                     max_lsn = lsn;

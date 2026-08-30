@@ -10,7 +10,7 @@ use crate::model::{
     err_json, BulkDoc, CreateDoc, QueryPage, QueryParams, ReadParams, DEFAULT_QUERY_LIMIT,
     MAX_QUERY_LIMIT,
 };
-use crate::query::{compare_by_sort, matches_filter, parse_filter, parse_sort};
+use crate::query::{decode_cursor, encode_cursor, parse_filter, parse_sort, sort_value, SortCursor, SortedRow};
 use crate::replication::{parse_write_concern, wc_query_string, WriteConcernParams, DEFAULT_WTIMEOUT_MS};
 use crate::cluster::ownership::Ownership;
 use crate::state::AppState;
@@ -392,6 +392,16 @@ pub async fn query_docs(
         Ok(p) => p,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
     };
+    // A sorted cursor is a position in the sort order and an unsorted one is a key, so a cursor
+    // carried over from a differently-shaped query cannot be honoured and must not be ignored.
+    let sort_cursor = match (&sort, params.cursor.as_deref()) {
+        (Some(_), Some(c)) => match decode_cursor::<SortCursor>(c) {
+            Some(c) => Some(c),
+            None => return err_json(StatusCode::BAD_REQUEST,
+                "cursor does not belong to this sorted query".to_string()),
+        },
+        _ => None,
+    };
 
     if state.config.role == "router" {
         return router_query(&state, &col_name, &params, limit, &sort, &fields, pref).await;
@@ -410,31 +420,34 @@ pub async fn query_docs(
     let after = params.cursor.clone();
     let start = params.start.clone();
     let end = params.end.clone();
+    let want_keys = params.keys.unwrap_or(false);
 
-    let result = tokio::task::spawn_blocking(move || -> io::Result<(Vec<serde_json::Value>, Option<String>)> {
-        if let Some(sort) = &sort {
-            let mut items = Vec::new();
-            for key in col_clone.range_from(None, start.as_deref(), end.as_deref()).into_iter() {
-                if let Some(val) = col_clone.get(&key)? {
-                    let matched = filter_obj.as_ref().map_or(true, |f| matches_filter(&val, f));
-                    if matched {
-                        items.push(val);
-                    }
-                }
-            }
-            items.sort_by(|a, b| compare_by_sort(a, b, sort));
-            items.truncate(limit);
-            let projected = items.iter().map(|v| project(v, &fields)).collect();
-            Ok((projected, None))
-        } else {
-            let (items, next_cursor) = col_clone.query_page(after.as_deref(), start.as_deref(), end.as_deref(), &filter_obj, limit)?;
-            let projected = items.iter().map(|v| project(v, &fields)).collect();
-            Ok((projected, next_cursor))
+    let result = tokio::task::spawn_blocking(move || -> io::Result<(Vec<SortedRow>, Option<String>)> {
+        match &sort {
+            Some(sort) => {
+                let (rows, more) = col_clone.sorted_page(
+                    start.as_deref(), end.as_deref(), &filter_obj, sort, sort_cursor.as_ref(), limit)?;
+                // The last row of the page is where the next one resumes, in sort order.
+                let next = match (more, rows.last()) {
+                    (true, Some(last)) => Some(encode_cursor(&SortCursor {
+                        value: sort_value(&last.value, sort).clone(),
+                        key: last.key.clone(),
+                    })),
+                    _ => None,
+                };
+                Ok((rows, next))
+            },
+            None => col_clone.query_page(
+                after.as_deref(), start.as_deref(), end.as_deref(), &filter_obj, limit),
         }
     }).await;
 
     match result {
-        Ok(Ok((items, next_cursor))) => (StatusCode::OK, Json(QueryPage { items, next_cursor })).into_response(),
+        Ok(Ok((rows, next_cursor))) => {
+            let keys = if want_keys { rows.iter().map(|r| r.key.clone()).collect() } else { Vec::new() };
+            let items = rows.iter().map(|r| project(&r.value, &fields)).collect();
+            (StatusCode::OK, Json(QueryPage { items, next_cursor, keys })).into_response()
+        },
         Ok(Err(e)) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -443,10 +456,278 @@ pub async fn query_docs(
 #[cfg(test)]
 mod tests {
     use crate::test_support::{
-        node_by_id, put_value, router_for, single_node, temp_root, three_node_cluster, wait_for,
+        node_by_id, put_value, router_for, single_node, temp_root, three_node_cluster,
+        two_shard_cluster, wait_for,
     };
     use axum::http::StatusCode;
     use std::time::Duration;
+
+    /// H8: with `?sort=`, `cursor` was ignored and `next_cursor` was always `None` — sorted
+    /// pagination was silently a no-op. The cursor is now a position in the sort order, which is one
+    /// position for the whole cluster rather than a per-shard map.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_sorted_query_pages_across_shards_in_one_global_order() {
+        let root = temp_root();
+        let (_s1, _s2, router) = two_shard_cluster(&root).await;
+        let client = reqwest::Client::new();
+
+        // Rank descends as the key ascends, so a page that came out in key order would show it.
+        let rows = 15i64;
+        for i in 0..rows {
+            let value = serde_json::json!({"rank": rows - i, "tag": if i % 2 == 0 { "even" } else { "odd" }});
+            assert_eq!(put_value(&client, &router.url(), "t", &format!("k{:02}", i), value, "").await,
+                StatusCode::CREATED);
+        }
+
+        let page = |q: Vec<(String, String)>| {
+            let (c, base) = (client.clone(), router.url());
+            async move {
+                let r = c.get(&format!("{}/collections/t/query", base)).query(&q).send().await.unwrap();
+                assert_eq!(r.status(), StatusCode::OK);
+                r.json::<serde_json::Value>().await.unwrap()
+            }
+        };
+        let sorted_page = |dir: &'static str, limit: usize, cursor: Option<String>| {
+            let mut q = vec![
+                ("sort".to_string(), format!("rank:{}", dir)),
+                ("limit".to_string(), limit.to_string()),
+            ];
+            if let Some(c) = cursor { q.push(("cursor".to_string(), c)); }
+            page(q)
+        };
+
+        for dir in ["asc", "desc"] {
+            let mut ranks: Vec<i64> = Vec::new();
+            let mut cursor: Option<String> = None;
+            for _ in 0..20 {
+                let body = sorted_page(dir, 4, cursor.clone()).await;
+                let items = body["items"].as_array().unwrap().clone();
+                assert!(items.len() <= 4, "a page of {} rows for a limit of 4", items.len());
+                ranks.extend(items.iter().map(|v| v["rank"].as_i64().unwrap()));
+                cursor = body["next_cursor"].as_str().map(str::to_string);
+                if cursor.is_none() {
+                    break;
+                }
+            }
+
+            let mut expected: Vec<i64> = (1..=rows).collect();
+            if dir == "desc" {
+                expected.reverse();
+            }
+            assert_eq!(ranks, expected,
+                "{}: every row once, in one global order across both shards", dir);
+        }
+
+        // The filter has to travel with the cursor, or a later page widens the result set.
+        let mut tagged: Vec<i64> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..20 {
+            let mut q = vec![
+                ("sort".to_string(), "rank:asc".to_string()),
+                ("limit".to_string(), "3".to_string()),
+                ("filter".to_string(), r#"{"tag": "even"}"#.to_string()),
+            ];
+            if let Some(c) = cursor.clone() { q.push(("cursor".to_string(), c)); }
+            let body = page(q).await;
+            tagged.extend(body["items"].as_array().unwrap().iter().map(|v| v["rank"].as_i64().unwrap()));
+            cursor = body["next_cursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(tagged.len(), 8, "eight even keys, paged three at a time: {:?}", tagged);
+        assert!(tagged.windows(2).all(|w| w[0] < w[1]), "still ordered: {:?}", tagged);
+
+        // A projection that drops the sort field must not disturb the order it is merged on.
+        let body = page(vec![
+            ("sort".to_string(), "rank:asc".to_string()),
+            ("fields".to_string(), "tag".to_string()),
+            ("limit".to_string(), "5".to_string()),
+        ]).await;
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 5);
+        assert!(items.iter().all(|v| v.get("rank").is_none() && v.get("tag").is_some()),
+            "projection applies after the merge: {:?}", items);
+
+        // Keys are opt-in and parallel to items, on both paths through the router.
+        for q in [vec![("sort".to_string(), "rank:asc".to_string()), ("keys".to_string(), "true".to_string()),
+                       ("limit".to_string(), "3".to_string())],
+                  vec![("keys".to_string(), "true".to_string()), ("limit".to_string(), "3".to_string())]] {
+            let sorted = q.iter().any(|(k, _)| k == "sort");
+            let body = page(q).await;
+            let items = body["items"].as_array().unwrap();
+            let keys = body["keys"].as_array().expect("keys were asked for");
+            assert_eq!(keys.len(), items.len(), "sorted={}", sorted);
+            if sorted {
+                assert_eq!(keys.iter().map(|k| k.as_str().unwrap()).collect::<Vec<_>>(),
+                    vec!["k14", "k13", "k12"], "rank ascends as the key descends");
+            }
+        }
+        assert!(page(vec![("limit".to_string(), "3".to_string())]).await.get("keys").is_none(),
+            "keys stay out of the response unless asked for");
+
+        // A cursor from a differently-shaped query is refused rather than quietly ignored.
+        let unsorted = page(vec![("limit".to_string(), "2".to_string())]).await;
+        let key_cursor = unsorted["next_cursor"].as_str().unwrap().to_string();
+        let refused = client.get(&format!("{}/collections/t/query", router.url()))
+            .query(&[("sort", "rank:asc"), ("cursor", &key_cursor)])
+            .send().await.unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "an unsorted cursor is not a sort position");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M3: `ceil(limit/n)` per shard, concatenated untrimmed, returned up to `n - 1` rows more than
+    /// asked for. Trimming afterwards is not the fix — a trimmed row sits behind the cursor its
+    /// shard already moved past — so the shares sum to the limit instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cross_shard_page_never_exceeds_its_limit_or_loses_a_row() {
+        let root = temp_root();
+        let (s1, s2, router) = two_shard_cluster(&root).await;
+        let client = reqwest::Client::new();
+
+        let keys: Vec<String> = (0..12).map(|i| format!("k{:02}", i)).collect();
+        for key in &keys {
+            assert_eq!(put_value(&client, &router.url(), "t", key, serde_json::json!({"k": key}), "").await,
+                StatusCode::CREATED, "write for {} did not land", key);
+        }
+
+        let held = |node: &crate::test_support::TestNode| {
+            node.state.as_ref().unwrap().db.as_ref().unwrap()
+                .get_collection("t").map(|c| c.list_all().map(|v| v.len()).unwrap_or(0)).unwrap_or(0)
+        };
+        assert!(held(&s1) > 0 && held(&s2) > 0, "both shards must hold rows or the fan-out is not tested");
+        assert_eq!(held(&s1) + held(&s2), keys.len(), "the router split the writes across the ring");
+
+        let page = |limit: usize, cursor: Option<String>| {
+            let (c, base) = (client.clone(), router.url());
+            async move {
+                let mut q = vec![("limit".to_string(), limit.to_string())];
+                if let Some(c) = cursor { q.push(("cursor".to_string(), c)); }
+                let r = c.get(&format!("{}/collections/t/query", base)).query(&q).send().await.unwrap();
+                assert_eq!(r.status(), StatusCode::OK);
+                r.json::<serde_json::Value>().await.unwrap()
+            }
+        };
+
+        // Unfixed: 3 rows from each of two shards for a limit of 5, and 1 from each for a limit of 1.
+        for limit in 1..=13usize {
+            let body = page(limit, None).await;
+            let n = body["items"].as_array().unwrap().len();
+            assert!(n <= limit, "limit {} returned {} rows", limit, n);
+        }
+
+        // Paging the whole collection five at a time: every row once, none invented.
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..20 {
+            let body = page(5, cursor.clone()).await;
+            let items = body["items"].as_array().unwrap().clone();
+            assert!(items.len() <= 5, "a page of {} rows for a limit of 5", items.len());
+            seen.extend(items.iter().map(|v| v["k"].as_str().unwrap().to_string()));
+            cursor = body["next_cursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        seen.sort();
+        assert_eq!(seen, keys, "paging must return every row exactly once");
+
+        // A limit smaller than the ring: the shard that got no share this page still gets its turn.
+        let mut ones: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..40 {
+            let body = page(1, cursor.clone()).await;
+            ones.extend(body["items"].as_array().unwrap().iter().map(|v| v["k"].as_str().unwrap().to_string()));
+            cursor = body["next_cursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        ones.sort();
+        assert_eq!(ones, keys, "one row per page must still walk the whole ring");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M13: unsorted positions are per shard, so a key that changes owners mid-scan lands behind a
+    /// position that never covered it. The cursor now records the layout it was taken against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unsorted_cursor_is_refused_when_the_shard_layout_moved_under_it() {
+        let root = temp_root();
+        let (_s1, _s2, router) = two_shard_cluster(&root).await;
+        let client = reqwest::Client::new();
+
+        for i in 0..10 {
+            put_value(&client, &router.url(), "t", &format!("k{:02}", i),
+                serde_json::json!({"i": i}), "").await;
+        }
+
+        let page = |cursor: Option<String>| {
+            let (c, base) = (client.clone(), router.url());
+            async move {
+                let mut q = vec![("limit".to_string(), "3".to_string())];
+                if let Some(c) = cursor { q.push(("cursor".to_string(), c)); }
+                let r = c.get(&format!("{}/collections/t/query", base)).query(&q).send().await.unwrap();
+                let status = r.status();
+                (status, r.json::<serde_json::Value>().await.unwrap())
+            }
+        };
+
+        let (status, first) = page(None).await;
+        assert_eq!(status, StatusCode::OK);
+        let cursor = first["next_cursor"].as_str().unwrap().to_string();
+
+        let (status, _) = page(Some(cursor.clone())).await;
+        assert_eq!(status, StatusCode::OK, "an unchanged layout keeps the scan going");
+
+        // Move the boundary between the two ranges. No data moves here, which is the point: the
+        // router cannot tell whether it did, so the cursor is no longer answerable either way.
+        let state = router.state.as_ref().unwrap();
+        let mut moved = state.cluster.read().unwrap().clone();
+        let boundary = moved.shards[0].end_hash / 2;
+        moved.shards[0].end_hash = boundary;
+        moved.shards[1].start_hash = boundary;
+        moved.version += 1;
+        moved.updated_by = "test".to_string();
+        moved.seeded = false;
+        assert!(matches!(state.adopt_cluster(moved), crate::cluster::metadata::Adoption::Adopted { .. }),
+            "the test could not move the ring, so it proves nothing");
+
+        let (status, body) = page(Some(cursor)).await;
+        assert_eq!(status, StatusCode::CONFLICT,
+            "unfixed this answered from positions the layout had invalidated: {}", body);
+
+        let (status, restarted) = page(None).await;
+        assert_eq!(status, StatusCode::OK, "restarting the scan is the documented remedy");
+        assert_eq!(restarted["items"].as_array().unwrap().len(), 3);
+
+        // A sorted scan carries one position for the cluster, so the same move does not touch it.
+        let sorted = |cursor: Option<String>| {
+            let (c, base) = (client.clone(), router.url());
+            async move {
+                let mut q = vec![("sort".to_string(), "i:asc".to_string()), ("limit".to_string(), "3".to_string())];
+                if let Some(c) = cursor { q.push(("cursor".to_string(), c)); }
+                let r = c.get(&format!("{}/collections/t/query", base)).query(&q).send().await.unwrap();
+                (r.status(), r.json::<serde_json::Value>().await.unwrap())
+            }
+        };
+        let (_, first_sorted) = sorted(None).await;
+        let sorted_cursor = first_sorted["next_cursor"].as_str().unwrap().to_string();
+
+        let mut back = state.cluster.read().unwrap().clone();
+        back.shards[0].end_hash = boundary * 2;
+        back.shards[1].start_hash = boundary * 2;
+        back.version += 1;
+        back.updated_by = "test".to_string();
+        state.adopt_cluster(back);
+
+        let (status, body) = sorted(Some(sorted_cursor)).await;
+        assert_eq!(status, StatusCode::OK, "a sorted cursor is not tied to the layout: {}", body);
+        assert_eq!(body["items"].as_array().unwrap()[0]["i"].as_i64(), Some(3));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// M4: `read=primary` used to be satisfiable by any replica that answered first — the router
     /// listed them as fallbacks and a shard never checked the preference at all.
@@ -500,8 +781,7 @@ mod tests {
     async fn a_router_reports_no_primary_rather_than_reading_a_replica() {
         let root = temp_root();
         let (mut n1, n2, n3) = three_node_cluster(&root).await;
-        let replicas = vec![n2.url(), n3.url()];
-        let router = router_for(&root, &n1.url(), &replicas).await;
+        let router = router_for(&root, &[(n1.url(), vec![n2.url(), n3.url()])]).await;
         let client = reqwest::Client::new();
 
         let doc = format!("{}/collections/t/docs/k", n1.url());

@@ -1,7 +1,8 @@
 //! Open collections under one data directory and the LSN counters they share.
 
 use super::collection::Collection;
-use super::index::{LsnMeta, ReadCacheConfig};
+use crate::consensus::config::is_system_collection;
+use super::index::{AppliedMeta, LsnMeta, ReadCacheConfig};
 use crate::util::remove_dir_with_retry;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -91,6 +92,15 @@ impl Database {
         let col = self.open_collection(name)?;
         collections.insert(name.to_string(), col.clone());
         Ok(col)
+    }
+
+    /// Opens a collection only if it is already there. `get_collection` creates the directory, so
+    /// probing a system log with it would put an empty one on every node that never used it.
+    pub fn existing_collection(&self, name: &str) -> Option<Arc<Collection>> {
+        if let Some(col) = self.collections.read().unwrap().get(name) {
+            return Some(col.clone());
+        }
+        self.root_path.join(name).is_dir().then(|| self.get_collection(name).ok()).flatten()
     }
 
     /// Holds the collection map write lock across release, directory swap, and reopen.
@@ -224,35 +234,28 @@ impl Database {
         Ok(out)
     }
 
+    /// What a client sees. A tombstone is still a collection on disk — it holds the log the drop
+    /// lives in, which replication and compaction both still have work to do on — but it is gone as
+    /// far as the API is concerned.
+    pub fn live_collections(&self) -> io::Result<Vec<String>> {
+        let mut names = self.list_collections()?;
+        names.retain(|name| !is_system_collection(name) && !self.is_dropped(name));
+        Ok(names)
+    }
+
+    pub fn is_dropped(&self, name: &str) -> bool {
+        if let Some(col) = self.collections.read().unwrap().get(name) {
+            return col.is_dropped();
+        }
+        AppliedMeta::load(&self.root_path.join(name)).is_some_and(|m| m.dropped)
+    }
+
     pub fn release_collection(&self, name: &str) -> io::Result<Option<PathBuf>> {
         let existing = self.collections.write().unwrap().remove(name);
         match existing {
             Some(col) => Ok(Some(col.release_handles()?)),
             None => Ok(None),
         }
-    }
-
-    pub fn drop_collection(&self, name: &str) -> io::Result<bool> {
-        let tombstone = self.release_collection(name)?;
-
-        let col_path = self.root_path.join(name);
-        let existed = col_path.is_dir();
-
-        for candidate in [
-            col_path,
-            self.root_path.join(format!("{}.tmp", name)),
-            self.root_path.join(format!("{}.old", name)),
-        ] {
-            if candidate.is_dir() {
-                remove_dir_with_retry(&candidate)?;
-            }
-        }
-
-        if let Some(path) = tombstone {
-            let _ = fs::remove_file(path);
-        }
-
-        Ok(existed)
     }
 
     // The one place the watermark may fall: a snapshot can shrink the log.
@@ -325,7 +328,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{idx, live_put, temp_root};
+    use crate::test_support::{live_put, temp_root};
 
     #[tokio::test]
     async fn a_restart_does_not_reissue_lsns_an_unopened_collection_holds() {
@@ -471,29 +474,29 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// M9: a drop that only unlinks files is invisible to every node but the one that ran it. The
+    /// collection survives its own drop as a tombstone holding the log entry, which is what a
+    /// replica and a later leader read it from.
     #[tokio::test]
-    async fn drop_collection_deletes_files_despite_open_wal_handle() {
+    async fn a_committed_drop_empties_the_collection_and_hides_it() {
         let root = temp_root();
         let db = Database::new(&root).unwrap();
 
         let col = db.get_collection("users").unwrap();
-        let (f, w, o, _) = col.put("k".into(), serde_json::json!({"v": 1}), 1).unwrap();
-        col.index.write().unwrap().insert("k".into(), idx(&f, w, o));
+        live_put(&col, "k", 1);
+        assert_eq!(db.live_collections().unwrap(), vec!["users".to_string()]);
 
-        assert!(root.join("users").is_dir());
+        let lsn = col.drop_marker(1).unwrap().3;
+        assert!(!db.is_dropped("users"), "appending the drop must not apply it");
+        assert_eq!(col.get("k").unwrap(), Some(serde_json::json!({"v": 1})));
 
-        let existed = db.drop_collection("users").unwrap();
+        col.apply_committed(lsn);
 
-        assert!(existed, "dropping a live collection reports that it existed");
-        assert!(!root.join("users").exists(),
-            "the collection dir must be gone even though a WAL handle was open");
-        assert!(db.list_collections().unwrap().is_empty());
-        assert!(!root.join(".released-users.wal").exists(), "the tombstone WAL must be cleaned up");
-
-        assert!(col.put("k2".into(), serde_json::json!({"v": 2}), 1).is_err(),
-            "a stale handle to a released collection must refuse further writes");
-
-        assert!(!db.drop_collection("users").unwrap(), "dropping a missing collection is a no-op");
+        assert!(col.is_dropped());
+        assert!(col.get("k").unwrap().is_none());
+        assert!(db.live_collections().unwrap().is_empty(), "a tombstone is gone to a client");
+        assert_eq!(db.list_collections().unwrap(), vec!["users".to_string()],
+            "but still present to replication and compaction, which own its log");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -504,14 +507,37 @@ mod tests {
         let db = Database::new(&root).unwrap();
 
         let col = db.get_collection("users").unwrap();
-        let (f, w, o, _) = col.put("k".into(), serde_json::json!({"v": 1}), 1).unwrap();
-        col.index.write().unwrap().insert("k".into(), idx(&f, w, o));
-
-        db.drop_collection("users").unwrap();
+        live_put(&col, "k", 1);
+        let lsn = col.drop_marker(1).unwrap().3;
+        col.enqueue_commit().await.unwrap().unwrap();
+        col.apply_committed(lsn);
+        drop(col);
+        db.release_collection("users").unwrap();
 
         let fresh = db.get_collection("users").unwrap();
+        assert!(fresh.is_dropped(), "the drop must survive a reopen");
         assert!(fresh.index.read().unwrap().is_empty(), "dropped data must not resurrect on reopen");
         assert!(fresh.get("k").unwrap().is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn writing_above_a_drop_brings_the_collection_back() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+
+        let col = db.get_collection("users").unwrap();
+        live_put(&col, "old", 1);
+        let dropped = col.drop_marker(1).unwrap().3;
+        col.apply_committed(dropped);
+
+        live_put(&col, "new", 2);
+
+        assert!(!col.is_dropped());
+        assert_eq!(db.live_collections().unwrap(), vec!["users".to_string()]);
+        assert!(col.get("old").unwrap().is_none(), "the drop still took the keys below it");
+        assert_eq!(col.get("new").unwrap(), Some(serde_json::json!({"v": 2})));
 
         let _ = fs::remove_dir_all(&root);
     }

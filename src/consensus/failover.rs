@@ -136,6 +136,7 @@ async fn resync_all_from(state: &AppState, leader: &str) {
     if let Err(e) = db.recompute_durable_lsn() {
         warn!(target: "demote", "could not recompute durable LSN after resync: {}", e);
     }
+    state.refresh_configuration();
 }
 
 /// Boot-time catch-up for a configured replica. `config.primary_addr` is a bootstrap seed, not a
@@ -653,6 +654,61 @@ mod tests {
             drop(n3);
             let _ = fs::remove_dir_all(&root);
         }
+    }
+
+    /// C17: a promotion inherits frames a previous leader left durable but uncommitted. `advance`
+    /// refuses to commit below the current term's floor, and a collection nothing writes to never
+    /// gets a floor, so the tail stayed staged forever — invisible, pinning `pending`, and blocking
+    /// compaction. The barrier is the floor.
+    ///
+    /// The tail is staged straight onto the follower rather than raced through replication: the
+    /// state is the same durable-and-unpublished frame either way, and what is under test is what
+    /// promotion does about it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_promoted_leader_publishes_a_tail_no_one_writes_over() {
+        let root = temp_root();
+        let (mut n1, n2, n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().unwrap();
+
+        // Everyone in sync first, so the staged LSN below lands above the committed watermark.
+        assert_eq!(put_doc_at(&client, &n1.url(), "t", "k1", 1, "?w=majority&wtimeout=4000").await,
+            StatusCode::CREATED);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // The longer log also makes n2 the only node that can win the election that follows.
+        let heir = n2.state.as_ref().unwrap().db.as_ref().unwrap().get_collection("t").unwrap();
+        live_put(&heir, "committed", 1);
+        let stranded = crate::test_support::stage_put(&heir, "inherited", 2);
+        assert!(heir.pending_len() > 0, "the tail must be staged for this to test anything");
+        assert!(!heir.exists("inherited"), "and unpublished, which is what makes it a tail");
+
+        n1.kill();
+        // Not asserted to be n2: a winner must be at least as fresh as every voter, so n3 can only
+        // win after receiving these frames, and the tail is published either way. Which node wins
+        // is a timing question this test has no stake in.
+        let winner = settle_leader(&[&n2, &n3], Duration::from_secs(20)).await
+            .expect("no leader was elected");
+
+        // Re-fetched every poll, never held: a resync releases the handle and clears its index, and
+        // a released handle answers reads as an empty collection rather than failing.
+        let live = |n: &TestNode| n.state.as_ref().unwrap().db.as_ref().unwrap().get_collection("t").ok();
+        // Generous, and it has to be: leadership can churn for another term or two after
+        // `settle_leader` returns, and each round defers the barrier that publishes the tail.
+        let published = wait_for(Duration::from_secs(30), || {
+            live(&n2).is_some_and(|c| c.exists("inherited") && c.pending_len() == 0)
+        }).await;
+        assert!(published,
+            "unfixed the inherited tail stays staged for the life of the process: staged lsn={},              term={}", stranded, n2.term());
+
+        // The barrier is above it, so the commit index covers both without a client write.
+        let leader = node_by_id(&[&n2, &n3], &winner);
+        assert!(leader.state.as_ref().unwrap().committed_lsn("t") > stranded,
+            "committing the tail means committing the barrier that carried it");
+
+        // And it survives as a normal published write.
+        assert_eq!(read_doc_http(&client, &leader.url(), "inherited").await, Some(2));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

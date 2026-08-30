@@ -1,6 +1,9 @@
 //! Runtime membership changes. Admitted nodes are learners; the quorum set is not touched here.
 
-use crate::cluster::metadata::{plan_join, plan_leave, Adoption, ClusterMetadata, JoinRequest};
+use crate::cluster::metadata::{
+    plan_configuration, plan_join, plan_leave, Adoption, ClusterMetadata, JoinRequest,
+};
+use crate::consensus::reconfigure::{change_membership, pending_change, ChangeError};
 use crate::model::err_json;
 use crate::state::AppState;
 use axum::extract::{Query, State};
@@ -112,6 +115,69 @@ pub async fn join_handler(
     }))).into_response()
 }
 
+/// What an operator asks for: the voting set they want, not the delta. Joint consensus makes an
+/// arbitrary set change safe, so the set is the primitive and add/remove are the caller's
+/// arithmetic over `GET /cluster/configuration`.
+#[derive(Deserialize)]
+pub struct ConfigurationRequest {
+    pub voters: Vec<String>,
+}
+
+fn configuration_body(state: &AppState) -> serde_json::Value {
+    let config = state.quorum_config();
+    serde_json::json!({
+        "voters": config.voters,
+        "outgoing": config.outgoing,
+        "joint": config.outgoing.is_some(),
+        "uncommitted": pending_change(state).is_some(),
+    })
+}
+
+pub async fn configuration_handler(
+    State(state): State<AppState>,
+) -> impl axum::response::IntoResponse {
+    if !state.is_shard() {
+        return err_json(StatusCode::CONFLICT,
+            "a router has no quorum; ask a shard node".to_string());
+    }
+    (StatusCode::OK, Json(configuration_body(&state))).into_response()
+}
+
+pub async fn set_configuration_handler(
+    State(state): State<AppState>,
+    Json(req): Json<ConfigurationRequest>,
+) -> impl axum::response::IntoResponse {
+    if let Err(resp) = writable(&state) {
+        return resp;
+    }
+
+    let installed = match change_membership(&state, req.voters).await {
+        Ok(config) => config,
+        Err(ChangeError::Refused(why)) => return err_json(StatusCode::UNPROCESSABLE_ENTITY, why),
+        // 503, not 500: the entry is durable and in force, and retrying the same change finishes it.
+        Err(ChangeError::Stalled(why)) => return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": why, "configuration": configuration_body(&state) })),
+        ).into_response(),
+    };
+
+    // Only after the log committed it. The view records the outcome; it never decides it, so a
+    // failure to publish costs routing accuracy and nothing in the quorum.
+    let own = state.own_url();
+    match plan_configuration(&state.cluster_view(), &state.config.node_id, &own, &installed.voters) {
+        Ok(next) => {
+            if publish(&state, next).await.is_ok() {
+                broadcast(&state, &state.cluster_view(), None);
+            }
+        },
+        Err(why) => warn!(target: "membership", error = %why,
+            "Configuration committed but the view could not record it"),
+    }
+
+    info!(target: "membership", voters = ?installed.voters, "Configuration changed");
+    (StatusCode::OK, Json(configuration_body(&state))).into_response()
+}
+
 pub async fn leave_handler(
     State(state): State<AppState>,
     Query(params): Query<LeaveParams>,
@@ -187,7 +253,7 @@ mod tests {
         assert_eq!(n4.heartbeat_timeout_secs, 1, "the guard must hold without a timing cushion");
         assert!(n4.state.as_ref().unwrap().is_learner(),
             "the mode must apply from boot, before any cluster view exists");
-        assert!(!n4.state.as_ref().unwrap().can_campaign());
+        assert!(!n4.state.as_ref().unwrap().in_quorum());
         assert!(n4.state.as_ref().unwrap().cluster_view().seeded,
             "this node has never received a published view");
 
@@ -235,7 +301,7 @@ mod tests {
 
         // Admission populated who to follow and started replication tracking, and nothing else.
         assert!(n4.state.as_ref().unwrap().is_learner(), "admission must not promote to voter");
-        assert!(!n4.state.as_ref().unwrap().can_campaign());
+        assert!(!n4.state.as_ref().unwrap().in_quorum());
         assert_eq!(n1.state.as_ref().unwrap().voting_replicas().len(), 2,
             "the quorum set is the same size it was before the join");
 
@@ -370,6 +436,237 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    async fn configuration(c: &reqwest::Client, node: &str) -> serde_json::Value {
+        c.get(&format!("{}/cluster/configuration", node)).send().await.unwrap()
+            .json().await.unwrap()
+    }
+
+    async fn set_voters(c: &reqwest::Client, leader: &str, voters: &[String])
+        -> (StatusCode, serde_json::Value)
+    {
+        let r = c.post(&format!("{}/cluster/configuration", leader))
+            .timeout(Duration::from_secs(30))
+            .json(&serde_json::json!({ "voters": voters }))
+            .send().await.unwrap();
+        let code = r.status();
+        (code, r.json().await.unwrap_or(serde_json::Value::Null))
+    }
+
+    /// The point of commit 44: a learner becomes a voter without the cluster ever passing through
+    /// a moment where the old and the new voting sets could each reach a majority on their own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_learner_is_promoted_into_the_quorum_through_a_joint_configuration() {
+        let root = temp_root();
+        let (n1, n2, n3) = three_node_cluster(&root).await;
+        let c = client();
+
+        let n4 = fresh_node(&root, "n4");
+        assert_eq!(join(&c, &n1.url(), &n4.url()).await.0, StatusCode::OK);
+        assert_eq!(put_doc_at(&c, &n1.url(), "t", "early", 1, "?w=majority").await, StatusCode::CREATED);
+        assert!(wait_for(Duration::from_secs(15), || {
+            n4.state.as_ref().unwrap().db.as_ref().unwrap()
+                .get_collection("t").map(|col| col.exists("early")).unwrap_or(false)
+        }).await, "the learner has to catch up before it is worth promoting");
+
+        let before = configuration(&c, &n1.url()).await;
+        assert_eq!(before["joint"], false);
+        assert_eq!(before["voters"].as_array().unwrap().len(), 3);
+
+        let voters: Vec<String> = vec![n1.url(), n2.url(), n3.url(), n4.url()];
+        let (code, body) = set_voters(&c, &n1.url(), &voters).await;
+        assert_eq!(code, StatusCode::OK, "promotion failed: {}", body);
+        assert_eq!(body["joint"], false, "the change must not stop in the joint entry: {}", body);
+        assert_eq!(body["uncommitted"], false);
+        assert_eq!(body["voters"].as_array().unwrap().len(), 4);
+
+        // Every node decides against the same set, and it reached them through the log.
+        for node in [&n1, &n2, &n3, &n4] {
+            assert!(wait_for(Duration::from_secs(15), || {
+                node.state.as_ref().unwrap().quorum_config().voters.len() == 4
+            }).await, "{} never adopted the new configuration", node.node_id);
+            let installed = node.state.as_ref().unwrap().quorum_config();
+            assert!(!installed.is_joint(), "{} is stuck in joint consensus", node.node_id);
+            assert!(installed.contains(&n4.url()));
+        }
+        assert!(n4.state.as_ref().unwrap().in_quorum(),
+            "a promoted node must be able to stand, or the quorum counting it cannot elect");
+
+        // A majority is 3 of 4 now, and writes still commit at it.
+        assert_eq!(put_doc_at(&c, &n1.url(), "t", "after", 2, "?w=majority").await, StatusCode::CREATED);
+        assert!(wait_for(Duration::from_secs(15), || {
+            n4.state.as_ref().unwrap().db.as_ref().unwrap()
+                .get_collection("t").map(|col| col.exists("after")).unwrap_or(false)
+        }).await);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other direction, and the reason a demoted node stays a member: it has to stop standing
+    /// for election, and being told is the only way it finds out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_demoted_voter_leaves_the_quorum_and_stops_campaigning() {
+        let root = temp_root();
+        let (n1, n2, n3) = three_node_cluster(&root).await;
+        let c = client();
+
+        assert_eq!(put_doc_at(&c, &n1.url(), "t", "k", 1, "?w=majority").await, StatusCode::CREATED);
+
+        let voters: Vec<String> = vec![n1.url(), n2.url()];
+        let (code, body) = set_voters(&c, &n1.url(), &voters).await;
+        assert_eq!(code, StatusCode::OK, "demotion failed: {}", body);
+        assert_eq!(body["voters"].as_array().unwrap().len(), 2);
+
+        assert!(wait_for(Duration::from_secs(15), || {
+            !n3.state.as_ref().unwrap().quorum_config().contains(&n3.url())
+        }).await, "the demoted node still counts itself in the quorum");
+        assert!(!n3.state.as_ref().unwrap().in_quorum(),
+            "a node outside the configuration standing for election is what a removal must prevent");
+
+        // A majority is 2 of 2 now, and the demoted node is still shipped frames.
+        assert_eq!(put_doc_at(&c, &n1.url(), "t", "after", 2, "?w=majority").await, StatusCode::CREATED);
+        assert!(wait_for(Duration::from_secs(15), || {
+            n3.state.as_ref().unwrap().db.as_ref().unwrap()
+                .get_collection("t").map(|col| col.exists("after")).unwrap_or(false)
+        }).await, "a demoted voter is a learner, not a node cut off");
+
+        // And it may now be removed outright, which it could not be while it was voting.
+        let r = c.delete(&format!("{}/cluster/members?url={}", n1.url(), n3.url()))
+            .send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "demotion is what unblocks the removal");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A promotion that does not reach the election path is half a promotion: the node is counted
+    /// in every majority and can neither be elected by one nor help elect anyone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_promoted_node_votes_and_can_be_elected() {
+        let root = temp_root();
+        let (mut n1, n2, n3) = three_node_cluster(&root).await;
+        let c = client();
+
+        let n4 = fresh_node(&root, "n4");
+        assert_eq!(join(&c, &n1.url(), &n4.url()).await.0, StatusCode::OK);
+        assert_eq!(put_doc_at(&c, &n1.url(), "t", "k", 1, "?w=majority").await, StatusCode::CREATED);
+        assert!(wait_for(Duration::from_secs(15), || {
+            n4.state.as_ref().unwrap().db.as_ref().unwrap()
+                .get_collection("t").map(|col| col.exists("k")).unwrap_or(false)
+        }).await);
+
+        let voters: Vec<String> = vec![n1.url(), n2.url(), n3.url(), n4.url()];
+        assert_eq!(set_voters(&c, &n1.url(), &voters).await.0, StatusCode::OK);
+        assert!(wait_for(Duration::from_secs(15), || {
+            n4.state.as_ref().unwrap().quorum_config().contains(&n4.url())
+        }).await);
+
+        // A candidate now needs three of four, which it cannot reach without the promoted node.
+        let vote = c.post(&format!("{}/internal/vote", n4.url()))
+            .json(&serde_json::json!({
+                "term": 99, "candidate_id": "someone", "last_lsn": 0, "last_term": 0}))
+            .send().await.unwrap();
+        assert_ne!(vote.status(), StatusCode::FORBIDDEN,
+            "a promoted node refusing to vote leaves its own quorum unable to elect");
+
+        n1.kill();
+        let elected = crate::test_support::settle_leader(&[&n2, &n3, &n4], Duration::from_secs(30)).await;
+        assert!(elected.is_some(), "the surviving three of four never settled on a leader");
+
+        let leader = crate::test_support::node_by_id(&[&n2, &n3, &n4], elected.as_deref().unwrap());
+        assert!(wait_for(Duration::from_secs(15),
+            || read_doc_http_blocking(leader)).await, "the committed write did not survive");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn read_doc_http_blocking(node: &TestNode) -> bool {
+        node.state.as_ref().unwrap().db.as_ref().unwrap()
+            .get_collection("t").map(|col| col.exists("k")).unwrap_or(false)
+    }
+
+    /// The configuration is a log entry, so a restart recovers it from the log, not from config.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_committed_configuration_survives_a_restart() {
+        let root = temp_root();
+        let (n1, n2, mut n3) = three_node_cluster(&root).await;
+        let c = client();
+
+        let voters: Vec<String> = vec![n1.url(), n2.url()];
+        assert_eq!(set_voters(&c, &n1.url(), &voters).await.0, StatusCode::OK);
+        assert!(wait_for(Duration::from_secs(15), || {
+            n3.state.as_ref().unwrap().quorum_config().voters.len() == 2
+        }).await);
+
+        n3.kill();
+        n3.start();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let installed = n3.state.as_ref().unwrap().quorum_config();
+        assert_eq!(installed.voters.len(), 2, "a restart fell back to the config-derived voter set");
+        assert!(!installed.contains(&n3.url()));
+        assert!(!n3.state.as_ref().unwrap().in_quorum(),
+            "a demoted node that forgets it on restart campaigns against a quorum it is not in");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn configuration_changes_are_refused_when_they_cannot_be_made_safely() {
+        let root = temp_root();
+        let (n1, n2, n3) = three_node_cluster(&root).await;
+        let c = client();
+
+        let (code, body) = set_voters(&c, &n2.url(), &[n1.url()]).await;
+        assert_eq!(code, StatusCode::CONFLICT, "only the leader may append a configuration: {}", body);
+
+        let (code, body) = set_voters(&c, &n1.url(), &[]).await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{}", body);
+
+        let (code, body) = set_voters(&c, &n1.url(), &[n2.url(), n3.url()]).await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{}", body);
+        assert!(body["error"].as_str().unwrap().contains("cannot remove itself"),
+            "nothing here transfers leadership, so a self-removal has to be refused: {}", body);
+
+        let stranger = "http://127.0.0.1:1".to_string();
+        let (code, body) = set_voters(&c, &n1.url(),
+            &[n1.url(), n2.url(), n3.url(), stranger]).await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{}", body);
+        assert!(body["error"].as_str().unwrap().contains("admit it as a learner first"),
+            "a node holding nothing must not be counted in a majority: {}", body);
+
+        // None of the refusals appended anything.
+        let after = configuration(&c, &n1.url()).await;
+        assert_eq!(after["joint"], false);
+        assert_eq!(after["uncommitted"], false);
+        assert_eq!(after["voters"].as_array().unwrap().len(), 3);
+        assert_eq!(put_doc_at(&c, &n1.url(), "t", "k", 1, "?w=majority").await, StatusCode::CREATED);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_config_log_is_not_reachable_as_a_collection() {
+        let root = temp_root();
+        let (n1, n2, _n3) = three_node_cluster(&root).await;
+        let c = client();
+
+        assert_eq!(set_voters(&c, &n1.url(), &[n1.url(), n2.url()]).await.0, StatusCode::OK);
+
+        let r = c.put(&format!("{}/collections/_config/docs/k", n1.url()))
+            .json(&serde_json::json!({"value": {"v": 1}})).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN,
+            "a client writing the config log would move the quorum from the public API");
+
+        let r = c.delete(&format!("{}/collections/_config", n1.url())).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+
+        let listed = c.get(&format!("{}/collections", n1.url())).send().await.unwrap()
+            .json::<serde_json::Value>().await.unwrap();
+        assert!(!listed["collections"].as_array().unwrap().iter().any(|v| v == "_config"),
+            "a system log is not a client collection: {}", listed);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn changes_that_would_move_the_quorum_are_refused_over_http() {
         let root = temp_root();
@@ -387,14 +684,15 @@ mod tests {
             .send().await.unwrap();
         assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert!(r.json::<serde_json::Value>().await.unwrap()["error"].as_str().unwrap()
-            .contains("joint consensus"));
+            .contains("/cluster/configuration"),
+            "a join is still never a promotion; it points at the endpoint that is one");
 
         let r = c.delete(&format!("{}/cluster/members?url={}", n1.url(), n2.url()))
             .send().await.unwrap();
         assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY,
-            "removing a voter shrinks every majority it was counted in");
+            "a voter dropped from the view is one the log still counts and nothing can route to");
         assert!(r.json::<serde_json::Value>().await.unwrap()["error"].as_str().unwrap()
-            .contains("shrink the quorum"));
+            .contains("demote it"));
 
         let r = c.delete(&format!("{}/cluster/members?url=http://nobody:1", n1.url()))
             .send().await.unwrap();

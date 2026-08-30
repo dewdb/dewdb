@@ -15,13 +15,13 @@ use crate::cluster::rebalance::rebalance_status_handler;
 use docs::{bulk_create_docs, create_doc, delete_doc, get_doc, list_docs, put_doc, query_docs, update_doc};
 use internal::{
     cluster_update_handler, cluster_view_handler, data_summary_handler, heartbeat_handler,
-    internal_drop_handler, migrate_cleanup_handler, migrate_handler, migrate_reset_handler,
+    migrate_cleanup_handler, migrate_handler, migrate_reset_handler,
     migration_status_handler,
     replicate_handler, resync_handler, snapshot_handler, vote_handler,
 };
-use members::{join_handler, leave_handler};
+use members::{configuration_handler, join_handler, leave_handler, set_configuration_handler};
 use migrate::{abort_migration_handler, migration_status, start_migration_handler};
-use middleware::{auth_middleware, metrics_middleware};
+use middleware::{auth_middleware, metrics_middleware, reserved_name_middleware};
 use observe::{cluster_handler, health_handler, metrics_handler};
 use ring::set_ring_handler;
 
@@ -35,6 +35,7 @@ pub fn build_app(state: &AppState) -> Router {
         .route("/metrics", get(metrics_handler))
         .route("/cluster", get(cluster_handler))
         .route("/cluster/members", post(join_handler).delete(leave_handler))
+        .route("/cluster/configuration", get(configuration_handler).post(set_configuration_handler))
         .route("/cluster/ring", post(set_ring_handler))
         .route("/cluster/migrate", post(start_migration_handler)
             .get(migration_status).delete(abort_migration_handler))
@@ -59,7 +60,6 @@ pub fn build_app(state: &AppState) -> Router {
             .route("/internal/snapshot", get(snapshot_handler))
             .route("/internal/resync", post(resync_handler))
             .route("/internal/vote", post(vote_handler))
-            .route("/internal/drop", post(internal_drop_handler))
             .route("/internal/heartbeat", get(heartbeat_handler))
             .route("/internal/data-summary", get(data_summary_handler))
             .route("/internal/migrate", post(migrate_handler))
@@ -68,7 +68,8 @@ pub fn build_app(state: &AppState) -> Router {
             .route("/internal/migration-status", get(migration_status_handler));
     }
 
-    app.layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
+    app.layer(axum::middleware::from_fn(reserved_name_middleware))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), metrics_middleware))
         .with_state(state.clone())
 }

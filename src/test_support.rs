@@ -6,8 +6,8 @@ use crate::cluster::metadata::ClusterMetadata;
 use crate::cluster::migration::MigrationRuns;
 use crate::config::NodeConfig;
 use crate::consensus::{
-    heartbeat_poll_task, progress_flush_task, seed_leader_progress, Progress, ReplicationMeta,
-    ReplicationState,
+    heartbeat_poll_task, progress_flush_task, publish_inherited_tails, seed_leader_progress,
+    Progress, ReplicationMeta, ReplicationState,
 };
 use crate::metrics::Metrics;
 use crate::state::AppState;
@@ -40,6 +40,25 @@ pub fn make_frame(term: u64, lsn: u64, prev_lsn: u64, prev_term: u64, key: &str,
         ts: 0,
     };
     let payload = serde_json::to_vec(&entry).unwrap();
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&payload);
+
+    let header = FrameHeader {
+        len: payload.len() as u32,
+        crc: hasher.finalize(),
+        term,
+        lsn,
+        prev_lsn,
+        prev_term,
+    };
+
+    let mut frame = header.encode().to_vec();
+    frame.extend_from_slice(&payload);
+    frame
+}
+
+pub fn make_drop_frame(term: u64, lsn: u64, prev_lsn: u64, prev_term: u64) -> Vec<u8> {
+    let payload = serde_json::to_vec(&LogEntry::Drop { ts: 0 }).unwrap();
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&payload);
 
@@ -236,8 +255,9 @@ impl TestNode {
                     replicas: config.replicas.clone(),
                     primary_addr: config.primary_addr.clone(),
                     last_known_primary_position: None,
-            progress: Progress::new(),
-            leader_committed: HashMap::new(),
+                    progress: Progress::new(),
+                    leader_committed: HashMap::new(),
+                    configuration: None,
                 }));
 
                 let state = AppState {
@@ -273,9 +293,12 @@ impl TestNode {
                     crate::cluster::probe::router_probe_task(state.clone());
                 } else {
                     state.follow_from_view();
+                    state.refresh_configuration();
                     state.react_to_migration();
                     if state.is_leader() {
                         seed_leader_progress(&state);
+                        publish_inherited_tails(&state);
+                        crate::consensus::reconfigure::resume_change(&state);
                     } else {
                         heartbeat_poll_task(state.clone());
                     }
@@ -429,14 +452,25 @@ pub async fn single_node(root: &Path) -> TestNode {
     n
 }
 
-/// A router in front of one shard group. Its own data dir holds only `cluster.meta`.
-pub async fn router_for(root: &Path, owner: &str, replicas: &[String]) -> TestNode {
+/// A router in front of the given shard groups, one hash range each. Its own data dir holds only
+/// `cluster.meta`.
+pub async fn router_for(root: &Path, groups: &[(String, Vec<String>)]) -> TestNode {
     let mut r = TestNode::new("router", free_port(), root, "primary");
     r.role = "router".to_string();
-    r.shard_map = vec![(owner.to_string(), replicas.to_vec())];
+    r.shard_map = groups.to_vec();
     r.start();
     tokio::time::sleep(Duration::from_millis(200)).await;
     r
+}
+
+/// Two single-node shards behind a router, so a query has to fan out across ranges and merge.
+pub async fn two_shard_cluster(root: &Path) -> (TestNode, TestNode, TestNode) {
+    let mut s1 = TestNode::new("s1", free_port(), root, "primary");
+    let mut s2 = TestNode::new("s2", free_port(), root, "primary");
+    s1.start();
+    s2.start();
+    let router = router_for(root, &[(s1.url(), Vec::new()), (s2.url(), Vec::new())]).await;
+    (s1, s2, router)
 }
 
 pub async fn get_raw(client: &reqwest::Client, base: &str, col: &str, key: &str) -> bool {

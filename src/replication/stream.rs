@@ -5,11 +5,11 @@ use super::protocol::{
 };
 use crate::consensus::demote;
 use crate::replication::protocol::forbidden_term;
+use crate::replication::write_concern::WriteQuorum;
 use crate::state::AppState;
 use crate::storage::FrameHeader;
 use axum::http::StatusCode;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -541,6 +541,8 @@ async fn replicate_one_await(
     }
 }
 
+/// Returns who holds the frame: this node first, then every voter that acknowledged. Identities
+/// rather than a count, because a joint quorum cannot be decided from one.
 pub async fn replicate_and_await(
     state: AppState,
     collection: String,
@@ -549,18 +551,19 @@ pub async fn replicate_and_await(
     commit_index: u64,
     lsn: u64,
     prev_lsn: u64,
-    required_acks: usize,
+    quorum: WriteQuorum,
     timeout: Duration,
-) -> usize {
+) -> Vec<String> {
+    let own = state.own_url();
     let replicas = state.replication_targets();
-    if replicas.is_empty() || required_acks <= 1 {
+    if replicas.is_empty() || quorum.met(std::slice::from_ref(&own)) {
         replicate_to_peers(state, collection, frame, term, commit_index, lsn, prev_lsn);
-        return 1;
+        return vec![own];
     }
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<bool>(replicas.len());
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Option<String>>(replicas.len());
     for replica_url in replicas {
-        // Learners are shipped the frame on the same path but report `false`: they hold the data
+        // Learners are shipped the frame on the same path but report nothing: they hold the data
         // and can be promoted later, yet counting them would let a write concern be met by nodes
         // outside the quorum, and a leader elected without them would not have their entries.
         let counts = state.is_voting_replica(&replica_url);
@@ -570,24 +573,28 @@ pub async fn replicate_and_await(
         let tx = tx.clone();
         tokio::spawn(async move {
             let ok = replicate_one_await(&state, &replica_url, &col, &frame, term, commit_index, lsn, prev_lsn).await;
-            let _ = tx.send(ok && counts).await;
+            let _ = tx.send((ok && counts).then_some(replica_url)).await;
         });
     }
     drop(tx);
 
-    let acks = Arc::new(AtomicUsize::new(1));
-    let acks_inner = acks.clone();
+    let holders = Arc::new(std::sync::Mutex::new(vec![own]));
+    let holders_inner = holders.clone();
     let _ = tokio::time::timeout(timeout, async move {
-        while acks_inner.load(Ordering::Relaxed) < required_acks {
+        loop {
+            if quorum.met(&holders_inner.lock().unwrap()) {
+                return;
+            }
             match rx.recv().await {
-                Some(true) => { acks_inner.fetch_add(1, Ordering::Relaxed); },
-                Some(false) => {},
+                Some(Some(replica)) => holders_inner.lock().unwrap().push(replica),
+                Some(None) => {},
                 None => break,
             }
         }
     }).await;
 
-    acks.load(Ordering::Relaxed)
+    let out = holders.lock().unwrap().clone();
+    out
 }
 
 #[cfg(test)]
@@ -599,7 +606,7 @@ mod tests {
         temp_root, three_node_cluster, wait_for_doc, TestNode,
     };
     use std::fs;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn repair_state(root: &std::path::Path) -> AppState {
         let config = serde_json::from_value(serde_json::json!({

@@ -30,8 +30,8 @@ use crate::cluster::probe::{router_probe_task, ROUTER_PROBE_INTERVAL_SECS};
 use crate::cluster::rebalance::rebalance_task;
 use crate::config::{config_warnings, NodeConfig};
 use crate::consensus::{
-    boot_resync, heartbeat_poll_task, progress_flush_task, seed_leader_progress, Progress,
-    ReplicationMeta, ReplicationState,
+    boot_resync, heartbeat_poll_task, progress_flush_task, publish_inherited_tails,
+    seed_leader_progress, Progress, ReplicationMeta, ReplicationState,
 };
 use crate::logging::init_logging;
 use crate::maintenance::maintenance_task;
@@ -178,6 +178,7 @@ async fn main() -> io::Result<()> {
             last_known_primary_position: None,
             progress: Progress::new(),
             leader_committed: HashMap::new(),
+            configuration: None,
         })))
     } else {
         None
@@ -222,9 +223,17 @@ async fn main() -> io::Result<()> {
     if config.role == "shard" {
         // A node admitted last time comes back knowing only what the durable view says.
         state.follow_from_view();
+        // Before any task can decide anything: the configuration in force is a log entry, and this
+        // node's own log is the only copy of it that survived the restart.
+        state.refresh_configuration();
         state.react_to_migration();
         if state.is_leader() {
             seed_leader_progress(&state);
+            // A solo primary booting on an uncommitted tail is the same stranded state a promotion
+            // inherits, and has the same floor to set.
+            publish_inherited_tails(&state);
+            // Same for a change the previous process was in the middle of.
+            crate::consensus::reconfigure::resume_change(&state);
         }
         progress_flush_task(state.clone());
         replication_drive_task(state.clone());

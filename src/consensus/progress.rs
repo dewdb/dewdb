@@ -1,7 +1,7 @@
 //! Leader-side replication progress and the quorum-committed watermark.
 
-use crate::consensus::election::majority;
-use crate::util::write_atomic;
+use crate::storage::frame::Configuration;
+use crate::util::{same_endpoint, write_atomic};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -166,21 +166,30 @@ impl Progress {
         self.committed.values().copied().max().unwrap_or(0)
     }
 
-    /// Highest LSN a majority holds, counting the leader. Never moves backwards:
-    /// a resynced replica can report a lower match than before.
+    /// Highest LSN the configuration's quorum holds, counting the leader for itself. Never moves
+    /// backwards: a resynced replica can report a lower match than before.
     ///
     /// Raft §5.4.2: a majority holding a *prior-term* entry is not proof a later leader will keep
     /// it, so counting may only commit at or above this leader's own first append. Entries below
     /// the floor commit indirectly, when a current-term entry above them does.
-    pub fn advance(&mut self, collection: &str, leader_durable: u64, replicas: &[String]) -> u64 {
-        let mut held: Vec<u64> = Vec::with_capacity(replicas.len() + 1);
-        held.push(leader_durable);
-        for replica in replicas {
-            held.push(self.matched(replica, collection));
-        }
-        held.sort_unstable_by(|a, b| b.cmp(a));
+    ///
+    /// A joint configuration takes the lower of the two halves, so an entry only the outgoing half
+    /// holds cannot commit while the incoming half could still elect a leader that lacks it.
+    pub fn advance(
+        &mut self,
+        collection: &str,
+        own_url: &str,
+        leader_durable: u64,
+        config: &Configuration,
+    ) -> u64 {
+        let quorum = config.quorum_lsn(|member| {
+            if same_endpoint(member, own_url) {
+                leader_durable
+            } else {
+                self.matched(member, collection)
+            }
+        });
 
-        let quorum = held[majority(held.len()) - 1];
         let floor = self.term_floor.get(collection).copied();
         let slot = self.committed.entry(collection.to_string()).or_insert(0);
         if floor.is_some_and(|f| quorum >= f) && quorum > *slot {
@@ -194,15 +203,24 @@ impl Progress {
 mod tests {
     use super::*;
 
+    const OWN: &str = "http://leader";
+
     fn urls(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("http://r{}", i)).collect()
+    }
+
+    /// The quorum this leader is a member of: itself plus the replicas it counts.
+    fn cfg(replicas: &[String]) -> Configuration {
+        let mut voters = vec![OWN.to_string()];
+        voters.extend(replicas.iter().cloned());
+        Configuration::simple(voters)
     }
 
     #[test]
     fn a_lone_leader_commits_its_own_writes() {
         let mut p = Progress::new();
         p.note_leader_append("c", 7);
-        assert_eq!(p.advance("c", 7, &[]), 7, "majority of one is itself");
+        assert_eq!(p.advance("c", OWN, 7, &cfg(&[])), 7, "majority of one is itself");
     }
 
     #[test]
@@ -211,13 +229,13 @@ mod tests {
         let mut p = Progress::new();
         p.note_leader_append("c", 10);
 
-        assert_eq!(p.advance("c", 10, &r), 0, "leader alone is not a majority of three");
+        assert_eq!(p.advance("c", OWN, 10, &cfg(&r)), 0, "leader alone is not a majority of three");
 
         p.observe_ack(&r[0], "c", 10);
-        assert_eq!(p.advance("c", 10, &r), 10, "leader plus one replica is two of three");
+        assert_eq!(p.advance("c", OWN, 10, &cfg(&r)), 10, "leader plus one replica is two of three");
 
         p.observe_ack(&r[1], "c", 10);
-        assert_eq!(p.advance("c", 10, &r), 10);
+        assert_eq!(p.advance("c", OWN, 10, &cfg(&r)), 10);
     }
 
     #[test]
@@ -231,7 +249,7 @@ mod tests {
         p.observe_ack(&r[3], "c", 1);
 
         // sorted: 20, 9, 5, 5, 1 -> majority of five is the 3rd
-        assert_eq!(p.advance("c", 20, &r), 5,
+        assert_eq!(p.advance("c", OWN, 20, &cfg(&r)), 5,
             "one fast replica must not carry an entry the majority lacks");
     }
 
@@ -241,11 +259,11 @@ mod tests {
         let mut p = Progress::new();
         p.note_leader_append("c", 10);
         p.observe_ack(&r[0], "c", 10);
-        assert_eq!(p.advance("c", 10, &r), 10);
+        assert_eq!(p.advance("c", OWN, 10, &cfg(&r)), 10);
 
         // a replica wiped and resynced reports less than it did before
         p.matched.clear();
-        assert_eq!(p.advance("c", 10, &r), 10, "already-committed entries stay committed");
+        assert_eq!(p.advance("c", OWN, 10, &cfg(&r)), 10, "already-committed entries stay committed");
     }
 
     #[test]
@@ -257,8 +275,8 @@ mod tests {
         p.observe_ack(&r[0], "alpha", 4);
         p.observe_ack(&r[1], "alpha", 4);
 
-        assert_eq!(p.advance("alpha", 4, &r), 4);
-        assert_eq!(p.advance("beta", 6, &r), 0,
+        assert_eq!(p.advance("alpha", OWN, 4, &cfg(&r)), 4);
+        assert_eq!(p.advance("beta", OWN, 6, &cfg(&r)), 0,
             "an ack for alpha must not commit beta, whose frames nobody has");
         assert_eq!(p.committed("alpha"), 4);
         assert_eq!(p.max_committed(), 4);
@@ -272,13 +290,13 @@ mod tests {
         // Inherited from the last leader: every node holds lsn 5, and none of it is ours.
         p.observe_ack(&r[0], "c", 5);
         p.observe_ack(&r[1], "c", 5);
-        assert_eq!(p.advance("c", 5, &r), 0,
+        assert_eq!(p.advance("c", OWN, 5, &cfg(&r)), 0,
             "a later leader can still overwrite lsn 5, so a majority holding it is not proof");
 
         // Our own first append of this term. A majority reaching it carries lsn 5 over with it.
         p.note_leader_append("c", 6);
         p.observe_ack(&r[0], "c", 6);
-        assert_eq!(p.advance("c", 6, &r), 6,
+        assert_eq!(p.advance("c", OWN, 6, &cfg(&r)), 6,
             "an entry of this term commits everything below it");
     }
 
@@ -290,8 +308,32 @@ mod tests {
 
         assert_eq!(p.committed("users"), 7,
             "a published entry was committed under the previous leader; re-deriving it by              counting is the Figure 8 hole");
-        assert_eq!(p.advance("users", 10, &r), 7,
+        assert_eq!(p.advance("users", OWN, 10, &cfg(&r)), 7,
             "and counting still moves nothing until this leader appends something of its own");
+    }
+
+    #[test]
+    fn a_joint_configuration_will_not_commit_on_the_outgoing_half_alone() {
+        let old_half = vec![OWN.to_string(), "http://a".to_string(), "http://b".to_string()];
+        let new_half = vec![OWN.to_string(), "http://c".to_string(), "http://d".to_string()];
+        let joint = Configuration::joint(old_half, new_half.clone());
+
+        let mut p = Progress::new();
+        p.note_leader_append("c", 5);
+        p.observe_ack("http://a", "c", 5);
+        p.observe_ack("http://b", "c", 5);
+        assert_eq!(p.advance("c", OWN, 5, &joint), 0,
+            "the whole outgoing half holds it and the incoming half could still elect without it");
+
+        p.observe_ack("http://c", "c", 5);
+        assert_eq!(p.advance("c", OWN, 5, &joint), 5, "a majority of each half is the joint quorum");
+
+        // Same acks against the plain incoming configuration: the outgoing half stops counting.
+        let mut p2 = Progress::new();
+        p2.note_leader_append("c", 5);
+        p2.observe_ack("http://a", "c", 5);
+        p2.observe_ack("http://b", "c", 5);
+        assert_eq!(p2.advance("c", OWN, 5, &Configuration::simple(new_half)), 0);
     }
 
     #[test]
@@ -347,14 +389,14 @@ mod tests {
         p.note_leader_append("users", 10);
         p.observe_ack(&r[0], "users", 10);
         p.observe_ack(&r[1], "users", 10);
-        assert_eq!(p.advance("users", 10, &r), 10);
+        assert_eq!(p.advance("users", OWN, 10, &cfg(&r)), 10);
 
         p.reinit_as_leader(&r, &owned(&[("users", 10)]), &HashMap::new(), &hint(&r[0], &[("users", 10)]));
         p.note_leader_append("users", 10);
 
         assert_eq!(p.matched(&r[0], "users"), 0, "a new term starts with no match evidence");
         assert_eq!(p.committed("users"), 0);
-        assert_eq!(p.advance("users", 10, &r), 0,
+        assert_eq!(p.advance("users", OWN, 10, &cfg(&r)), 0,
             "a cursor restored from disk says where to resume sending, never that a replica holds it");
     }
 
@@ -402,11 +444,11 @@ mod tests {
         let r = urls(2);
         let mut p = Progress::new();
         p.observe_ack(&r[0], "c", 10);
-        p.advance("c", 10, &r);
+        p.advance("c", OWN, 10, &cfg(&r));
 
         p.reset();
         assert_eq!(p.matched(&r[0], "c"), 0);
         assert_eq!(p.committed("c"), 0);
-        assert_eq!(p.advance("c", 10, &r), 0, "a new leader must re-earn its quorum");
+        assert_eq!(p.advance("c", OWN, 10, &cfg(&r)), 0, "a new leader must re-earn its quorum");
     }
 }

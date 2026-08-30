@@ -1,6 +1,7 @@
 //! Authentication and latency-recording middleware.
 
 use crate::auth::{authorize, AuthOutcome, API_KEY_HEADER, INTERNAL_SECRET_HEADER};
+use crate::consensus::config::is_system_collection;
 use crate::model::err_json;
 use crate::state::AppState;
 use axum::extract::State;
@@ -38,6 +39,25 @@ pub async fn metrics_middleware(
 
     state.metrics.observe(key, nanos, response.status().is_server_error() || response.status().is_client_error());
     response
+}
+
+/// The one gate on reserved names, rather than a check in each of the eleven `/collections/:name`
+/// handlers: a system log is a consensus structure, and a client writing to one moves the quorum.
+/// Internal replication reaches it by collection name in a body, not by path, so it is unaffected.
+pub async fn reserved_name_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let name = req.uri().path()
+        .strip_prefix("/collections/")
+        .map(|rest| rest.split('/').next().unwrap_or(rest));
+
+    match name {
+        Some(name) if is_system_collection(name) => err_json(
+            StatusCode::FORBIDDEN,
+            format!("'{}' is a system collection; names beginning with '_' are reserved", name)),
+        _ => next.run(req).await,
+    }
 }
 
 pub async fn auth_middleware(

@@ -1,6 +1,6 @@
 //! Index entries, their persisted snapshot, and the commit watermark file.
 
-use super::frame::HEADER_LEN;
+use super::frame::{Configuration, HEADER_LEN};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -69,6 +69,14 @@ pub struct LsnMeta {
 #[derive(Serialize, Deserialize)]
 pub struct AppliedMeta {
     pub applied_lsn: u64,
+    /// Set by a committed `Drop`, cleared by any keyed entry above it. Survives compaction, which
+    /// retires the drop frame along with everything else the empty index no longer points at.
+    #[serde(default)]
+    pub dropped: bool,
+    /// The newest committed `Config`. Here for the same reason `dropped` is: a configuration entry
+    /// is never in the index, so compaction retires its frame and replay cannot find it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<Configuration>,
 }
 
 impl AppliedMeta {

@@ -3,7 +3,7 @@
 use crate::model::err_json;
 use crate::replication::stream::{replicate_and_await, replicate_to_peers};
 use crate::replication::WriteConcern;
-use crate::replication::write_concern::required_acks;
+use crate::replication::write_concern::write_quorum;
 use crate::json::merge_patch;
 use crate::state::AppState;
 use crate::storage::{Collection, FrameHeader};
@@ -89,33 +89,35 @@ async fn finish_write(
         return Ok(WriteOutcome { met: true, acks: 1, required: 1, existed });
     }
 
-    // Quorum set only: a learner acknowledging must never help satisfy a write concern.
-    let replicas = state.voting_replicas();
-    let required = required_acks(&wc, replicas.len());
+    // Resolved against the configuration in force, not a replica count: while a change is in
+    // flight a majority means a majority of each half. A learner acknowledging never counts.
+    let quorum = write_quorum(&wc, &state.quorum_config());
+    let required = quorum.required();
+    let own = state.own_url();
     // From the header, not lsn - 1: the previous LSN usually belongs to another collection.
     let prev_lsn = FrameHeader::parse(&frame).map_or(0, |h| h.prev_lsn);
     // Predates this frame, which is what lets the send start before the fsync lands. Followers
     // already expect a trailing watermark and publish on the next message carrying a higher one.
     let commit_index = state.committed_lsn(col_name);
 
-    let acks = if required <= 1 {
+    let holders = if quorum.met(std::slice::from_ref(&own)) {
         replicate_to_peers(state.clone(), col_name.to_string(), frame, term, commit_index, lsn, prev_lsn);
         if let Some(c) = commit {
             settle_commit(c).await?;
         }
-        1
+        vec![own]
     } else {
         let replicating = replicate_and_await(
             state.clone(), col_name.to_string(), frame, term, commit_index, lsn, prev_lsn,
-            required, wtimeout,
+            quorum.clone(), wtimeout,
         );
         match commit {
             // The local disk write and the replica round trips are independent, so the client waits
             // for the slower of the two instead of their sum.
             Some(c) => {
-                let (acks, committed) = tokio::join!(replicating, settle_commit(c));
+                let (holders, committed) = tokio::join!(replicating, settle_commit(c));
                 committed?;
-                acks
+                holders
             },
             None => replicating.await,
         }
@@ -130,7 +132,7 @@ async fn finish_write(
         .map_or(0, |col| col.durable_lsn());
     state.advance_own_commit(col_name, own_durable);
 
-    Ok(WriteOutcome { met: acks >= required, acks, required, existed })
+    Ok(WriteOutcome { met: quorum.met(&holders), acks: holders.len(), required, existed })
 }
 
 /// 503 rather than 500: the write is not wrong, the leader is too far ahead of its quorum, and the
@@ -216,6 +218,51 @@ pub async fn local_patch(
     };
 
     Ok(Some(finish_write(state, col_name, pending, wc, wtimeout).await?))
+}
+
+/// The drop as a replicated log entry: it commits the way a write does, so a quorum holds it before
+/// the client hears success, a replica that was down for it picks it up from the log, and a leader
+/// elected afterwards replays it instead of having to be told.
+pub async fn local_drop(
+    state: &AppState,
+    col_name: &str,
+    wc: WriteConcern,
+    wtimeout: Duration,
+) -> Result<WriteOutcome, axum::response::Response> {
+    if let Err(pending) = state.admit_write(col_name) {
+        return Err(backpressure_response(
+            col_name, pending, state.config.flow_control.max_uncommitted_frames));
+    }
+
+    let db = state.db.as_ref().unwrap();
+    let col = match db.get_collection(col_name) {
+        Ok(c) => c,
+        Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    };
+
+    let pending = {
+        // Every stripe, in order: a drop removes every key, so an in-flight read-modify-write on
+        // any of them must land on one side of it or the other.
+        let mut _guards = Vec::with_capacity(col.key_locks.len());
+        for lock in col.key_locks.iter() {
+            _guards.push(lock.lock().await);
+        }
+
+        let term = state.current_term();
+        let col_clone = col.clone();
+        let appended = tokio::task::spawn_blocking(move || col_clone.drop_marker(term)).await;
+        let (frame, _wal_id, _offset, lsn) = match appended {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+            Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        };
+
+        let commit = col.enqueue_commit();
+        state.note_leader_append(col_name, lsn);
+        PendingWrite { frame, term, lsn, existed: true, commit: Some(commit) }
+    };
+
+    finish_write(state, col_name, pending, wc, wtimeout).await
 }
 
 async fn local_write_batch_inner(

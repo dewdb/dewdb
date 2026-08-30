@@ -3,20 +3,46 @@
 use crate::json::{get_path_value, json_cmp};
 use crate::model::MAX_QUERY_LIMIT;
 use crate::util::base64_bytes;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 
+/// Per-shard scan positions for an unsorted page. `Some(key)` resumes after that key, `None` is a
+/// shard the page ahead of this one had no rows to spend on, and an absent shard has been drained.
+///
+/// `ring` is the partitioning these positions were taken against. An unsorted scan walks keyspaces
+/// per shard, so a key moving between shards mid-scan puts it behind a position it was never
+/// covered by; the fingerprint is what makes that visible instead of a silently short answer.
 #[derive(Serialize, Deserialize, Default)]
 pub struct ShardCursor {
-    pub positions: BTreeMap<String, String>,
+    pub ring: u64,
+    pub positions: BTreeMap<String, Option<String>>,
 }
 
-pub fn encode_cursor(c: &ShardCursor) -> String {
+/// Where a sorted scan stopped, as a position in the sort order rather than in the keyspace. One
+/// of these covers the whole cluster: "after this row" is the same question on every shard, so a
+/// sorted page needs no per-shard state and survives a shard joining mid-scan.
+#[derive(Serialize, Deserialize)]
+pub struct SortCursor {
+    pub value: serde_json::Value,
+    pub key: String,
+}
+
+/// A document with the key it is stored under. Sorting and merging need the key: it is the
+/// tiebreaker that makes the order total, and a cursor cannot resume against anything less.
+#[derive(Clone)]
+pub struct SortedRow {
+    pub key: String,
+    pub value: serde_json::Value,
+}
+
+pub fn encode_cursor<T: Serialize>(c: &T) -> String {
     let json = serde_json::to_vec(c).unwrap_or_default();
     base64_bytes::base64_encode(&json)
 }
 
-pub fn decode_cursor(s: &str) -> Option<ShardCursor> {
+pub fn decode_cursor<T: DeserializeOwned>(s: &str) -> Option<T> {
     let bytes = base64_bytes::base64_decode(s).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
@@ -44,18 +70,34 @@ pub fn parse_sort(s: Option<&str>) -> Option<SortSpec> {
     Some(SortSpec { field: field.to_string(), desc: dir.eq_ignore_ascii_case("desc") })
 }
 
-pub fn compare_by_sort(a: &serde_json::Value, b: &serde_json::Value, sort: &SortSpec) -> std::cmp::Ordering {
-    let va = get_path_value(a, &sort.field).cloned().unwrap_or(serde_json::Value::Null);
-    let vb = get_path_value(b, &sort.field).cloned().unwrap_or(serde_json::Value::Null);
-    let ord = json_cmp(&va, &vb);
-    if sort.desc {
-        ord.reverse()
-    } else {
-        ord
-    }
+/// The sort field, or `Null` where the document does not have it.
+pub fn sort_value<'a>(doc: &'a serde_json::Value, sort: &SortSpec) -> &'a serde_json::Value {
+    get_path_value(doc, &sort.field).unwrap_or(&serde_json::Value::Null)
 }
 
-pub fn kway_merge(lists: Vec<Vec<serde_json::Value>>, sort: &SortSpec, limit: usize) -> Vec<serde_json::Value> {
+/// Direction applies to the field only; the key tiebreaker always ascends. Both halves matter:
+/// without the key two rows with the same field value tie, and a cursor cannot resume past a tie.
+pub fn compare_positions(
+    a: (&serde_json::Value, &str),
+    b: (&serde_json::Value, &str),
+    sort: &SortSpec,
+) -> Ordering {
+    let ord = json_cmp(a.0, b.0);
+    let ord = if sort.desc { ord.reverse() } else { ord };
+    ord.then_with(|| a.1.cmp(b.1))
+}
+
+pub fn compare_rows(a: &SortedRow, b: &SortedRow, sort: &SortSpec) -> Ordering {
+    compare_positions((sort_value(&a.value, sort), &a.key), (sort_value(&b.value, sort), &b.key), sort)
+}
+
+/// Rows strictly after the cursor, in the same order the pages are emitted in.
+pub fn is_after(row: &SortedRow, cursor: &SortCursor, sort: &SortSpec) -> bool {
+    compare_positions((sort_value(&row.value, sort), &row.key), (&cursor.value, &cursor.key), sort)
+        == Ordering::Greater
+}
+
+pub fn kway_merge(lists: Vec<Vec<SortedRow>>, sort: &SortSpec, limit: usize) -> Vec<SortedRow> {
     let mut heads = vec![0usize; lists.len()];
     let mut out = Vec::with_capacity(limit.min(MAX_QUERY_LIMIT));
 
@@ -66,7 +108,7 @@ pub fn kway_merge(lists: Vec<Vec<serde_json::Value>>, sort: &SortSpec, limit: us
                 match best {
                     None => best = Some(i),
                     Some(b) => {
-                        if compare_by_sort(&lists[i][heads[i]], &lists[b][heads[b]], sort) == std::cmp::Ordering::Less {
+                        if compare_rows(&lists[i][heads[i]], &lists[b][heads[b]], sort) == Ordering::Less {
                             best = Some(i);
                         }
                     }
@@ -194,9 +236,20 @@ pub fn matches_filter(doc: &serde_json::Value, filter: &Filter) -> bool {
 mod tests {
     use super::*;
 
+    fn rows(sort_field: &str, ns: &[i64]) -> Vec<SortedRow> {
+        ns.iter().map(|n| SortedRow {
+            key: format!("k{}", n),
+            value: serde_json::json!({ sort_field: n }),
+        }).collect()
+    }
+
+    fn ns_of(rows: &[SortedRow]) -> Vec<i64> {
+        rows.iter().map(|r| r.value["n"].as_i64().unwrap()).collect()
+    }
+
     #[test]
     fn a_merge_bounded_by_a_huge_limit_allocates_for_what_it_holds() {
-        let lists = vec![vec![serde_json::json!({"n": 1})], vec![serde_json::json!({"n": 2})]];
+        let lists = vec![rows("n", &[1]), rows("n", &[2])];
         let sort = parse_sort(Some("n:asc")).unwrap();
 
         // Unfixed this reserves usize::MAX values before reading the first row.
@@ -207,18 +260,22 @@ mod tests {
     #[test]
     fn shard_cursor_round_trips_through_base64() {
         let mut positions = BTreeMap::new();
-        positions.insert("http://s1".to_string(), "k42".to_string());
-        positions.insert("http://s2".to_string(), "k17".to_string());
-        let c = ShardCursor { positions };
+        positions.insert("http://s1".to_string(), Some("k42".to_string()));
+        positions.insert("http://s2".to_string(), Some("k17".to_string()));
+        positions.insert("http://s3".to_string(), None);
+        let c = ShardCursor { ring: 99, positions };
 
         let encoded = encode_cursor(&c);
         assert!(!encoded.contains('{'), "encoded cursor should be opaque, not raw JSON");
 
-        let decoded = decode_cursor(&encoded).expect("must decode");
-        assert_eq!(decoded.positions.get("http://s1").map(|s| s.as_str()), Some("k42"));
-        assert_eq!(decoded.positions.get("http://s2").map(|s| s.as_str()), Some("k17"));
+        let decoded: ShardCursor = decode_cursor(&encoded).expect("must decode");
+        assert_eq!(decoded.positions.get("http://s1"), Some(&Some("k42".to_string())));
+        assert_eq!(decoded.positions.get("http://s2"), Some(&Some("k17".to_string())));
+        assert_eq!(decoded.positions.get("http://s3"), Some(&None), "unstarted is not the same as drained");
+        assert_eq!(decoded.positions.get("http://s4"), None, "drained shards are absent");
+        assert_eq!(decoded.ring, 99, "the positions are only meaningful against their partitioning");
 
-        assert!(decode_cursor("!!!not base64 json!!!").is_none());
+        assert!(decode_cursor::<ShardCursor>("!!!not base64 json!!!").is_none());
     }
 
     #[test]
@@ -239,15 +296,11 @@ mod tests {
 
     #[test]
     fn kway_merge_produces_global_order_bounded_by_limit() {
-        use serde_json::json;
         let sort = SortSpec { field: "n".to_string(), desc: false };
-        let l1 = vec![json!({"n": 1}), json!({"n": 4}), json!({"n": 7})];
-        let l2 = vec![json!({"n": 2}), json!({"n": 3}), json!({"n": 8})];
-        let l3 = vec![json!({"n": 5}), json!({"n": 6})];
+        let lists = vec![rows("n", &[1, 4, 7]), rows("n", &[2, 3, 8]), rows("n", &[5, 6])];
 
-        let merged = kway_merge(vec![l1, l2, l3], &sort, 5);
-        let ns: Vec<i64> = merged.iter().map(|v| v["n"].as_i64().unwrap()).collect();
-        assert_eq!(ns, vec![1, 2, 3, 4, 5], "globally sorted, bounded to limit");
+        let merged = kway_merge(lists, &sort, 5);
+        assert_eq!(ns_of(&merged), vec![1, 2, 3, 4, 5], "globally sorted, bounded to limit");
     }
 
     /// M1: an object condition with no operators is an equality test, not "has this field".
@@ -296,12 +349,53 @@ mod tests {
 
     #[test]
     fn kway_merge_desc() {
-        use serde_json::json;
         let sort = SortSpec { field: "n".to_string(), desc: true };
-        let l1 = vec![json!({"n": 9}), json!({"n": 3})];
-        let l2 = vec![json!({"n": 7}), json!({"n": 1})];
-        let merged = kway_merge(vec![l1, l2], &sort, 3);
-        let ns: Vec<i64> = merged.iter().map(|v| v["n"].as_i64().unwrap()).collect();
-        assert_eq!(ns, vec![9, 7, 3]);
+        let merged = kway_merge(vec![rows("n", &[9, 3]), rows("n", &[7, 1])], &sort, 3);
+        assert_eq!(ns_of(&merged), vec![9, 7, 3]);
+    }
+
+    /// H8: a sorted page resumes from a position in the sort order, so rows that tie on the sort
+    /// field have to be separated by something. Without the key the merge picks a tied row
+    /// arbitrarily and the cursor built from it either repeats its twin or skips it.
+    #[test]
+    fn ties_on_the_sort_field_are_broken_by_key() {
+        use serde_json::json;
+        let sort = SortSpec { field: "n".to_string(), desc: false };
+        let tied = |key: &str| SortedRow { key: key.to_string(), value: json!({"n": 1}) };
+
+        assert_eq!(compare_rows(&tied("a"), &tied("b"), &sort), Ordering::Less);
+        assert_eq!(compare_rows(&tied("b"), &tied("a"), &sort), Ordering::Greater);
+        assert_eq!(compare_rows(&tied("a"), &tied("a"), &sort), Ordering::Equal);
+
+        // Descending applies to the field, never to the tiebreaker.
+        let desc = SortSpec { field: "n".to_string(), desc: true };
+        assert_eq!(compare_rows(&tied("a"), &tied("b"), &desc), Ordering::Less);
+
+        let merged = kway_merge(vec![vec![tied("c")], vec![tied("a")], vec![tied("b")]], &sort, 3);
+        assert_eq!(merged.iter().map(|r| r.key.clone()).collect::<Vec<_>>(), vec!["a", "b", "c"],
+            "a merge of tied rows must still have one answer");
+    }
+
+    #[test]
+    fn a_sort_cursor_admits_exactly_the_rows_after_it() {
+        use serde_json::json;
+        let sort = SortSpec { field: "n".to_string(), desc: false };
+        let at = SortCursor { value: json!(2), key: "k2".to_string() };
+        let row = |key: &str, n: i64| SortedRow { key: key.to_string(), value: json!({"n": n}) };
+
+        assert!(!is_after(&row("k1", 1), &at, &sort));
+        assert!(!is_after(&row("k2", 2), &at, &sort), "the cursor row itself is behind it");
+        assert!(is_after(&row("k3", 2), &at, &sort), "a tie is separated by the key");
+        assert!(!is_after(&row("k0", 2), &at, &sort), "and separated in both directions");
+        assert!(is_after(&row("k0", 3), &at, &sort));
+
+        let desc = SortSpec { field: "n".to_string(), desc: true };
+        assert!(is_after(&row("k1", 1), &at, &desc), "descending walks the other way");
+        assert!(!is_after(&row("k9", 3), &at, &desc));
+
+        // A document without the field sorts as null, which is before every number ascending.
+        let missing = SortedRow { key: "k5".to_string(), value: json!({"other": 1}) };
+        assert!(!is_after(&missing, &at, &sort));
+        assert!(is_after(&missing, &at, &desc));
     }
 }

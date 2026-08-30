@@ -470,6 +470,36 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// M9: the drop frame is not in the index, so compaction retires it with everything else the
+    /// empty index no longer points at. The applied watermark is what carries the drop past that.
+    #[tokio::test]
+    async fn a_drop_survives_the_compaction_that_retires_its_own_frame() {
+        let root = temp_root();
+
+        {
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("c").unwrap();
+            live_put(&col, "a", 1);
+            live_put(&col, "b", 2);
+
+            let lsn = col.drop_marker(1).unwrap().3;
+            col.enqueue_commit().await.unwrap().unwrap();
+            col.apply_committed(lsn);
+
+            col.compact().unwrap();
+            assert!(col.is_dropped());
+        }
+
+        let db2 = Database::new(&root).unwrap();
+        assert!(db2.is_dropped("c"), "a compacted tombstone must not come back as a live collection");
+        let col2 = db2.get_collection("c").unwrap();
+        assert!(col2.is_dropped());
+        assert!(col2.get("a").unwrap().is_none());
+        assert!(db2.live_collections().unwrap().is_empty());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn a_frozen_wal_that_outlives_compaction_cannot_resurrect_a_deleted_key() {
         let root = temp_root();

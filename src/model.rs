@@ -33,12 +33,18 @@ pub struct QueryParams {
     pub cursor: Option<String>,
     pub sort: Option<String>,
     pub fields: Option<String>,
+    /// Return each row's key alongside it. The cross-shard merge needs them to order ties and to
+    /// build the next cursor, so the router always asks; a client may.
+    pub keys: Option<bool>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 pub struct QueryPage {
     pub items: Vec<serde_json::Value>,
     pub next_cursor: Option<String>,
+    /// Parallel to `items`, and only present when the request asked for it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
 }
 
 #[derive(Deserialize)]

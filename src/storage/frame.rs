@@ -63,6 +63,33 @@ pub enum LogEntry {
         key: String,
         ts: u64,
     },
+    /// A no-op occupying an LSN. A leader appends one per collection on promotion so the inherited
+    /// tail has a current-term entry above it to be committed by. It applies nothing, is never in
+    /// the index, and compaction therefore drops it like any superseded frame.
+    Barrier {
+        ts: u64,
+    },
+    /// Removes every key and leaves the collection a tombstone until something is written above it.
+    /// Committing it, not appending it, is what makes the collection gone.
+    Drop {
+        ts: u64,
+    },
+    /// A voting set. Unlike every other entry it takes effect where it is *appended*, not where it
+    /// commits, so a leader cannot decide a change using the membership the change replaces.
+    Config {
+        config: Configuration,
+        ts: u64,
+    },
+}
+
+/// A quorum membership, as it travels in the log. `outgoing` is present only between the two
+/// entries of a change, and while it is, a decision needs a majority of each half separately.
+/// The arithmetic over this is `consensus::config`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct Configuration {
+    pub voters: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outgoing: Option<Vec<String>>,
 }
 
 #[derive(Debug)]

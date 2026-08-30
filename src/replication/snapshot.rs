@@ -230,6 +230,8 @@ fn stream_snapshot(
             &mut applied_file,
             &AppliedMeta {
                 applied_lsn: collection.applied_lsn(),
+                dropped: collection.is_dropped(),
+                config: collection.committed_config(),
             },
         )
         .map_err(io::Error::other)?;

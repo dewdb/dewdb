@@ -281,11 +281,32 @@ impl ClusterMetadata {
         next
     }
 
-    fn bump(&mut self, by: &str) {
+    pub(crate) fn bump(&mut self, by: &str) {
         self.version += 1;
         self.updated_by = by.to_string();
         // The result is a decision, not a guess, however it was derived.
         self.seeded = false;
+    }
+
+    /// Fingerprint of what maps a key to an owner: the ranges and the endpoints owning them, plus
+    /// the target of a migration in flight, since that moves keys too. Replicas are deliberately
+    /// out of it — one joining or leaving moves no key, and a scan must not be disturbed by it.
+    pub fn partition_fingerprint(&self) -> u64 {
+        let mut parts: Vec<String> = match &self.ring {
+            // Vnode tokens come from endpoint and index alone, so the owning set fixes the mapping.
+            Some(ring) => std::iter::once(format!("vnodes={}", ring.vnodes))
+                .chain(ring.shards.iter().map(|s| endpoint_of(&s.node_url).to_string()))
+                .collect(),
+            None => self.shards.iter()
+                .map(|s| format!("{}-{}@{}", s.start_hash, s.end_hash, endpoint_of(&s.node_url)))
+                .collect(),
+        };
+        if let Some(m) = &self.migration {
+            parts.push(format!("->{}", m.id));
+        }
+        // Sorted: the same owners listed in a different order are the same partitioning.
+        parts.sort();
+        xxhash_rust::xxh64::xxh64(parts.join("|").as_bytes(), 0)
     }
 
     /// Owners in the model actually in force, so fan-out and probing never disagree with routing.
@@ -422,8 +443,9 @@ pub fn plan_join(current: &ClusterMetadata, by: &str, leader_url: &str, req: &Jo
         return Err("url is required".to_string());
     }
     if req.voting == Some(true) {
-        return Err("a node cannot join as voting; runtime quorum changes need joint consensus \
-                    (commit 44). It joins as a learner and replicates immediately".to_string());
+        return Err("a node cannot join as voting; it joins as a learner and replicates \
+                    immediately, and POST /cluster/configuration promotes it through joint \
+                    consensus once it has caught up".to_string());
     }
     let role = req.role.clone().unwrap_or_else(|| "shard".to_string());
     if role != "shard" && role != "router" {
@@ -466,14 +488,56 @@ pub fn plan_join(current: &ClusterMetadata, by: &str, leader_url: &str, req: &Jo
     next.validate().map(|_| next).map_err(|e| e)
 }
 
+/// The view caught up with a committed configuration. Descriptive, not decisive: the log is what
+/// moved the quorum, and this only records where it moved to, so a node that has not adopted the
+/// view yet is behind on routing rather than voting against the change.
+///
+/// A demoted node stays a member as a learner rather than being dropped. It keeps receiving frames,
+/// and `in_quorum` reads the view when no configuration entry has reached the node yet.
+pub fn plan_configuration(
+    current: &ClusterMetadata,
+    by: &str,
+    leader_url: &str,
+    voters: &[String],
+) -> Result<ClusterMetadata, String> {
+    let mut next = current.clone();
+    for member in next.members.iter_mut() {
+        if member.role != "shard" {
+            continue;
+        }
+        let voting = voters.iter().any(|v| same_url(v, &member.url));
+        if voting == member.voting {
+            continue;
+        }
+        member.voting = voting;
+        member.follows = (!voting && !same_url(&member.url, leader_url))
+            .then(|| leader_url.to_string());
+    }
+    // A voter admitted straight from config may never have been a member of the view.
+    for voter in voters {
+        if next.member(voter).is_none() {
+            next.members.push(Member {
+                url: voter.clone(),
+                node_id: None,
+                role: "shard".to_string(),
+                shard_role: Some(if same_url(voter, leader_url) { "primary" } else { "replica" }.to_string()),
+                voting: true,
+                follows: None,
+            });
+        }
+    }
+    next.bump(by);
+    next.validate().map(|_| next)
+}
+
 pub fn plan_leave(current: &ClusterMetadata, by: &str, url: &str) -> Result<ClusterMetadata, String> {
     match current.member(url) {
         None => Err(format!("{} is not a member", url)),
-        // Losing a voter shrinks every majority it was counted in, and nothing here orders that
-        // against an election already in flight.
+        // Dropping it from the view is not what shrinks the quorum -- the log is -- but a member
+        // the log still counts and the view cannot name is a voter nothing can route to.
         Some(m) if m.voting => Err(format!(
-            "{} is a voting member; removing it would shrink the quorum, which needs joint \
-             consensus (commit 44)", url)),
+            "{} is a voting member; demote it with POST /cluster/configuration first, then \
+             remove it", url)),
         Some(_) => {
             let next = current.without_member(by, url);
             next.validate().map(|_| next).map_err(|e| e)
@@ -809,7 +873,8 @@ mod tests {
         let mut voting = join("http://n4");
         voting.voting = Some(true);
         let err = plan_join(&current, "n1", "http://n1", &voting).unwrap_err();
-        assert!(err.contains("joint consensus"), "the refusal must say what would make it safe: {}", err);
+        assert!(err.contains("/cluster/configuration"),
+            "the refusal must name what would make it safe: {}", err);
 
         let err = plan_join(&current, "n1", "http://n1", &join("http://n2")).unwrap_err();
         assert!(err.contains("already a voting member"),
@@ -819,7 +884,7 @@ mod tests {
         assert!(err.contains("itself"), "got: {}", err);
 
         let err = plan_leave(&current, "n1", "http://n2").unwrap_err();
-        assert!(err.contains("shrink the quorum"), "got: {}", err);
+        assert!(err.contains("demote it"), "got: {}", err);
 
         let err = plan_leave(&current, "n1", "http://nobody").unwrap_err();
         assert!(err.contains("not a member"), "got: {}", err);
@@ -857,6 +922,59 @@ mod tests {
         assert_eq!(twice.members.len(), 3, "the same node must not appear twice: {:?}", twice.members);
         assert_eq!(twice.member("http://c").unwrap().follows.as_deref(), Some("http://b"));
         twice.validate().expect("a duplicate would have failed validation");
+    }
+
+    /// M13: an unsorted cursor's positions only mean anything against the layout they were taken
+    /// against, so the fingerprint has to move when ownership moves and stay put when it does not.
+    #[test]
+    fn the_partition_fingerprint_tracks_ownership_and_nothing_else() {
+        let range = |start: u64, end: u64, url: &str, replicas: Vec<&str>| ShardInfo {
+            start_hash: start,
+            end_hash: end,
+            node_url: url.to_string(),
+            replica_urls: replicas.into_iter().map(str::to_string).collect(),
+        };
+        let split = |at: u64, replicas: Vec<&str>| view(1, "t", vec![
+            range(0, at, "http://a", replicas.clone()),
+            range(at, 0, "http://b", Vec::new()),
+        ]);
+
+        let base = split(100, Vec::new()).partition_fingerprint();
+        assert_eq!(split(100, Vec::new()).partition_fingerprint(), base, "the same layout twice");
+        assert_eq!(split(100, vec!["http://r1"]).partition_fingerprint(), base,
+            "a replica joining moves no key and must not invalidate a scan");
+        assert_ne!(split(200, Vec::new()).partition_fingerprint(), base, "a moved boundary moves keys");
+
+        let mut reordered = split(100, Vec::new());
+        reordered.shards.reverse();
+        assert_eq!(reordered.partition_fingerprint(), base, "the same ranges listed the other way");
+
+        let mut renamed = split(100, Vec::new());
+        renamed.shards[1].node_url = "http://c".to_string();
+        assert_ne!(renamed.partition_fingerprint(), base, "a different owner for the same range");
+
+        let mut trailing_slash = split(100, Vec::new());
+        trailing_slash.shards[0].node_url = "http://a/".to_string();
+        assert_eq!(trailing_slash.partition_fingerprint(), base, "endpoints, not raw URLs");
+
+        let ringed = ClusterMetadata {
+            ring: Some(HashRing { vnodes: 8, shards: vec![
+                crate::ring::RingShard { node_url: "http://a".to_string(), replica_urls: Vec::new() },
+            ]}),
+            ..view(2, "t", Vec::new())
+        };
+        let mut migrating = ringed.clone();
+        migrating.migration = Some(Migration {
+            id: "m1".to_string(),
+            target: HashRing { vnodes: 8, shards: vec![
+                crate::ring::RingShard { node_url: "http://a".to_string(), replica_urls: Vec::new() },
+                crate::ring::RingShard { node_url: "http://b".to_string(), replica_urls: Vec::new() },
+            ]},
+            started_by: "t".to_string(),
+            phase: MigrationPhase::default(),
+        });
+        assert_ne!(migrating.partition_fingerprint(), ringed.partition_fingerprint(),
+            "keys are moving while a handover is in flight");
     }
 
     #[test]

@@ -3,11 +3,14 @@
 use super::failover::{adopt_existing_leader, demote};
 use super::progress::ProgressMeta;
 use crate::consensus::state::ReplicationMeta;
+use crate::replication::stream::replicate_to_peers;
 use crate::state::AppState;
+use crate::storage::frame::Configuration;
+use crate::storage::FrameHeader;
 use crate::util::same_endpoint;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -30,6 +33,10 @@ pub struct VoteRequest {
     pub last_term: u64,
     #[serde(default)]
     pub logs: HashMap<String, LogTail>,
+    /// How a voter recognises the candidate in its own configuration, which is keyed by endpoint
+    /// and not by `candidate_id`. Absent from a peer that predates configuration entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_url: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -104,12 +111,28 @@ fn candidate_is_current(my_logs: &HashMap<String, LogTail>, my_summary: LogTail,
     my_logs.iter().all(|(name, mine)| req.logs.get(name).copied().unwrap_or_default() >= *mine)
 }
 
-// Election invariant: at most one vote per term, never for a candidate whose log is behind.
+/// Whether this voter's own configuration still counts the candidate. A demoted node that has not
+/// heard about its demotion goes on campaigning, and a voter that grants it a vote hands a leader
+/// to a set the cluster has left: its majorities are computed over the members it still thinks it
+/// has, and those are not majorities of the configuration in force.
+///
+/// `None` for either side is a grant: a peer that sends no url predates configuration entries, and
+/// a voter holding no configuration has nothing to judge the candidate against.
+fn candidate_is_a_member(my_config: Option<&Configuration>, req: &VoteRequest) -> bool {
+    match (my_config, req.candidate_url.as_deref()) {
+        (Some(config), Some(url)) => config.contains(url),
+        _ => true,
+    }
+}
+
+// Election invariant: at most one vote per term, never for a candidate whose log is behind, and
+// never for one this voter's configuration does not name.
 pub fn decide_vote(
     cur_term: u64,
     cur_voted_for: &Option<String>,
     my_logs: &HashMap<String, LogTail>,
     my_summary: LogTail,
+    my_config: Option<&Configuration>,
     req: &VoteRequest,
 ) -> VoteDecision {
     if req.term < cur_term {
@@ -129,7 +152,7 @@ pub fn decide_vote(
     };
     let up_to_date = candidate_is_current(my_logs, my_summary, req);
 
-    if can_vote && up_to_date {
+    if can_vote && up_to_date && candidate_is_a_member(my_config, req) {
         VoteDecision { granted: true, term, voted_for: Some(req.candidate_id.clone()) }
     } else {
         VoteDecision { granted: false, term, voted_for }
@@ -147,7 +170,7 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64) {
 
     // Checked here rather than at the poll, so a node told mid-flight still stops. Covers both a
     // node booted as a learner and one the view has since named non-voting.
-    if !state.can_campaign() {
+    if !state.in_quorum() {
         info!(target: "election",
             "This node is a non-voting member; waiting for the leader rather than standing");
         adopt_existing_leader(state).await;
@@ -179,19 +202,23 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64) {
         return;
     }
 
-    let voters = state.voting_set();
-    let needed = majority(voters.len());
+    let quorum = state.quorum_config();
     let own = state.own_url();
-    let peers: Vec<String> = voters.into_iter().filter(|v| !same_endpoint(v, &own)).collect();
-    info!(target: "election", "Node {} standing for term {} ({} voters, need {} votes)", candidate_id, new_term, peers.len() + 1, needed);
+    let peers: Vec<String> = quorum.members().into_iter().filter(|v| !same_endpoint(v, &own)).collect();
+    info!(target: "election", "Node {} standing for term {} (voters {:?}, outgoing {:?})",
+        candidate_id, new_term, quorum.voters, quorum.outgoing);
 
-    if peers.is_empty() {
-        // Sole voter, so the self-vote already is the majority.
+    // The self-vote alone can carry a lone voter; while joint it cannot carry a half it is not in.
+    if quorum.has_quorum(std::slice::from_ref(&own)) {
         become_leader(state, new_term, &candidate_id).await;
         return;
     }
+    if peers.is_empty() {
+        info!(target: "election", "No peers to ask and the self-vote is short of a quorum");
+        return;
+    }
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<(bool, u64)>(peers.len());
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, bool, u64)>(peers.len());
     for peer in peers {
         let client = state.client.clone();
         let req = VoteRequest {
@@ -200,14 +227,16 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64) {
             last_lsn: my_tail.last_lsn,
             last_term: my_tail.last_term,
             logs: my_logs.clone(),
+            candidate_url: Some(own.clone()),
         };
         let tx = tx.clone();
+        let voter = peer.clone();
         tokio::spawn(async move {
             let url = format!("{}/internal/vote", peer);
             let sent = client.post(&url)
                 .timeout(Duration::from_millis(VOTE_REQUEST_TIMEOUT_MS))
                 .json(&req).send().await;
-            let result = match sent {
+            let (granted, term) = match sent {
                 Ok(r) if r.status().is_success() => {
                     match r.json::<VoteResponse>().await {
                         Ok(v) => (v.vote_granted, v.term),
@@ -216,25 +245,31 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64) {
                 },
                 _ => (false, 0),
             };
-            let _ = tx.send(result).await;
+            let _ = tx.send((voter, granted, term)).await;
         });
     }
     drop(tx);
 
-    let votes = Arc::new(AtomicUsize::new(1));
+    // Who granted, not how many: while joint a tally cannot tell a majority of both halves from
+    // the same count spread across one of them.
+    let granted = Arc::new(std::sync::Mutex::new(vec![own.clone()]));
     let highest_term = Arc::new(AtomicU64::new(new_term));
-    let votes_inner = votes.clone();
+    let granted_inner = granted.clone();
     let ht_inner = highest_term.clone();
+    let quorum_inner = quorum.clone();
     let election_timeout = Duration::from_millis(max_delay_ms.max(1000) + 2000);
     let _ = tokio::time::timeout(election_timeout, async move {
-        while votes_inner.load(Ordering::Relaxed) < needed {
+        loop {
+            if quorum_inner.has_quorum(&granted_inner.lock().unwrap()) {
+                return;
+            }
             match rx.recv().await {
-                Some((granted, term)) => {
+                Some((voter, vote_granted, term)) => {
                     if term > ht_inner.load(Ordering::Relaxed) {
                         ht_inner.store(term, Ordering::Relaxed);
                     }
-                    if granted {
-                        votes_inner.fetch_add(1, Ordering::Relaxed);
+                    if vote_granted {
+                        granted_inner.lock().unwrap().push(voter);
                     }
                 },
                 None => break,
@@ -249,11 +284,12 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64) {
         return;
     }
 
-    let tally = votes.load(Ordering::Relaxed);
-    if tally >= needed {
+    let granted = granted.lock().unwrap().clone();
+    if quorum.has_quorum(&granted) {
         become_leader(state, new_term, &candidate_id).await;
     } else {
-        info!(target: "election", "Only {}/{} votes for term {}; election failed, will retry", tally, needed, new_term);
+        info!(target: "election", "Votes {:?} are short of a quorum for term {}; election failed, will retry",
+            granted, new_term);
     }
 }
 
@@ -280,13 +316,73 @@ pub fn seed_leader_progress(state: &AppState) {
     }
 }
 
+/// Raft's no-op, appended once per collection that has one. A collection with a durable-but-
+/// uncommitted tail from a previous leader has no current-term entry, so `advance` has no floor and
+/// will not commit it however many replicas hold it; committing a barrier above it commits it
+/// indirectly. Collections with nothing pending are skipped — the floor a write sets is enough for
+/// the write itself, and a barrier there would be a frame written for no reason on every election.
+pub fn publish_inherited_tails(state: &AppState) {
+    let db = match state.db.as_ref() {
+        Some(db) => db.clone(),
+        None => return,
+    };
+    let term = state.current_term();
+    let state = state.clone();
+
+    tokio::spawn(async move {
+        for name in db.list_collections().unwrap_or_default() {
+            let col = match db.get_collection(&name) {
+                Ok(c) if c.pending_len() > 0 => c,
+                _ => continue,
+            };
+            // Leadership is re-checked per collection: this loop outlives a demotion otherwise.
+            if !state.is_leader() || state.current_term() != term {
+                return;
+            }
+
+            let appended = {
+                let col = col.clone();
+                tokio::task::spawn_blocking(move || col.barrier(term)).await
+            };
+            let (frame, _wal_id, _offset, lsn) = match appended {
+                Ok(Ok(t)) => t,
+                Ok(Err(e)) => {
+                    warn!(target: "election", collection = %name, error = %e,
+                        "Could not append the promotion barrier; the inherited tail stays staged");
+                    continue;
+                },
+                Err(e) => {
+                    warn!(target: "election", collection = %name, error = %e, "Barrier append panicked");
+                    continue;
+                },
+            };
+
+            state.note_leader_append(&name, lsn);
+            let commit = col.enqueue_commit();
+            let prev_lsn = FrameHeader::parse(&frame).map_or(0, |h| h.prev_lsn);
+            let commit_index = state.committed_lsn(&name);
+            replicate_to_peers(state.clone(), name.clone(), frame, term, commit_index, lsn, prev_lsn);
+
+            // Own durability counts toward the quorum only after the fsync, as on the write path.
+            if matches!(commit.await, Ok(Ok(()))) {
+                state.advance_own_commit(&name, col.durable_lsn());
+            }
+            info!(target: "election", collection = %name, lsn,
+                "Appended a promotion barrier to publish an inherited tail");
+        }
+    });
+}
+
 async fn become_leader(state: &AppState, term: u64, candidate_id: &str) {
     // The caller already refused to campaign, so reaching here means a new path grew that skips
     // that check. Cheaper to re-test than to discover it as a split brain.
-    if !state.can_campaign() {
+    if !state.in_quorum() {
         warn!(target: "election", "Refusing leadership at term {}: this node is non-voting", term);
         return;
     }
+    // A configuration this node holds but never installed -- a snapshot arriving between boot and
+    // now -- would otherwise seed the commit quorum from the view instead of from the log.
+    state.refresh_configuration();
     // Sampled before the replication lock, which `voting_peers` must never be called under. Same
     // set the election counted, so the commit quorum cannot end up narrower than the vote was.
     let quorum_peers = state.voting_peers();
@@ -302,6 +398,9 @@ async fn become_leader(state: &AppState, term: u64, candidate_id: &str) {
         repl.replicas = quorum_peers;
     }
     seed_leader_progress(state);
+    publish_inherited_tails(state);
+    // The leader that would have ended a change in flight is the one this node replaced.
+    super::reconfigure::resume_change(state);
     // Term and self-vote are already durable; losing only is_leader rejoins as a follower.
     if let Err(e) = (ReplicationMeta { term, is_leader: true, voted_for: Some(candidate_id.to_string()) })
         .save(&state.config.data_dir)
@@ -335,6 +434,7 @@ mod tests {
             last_term,
             last_lsn,
             logs: HashMap::new(),
+            candidate_url: None,
         }
     }
 
@@ -353,6 +453,7 @@ mod tests {
             last_term: summary.last_term,
             last_lsn: logs.values().map(|t| t.last_lsn).max().unwrap_or(0),
             logs,
+            candidate_url: None,
         }
     }
 
@@ -371,7 +472,7 @@ mod tests {
 
     #[test]
     fn vote_granted_for_fresh_higher_term_when_up_to_date() {
-        let d = decide_vote(2, &None, &HashMap::new(), scalar(2, 100), &vote_req(3, "n1", 2, 100));
+        let d = decide_vote(2, &None, &HashMap::new(), scalar(2, 100), None, &vote_req(3, "n1", 2, 100));
         assert!(d.granted);
         assert_eq!(d.term, 3);
         assert_eq!(d.voted_for.as_deref(), Some("n1"));
@@ -379,7 +480,7 @@ mod tests {
 
     #[test]
     fn vote_denied_for_stale_candidate_term() {
-        let d = decide_vote(5, &None, &HashMap::new(), scalar(5, 100), &vote_req(4, "n1", 5, 100));
+        let d = decide_vote(5, &None, &HashMap::new(), scalar(5, 100), None, &vote_req(4, "n1", 5, 100));
         assert!(!d.granted);
         assert_eq!(d.term, 5);
         assert_eq!(d.voted_for, None);
@@ -387,34 +488,34 @@ mod tests {
 
     #[test]
     fn vote_at_most_once_per_term() {
-        let d1 = decide_vote(3, &None, &HashMap::new(), scalar(1, 50), &vote_req(3, "n1", 1, 50));
+        let d1 = decide_vote(3, &None, &HashMap::new(), scalar(1, 50), None, &vote_req(3, "n1", 1, 50));
         assert!(d1.granted);
         assert_eq!(d1.voted_for.as_deref(), Some("n1"));
 
-        let d2 = decide_vote(3, &d1.voted_for, &HashMap::new(), scalar(1, 50), &vote_req(3, "n2", 1, 50));
+        let d2 = decide_vote(3, &d1.voted_for, &HashMap::new(), scalar(1, 50), None, &vote_req(3, "n2", 1, 50));
         assert!(!d2.granted, "must not vote for a second candidate in the same term");
         assert_eq!(d2.voted_for.as_deref(), Some("n1"));
 
-        let d3 = decide_vote(3, &d1.voted_for, &HashMap::new(), scalar(1, 50), &vote_req(3, "n1", 1, 50));
+        let d3 = decide_vote(3, &d1.voted_for, &HashMap::new(), scalar(1, 50), None, &vote_req(3, "n1", 1, 50));
         assert!(d3.granted, "re-voting for the same candidate is idempotent");
     }
 
     #[test]
     fn vote_denied_when_candidate_log_behind() {
-        let behind_lsn = decide_vote(3, &None, &HashMap::new(), scalar(2, 100), &vote_req(4, "n1", 2, 99));
+        let behind_lsn = decide_vote(3, &None, &HashMap::new(), scalar(2, 100), None, &vote_req(4, "n1", 2, 99));
         assert!(!behind_lsn.granted, "candidate with lower lsn at same log term must lose");
 
-        let behind_term = decide_vote(3, &None, &HashMap::new(), scalar(2, 100), &vote_req(4, "n1", 1, 500));
+        let behind_term = decide_vote(3, &None, &HashMap::new(), scalar(2, 100), None, &vote_req(4, "n1", 1, 500));
         assert!(!behind_term.granted, "candidate with lower last log term must lose even with higher lsn");
 
-        let ahead = decide_vote(3, &None, &HashMap::new(), scalar(2, 100), &vote_req(4, "n1", 3, 1));
+        let ahead = decide_vote(3, &None, &HashMap::new(), scalar(2, 100), None, &vote_req(4, "n1", 3, 1));
         assert!(ahead.granted, "higher last log term wins regardless of lsn");
     }
 
     #[test]
     fn higher_term_vote_resets_prior_vote() {
         let prior = Some("n2".to_string());
-        let d = decide_vote(3, &prior, &HashMap::new(), scalar(1, 50), &vote_req(4, "n1", 1, 50));
+        let d = decide_vote(3, &prior, &HashMap::new(), scalar(1, 50), None, &vote_req(4, "n1", 1, 50));
         assert!(d.granted, "a higher term clears the old vote, so n1 can win");
         assert_eq!(d.term, 4);
         assert_eq!(d.voted_for.as_deref(), Some("n1"));
@@ -429,7 +530,7 @@ mod tests {
         let swapped = per_log_req(5, "n1", &[("users", 4, 3), ("orders", 4, 10)]);
         assert_eq!(swapped.last_lsn, 10, "the global summary cannot tell these two apart");
 
-        let d = decide_vote(4, &None, &mine, summary, &swapped);
+        let d = decide_vote(4, &None, &mine, summary, None, &swapped);
         assert!(!d.granted,
             "the candidate is missing users 4..10; electing it would drop entries a quorum may hold");
         assert_eq!(d.term, 5, "the term still advances even though the vote is refused");
@@ -439,7 +540,7 @@ mod tests {
     fn a_higher_term_on_one_collection_does_not_excuse_a_stale_other() {
         let mine = tails(&[("users", 4, 10), ("orders", 4, 11)]);
 
-        let d = decide_vote(4, &None, &mine, scalar(4, 11),
+        let d = decide_vote(4, &None, &mine, scalar(4, 11), None,
             &per_log_req(5, "n1", &[("users", 4, 5), ("orders", 5, 12)]));
         assert!(!d.granted,
             "a newer term on orders says nothing about users, where this candidate is behind");
@@ -449,11 +550,11 @@ mod tests {
     fn a_candidate_current_on_every_collection_wins() {
         let mine = tails(&[("users", 4, 10), ("orders", 4, 11)]);
 
-        let equal = decide_vote(4, &None, &mine, scalar(4, 11),
+        let equal = decide_vote(4, &None, &mine, scalar(4, 11), None,
             &per_log_req(5, "n1", &[("users", 4, 10), ("orders", 4, 11)]));
         assert!(equal.granted, "matching every log is up to date");
 
-        let ahead = decide_vote(4, &None, &mine, scalar(4, 11),
+        let ahead = decide_vote(4, &None, &mine, scalar(4, 11), None,
             &per_log_req(5, "n2", &[("users", 5, 20), ("orders", 4, 11)]));
         assert!(ahead.granted, "ahead on one log and level on the rest is up to date");
     }
@@ -462,12 +563,12 @@ mod tests {
     fn a_collection_the_candidate_has_never_seen_makes_it_stale() {
         let mine = tails(&[("users", 4, 10), ("orders", 4, 3)]);
 
-        let d = decide_vote(4, &None, &mine, scalar(4, 10),
+        let d = decide_vote(4, &None, &mine, scalar(4, 10), None,
             &per_log_req(5, "n1", &[("users", 4, 10)]));
         assert!(!d.granted, "a log absent from the candidate is one it holds nothing of");
 
         let empty_too = tails(&[("users", 4, 10), ("orders", 0, 0)]);
-        let d = decide_vote(4, &None, &empty_too, scalar(4, 10),
+        let d = decide_vote(4, &None, &empty_too, scalar(4, 10), None,
             &per_log_req(5, "n2", &[("users", 4, 10)]));
         assert!(d.granted, "but an empty collection dir costs the candidate nothing");
     }
@@ -476,14 +577,14 @@ mod tests {
     fn collections_the_candidate_alone_holds_do_not_block_it() {
         let mine = tails(&[("users", 4, 10)]);
 
-        let d = decide_vote(4, &None, &mine, scalar(4, 10),
+        let d = decide_vote(4, &None, &mine, scalar(4, 10), None,
             &per_log_req(5, "n1", &[("users", 4, 10), ("audit", 4, 99)]));
         assert!(d.granted, "only logs this voter holds can be lost, so extras are irrelevant");
     }
 
     #[test]
     fn a_voter_holding_no_log_grants_freely() {
-        let d = decide_vote(0, &None, &HashMap::new(), LogTail::default(),
+        let d = decide_vote(0, &None, &HashMap::new(), LogTail::default(), None,
             &per_log_req(1, "n1", &[("users", 3, 40)]));
         assert!(d.granted, "a node with nothing to lose has no grounds to refuse");
     }
@@ -492,14 +593,38 @@ mod tests {
     fn a_peer_that_sends_no_summaries_falls_back_to_the_scalar_compare() {
         let mine = tails(&[("users", 4, 10), ("orders", 4, 3)]);
 
-        let current = decide_vote(4, &None, &mine, scalar(4, 10), &vote_req(5, "n1", 4, 10));
+        let current = decide_vote(4, &None, &mine, scalar(4, 10), None, &vote_req(5, "n1", 4, 10));
         assert!(current.granted, "a pre-`logs` peer is still judged on the summary it does send");
 
-        let behind = decide_vote(4, &None, &mine, scalar(4, 10), &vote_req(5, "n2", 4, 9));
+        let behind = decide_vote(4, &None, &mine, scalar(4, 10), None, &vote_req(5, "n2", 4, 9));
         assert!(!behind.granted);
 
-        let nothing = decide_vote(4, &None, &mine, scalar(4, 10), &vote_req(5, "n3", 0, 0));
+        let nothing = decide_vote(4, &None, &mine, scalar(4, 10), None, &vote_req(5, "n3", 0, 0));
         assert!(!nothing.granted, "an empty log must lose to a voter that holds entries");
+    }
+
+    #[test]
+    fn a_candidate_the_voters_configuration_does_not_name_is_refused() {
+        let config = Configuration::simple(vec!["http://a".into(), "http://b".into()]);
+        let mut req = vote_req(5, "n3", 4, 10);
+
+        req.candidate_url = Some("http://c".to_string());
+        let d = decide_vote(4, &None, &HashMap::new(), LogTail::default(), Some(&config), &req);
+        assert!(!d.granted,
+            "a demoted node that has not heard about its demotion goes on campaigning, and this \
+             vote would hand it a leadership over a set the cluster has left");
+        assert_eq!(d.term, 5, "the term still advances; only the grant is withheld");
+
+        req.candidate_url = Some("http://b".to_string());
+        assert!(decide_vote(4, &None, &HashMap::new(), LogTail::default(), Some(&config), &req).granted);
+
+        // Both directions of not knowing: no url from the peer, or no configuration here.
+        req.candidate_url = None;
+        assert!(decide_vote(4, &None, &HashMap::new(), LogTail::default(), Some(&config), &req).granted,
+            "a peer that predates configuration entries must still be able to win an election");
+        req.candidate_url = Some("http://c".to_string());
+        assert!(decide_vote(4, &None, &HashMap::new(), LogTail::default(), None, &req).granted,
+            "and a voter holding no configuration has nothing to judge the candidate against");
     }
 
     #[test]

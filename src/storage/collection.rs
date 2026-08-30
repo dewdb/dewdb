@@ -1,10 +1,10 @@
 //! A collection's index, key locks, group commit, and read path.
 
-use super::frame::LogEntry;
+use super::frame::{Configuration, LogEntry};
 use super::index::{AppliedMeta, IndexEntry, IndexSnapshot, LsnMeta, ReadCacheConfig, INDEX_FILENAME};
 use super::wal::WalsState;
 use crate::model::MAX_QUERY_LIMIT;
-use crate::query::{matches_filter, Filter};
+use crate::query::{compare_rows, is_after, matches_filter, Filter, SortCursor, SortSpec, SortedRow};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Write};
@@ -41,6 +41,11 @@ pub struct Collection {
     /// location at or under this id is stale and must be re-resolved rather than read.
     pub retired_through: AtomicU64,
     pub released: AtomicBool,
+    /// A committed drop emptied this collection and nothing has been written since. It still holds
+    /// the log the drop lives in, which is what a lagging replica and a new leader read it from.
+    pub dropped: AtomicBool,
+    /// Newest committed `Config`. Rides `applied.meta` for the same reason `dropped` does.
+    committed_config: std::sync::Mutex<Option<Configuration>>,
     pub compacting: AtomicBool,
     /// Prevents compaction from retiring WAL files during snapshot streaming.
     pub snapshot_boundary: std::sync::Mutex<()>,
@@ -58,10 +63,34 @@ pub struct Collection {
 }
 
 pub struct StagedApply {
-    pub key: String,
     pub wal_id: u64,
     pub offset: u64,
-    pub entry: Option<IndexEntry>,
+    pub effect: StagedEffect,
+}
+
+/// What committing a staged frame does to the index.
+pub enum StagedEffect {
+    Put { key: String, entry: IndexEntry },
+    Remove { key: String },
+    /// A barrier: it occupies an LSN and touches nothing.
+    Nothing,
+    /// A drop: every key goes, and the collection is a tombstone until something is written above it.
+    Clear,
+    /// A configuration. Like a barrier it touches no key; unlike one it leaves something behind.
+    Configure(Configuration),
+}
+
+impl StagedEffect {
+    /// What this frame leaves for `key`: `None` if it does not touch it, otherwise the entry it
+    /// leaves behind, or `Some(None)` if the key is gone.
+    fn resolve<'a>(&'a self, key: &str) -> Option<Option<&'a IndexEntry>> {
+        match self {
+            Self::Put { key: k, entry } if k == key => Some(Some(entry)),
+            Self::Remove { key: k } if k == key => Some(None),
+            Self::Clear => Some(None),
+            _ => None,
+        }
+    }
 }
 
 impl Collection {
@@ -78,9 +107,12 @@ impl Collection {
         let data_root = root_path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
         // Absent means no consensus history (fresh node, or standalone engine): replay everything.
-        let applied_through = AppliedMeta::load(&root_path)
-            .map(|m| m.applied_lsn)
-            .unwrap_or(u64::MAX);
+        let applied = AppliedMeta::load(&root_path);
+        let applied_through = applied.as_ref().map(|m| m.applied_lsn).unwrap_or(u64::MAX);
+        // Seeded from the watermark because compaction retires the drop and config frames replay
+        // would otherwise find them in.
+        let mut dropped = applied.as_ref().is_some_and(|m| m.dropped);
+        let mut committed_config = applied.and_then(|m| m.config);
 
         let mut index = BTreeMap::new();
         let mut pending: BTreeMap<u64, StagedApply> = BTreeMap::new();
@@ -145,7 +177,7 @@ impl Collection {
         if !snapshot_loaded {
             info!(target: "storage", collection = %name, "Replaying all WALs");
              for (id, path) in &wal_files {
-                let r = Self::replay_file_from(*id, path, 0, &mut index, &mut pending, applied_through, &cache, &mut inline_used)?;
+                let r = Self::replay_file_from(*id, path, 0, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut dropped, &mut committed_config)?;
                 fold(r, &mut max_lsn, &mut max_term);
             }
         } else {
@@ -154,10 +186,10 @@ impl Collection {
                      continue;
                  } else if *id == snapshot_wal_id {
                      info!(target: "storage", collection = %name, wal_id = id, offset = snapshot_offset, "Resuming WAL from snapshot offset");
-                     let r = Self::replay_file_from(*id, path, snapshot_offset, &mut index, &mut pending, applied_through, &cache, &mut inline_used)?;
+                     let r = Self::replay_file_from(*id, path, snapshot_offset, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut dropped, &mut committed_config)?;
                      fold(r, &mut max_lsn, &mut max_term);
                  } else {
-                     let r = Self::replay_file_from(*id, path, 0, &mut index, &mut pending, applied_through, &cache, &mut inline_used)?;
+                     let r = Self::replay_file_from(*id, path, 0, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut dropped, &mut committed_config)?;
                      fold(r, &mut max_lsn, &mut max_term);
                  }
              }
@@ -200,6 +232,8 @@ impl Collection {
             read_pool_counter: AtomicUsize::new(0),
             retired_through: AtomicU64::new(0),
             released: AtomicBool::new(false),
+            dropped: AtomicBool::new(dropped),
+            committed_config: std::sync::Mutex::new(committed_config),
             compacting: AtomicBool::new(false),
             snapshot_boundary: std::sync::Mutex::new(()),
             cache,
@@ -242,6 +276,11 @@ impl Collection {
         }
     }
 
+    fn clear_index(&self, index: &mut BTreeMap<String, IndexEntry>) {
+        index.clear();
+        self.inline_bytes.store(0, Ordering::Relaxed);
+    }
+
     // Striped: distinct keys share locks, and batch callers must dedupe stripes or self-deadlock.
     pub fn key_stripe(&self, key: &str) -> usize {
         xxhash_rust::xxh64::xxh64(key.as_bytes(), 0) as usize % KEY_LOCK_STRIPES
@@ -260,7 +299,7 @@ impl Collection {
     pub fn exists_including_staged(&self, key: &str) -> bool {
         let staged = {
             let pending = self.pending.lock().unwrap();
-            pending.values().rev().find(|s| s.key == key).map(|s| s.entry.is_some())
+            pending.values().rev().find_map(|s| s.effect.resolve(key)).map(|e| e.is_some())
         };
         staged.unwrap_or_else(|| self.exists(key))
     }
@@ -284,6 +323,47 @@ impl Collection {
             ts: Self::current_timestamp(),
         };
         self.append(entry, term)
+    }
+
+    /// Raft's no-op. Committing it commits everything below it, which is the only way an entry from
+    /// a previous leader's term becomes visible in a collection nothing writes to.
+    pub fn barrier(&self, term: u64) -> io::Result<(Vec<u8>, u64, u64, u64)> {
+        self.append(LogEntry::Barrier { ts: Self::current_timestamp() }, term)
+    }
+
+    /// The drop as a log entry. Appending it deletes nothing: it takes effect where every other
+    /// entry does, on commit, which is what makes a drop survive a leader change and reach a
+    /// replica that was down for it.
+    pub fn drop_marker(&self, term: u64) -> io::Result<(Vec<u8>, u64, u64, u64)> {
+        self.append(LogEntry::Drop { ts: Self::current_timestamp() }, term)
+    }
+
+    /// A voting set. It is the one entry a node acts on before it commits, so the caller must
+    /// re-read `latest_config` the moment this returns rather than waiting for the apply.
+    pub fn configure(&self, config: Configuration, term: u64) -> io::Result<(Vec<u8>, u64, u64, u64)> {
+        self.append(LogEntry::Config { config, ts: Self::current_timestamp() }, term)
+    }
+
+    pub fn is_dropped(&self) -> bool {
+        self.dropped.load(Ordering::SeqCst)
+    }
+
+    pub fn committed_config(&self) -> Option<Configuration> {
+        self.committed_config.lock().unwrap().clone()
+    }
+
+    /// The configuration in force: the newest one in the log, committed or not. Raft §6 — a node
+    /// uses the latest configuration it holds, because the one that replaces it may never commit
+    /// and the quorum that would commit it is the one it names.
+    pub fn latest_config(&self) -> Option<Configuration> {
+        let staged = {
+            let pending = self.pending.lock().unwrap();
+            pending.values().rev().find_map(|s| match &s.effect {
+                StagedEffect::Configure(c) => Some(c.clone()),
+                _ => None,
+            })
+        };
+        staged.or_else(|| self.committed_config())
     }
 
     // Group commit: one fsync serves every waiter; the tick bounds latency when the batch stays short.
@@ -461,7 +541,7 @@ impl Collection {
         end: Option<&str>,
         filter: &Option<Filter>,
         limit: usize,
-    ) -> io::Result<(Vec<serde_json::Value>, Option<String>)> {
+    ) -> io::Result<(Vec<SortedRow>, Option<String>)> {
         // Capacity is capped independently of the caller: the vector still grows to `limit`.
         let mut items = Vec::with_capacity(limit.min(MAX_QUERY_LIMIT));
         let mut last_key: Option<String> = None;
@@ -483,10 +563,10 @@ impl Collection {
                         }
                     }
                 }
-            } else if let Some(val) = self.get(key)? {
-                let matched = filter.as_ref().map_or(true, |f| matches_filter(&val, f));
+            } else if let Some(value) = self.get(key)? {
+                let matched = filter.as_ref().map_or(true, |f| matches_filter(&value, f));
                 if matched {
-                    items.push(val);
+                    items.push(SortedRow { key: key.to_string(), value });
                     last_key = Some(key.to_string());
                 }
             }
@@ -495,6 +575,53 @@ impl Collection {
 
         let next_cursor = if has_more { last_key } else { None };
         Ok((items, next_cursor))
+    }
+
+    /// Top `limit` rows of the range in sort order, holding at most `2 * limit` of them at once.
+    /// The scan itself is still the whole range: there is no index on the sort field, so every page
+    /// re-reads it and pagination bounds the memory rather than the work.
+    pub fn sorted_page(
+        &self,
+        start: Option<&str>,
+        end: Option<&str>,
+        filter: &Option<Filter>,
+        sort: &SortSpec,
+        after: Option<&SortCursor>,
+        limit: usize,
+    ) -> io::Result<(Vec<SortedRow>, bool)> {
+        let keep = limit.min(MAX_QUERY_LIMIT);
+        let spill = keep.saturating_mul(2).max(1);
+        let mut rows: Vec<SortedRow> = Vec::new();
+        let mut matched = 0usize;
+
+        self.try_for_each_key::<io::Error, _>(None, start, end, |key| {
+            let value = match self.get(key)? {
+                Some(v) => v,
+                None => return Ok(true),
+            };
+            if let Some(f) = filter {
+                if !matches_filter(&value, f) {
+                    return Ok(true);
+                }
+            }
+
+            let row = SortedRow { key: key.to_string(), value };
+            if after.map_or(false, |c| !is_after(&row, c, sort)) {
+                return Ok(true);
+            }
+
+            matched += 1;
+            rows.push(row);
+            if rows.len() >= spill {
+                rows.sort_by(|a, b| compare_rows(a, b, sort));
+                rows.truncate(keep);
+            }
+            Ok(true)
+        })?;
+
+        rows.sort_by(|a, b| compare_rows(a, b, sort));
+        rows.truncate(keep);
+        Ok((rows, matched > keep))
     }
 
     fn value_from_payload(payload: &[u8]) -> Option<serde_json::Value> {
@@ -599,14 +726,17 @@ impl Collection {
     /// its WAL would lose a write whose client is still waiting on the fsync. There is deliberately
     /// no public way to stage, so no append path can grow that window back.
     pub(super) fn stage_appended(&self, lsn: u64, entry: &LogEntry, wal_id: u64, offset: u64, payload: &[u8]) {
-        let staged = match entry {
-            LogEntry::Put { key, .. } => StagedApply {
-                key: key.clone(), wal_id, offset,
-                entry: Some(self.build_entry(wal_id, offset, payload)),
+        let effect = match entry {
+            LogEntry::Put { key, .. } => StagedEffect::Put {
+                key: key.clone(),
+                entry: self.build_entry(wal_id, offset, payload),
             },
-            LogEntry::Del { key, .. } => StagedApply { key: key.clone(), wal_id, offset, entry: None },
+            LogEntry::Del { key, .. } => StagedEffect::Remove { key: key.clone() },
+            LogEntry::Barrier { .. } => StagedEffect::Nothing,
+            LogEntry::Drop { .. } => StagedEffect::Clear,
+            LogEntry::Config { config, .. } => StagedEffect::Configure(config.clone()),
         };
-        self.pending.lock().unwrap().insert(lsn, staged);
+        self.pending.lock().unwrap().insert(lsn, StagedApply { wal_id, offset, effect });
     }
 
     /// First stage marks this collection consensus-managed. Without the watermark, a restart before
@@ -615,7 +745,9 @@ impl Collection {
     pub(super) fn record_watermark_once(&self) {
         if !self.watermark_recorded.swap(true, Ordering::SeqCst) {
             let applied_lsn = self.applied_lsn();
-            if let Err(e) = (AppliedMeta { applied_lsn }).save(&self.root_path) {
+            if let Err(e) = (AppliedMeta { applied_lsn, dropped: self.is_dropped(), config: self.committed_config() })
+                .save(&self.root_path)
+            {
                 error!(target: "storage", collection = %self.name, error = %e,
                     "Failed to record applied watermark");
                 self.watermark_recorded.store(false, Ordering::SeqCst);
@@ -639,9 +771,26 @@ impl Collection {
             if !ready.is_empty() {
                 let mut index = self.index.write().unwrap();
                 for (_lsn, staged) in ready.iter() {
-                    match &staged.entry {
-                        Some(entry) => self.apply_index_put(&mut index, staged.key.clone(), entry.clone()),
-                        None => self.apply_index_remove(&mut index, &staged.key),
+                    match &staged.effect {
+                        StagedEffect::Put { key, entry } => {
+                            self.apply_index_put(&mut index, key.clone(), entry.clone());
+                            self.dropped.store(false, Ordering::SeqCst);
+                        },
+                        StagedEffect::Remove { key } => {
+                            self.apply_index_remove(&mut index, key);
+                            self.dropped.store(false, Ordering::SeqCst);
+                        },
+                        // A barrier is committed, never applied: being committed is its whole job.
+                        StagedEffect::Nothing => {},
+                        StagedEffect::Clear => {
+                            self.clear_index(&mut index);
+                            self.dropped.store(true, Ordering::SeqCst);
+                        },
+                        // Already in force since it was appended; committing it is what makes it
+                        // survive compaction retiring its frame.
+                        StagedEffect::Configure(config) => {
+                            *self.committed_config.lock().unwrap() = Some(config.clone());
+                        },
                     }
                 }
             }
@@ -651,7 +800,13 @@ impl Collection {
         };
 
         if advanced {
-            if let Err(e) = (AppliedMeta { applied_lsn: committed_lsn }).save(&self.root_path) {
+            if let Err(e) = (AppliedMeta {
+                applied_lsn: committed_lsn,
+                dropped: self.is_dropped(),
+                config: self.committed_config(),
+            })
+                .save(&self.root_path)
+            {
                 error!(target: "storage", collection = %self.name, error = %e,
                     "Failed to persist applied watermark; a restart will re-stage these entries");
             }
@@ -666,8 +821,8 @@ impl Collection {
             pending
                 .values()
                 .rev()
-                .find(|s| s.key == key)
-                .map(|s| s.entry.clone())
+                .find_map(|s| s.effect.resolve(key))
+                .map(|e| e.cloned())
         };
         match staged {
             Some(None) => Ok(None),
@@ -935,6 +1090,55 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// H8: the sorted path used to materialize every value in the range and drop `cursor` on the
+    /// floor. It now holds at most `2 * limit` rows and resumes from a position in the sort order.
+    #[tokio::test]
+    async fn sorted_page_walks_the_whole_order_in_bounded_pages() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        // Keys ascend while the sort field descends, so key order cannot stand in for sort order.
+        for i in 1..=9i64 {
+            let lsn = col.put(format!("k{}", i), serde_json::json!({"n": 10 - i}), 1).unwrap().3;
+            col.apply_committed(lsn);
+        }
+
+        let sort = SortSpec { field: "n".to_string(), desc: false };
+        let mut seen: Vec<i64> = Vec::new();
+        let mut cursor: Option<SortCursor> = None;
+
+        for _ in 0..10 {
+            let (rows, more) = col.sorted_page(None, None, &None, &sort, cursor.as_ref(), 2).unwrap();
+            assert!(rows.len() <= 2);
+            seen.extend(rows.iter().map(|r| r.value["n"].as_i64().unwrap()));
+            match (more, rows.last()) {
+                (true, Some(last)) => cursor = Some(SortCursor {
+                    value: last.value["n"].clone(),
+                    key: last.key.clone(),
+                }),
+                _ => break,
+            }
+        }
+
+        assert_eq!(seen, (1..=9).collect::<Vec<i64>>(), "every row once, in sort order");
+
+        let (desc_rows, _) = col.sorted_page(
+            None, None, &None, &SortSpec { field: "n".to_string(), desc: true }, None, 3).unwrap();
+        assert_eq!(desc_rows.iter().map(|r| r.value["n"].as_i64().unwrap()).collect::<Vec<_>>(),
+            vec![9, 8, 7]);
+
+        let (bounded, more) = col.sorted_page(None, None, &None, &sort, None, 4).unwrap();
+        assert_eq!(bounded.len(), 4);
+        assert!(more, "five rows are left, so the page has to say so");
+
+        let (all, more) = col.sorted_page(None, None, &None, &sort, None, 9).unwrap();
+        assert_eq!(all.len(), 9);
+        assert!(!more, "a page holding the whole collection has nothing after it");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn query_page_paginates_without_loss_or_duplication() {
         let root = temp_root();
@@ -953,12 +1157,12 @@ mod tests {
 
         let (p2, c2) = col.query_page(c1.as_deref(), None, None, &None, 2).unwrap();
         assert_eq!(p2.len(), 2);
-        assert_eq!(p2[0], serde_json::json!({"i": 3}));
+        assert_eq!(p2[0].value, serde_json::json!({"i": 3}));
         assert_eq!(c2.as_deref(), Some("k4"));
 
         let (p3, c3) = col.query_page(c2.as_deref(), None, None, &None, 2).unwrap();
         assert_eq!(p3.len(), 1, "final short page");
-        assert_eq!(p3[0], serde_json::json!({"i": 5}));
+        assert_eq!(p3[0].value, serde_json::json!({"i": 5}));
         assert_eq!(c3, None, "no cursor once the range is exhausted");
 
         let _ = fs::remove_dir_all(&root);
@@ -1277,6 +1481,169 @@ mod tests {
 
         col.apply_committed(del);
         assert!(col.get("k").unwrap().is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// M9: an uncommitted drop is durable and revocable, exactly like an uncommitted delete. It
+    /// hides nothing until it commits, and a restart must leave it staged rather than apply it.
+    #[tokio::test]
+    async fn an_uncommitted_drop_hides_nothing_and_stays_staged_across_a_restart() {
+        let root = temp_root();
+
+        let dropped = {
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("c").unwrap();
+            live_put(&col, "k", 1);
+
+            let dropped = col.drop_marker(1).unwrap().3;
+            col.enqueue_commit().await.unwrap().unwrap();
+            assert_eq!(col.get("k").unwrap(), Some(serde_json::json!({"v": 1})),
+                "a durable drop no quorum has confirmed is not yet an answer");
+            assert!(!col.is_dropped());
+            col.save_index().unwrap();
+            dropped
+        };
+
+        let reopened = Database::new(&root).unwrap().get_collection("c").unwrap();
+        assert_eq!(reopened.pending_len(), 1, "the drop was never committed, so it is still staged");
+        assert!(!reopened.is_dropped());
+        assert_eq!(reopened.get("k").unwrap(), Some(serde_json::json!({"v": 1})));
+
+        reopened.apply_committed(dropped);
+        assert!(reopened.is_dropped());
+        assert!(reopened.get("k").unwrap().is_none());
+        assert_eq!(reopened.pending_len(), 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// C17: a barrier occupies an LSN and applies nothing. It has to survive replay, drain from
+    /// `pending` on commit like any other frame, and never reach the index.
+    #[tokio::test]
+    async fn a_barrier_commits_the_tail_below_it_without_touching_the_index() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        let stranded = stage_put(&col, "k", 1);
+        assert!(!col.exists("k"), "the tail is durable and unpublished, as after a promotion");
+
+        let (_frame, _wal, _off, barrier) = col.barrier(7).unwrap();
+        assert!(barrier > stranded, "a barrier is appended above the tail it publishes");
+        assert_eq!(col.pending_len(), 2, "and is itself staged until it commits");
+
+        col.apply_committed(barrier);
+        assert!(col.exists("k"), "committing the barrier commits everything below it");
+        assert_eq!(col.pending_len(), 0, "including the barrier, which drains and applies nothing");
+        assert_eq!(col.index.read().unwrap().len(), 1, "the barrier is not a key");
+        assert_eq!(col.last_appended(), (7, barrier), "the tail is the barrier's own term");
+
+        // A reopen replays it: still one key, and the LSN it occupied is still accounted for.
+        col.save_index().unwrap();
+        drop(col);
+        let reopened = Database::new(&root).unwrap().get_collection("c").unwrap();
+        assert!(reopened.exists("k"));
+        assert_eq!(reopened.index.read().unwrap().len(), 1, "replay must not invent a key for it");
+        assert_eq!(reopened.pending_len(), 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn config_of(names: &[&str]) -> Configuration {
+        Configuration::simple(names.iter().map(|n| format!("http://{}", n)).collect())
+    }
+
+    /// A configuration entry is in force where it is appended, not where it commits, and it has to
+    /// survive both a restart and a compaction that retires the frame carrying it.
+    #[tokio::test]
+    async fn a_configuration_is_in_force_while_staged_and_durable_once_committed() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        assert_eq!(col.latest_config(), None, "a log with no configuration entry names no voters");
+
+        let first = config_of(&["a", "b", "c"]);
+        let (_f, _w, _o, lsn) = col.configure(first.clone(), 3).unwrap();
+        assert_eq!(col.latest_config(), Some(first.clone()),
+            "the entry decides from the append; waiting for the commit is the split-brain window");
+        assert_eq!(col.committed_config(), None);
+        assert_eq!(col.index.read().unwrap().len(), 0, "a configuration is not a key");
+
+        col.apply_committed(lsn);
+        assert_eq!(col.committed_config(), Some(first.clone()));
+        assert_eq!(col.pending_len(), 0);
+
+        // The newest entry wins, staged or not.
+        let joint = Configuration::joint(first.voters.clone(), config_of(&["b", "c", "d"]).voters);
+        col.configure(joint.clone(), 3).unwrap();
+        assert_eq!(col.latest_config(), Some(joint));
+        assert_eq!(col.committed_config(), Some(first.clone()), "still the newest committed one");
+
+        // Compaction relocates index keys and a configuration is never in one, so the frame goes.
+        let tail = col.last_appended_lsn();
+        col.enqueue_commit().await.unwrap().unwrap();
+        col.apply_committed(tail);
+        col.compact().unwrap();
+        col.save_index().unwrap();
+        drop(col);
+
+        let reopened = Database::new(&root).unwrap().get_collection("c").unwrap();
+        assert!(reopened.latest_config().is_some_and(|c| c.is_joint()),
+            "the watermark is what carries it past a compaction that dropped its frame");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An uncommitted configuration comes back staged and still in force, the way Raft requires:
+    /// the quorum that would commit it is the one it names.
+    #[tokio::test]
+    async fn an_uncommitted_configuration_replays_still_in_force() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        let committed = config_of(&["a", "b", "c"]);
+        let (_f, _w, _o, lsn) = col.configure(committed.clone(), 3).unwrap();
+        col.apply_committed(lsn);
+
+        let staged = config_of(&["a", "b", "c", "d"]);
+        col.configure(staged.clone(), 3).unwrap();
+        col.enqueue_commit().await.unwrap().unwrap();
+        col.save_index().unwrap();
+        drop(col);
+
+        let reopened = Database::new(&root).unwrap().get_collection("c").unwrap();
+        assert_eq!(reopened.pending_len(), 1, "it was durable and never committed");
+        assert_eq!(reopened.committed_config(), Some(committed));
+        assert_eq!(reopened.latest_config(), Some(staged),
+            "a restart must come back deciding against the entry it last appended");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An uncommitted barrier comes back staged, the way an uncommitted put does.
+    #[tokio::test]
+    async fn an_uncommitted_barrier_replays_into_pending() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        stage_put(&col, "k", 1);
+        col.barrier(7).unwrap();
+        col.enqueue_commit().await.unwrap().unwrap();
+        col.save_index().unwrap();
+        drop(col);
+
+        let reopened = Database::new(&root).unwrap().get_collection("c").unwrap();
+        assert_eq!(reopened.pending_len(), 2, "neither frame was committed before the restart");
+        assert!(!reopened.exists("k"));
+
+        let tail = reopened.last_appended_lsn();
+        reopened.apply_committed(tail);
+        assert!(reopened.exists("k"), "and the barrier still publishes the tail after a replay");
+        assert_eq!(reopened.pending_len(), 0);
 
         let _ = fs::remove_dir_all(&root);
     }
