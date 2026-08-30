@@ -68,6 +68,9 @@ pub struct Collection {
 pub struct StagedApply {
     pub wal_id: u64,
     pub offset: u64,
+    /// The frame's own term. What tells a leader's retransmit from an entry of a log it replaced,
+    /// which is the difference between a duplicate and a truncation.
+    pub term: u64,
     pub effect: StagedEffect,
 }
 
@@ -390,6 +393,10 @@ impl Collection {
         let wal = self.wal_writer.lock().unwrap();
         let synced_through = wal.last_appended_lsn;
         wal.current_wal.sync_data()?;
+        // Raised under the append lock, ahead of the acks: a waiter reads durable_lsn to count its
+        // own write, and a truncation holds the same lock so it cannot be re-raised past its cut.
+        self.durable_lsn.fetch_max(synced_through, Ordering::SeqCst);
+        self.db_durable_lsn.fetch_max(synced_through, Ordering::SeqCst);
         Ok(synced_through)
     }
 
@@ -425,18 +432,11 @@ impl Collection {
                 let col_sync = col.clone();
                 let sync_result = tokio::task::spawn_blocking(move || col_sync.sync_wal()).await;
 
-                let (result, synced_through) = match sync_result {
-                    Ok(Ok(lsn)) => (Ok(()), lsn),
-                    Ok(Err(e)) => (Err(format!("WAL sync failed: {}", e)), 0),
-                    Err(e) => (Err(format!("Commit task panicked: {}", e)), 0),
+                let result = match sync_result {
+                    Ok(Ok(_)) => Ok(()),
+                    Ok(Err(e)) => Err(format!("WAL sync failed: {}", e)),
+                    Err(e) => Err(format!("Commit task panicked: {}", e)),
                 };
-
-                // Ahead of the acks: a waiter reads durable_lsn to count its own write toward the
-                // commit index, and would otherwise read the value from before its fsync.
-                if result.is_ok() {
-                    col.durable_lsn.fetch_max(synced_through, Ordering::SeqCst);
-                    col.db_durable_lsn.fetch_max(synced_through, Ordering::SeqCst);
-                }
 
                 let notifiers: Vec<_> = {
                     let mut q = col.commit_notifiers.lock().unwrap();
@@ -729,7 +729,7 @@ impl Collection {
     /// stage the frame is on disk and in neither the index nor `pending`, and a compaction retiring
     /// its WAL would lose a write whose client is still waiting on the fsync. There is deliberately
     /// no public way to stage, so no append path can grow that window back.
-    pub(super) fn stage_appended(&self, lsn: u64, entry: &LogEntry, wal_id: u64, offset: u64, payload: &[u8]) {
+    pub(super) fn stage_appended(&self, lsn: u64, term: u64, entry: &LogEntry, wal_id: u64, offset: u64, payload: &[u8]) {
         let effect = match entry {
             LogEntry::Put { key, .. } => StagedEffect::Put {
                 key: key.clone(),
@@ -740,7 +740,7 @@ impl Collection {
             LogEntry::Drop { .. } => StagedEffect::Clear,
             LogEntry::Config { config, .. } => StagedEffect::Configure(config.clone()),
         };
-        self.pending.lock().unwrap().insert(lsn, StagedApply { wal_id, offset, effect });
+        self.pending.lock().unwrap().insert(lsn, StagedApply { wal_id, offset, term, effect });
     }
 
     /// First stage marks this collection consensus-managed. Without the watermark, a restart before
@@ -757,6 +757,11 @@ impl Collection {
                 self.watermark_recorded.store(false, Ordering::SeqCst);
             }
         }
+    }
+
+    /// The term we recorded for a staged frame, or `None` if we hold no uncommitted frame there.
+    pub fn staged_term(&self, lsn: u64) -> Option<u64> {
+        self.pending.lock().unwrap().get(&lsn).map(|s| s.term)
     }
 
     /// Position of the oldest frame the index does not yet reflect.

@@ -109,12 +109,21 @@ pub fn replicate_to_peers(
                                 warn!(target: "replication", "Replica {} reports higher term {}; demoting", replica_url, t);
                                 demote(&state, t).await;
                             },
-                            ConflictKind::Divergent(last_lsn) => {
+                            ConflictKind::Divergent { last_lsn, applied } => {
                                 state.metrics.note_divergence();
-                                warn!(target: "replication", "Replica {} diverges from us at lsn {} (its last_lsn={}); snapshotting it", replica_url, lsn, last_lsn);
-                                // The snapshot decides its tail, so the cursor is stale either way.
-                                state.rewind_replica(&replica_url, &col, last_lsn);
-                                trigger_resync(&state, &replica_url, &col).await;
+                                match applied {
+                                    Some(watermark) => {
+                                        warn!(target: "replication", "Replica {} diverges from us at lsn {} (its last_lsn={}); resuming from its watermark {}", replica_url, lsn, last_lsn, watermark);
+                                        state.rewind_replica(&replica_url, &col, watermark);
+                                        let _ = repair_replica(state.clone(), replica_url.clone(), col, watermark, None, 0).await;
+                                    },
+                                    None => {
+                                        warn!(target: "replication", "Replica {} diverges from us at lsn {} (its last_lsn={}) and reports no watermark; snapshotting it", replica_url, lsn, last_lsn);
+                                        // The snapshot decides its tail, so the cursor is stale either way.
+                                        state.rewind_replica(&replica_url, &col, last_lsn);
+                                        trigger_resync(&state, &replica_url, &col).await;
+                                    },
+                                }
                             },
                             ConflictKind::Gap(last_lsn, last_term) => {
                                 state.metrics.note_gap();
@@ -415,8 +424,10 @@ async fn stream_chain_once(
                         demote(&state, t).await;
                         return None;
                     },
-                    ConflictKind::Divergent(last_lsn) => {
-                        warn!(target: "repair", "Replica {} diverges from us at lsn {} (its last_lsn={}); snapshotting it", replica_url, lsn, last_lsn);
+                    // We already resumed from a point the replica named; diverging from that one
+                    // leaves nothing above its watermark to back up to.
+                    ConflictKind::Divergent { last_lsn, .. } => {
+                        warn!(target: "repair", "Replica {} diverges from us at lsn {} (its last_lsn={}) during backfill; snapshotting it", replica_url, lsn, last_lsn);
                         state.rewind_replica(&replica_url, &collection, last_lsn);
                         trigger_resync(&state, &replica_url, &collection).await;
                         return None;
@@ -514,12 +525,22 @@ async fn replicate_one_await(
                     demote(state, t).await;
                     false
                 },
-                ConflictKind::Divergent(last_lsn) => {
+                ConflictKind::Divergent { last_lsn, applied } => {
                     state.metrics.note_divergence();
-                    warn!(target: "replication", "Replica {} diverges from us at lsn {} (its last_lsn={}); snapshotting it", replica_url, lsn, last_lsn);
-                    state.rewind_replica(replica_url, collection, last_lsn);
-                    trigger_resync(state, replica_url, collection).await;
-                    false
+                    match applied {
+                        Some(watermark) => {
+                            warn!(target: "replication", "Replica {} diverges from us at lsn {} (its last_lsn={}); resuming from its watermark {}", replica_url, lsn, last_lsn, watermark);
+                            state.rewind_replica(replica_url, collection, watermark);
+                            repair_replica(state.clone(), replica_url.to_string(), collection.to_string(),
+                                watermark, None, lsn).await
+                        },
+                        None => {
+                            warn!(target: "replication", "Replica {} diverges from us at lsn {} (its last_lsn={}) and reports no watermark; snapshotting it", replica_url, lsn, last_lsn);
+                            state.rewind_replica(replica_url, collection, last_lsn);
+                            trigger_resync(state, replica_url, collection).await;
+                            false
+                        },
+                    }
                 },
                 ConflictKind::Gap(last_lsn, last_term) => {
                     state.metrics.note_gap();
@@ -710,6 +731,88 @@ mod tests {
         leader.kill();
         let _ = fs::remove_dir_all(&root);
     }
+    /// Refuses anything that does not resume from its watermark, and counts the resyncs it is
+    /// asked for. A real replica's answer to the same frames, with the truncation left out.
+    #[derive(Default)]
+    struct DivergentStub {
+        prev_lsns: std::sync::Mutex<Vec<u64>>,
+        resyncs: AtomicUsize,
+    }
+
+    const STUB_WATERMARK: u64 = 3;
+
+    async fn diverge_below_watermark(
+        axum::extract::State(stub): axum::extract::State<Arc<DivergentStub>>,
+        axum::Json(req): axum::Json<ReplicateRequest>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        stub.prev_lsns.lock().unwrap().push(req.prev_lsn);
+        if req.prev_lsn == STUB_WATERMARK {
+            return (axum::http::StatusCode::OK,
+                axum::Json(serde_json::json!({"status": "applied"}))).into_response();
+        }
+        (axum::http::StatusCode::CONFLICT, axum::Json(serde_json::json!({
+            "status": "divergent",
+            "last_lsn": 7,
+            "last_term": 1,
+            "applied": STUB_WATERMARK,
+        }))).into_response()
+    }
+
+    async fn count_resync(
+        axum::extract::State(stub): axum::extract::State<Arc<DivergentStub>>,
+    ) -> axum::http::StatusCode {
+        stub.resyncs.fetch_add(1, Ordering::SeqCst);
+        axum::http::StatusCode::OK
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_diverged_replica_is_backed_up_to_rather_than_snapshotted() {
+        let root = temp_root();
+        let stub = Arc::new(DivergentStub::default());
+        let stub_port = next_test_port();
+        let stub_url = format!("http://127.0.0.1:{}", stub_port);
+
+        let app = axum::Router::new()
+            .route("/internal/replicate", axum::routing::post(diverge_below_watermark))
+            .route("/internal/resync", axum::routing::post(count_resync))
+            .with_state(stub.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", stub_port)).await.unwrap();
+        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+
+        // Not in the config, so nothing ships here on its own and this frame is the only traffic.
+        let mut leader = TestNode::new("solo", next_test_port(), &root, "primary");
+        leader.start();
+        let state = leader.state.clone().unwrap();
+        let client = reqwest::Client::new();
+        for i in 1..=7 {
+            assert!(put_doc_http(&client, &leader.url(), &format!("k{}", i), i).await.is_success());
+        }
+
+        let col = state.db.as_ref().unwrap().get_collection("t").unwrap();
+        let tail = col.last_appended_lsn();
+        let (lsn, frame) = col.read_frames_after(0, tail).unwrap().pop().unwrap();
+        let prev_lsn = FrameHeader::parse(&frame).unwrap().prev_lsn;
+
+        let held = replicate_one_await(&state, &stub_url, "t", &frame, state.current_term(),
+            tail, lsn, prev_lsn).await;
+
+        let seen = stub.prev_lsns.lock().unwrap().clone();
+        assert!(held, "the replica holds the frame once the backed-up stream lands; saw {:?}", seen);
+        assert_eq!(seen.first(), Some(&prev_lsn), "the first attempt is the ordinary send");
+        assert!(seen.contains(&STUB_WATERMARK),
+            "the refusal names a watermark and the leader has to resume from it, not from its own              cursor; saw {:?}", seen);
+
+        let (_, divergences, resyncs) = state.metrics.repair_counts();
+        assert_eq!(divergences, 1);
+        assert_eq!(stub.resyncs.load(Ordering::SeqCst), 0);
+        assert_eq!(resyncs, 0,
+            "a divergence above the replica's watermark costs a backfill, not a whole collection");
+
+        leader.kill();
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn backfill_reads_and_applies_missing_frames() {
         let proot = temp_root();

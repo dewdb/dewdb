@@ -96,7 +96,7 @@ impl Collection {
                         LogEntry::Drop { .. } => StagedEffect::Clear,
                         LogEntry::Config { config, .. } => StagedEffect::Configure(config),
                     };
-                    pending.insert(lsn, StagedApply { wal_id, offset, effect });
+                    pending.insert(lsn, StagedApply { wal_id, offset, term, effect });
                     if lsn > max_lsn {
                         max_lsn = lsn;
                         max_term = term;
@@ -215,10 +215,81 @@ impl Collection {
         wal.last_appended_term = term;
         self.db_last_log_term.store(term, Ordering::SeqCst);
 
-        self.stage_appended(lsn, &entry, wal_id, offset, &json_bytes);
+        self.stage_appended(lsn, term, &entry, wal_id, offset, &json_bytes);
         drop(wal);
 
         Ok((frame, wal_id, offset, lsn))
+    }
+
+    /// Raft §5.3: entries past the leader's position came from a log it does not have, so they are
+    /// deleted. Only above the committed watermark -- below it they are agreed, and a leader asking
+    /// us to drop one is not a leader we can follow, so the caller answers `Divergent` and the
+    /// snapshot path takes over.
+    ///
+    /// `Some(())` means the log now ends at `prev_lsn` and the caller may set the tail to
+    /// `(prev_lsn, prev_term)`. The frame at `prev_lsn` is checked against `prev_term` when we hold
+    /// it staged; at the watermark itself it is committed, so both logs carry the same one.
+    fn rewind_to(&self, wal: &mut WalsState, prev_lsn: u64, prev_term: u64) -> io::Result<Option<()>> {
+        let cut = {
+            let mut pending = self.pending.lock().unwrap();
+            // Read under `pending`, which `apply_committed` also holds while it publishes and moves
+            // the watermark. Outside it an entry can commit between this check and the cut.
+            let applied = self.applied_lsn();
+            if prev_lsn < applied {
+                return Ok(None);
+            }
+            match pending.get(&prev_lsn) {
+                Some(staged) if staged.term != prev_term => return Ok(None),
+                // Sparse LSNs: no staged frame here and not the watermark means we never held it.
+                None if prev_lsn != applied => return Ok(None),
+                _ => {},
+            }
+
+            let doomed: Vec<u64> = pending.range((prev_lsn + 1)..).map(|(lsn, _)| *lsn).collect();
+            // Our tail is above the cut, yet nothing uncommitted is: they were published while we
+            // decided, and a published entry is not ours to drop.
+            if doomed.is_empty() {
+                return Ok(None);
+            }
+            let cut = pending.get(&doomed[0]).map(|s| (s.wal_id, s.offset));
+            for lsn in doomed {
+                pending.remove(&lsn);
+            }
+            cut
+        };
+
+        if let Some((wal_id, offset)) = cut {
+            self.shrink_wal_to(wal, wal_id, offset)?;
+            // The fsynced tail is now the cut. Left high, a promotion would count durability this
+            // node no longer has toward the quorum that decides a commit index.
+            self.durable_lsn.store(prev_lsn, Ordering::SeqCst);
+        }
+        Ok(Some(()))
+    }
+
+    /// Later WALs are emptied before the cut file shrinks. The reverse order leaves frames above a
+    /// truncation point after a crash, and replay cannot tell those from a log that continues.
+    fn shrink_wal_to(&self, wal: &mut WalsState, cut_wal_id: u64, cut_offset: u64) -> io::Result<()> {
+        for id in (cut_wal_id + 1)..=wal.current_wal_id {
+            let path = self.root_path.join(format!("wal-{:05}.log", id));
+            if path.exists() {
+                let emptied = OpenOptions::new().write(true).open(&path)?;
+                emptied.set_len(0)?;
+                emptied.sync_all()?;
+            }
+        }
+
+        let path = self.root_path.join(format!("wal-{:05}.log", cut_wal_id));
+        // Through a write handle, not the writer's: an append-mode handle carries no write access
+        // on Windows and `set_len` on one is refused outright.
+        let shrinking = OpenOptions::new().write(true).open(&path)?;
+        shrinking.set_len(cut_offset)?;
+        shrinking.sync_all()?;
+
+        wal.current_wal = OpenOptions::new().create(true).append(true).read(true).open(&path)?;
+        wal.current_wal_id = cut_wal_id;
+        wal.current_wal_size = cut_offset;
+        Ok(())
     }
 
     pub fn append_raw_frame(&self, frame_bytes: &[u8]) -> io::Result<ReplicaApply> {
@@ -251,22 +322,27 @@ impl Collection {
         let last = wal.last_appended_lsn;
         let last_term = wal.last_appended_term;
 
-        // Ordering invariant: divergence before duplicate. A newer term reusing an LSN we hold is a
-        // conflicting log, not a retransmit, and checking duplicate first keeps a deposed leader's tail.
-        if header.lsn <= last && header.term > last_term {
-            return Ok(ReplicaApply::Divergent { last_lsn: last, last_term });
-        }
-
-        if header.lsn <= last {
+        // A retransmit: committed entries are agreed, staged ones match only at the same term.
+        // Ahead of the truncation, which would read an ordinary resend as a conflicting log.
+        if header.lsn <= last
+            && (header.lsn <= self.applied_lsn() || self.staged_term(header.lsn) == Some(header.term))
+        {
             return Ok(ReplicaApply::Duplicate { last_lsn: last });
         }
 
-        if header.prev_lsn != last {
+        if header.prev_lsn > last {
             return Ok(ReplicaApply::Gap { last_lsn: last, last_term });
         }
 
-        // Raft log matching: same position, different history.
-        if header.prev_term != last_term {
+        if header.prev_lsn < last {
+            if self.rewind_to(&mut wal, header.prev_lsn, header.prev_term)?.is_none() {
+                return Ok(ReplicaApply::Divergent { last_lsn: last, last_term });
+            }
+            wal.last_appended_lsn = header.prev_lsn;
+            wal.last_appended_term = header.prev_term;
+        } else if header.prev_term != last_term {
+            // Raft log matching: same position, different history. The conflict is at or below our
+            // tail, so there is nothing here to truncate to -- the leader has to back up further.
             return Ok(ReplicaApply::Divergent { last_lsn: last, last_term });
         }
 
@@ -293,7 +369,7 @@ impl Collection {
         self.db_next_lsn.fetch_max(header.lsn, Ordering::SeqCst);
         self.db_last_log_term.store(header.term, Ordering::SeqCst);
 
-        self.stage_appended(header.lsn, &entry, wal_id, offset, payload);
+        self.stage_appended(header.lsn, header.term, &entry, wal_id, offset, payload);
 
         Ok(ReplicaApply::Applied { lsn: header.lsn })
     }
@@ -818,14 +894,10 @@ mod tests {
         let _ = fs::remove_dir_all(&rroot);
     }
 
-    #[tokio::test]
-    async fn a_replica_holding_a_superseded_leaders_tail_reports_divergence() {
-        let root = temp_root();
-        let db = Database::new(&root).unwrap();
-        let col = db.get_collection("c").unwrap();
-
+    /// Replicates `lsn` frames of term 1, chained, and returns the tail as `(lsn, term)`.
+    fn replicate_term_one(col: &Arc<Collection>, through: u64) -> (u64, u64) {
         let mut prev = (0u64, 0u64);
-        for lsn in 1..=3u64 {
+        for lsn in 1..=through {
             let frame = make_frame(1, lsn, prev.0, prev.1, &format!("k{}", lsn), lsn as i64);
             match col.append_raw_frame(&frame).unwrap() {
                 ReplicaApply::Applied { .. } => {},
@@ -833,19 +905,107 @@ mod tests {
             }
             prev = (lsn, 1);
         }
+        prev
+    }
+
+    #[tokio::test]
+    async fn a_replica_holding_a_superseded_leaders_tail_truncates_it_and_applies() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        replicate_term_one(&col, 2);
+        let through_two = col.wal_writer.lock().unwrap().current_wal_size;
+        col.append_raw_frame(&make_frame(1, 3, 2, 1, "k3", 3)).unwrap();
 
         let contested = make_frame(2, 3, 2, 1, "k3", 99);
         match col.append_raw_frame(&contested).unwrap() {
-            ReplicaApply::Divergent { last_lsn, last_term } => assert_eq!((last_lsn, last_term), (3, 1),
-                "the replica must report where its own log ends so the primary can replace it"),
-            other => panic!("a newer term re-using an occupied lsn is divergence, not a duplicate: {:?}", other),
+            ReplicaApply::Applied { lsn } => assert_eq!(lsn, 3),
+            other => panic!("an uncommitted tail is the leader's to replace, not a snapshot: {:?}", other),
         }
+
+        assert_eq!(col.last_appended(), (2, 3), "the tail is now the entry the leader sent");
+        assert_eq!(col.pending_len(), 3, "the superseded frame at lsn 3 must be gone, not shadowed");
+        assert_eq!(col.wal_writer.lock().unwrap().current_wal_size, through_two + contested.len() as u64,
+            "the frame it replaced must leave the WAL, not sit under the one that replaced it");
+
+        col.enqueue_commit().await.unwrap().unwrap();
+        col.apply_committed(3);
+        assert_eq!(col.get("k3").unwrap(), Some(serde_json::json!({"v": 99})));
+
+        drop(col);
+        drop(db);
+        let reopened = Database::new(&root).unwrap();
+        let col2 = reopened.get_collection("c").unwrap();
+        assert_eq!(col2.last_appended(), (2, 3), "and the truncation must survive a restart");
+        assert_eq!(col2.get("k3").unwrap(), Some(serde_json::json!({"v": 99})));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_retransmit_is_a_duplicate_and_never_truncates_what_follows_it() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        replicate_term_one(&col, 3);
 
         let retransmit = make_frame(1, 2, 1, 1, "k2", 2);
         match col.append_raw_frame(&retransmit).unwrap() {
             ReplicaApply::Duplicate { last_lsn } => assert_eq!(last_lsn, 3),
             other => panic!("expected Duplicate, got {:?}", other),
         }
+        assert_eq!(col.last_appended(), (1, 3),
+            "reading an ordinary resend as a conflicting log would drop lsn 3 on every retry");
+        assert_eq!(col.pending_len(), 3);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The line truncation may not cross. Below the watermark the entries are agreed, and a leader
+    /// asking us to drop one is not a leader we can follow -- the snapshot path takes over.
+    #[tokio::test]
+    async fn a_leader_backing_up_past_the_committed_watermark_is_refused() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        replicate_term_one(&col, 5);
+        col.enqueue_commit().await.unwrap().unwrap();
+        col.apply_committed(3);
+        assert_eq!(col.applied_lsn(), 3);
+
+        // A leader whose log runs 1, 2, 4 -- it never held the lsn 3 we have committed.
+        let backed_up = make_frame(2, 4, 2, 1, "k4", 99);
+        match col.append_raw_frame(&backed_up).unwrap() {
+            ReplicaApply::Divergent { last_lsn, last_term } => assert_eq!((last_lsn, last_term), (5, 1),
+                "the replica must report its own tail so the primary can snapshot it"),
+            other => panic!("committed entries are not the leader's to withdraw: {:?}", other),
+        }
+        assert_eq!(col.last_appended(), (1, 5), "and nothing may be dropped on the way to refusing");
+        assert_eq!(col.pending_len(), 2);
+        assert_eq!(col.get("k3").unwrap(), Some(serde_json::json!({"v": 3})));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The conflict is at our tail rather than above it, so there is nothing to truncate to.
+    #[tokio::test]
+    async fn a_conflict_at_the_tail_itself_asks_the_leader_to_back_up() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        replicate_term_one(&col, 3);
+
+        let next = make_frame(2, 4, 3, 2, "k4", 4);
+        match col.append_raw_frame(&next).unwrap() {
+            ReplicaApply::Divergent { last_lsn, last_term } => assert_eq!((last_lsn, last_term), (3, 1),
+                "our lsn 3 is from a term the leader does not have there"),
+            other => panic!("expected Divergent, got {:?}", other),
+        }
+        assert_eq!(col.last_appended(), (1, 3));
 
         let _ = fs::remove_dir_all(&root);
     }

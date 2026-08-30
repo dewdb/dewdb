@@ -44,11 +44,13 @@ pub struct ResyncRequest {
     pub collection: String,
 }
 
-// Gap streams back; divergence does not, since the replica holds entries we lack.
+/// Both stream back. `applied` is the replica's committed watermark, which is the lowest point it
+/// will truncate to and so where a backed-up stream has to start; `None` is a peer that predates
+/// reporting it, and there is nothing to back up to but a snapshot.
 pub enum ConflictKind {
     StaleTerm(u64),
     Gap(u64, u64),
-    Divergent(u64),
+    Divergent { last_lsn: u64, applied: Option<u64> },
 }
 
 pub fn classify_conflict(body: &Option<serde_json::Value>) -> ConflictKind {
@@ -62,7 +64,10 @@ pub fn classify_conflict(body: &Option<serde_json::Value>) -> ConflictKind {
 
     match b.get("status").and_then(|s| s.as_str()) {
         Some("stale_term") => ConflictKind::StaleTerm(b.get("term").and_then(|v| v.as_u64()).unwrap_or(0)),
-        Some("divergent") => ConflictKind::Divergent(last_lsn),
+        Some("divergent") => ConflictKind::Divergent {
+            last_lsn,
+            applied: b.get("applied").and_then(|v| v.as_u64()),
+        },
         _ => ConflictKind::Gap(last_lsn, last_term),
     }
 }
@@ -149,7 +154,7 @@ mod tests {
 
         let divergent = Some(serde_json::json!({"status": "divergent", "last_lsn": 11, "last_term": 3}));
         match classify_conflict(&divergent) {
-            ConflictKind::Divergent(l) => assert_eq!(l, 11),
+            ConflictKind::Divergent { last_lsn, .. } => assert_eq!(last_lsn, 11),
             _ => panic!("expected Divergent"),
         }
 

@@ -181,13 +181,17 @@ pub async fn replicate_handler(
             }))).into_response()
         },
         Some(Ok(ReplicaApply::Divergent { last_lsn, last_term })) => {
+            // `applied` is where truncation stops, so it is the highest point the leader can back
+            // up to and still be replacing entries this node is free to drop.
+            let applied = col.applied_lsn();
             warn!(target: "replicate", collection = %req.collection, lsn = req.lsn, term = req.term,
-                last_lsn, last_term,
-                "Log divergence: our tail came from a superseded leader, awaiting snapshot");
+                last_lsn, last_term, applied,
+                "Log divergence below our tail; asking the leader to resume from our watermark");
             (StatusCode::CONFLICT, Json(serde_json::json!({
                 "status": "divergent",
                 "last_lsn": last_lsn,
                 "last_term": last_term,
+                "applied": applied,
             }))).into_response()
         },
         Some(Ok(_)) => (StatusCode::OK, Json(serde_json::json!({"status": "applied", "lsn": highest}))).into_response(),
@@ -718,6 +722,64 @@ mod tests {
         assert!(col.get("k1").unwrap().is_none(),
             "a watermark from a superseded term published an entry the current leader may revoke");
         assert_eq!(col.pending_len(), 1, "the entry is still staged, not lost");
+
+        replica.kill();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_replica_replaces_an_uncommitted_tail_rather_than_asking_for_a_snapshot() {
+        let root = temp_root();
+        let mut replica = TestNode::new("replica", next_test_port(), &root, "replica");
+        replica.membership_mode = "learner".to_string();
+        replica.primary_addr = Some("http://127.0.0.1:1".to_string());
+        replica.start();
+
+        for lsn in 1..=3u64 {
+            let (status, _) = replicate(&replica, 5, lsn, lsn - 1, 0,
+                make_frame(5, lsn, lsn - 1, if lsn == 1 { 0 } else { 5 }, &format!("k{}", lsn), lsn as i64)).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let (status, body) = replicate(&replica, 6, 3, 2, 0, make_frame(6, 3, 2, 5, "k3", 99)).await;
+        assert_eq!(status, StatusCode::OK, "an uncommitted tail is the leader's to replace: {:?}", body);
+        assert_eq!(body["status"], "applied");
+
+        let col = replica.state.as_ref().unwrap()
+            .db.as_ref().unwrap()
+            .get_collection("t").unwrap();
+        assert_eq!(col.last_appended(), (6, 3));
+        assert_eq!(col.pending_len(), 3, "the superseded frame is gone, not stacked under its replacement");
+
+        replica.kill();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The whole of commit 46 rests on this field: without it the leader has no point below the
+    /// replica's tail that it knows they agree on, and a snapshot is the only way back.
+    #[tokio::test]
+    async fn a_divergent_refusal_carries_the_watermark_the_leader_can_back_up_to() {
+        let root = temp_root();
+        let mut replica = TestNode::new("replica", next_test_port(), &root, "replica");
+        replica.membership_mode = "learner".to_string();
+        replica.primary_addr = Some("http://127.0.0.1:1".to_string());
+        replica.start();
+
+        assert_eq!(replicate(&replica, 5, 1, 0, 0, make_frame(5, 1, 0, 0, "k1", 1)).await.0, StatusCode::OK);
+        assert_eq!(replicate(&replica, 5, 2, 1, 1, make_frame(5, 2, 1, 5, "k2", 2)).await.0, StatusCode::OK);
+
+        let col = replica.state.as_ref().unwrap()
+            .db.as_ref().unwrap()
+            .get_collection("t").unwrap();
+        let watermark = col.applied_lsn();
+        assert!(watermark > 0, "the fixture needs something committed to name");
+
+        // Same position as our tail, different history: the conflict is at lsn 2 or below.
+        let (status, body) = replicate(&replica, 6, 3, 2, 0, make_frame(6, 3, 2, 6, "k3", 3)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["status"], "divergent");
+        assert_eq!(body["last_lsn"], 2);
+        assert_eq!(body["applied"], watermark, "the leader resumes from here instead of snapshotting");
 
         replica.kill();
         let _ = fs::remove_dir_all(&root);
