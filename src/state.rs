@@ -205,6 +205,19 @@ impl AppState {
         }
     }
 
+    /// Whether an entry of this leader's own term has committed for the collection. Until one has,
+    /// `committed_lsn` can sit below entries a previous leader committed and this node holds staged.
+    pub fn has_current_term_commit(&self, collection: &str) -> bool {
+        match self.replication.as_ref() {
+            Some(r) => {
+                let g = r.read().unwrap();
+                g.progress.term_floor(collection)
+                    .is_some_and(|floor| g.progress.committed(collection) >= floor)
+            },
+            None => false,
+        }
+    }
+
     pub fn matched_lsn(&self, replica: &str, collection: &str) -> u64 {
         match self.replication.as_ref() {
             Some(r) => r.read().unwrap().progress.matched(replica, collection),

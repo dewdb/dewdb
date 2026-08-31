@@ -5,6 +5,7 @@ use crate::cluster::router::{
     parse_read_pref, router_forward_write, router_read_doc, router_query, bulk_router_forward,
     passthrough, ForwardMethod, ReadPreference,
 };
+use crate::consensus::read_index::read_index;
 use crate::json::{parse_fields, project};
 use crate::model::{
     err_json, BulkDoc, CreateDoc, QueryPage, QueryParams, ReadParams, DEFAULT_QUERY_LIMIT,
@@ -61,7 +62,8 @@ fn own_id(state: &AppState, collection: &str, first: String) -> Option<String> {
 /// `read=primary` is a guarantee, not a hint: a node that does not lead refuses rather than
 /// answering from a log it may be behind on. The router forwards the preference for this check.
 fn not_the_primary(state: &AppState, pref: &ReadPreference) -> Option<axum::response::Response> {
-    if !matches!(pref, ReadPreference::Primary) || !state.is_shard() || state.is_leader() {
+    if !matches!(pref, ReadPreference::Primary | ReadPreference::Quorum)
+        || !state.is_shard() || state.is_leader() {
         return None;
     }
     Some((
@@ -223,6 +225,29 @@ pub async fn bulk_create_docs(
     }
 }
 
+/// `read=quorum` is the guarantee `read=primary` is not: the answer comes from a leader that has
+/// confirmed with a majority that it still leads, at an index it has already applied.
+///
+/// Every refusal is `503` with `Retry-After`, because none of them means the read was wrong -- an
+/// unconfirmed leader, a term too new to answer at, and an index not yet visible are all "not now".
+async fn unconfirmed_leader(
+    state: &AppState,
+    pref: &ReadPreference,
+    collection: &str,
+) -> Option<axum::response::Response> {
+    if !matches!(pref, ReadPreference::Quorum) {
+        return None;
+    }
+    match read_index(state, collection).await {
+        Ok(_) => None,
+        Err(refusal) => Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "1")],
+            Json(serde_json::json!({"error": refusal.message()})),
+        ).into_response()),
+    }
+}
+
 pub async fn get_doc(
     State(state): State<AppState>,
     AxumPath((col_name, id)): AxumPath<(String, String)>,
@@ -238,6 +263,9 @@ pub async fn get_doc(
     }
 
     if let Some(refusal) = not_the_primary(&state, &pref) {
+        return refusal;
+    }
+    if let Some(refusal) = unconfirmed_leader(&state, &pref, &col_name).await {
         return refusal;
     }
 
@@ -408,6 +436,11 @@ pub async fn query_docs(
     }
 
     if let Some(refusal) = not_the_primary(&state, &pref) {
+        return refusal;
+    }
+    // Makes the page's starting point linearizable, not the scan atomic: a walk is not a snapshot
+    // whatever it is asked for, and rows written between chunks may or may not be seen.
+    if let Some(refusal) = unconfirmed_leader(&state, &pref, &col_name).await {
         return refusal;
     }
 
@@ -771,6 +804,51 @@ mod tests {
         // A preference nobody implements is refused rather than quietly downgraded to primary.
         assert_eq!(read(n1.url(), "?read=Primary").await, StatusCode::BAD_REQUEST);
         assert_eq!(q(n1.url(), "?read=nearest").await, StatusCode::BAD_REQUEST);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The guarantee `read=primary` cannot give. It asks the node for its own opinion of who leads,
+    /// and a leader that has already been replaced still holds that opinion; `read=quorum` makes it
+    /// confirm with a majority before answering.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_quorum_read_is_refused_by_a_leader_that_cannot_reach_its_voters() {
+        let root = temp_root();
+        let (n1, n2, n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::new();
+
+        let doc = format!("{}/collections/t/docs/k", n1.url());
+        assert!(client.put(&format!("{}?w=majority&wtimeout=4000", doc))
+            .json(&serde_json::json!({"value": {"v": 1}})).send().await.unwrap().status().is_success());
+
+        let mut nodes = vec![n1, n2, n3];
+        let leader = nodes.iter().position(|n| n.is_leader()).expect("the cluster settled on a leader");
+        let base = nodes[leader].url();
+
+        let read = |base: String, q: &'static str| {
+            let c = client.clone();
+            async move { c.get(&format!("{}/collections/t/docs/k{}", base, q)).send().await.unwrap().status() }
+        };
+
+        assert_eq!(read(base.clone(), "?read=quorum").await, StatusCode::OK,
+            "a leader that can reach its voters answers, and pays one heartbeat round for it");
+
+        for (i, node) in nodes.iter_mut().enumerate() {
+            if i != leader {
+                node.kill();
+            }
+        }
+
+        assert_eq!(read(base.clone(), "?read=primary").await, StatusCode::OK,
+            "read=primary is an opinion, and this node still holds it");
+        assert_eq!(read(base.clone(), "?read=quorum").await, StatusCode::SERVICE_UNAVAILABLE,
+            "with no majority reachable, nothing rules out a leader elected on the other side of \
+             the partition, and answering here is the stale read");
+
+        // /query reaches the barrier by its own path, so it has its own assertion.
+        let status = client.get(&format!("{}/collections/t/query?read=quorum", base))
+            .send().await.unwrap().status();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
         let _ = std::fs::remove_dir_all(&root);
     }

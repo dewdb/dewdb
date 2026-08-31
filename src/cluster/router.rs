@@ -258,6 +258,9 @@ pub async fn bulk_router_forward(
 pub enum ReadPreference {
     /// Explicitly asked for. A node that is not the leader refuses instead of answering.
     Primary,
+    /// `Primary` plus a confirmed one: the answering node establishes a read index first, so the
+    /// answer cannot come from a leader that has already been replaced. See consensus/read_index.rs.
+    Quorum,
     Replica,
     /// Nothing asked for: leader first, replicas after, no guarantee either way.
     Any,
@@ -267,8 +270,10 @@ pub fn parse_read_pref(r: Option<&str>) -> Result<ReadPreference, String> {
     match r {
         None => Ok(ReadPreference::Any),
         Some("primary") => Ok(ReadPreference::Primary),
+        Some("quorum") => Ok(ReadPreference::Quorum),
         Some("replica") => Ok(ReadPreference::Replica),
-        Some(other) => Err(format!("unknown read preference `{}`; use `primary` or `replica`", other)),
+        Some(other) => Err(format!(
+            "unknown read preference `{}`; use `primary`, `quorum` or `replica`", other)),
     }
 }
 
@@ -277,6 +282,7 @@ pub fn parse_read_pref(r: Option<&str>) -> Result<ReadPreference, String> {
 fn forwarded_read_pref(pref: &ReadPreference) -> Option<&'static str> {
     match pref {
         ReadPreference::Primary => Some("primary"),
+        ReadPreference::Quorum => Some("quorum"),
         _ => None,
     }
 }
@@ -321,7 +327,9 @@ fn read_targets(
 ) -> Vec<String> {
     let mut targets = Vec::new();
     match pref {
-        ReadPreference::Primary | ReadPreference::Any => {
+        // Replicas stay in the list for `Primary` and `Quorum` alike: both refuse on a follower,
+        // and dropping them would stop a promoted one from ever being found.
+        ReadPreference::Primary | ReadPreference::Quorum | ReadPreference::Any => {
             targets.push(effective_primary.to_string());
             for r in replicas {
                 targets.push(r.clone());
@@ -822,7 +830,10 @@ mod tests {
     fn a_read_preference_is_distinguishable_from_no_preference() {
         assert!(matches!(parse_read_pref(None), Ok(ReadPreference::Any)));
         assert!(matches!(parse_read_pref(Some("primary")), Ok(ReadPreference::Primary)));
+        assert!(matches!(parse_read_pref(Some("quorum")), Ok(ReadPreference::Quorum)));
         assert!(matches!(parse_read_pref(Some("replica")), Ok(ReadPreference::Replica)));
+        assert!(matches!(parse_read_pref(Some("garbage")), Err(ref e) if e.contains("quorum")),
+            "the error has to name every preference, or a client cannot discover this one");
 
         // Unfixed, `read=Primary` and `read=preimary` both silently meant primary.
         assert!(parse_read_pref(Some("garbage")).is_err());

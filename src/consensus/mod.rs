@@ -4,6 +4,7 @@ pub mod config;
 pub mod election;
 pub mod failover;
 pub mod progress;
+pub mod read_index;
 pub mod reconfigure;
 pub mod state;
 

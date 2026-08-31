@@ -154,6 +154,12 @@ impl Progress {
             .unwrap_or(0)
     }
 
+    /// The first LSN this leader appended to the collection in its own term, if it has appended
+    /// one. Read by the quorum-read path: below it the commit index is a floor, not the answer.
+    pub fn term_floor(&self, collection: &str) -> Option<u64> {
+        self.term_floor.get(collection).copied()
+    }
+
     pub fn committed(&self, collection: &str) -> u64 {
         self.committed.get(collection).copied().unwrap_or(0)
     }
