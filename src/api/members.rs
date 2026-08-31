@@ -481,8 +481,11 @@ mod tests {
 
         // Every node decides against the same set, and it reached them through the log.
         for node in [&n1, &n2, &n3, &n4] {
+            // Not `voters.len() == 4`: the joint entry's incoming half is also those four, so that
+            // alone is satisfied before the target entry lands and the assert below then races it.
             assert!(wait_for(Duration::from_secs(15), || {
-                node.state.as_ref().unwrap().quorum_config().voters.len() == 4
+                let installed = node.state.as_ref().unwrap().quorum_config();
+                !installed.is_joint() && installed.voters.len() == 4
             }).await, "{} never adopted the new configuration", node.node_id);
             let installed = node.state.as_ref().unwrap().quorum_config();
             assert!(!installed.is_joint(), "{} is stuck in joint consensus", node.node_id);

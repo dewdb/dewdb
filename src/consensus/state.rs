@@ -1,5 +1,6 @@
 //! Durable term/vote state and the demotion transition.
 
+use super::lease::Leases;
 use super::progress::Progress;
 use crate::storage::frame::Configuration;
 use crate::util::{same_endpoint, write_atomic};
@@ -39,6 +40,11 @@ pub struct ReplicationState {
     pub last_known_primary_position: Option<u64>,
     // Leader side: what each replica holds, and what a quorum has committed.
     pub progress: Progress,
+    // Leader side: which voters have promised not to grant a vote, and until when.
+    pub leases: Leases,
+    /// When this process came up. A restart forgets the promise it made a leader, so it is what
+    /// tells `lease::withholds_vote` to keep the promise anyway until the window is out.
+    pub booted_at: std::time::Instant,
     // Follower side: the commit watermark the leader last told us, per collection.
     pub leader_committed: HashMap<String, u64>,
     /// The newest configuration in the config log, once that log has one. `None` means no
@@ -122,6 +128,7 @@ pub fn apply_demotion(repl: &mut ReplicationState, new_term: u64) -> Option<bool
     // Quorum evidence belongs to the term it was gathered in. Kept, it goes on being served as a
     // commit watermark by a node that no longer has the standing to have one.
     repl.progress.reset();
+    repl.leases.clear();
     repl.last_heartbeat = Some(std::time::Instant::now());
     repl.last_replication = None;
     repl.was_receiving_replication = false;
@@ -255,6 +262,8 @@ mod tests {
             replicas: vec![],
             last_known_primary_position: None,
             progress: Progress::new(),
+            leases: Default::default(),
+            booted_at: std::time::Instant::now(),
             leader_committed: HashMap::new(),
             configuration: None,
         }

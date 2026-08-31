@@ -95,6 +95,21 @@ async fn confirm_with_quorum(state: &AppState) -> Result<(), ReadRefusal> {
     }
 }
 
+/// The lease first: it establishes exactly what the round would -- that no voter can have elected
+/// anyone else -- and the polls that paid for it were being sent anyway.
+async fn confirm_leadership(state: &AppState) -> Result<(), ReadRefusal> {
+    if state.holds_read_lease() {
+        return Ok(());
+    }
+    confirm_with_quorum(state).await?;
+    // A demotion during the round means the confirmation was for a term this node no longer holds.
+    if state.is_leader() {
+        Ok(())
+    } else {
+        Err(ReadRefusal::NotLeader)
+    }
+}
+
 async fn wait_for_applied(col: &Arc<Collection>, index: u64) -> Result<(), ReadRefusal> {
     let deadline = Instant::now() + APPLY_TIMEOUT;
     while col.applied_lsn() < index {
@@ -108,33 +123,35 @@ async fn wait_for_applied(col: &Arc<Collection>, index: u64) -> Result<(), ReadR
 
 /// Establishes the point a linearizable read may be answered at, and returns it once local state
 /// has caught up to it. The order is Raft's and none of it is optional: the index is sampled before
-/// the confirmation so a write that lands during the round cannot be required, the confirmation
-/// rules out a newer leader, and the wait is what makes the index readable rather than merely known.
+/// leadership is confirmed so a write landing during a round cannot be required, the confirmation
+/// rules out a newer leader, and the wait makes the index readable and not merely known.
 pub async fn read_index(state: &AppState, collection: &str) -> Result<u64, ReadRefusal> {
     if !state.is_leader() {
         return Err(ReadRefusal::NotLeader);
     }
 
-    let col = match state.db.as_ref().and_then(|db| db.existing_collection(collection)) {
-        Some(col) => col,
+    let index = match state.db.as_ref().and_then(|db| db.existing_collection(collection)) {
         // Nothing has ever been written here, so there is no entry a read could be behind on.
-        None => return confirm_with_quorum(state).await.map(|_| 0),
+        None => {
+            confirm_leadership(state).await?;
+            0
+        },
+        Some(col) => {
+            if !index_is_complete(state, collection, &col) {
+                return Err(ReadRefusal::TermTooNew);
+            }
+            let index = state.committed_lsn(collection);
+            confirm_leadership(state).await?;
+            wait_for_applied(&col, index).await?;
+            index
+        },
     };
 
-    if !index_is_complete(state, collection, &col) {
-        return Err(ReadRefusal::TermTooNew);
-    }
-
-    let index = state.committed_lsn(collection);
-    confirm_with_quorum(state).await?;
-
-    // Re-checked after the round: a demotion during it means the confirmation was for a term this
-    // node no longer holds.
+    // Re-read at the end: every check above is in the past, and both of the steps that await can
+    // span a vote this node grants, which deposes it.
     if !state.is_leader() {
         return Err(ReadRefusal::NotLeader);
     }
-
-    wait_for_applied(&col, index).await?;
     Ok(index)
 }
 
@@ -142,7 +159,7 @@ pub async fn read_index(state: &AppState, collection: &str) -> Result<u64, ReadR
 mod tests {
     use super::*;
     use crate::storage::frame::Configuration;
-    use crate::test_support::{next_test_port, put_doc_http, temp_root, TestNode};
+    use crate::test_support::{next_test_port, put_doc_http, temp_root, wait_for, TestNode};
     use std::fs;
 
     /// A stub voter, answering the one field the confirmation reads.
@@ -253,6 +270,128 @@ mod tests {
 
         assert_eq!(read_index(&state, "t").await, Err(ReadRefusal::Unconfirmed),
             "a partitioned leader that answers is exactly the stale read this exists to stop");
+
+        leader.kill();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Hands the leader the promise a follower's poll would carry, from a peer that does not have
+    /// to exist for it: the promise is the whole of the evidence.
+    async fn promise(state: &AppState, voter: &str, term: u64, ms: u64) {
+        let url = format!("{}/internal/heartbeat", state.own_url());
+        let response = state.client.get(&url)
+            .query(&[("from", voter), ("term", &term.to_string()), ("novote_ms", &ms.to_string())])
+            .send().await.unwrap();
+        assert!(response.status().is_success());
+    }
+
+    /// A solo leader whose two voters are unreachable ports: the same setup that has to refuse a
+    /// read while it is asking them, and may answer it once they have answered in advance.
+    async fn leader_with_absent_voters(root: &std::path::Path) -> (TestNode, Vec<String>) {
+        let mut leader = TestNode::new("solo", next_test_port(), root, "primary");
+        leader.heartbeat_timeout_secs = 30;
+        leader.start();
+        let state = leader.state.clone().unwrap();
+        let client = reqwest::Client::new();
+        assert!(put_doc_http(&client, &leader.url(), "k1", 1).await.is_success());
+
+        let voters: Vec<String> = (0..2).map(|_| format!("http://127.0.0.1:{}", next_test_port())).collect();
+        let mut all = vec![state.own_url()];
+        all.extend(voters.iter().cloned());
+        state.install_configuration(Configuration::simple(all));
+        (leader, voters)
+    }
+
+    #[tokio::test]
+    async fn a_promised_majority_answers_the_read_with_no_round_at_all() {
+        let root = temp_root();
+        let (mut leader, voters) = leader_with_absent_voters(&root).await;
+        let state = leader.state.clone().unwrap();
+        let term = state.current_term();
+
+        assert_eq!(read_index(&state, "t").await, Err(ReadRefusal::Unconfirmed),
+            "nothing is reachable, so a read that has to ask cannot be answered at all");
+
+        for voter in &voters {
+            promise(&state, voter, term, 10_000).await;
+        }
+
+        let index = read_index(&state, "t").await
+            .expect("a majority that has promised not to vote is a majority that cannot elect");
+        assert!(index > 0);
+
+        leader.kill();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The plumbing end to end: a real follower's polls carry the promise and the leader's reads
+    /// stop asking. Killing the follower is what tells a lease from a round -- a round would fail.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_real_followers_polls_are_the_lease_and_it_outlives_the_follower() {
+        let root = temp_root();
+        let (p1, p2) = (next_test_port(), next_test_port());
+        let (u1, u2) = (format!("http://127.0.0.1:{}", p1), format!("http://127.0.0.1:{}", p2));
+
+        let mut leader = TestNode::new("n1", p1, &root, "primary");
+        leader.heartbeat_timeout_secs = 30;
+        leader.peers = vec![u2.clone()];
+        leader.replicas = vec![u2.clone()];
+        let mut follower = TestNode::new("n2", p2, &root, "replica");
+        follower.heartbeat_timeout_secs = 30;
+        follower.peers = vec![u1.clone()];
+        follower.primary_addr = Some(u1.clone());
+        leader.start();
+        follower.start();
+
+        let state = leader.state.clone().unwrap();
+        let client = reqwest::Client::new();
+        assert!(put_doc_http(&client, &leader.url(), "k1", 1).await.is_success());
+
+        assert!(wait_for(Duration::from_secs(10), || state.holds_read_lease()).await,
+            "a voter polling twice a second and promising each time has to add up to a lease");
+
+        follower.kill();
+        assert!(read_index(&state, "t").await.is_ok(),
+            "the promise was for a window, not for as long as the node making it stays up");
+
+        leader.kill();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_voter_at_a_higher_term_cannot_promise_a_lease() {
+        let root = temp_root();
+        let (mut leader, voters) = leader_with_absent_voters(&root).await;
+        let state = leader.state.clone().unwrap();
+        let term = state.current_term();
+
+        // It computed that promise off a contact clock our answer will not reset, since it refuses
+        // everything from a term below its own. The promise is real; it is just not ours.
+        for voter in &voters {
+            promise(&state, voter, term + 1, 10_000).await;
+        }
+
+        assert_eq!(read_index(&state, "t").await, Err(ReadRefusal::Unconfirmed));
+
+        leader.kill();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_lease_expires_rather_than_standing_until_something_contradicts_it() {
+        let root = temp_root();
+        let (mut leader, voters) = leader_with_absent_voters(&root).await;
+        let state = leader.state.clone().unwrap();
+        let term = state.current_term();
+
+        for voter in &voters {
+            promise(&state, voter, term, 300).await;
+        }
+        assert!(read_index(&state, "t").await.is_ok());
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(read_index(&state, "t").await, Err(ReadRefusal::Unconfirmed),
+            "a voter is free again the moment its promise runs out, and so is the leader");
 
         leader.kill();
         let _ = fs::remove_dir_all(&root);

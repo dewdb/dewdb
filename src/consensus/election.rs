@@ -134,6 +134,7 @@ pub fn decide_vote(
     my_summary: LogTail,
     my_config: Option<&Configuration>,
     req: &VoteRequest,
+    must_withhold: bool,
 ) -> VoteDecision {
     if req.term < cur_term {
         return VoteDecision { granted: false, term: cur_term, voted_for: cur_voted_for.clone() };
@@ -152,7 +153,9 @@ pub fn decide_vote(
     };
     let up_to_date = candidate_is_current(my_logs, my_summary, req);
 
-    if can_vote && up_to_date && candidate_is_a_member(my_config, req) {
+    // The lease's other half: a voter that owes a leader silence withholds its vote, which is what
+    // makes a majority of promises a window no election can complete in. The term is still adopted.
+    if can_vote && up_to_date && candidate_is_a_member(my_config, req) && !must_withhold {
         VoteDecision { granted: true, term, voted_for: Some(req.candidate_id.clone()) }
     } else {
         VoteDecision { granted: false, term, voted_for }
@@ -313,6 +316,8 @@ pub fn seed_leader_progress(state: &AppState) {
         let mut g = repl.write().unwrap();
         let replicas = g.replicas.clone();
         g.progress.reinit_as_leader(&replicas, &own_tails, &applied, &hints);
+        // A promise was made to the node this one was a moment ago; the first read pays a round.
+        g.leases.clear();
     }
 }
 
@@ -472,7 +477,7 @@ mod tests {
 
     #[test]
     fn vote_granted_for_fresh_higher_term_when_up_to_date() {
-        let d = decide_vote(2, &None, &HashMap::new(), scalar(2, 100), None, &vote_req(3, "n1", 2, 100));
+        let d = decide_vote(2, &None, &HashMap::new(), scalar(2, 100), None, &vote_req(3, "n1", 2, 100), false);
         assert!(d.granted);
         assert_eq!(d.term, 3);
         assert_eq!(d.voted_for.as_deref(), Some("n1"));
@@ -480,7 +485,7 @@ mod tests {
 
     #[test]
     fn vote_denied_for_stale_candidate_term() {
-        let d = decide_vote(5, &None, &HashMap::new(), scalar(5, 100), None, &vote_req(4, "n1", 5, 100));
+        let d = decide_vote(5, &None, &HashMap::new(), scalar(5, 100), None, &vote_req(4, "n1", 5, 100), false);
         assert!(!d.granted);
         assert_eq!(d.term, 5);
         assert_eq!(d.voted_for, None);
@@ -488,34 +493,34 @@ mod tests {
 
     #[test]
     fn vote_at_most_once_per_term() {
-        let d1 = decide_vote(3, &None, &HashMap::new(), scalar(1, 50), None, &vote_req(3, "n1", 1, 50));
+        let d1 = decide_vote(3, &None, &HashMap::new(), scalar(1, 50), None, &vote_req(3, "n1", 1, 50), false);
         assert!(d1.granted);
         assert_eq!(d1.voted_for.as_deref(), Some("n1"));
 
-        let d2 = decide_vote(3, &d1.voted_for, &HashMap::new(), scalar(1, 50), None, &vote_req(3, "n2", 1, 50));
+        let d2 = decide_vote(3, &d1.voted_for, &HashMap::new(), scalar(1, 50), None, &vote_req(3, "n2", 1, 50), false);
         assert!(!d2.granted, "must not vote for a second candidate in the same term");
         assert_eq!(d2.voted_for.as_deref(), Some("n1"));
 
-        let d3 = decide_vote(3, &d1.voted_for, &HashMap::new(), scalar(1, 50), None, &vote_req(3, "n1", 1, 50));
+        let d3 = decide_vote(3, &d1.voted_for, &HashMap::new(), scalar(1, 50), None, &vote_req(3, "n1", 1, 50), false);
         assert!(d3.granted, "re-voting for the same candidate is idempotent");
     }
 
     #[test]
     fn vote_denied_when_candidate_log_behind() {
-        let behind_lsn = decide_vote(3, &None, &HashMap::new(), scalar(2, 100), None, &vote_req(4, "n1", 2, 99));
+        let behind_lsn = decide_vote(3, &None, &HashMap::new(), scalar(2, 100), None, &vote_req(4, "n1", 2, 99), false);
         assert!(!behind_lsn.granted, "candidate with lower lsn at same log term must lose");
 
-        let behind_term = decide_vote(3, &None, &HashMap::new(), scalar(2, 100), None, &vote_req(4, "n1", 1, 500));
+        let behind_term = decide_vote(3, &None, &HashMap::new(), scalar(2, 100), None, &vote_req(4, "n1", 1, 500), false);
         assert!(!behind_term.granted, "candidate with lower last log term must lose even with higher lsn");
 
-        let ahead = decide_vote(3, &None, &HashMap::new(), scalar(2, 100), None, &vote_req(4, "n1", 3, 1));
+        let ahead = decide_vote(3, &None, &HashMap::new(), scalar(2, 100), None, &vote_req(4, "n1", 3, 1), false);
         assert!(ahead.granted, "higher last log term wins regardless of lsn");
     }
 
     #[test]
     fn higher_term_vote_resets_prior_vote() {
         let prior = Some("n2".to_string());
-        let d = decide_vote(3, &prior, &HashMap::new(), scalar(1, 50), None, &vote_req(4, "n1", 1, 50));
+        let d = decide_vote(3, &prior, &HashMap::new(), scalar(1, 50), None, &vote_req(4, "n1", 1, 50), false);
         assert!(d.granted, "a higher term clears the old vote, so n1 can win");
         assert_eq!(d.term, 4);
         assert_eq!(d.voted_for.as_deref(), Some("n1"));
@@ -530,7 +535,7 @@ mod tests {
         let swapped = per_log_req(5, "n1", &[("users", 4, 3), ("orders", 4, 10)]);
         assert_eq!(swapped.last_lsn, 10, "the global summary cannot tell these two apart");
 
-        let d = decide_vote(4, &None, &mine, summary, None, &swapped);
+        let d = decide_vote(4, &None, &mine, summary, None, &swapped, false);
         assert!(!d.granted,
             "the candidate is missing users 4..10; electing it would drop entries a quorum may hold");
         assert_eq!(d.term, 5, "the term still advances even though the vote is refused");
@@ -541,7 +546,7 @@ mod tests {
         let mine = tails(&[("users", 4, 10), ("orders", 4, 11)]);
 
         let d = decide_vote(4, &None, &mine, scalar(4, 11), None,
-            &per_log_req(5, "n1", &[("users", 4, 5), ("orders", 5, 12)]));
+            &per_log_req(5, "n1", &[("users", 4, 5), ("orders", 5, 12)]), false);
         assert!(!d.granted,
             "a newer term on orders says nothing about users, where this candidate is behind");
     }
@@ -551,11 +556,11 @@ mod tests {
         let mine = tails(&[("users", 4, 10), ("orders", 4, 11)]);
 
         let equal = decide_vote(4, &None, &mine, scalar(4, 11), None,
-            &per_log_req(5, "n1", &[("users", 4, 10), ("orders", 4, 11)]));
+            &per_log_req(5, "n1", &[("users", 4, 10), ("orders", 4, 11)]), false);
         assert!(equal.granted, "matching every log is up to date");
 
         let ahead = decide_vote(4, &None, &mine, scalar(4, 11), None,
-            &per_log_req(5, "n2", &[("users", 5, 20), ("orders", 4, 11)]));
+            &per_log_req(5, "n2", &[("users", 5, 20), ("orders", 4, 11)]), false);
         assert!(ahead.granted, "ahead on one log and level on the rest is up to date");
     }
 
@@ -564,12 +569,12 @@ mod tests {
         let mine = tails(&[("users", 4, 10), ("orders", 4, 3)]);
 
         let d = decide_vote(4, &None, &mine, scalar(4, 10), None,
-            &per_log_req(5, "n1", &[("users", 4, 10)]));
+            &per_log_req(5, "n1", &[("users", 4, 10)]), false);
         assert!(!d.granted, "a log absent from the candidate is one it holds nothing of");
 
         let empty_too = tails(&[("users", 4, 10), ("orders", 0, 0)]);
         let d = decide_vote(4, &None, &empty_too, scalar(4, 10), None,
-            &per_log_req(5, "n2", &[("users", 4, 10)]));
+            &per_log_req(5, "n2", &[("users", 4, 10)]), false);
         assert!(d.granted, "but an empty collection dir costs the candidate nothing");
     }
 
@@ -578,14 +583,14 @@ mod tests {
         let mine = tails(&[("users", 4, 10)]);
 
         let d = decide_vote(4, &None, &mine, scalar(4, 10), None,
-            &per_log_req(5, "n1", &[("users", 4, 10), ("audit", 4, 99)]));
+            &per_log_req(5, "n1", &[("users", 4, 10), ("audit", 4, 99)]), false);
         assert!(d.granted, "only logs this voter holds can be lost, so extras are irrelevant");
     }
 
     #[test]
     fn a_voter_holding_no_log_grants_freely() {
         let d = decide_vote(0, &None, &HashMap::new(), LogTail::default(), None,
-            &per_log_req(1, "n1", &[("users", 3, 40)]));
+            &per_log_req(1, "n1", &[("users", 3, 40)]), false);
         assert!(d.granted, "a node with nothing to lose has no grounds to refuse");
     }
 
@@ -593,13 +598,13 @@ mod tests {
     fn a_peer_that_sends_no_summaries_falls_back_to_the_scalar_compare() {
         let mine = tails(&[("users", 4, 10), ("orders", 4, 3)]);
 
-        let current = decide_vote(4, &None, &mine, scalar(4, 10), None, &vote_req(5, "n1", 4, 10));
+        let current = decide_vote(4, &None, &mine, scalar(4, 10), None, &vote_req(5, "n1", 4, 10), false);
         assert!(current.granted, "a pre-`logs` peer is still judged on the summary it does send");
 
-        let behind = decide_vote(4, &None, &mine, scalar(4, 10), None, &vote_req(5, "n2", 4, 9));
+        let behind = decide_vote(4, &None, &mine, scalar(4, 10), None, &vote_req(5, "n2", 4, 9), false);
         assert!(!behind.granted);
 
-        let nothing = decide_vote(4, &None, &mine, scalar(4, 10), None, &vote_req(5, "n3", 0, 0));
+        let nothing = decide_vote(4, &None, &mine, scalar(4, 10), None, &vote_req(5, "n3", 0, 0), false);
         assert!(!nothing.granted, "an empty log must lose to a voter that holds entries");
     }
 
@@ -609,22 +614,40 @@ mod tests {
         let mut req = vote_req(5, "n3", 4, 10);
 
         req.candidate_url = Some("http://c".to_string());
-        let d = decide_vote(4, &None, &HashMap::new(), LogTail::default(), Some(&config), &req);
+        let d = decide_vote(4, &None, &HashMap::new(), LogTail::default(), Some(&config), &req, false);
         assert!(!d.granted,
             "a demoted node that has not heard about its demotion goes on campaigning, and this \
              vote would hand it a leadership over a set the cluster has left");
         assert_eq!(d.term, 5, "the term still advances; only the grant is withheld");
 
         req.candidate_url = Some("http://b".to_string());
-        assert!(decide_vote(4, &None, &HashMap::new(), LogTail::default(), Some(&config), &req).granted);
+        assert!(decide_vote(4, &None, &HashMap::new(), LogTail::default(), Some(&config), &req, false).granted);
 
         // Both directions of not knowing: no url from the peer, or no configuration here.
         req.candidate_url = None;
-        assert!(decide_vote(4, &None, &HashMap::new(), LogTail::default(), Some(&config), &req).granted,
+        assert!(decide_vote(4, &None, &HashMap::new(), LogTail::default(), Some(&config), &req, false).granted,
             "a peer that predates configuration entries must still be able to win an election");
         req.candidate_url = Some("http://c".to_string());
-        assert!(decide_vote(4, &None, &HashMap::new(), LogTail::default(), None, &req).granted,
+        assert!(decide_vote(4, &None, &HashMap::new(), LogTail::default(), None, &req, false).granted,
             "and a voter holding no configuration has nothing to judge the candidate against");
+    }
+
+    /// The promise a leader's lease is built on. Withholding has to survive everything that would
+    /// otherwise win the vote -- a higher term, a longer log, an unspent vote -- or the leases
+    /// handed out on the strength of it are not leases.
+    #[test]
+    fn a_voter_with_fresh_leader_contact_withholds_its_vote_but_still_takes_the_term() {
+        let req = vote_req(9, "n1", 4, 500);
+        let mine: HashMap<String, LogTail> = HashMap::new();
+
+        let withheld = decide_vote(4, &None, &mine, scalar(4, 10), None, &req, true);
+        assert!(!withheld.granted,
+            "a read is being answered on this node's promise not to vote for the next candidate");
+        assert_eq!(withheld.term, 9, "refusing is not following: the term still advances");
+        assert_eq!(withheld.voted_for, None, "and the term it advances to has its vote unspent");
+
+        assert!(decide_vote(4, &None, &mine, scalar(4, 10), None, &req, false).granted,
+            "the same request wins once the leader has gone quiet, which is the whole liveness story");
     }
 
     #[test]

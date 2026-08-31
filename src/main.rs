@@ -177,6 +177,8 @@ async fn main() -> io::Result<()> {
             primary_addr: config.primary_addr.clone(),
             last_known_primary_position: None,
             progress: Progress::new(),
+            leases: Default::default(),
+            booted_at: std::time::Instant::now(),
             leader_committed: HashMap::new(),
             configuration: None,
         })))

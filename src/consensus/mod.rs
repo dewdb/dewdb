@@ -3,6 +3,7 @@
 pub mod config;
 pub mod election;
 pub mod failover;
+pub mod lease;
 pub mod progress;
 pub mod read_index;
 pub mod reconfigure;

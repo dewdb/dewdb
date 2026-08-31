@@ -841,9 +841,15 @@ mod tests {
 
         assert_eq!(read(base.clone(), "?read=primary").await, StatusCode::OK,
             "read=primary is an opinion, and this node still holds it");
+        // Killing them did not withdraw the promises they made while up, and until those lapse the
+        // leader is right to answer: nodes that cannot vote cannot have elected anyone.
+        let window = crate::consensus::lease::refusal_window(
+            Duration::from_secs(nodes[leader].heartbeat_timeout_secs));
+        tokio::time::sleep(window + Duration::from_millis(300)).await;
+
         assert_eq!(read(base.clone(), "?read=quorum").await, StatusCode::SERVICE_UNAVAILABLE,
-            "with no majority reachable, nothing rules out a leader elected on the other side of \
-             the partition, and answering here is the stale read");
+            "with the lease lapsed and no majority reachable, nothing rules out a leader \
+             elected on the other side of the partition, and answering here is stale");
 
         // /query reaches the barrier by its own path, so it has its own assertion.
         let status = client.get(&format!("{}/collections/t/query?read=quorum", base))

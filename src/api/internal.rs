@@ -4,6 +4,7 @@ use crate::cluster::metadata::{Adoption, ClusterMetadata};
 use crate::cluster::metadata::MigrationPhase;
 use crate::cluster::migration::{MigrateBatch, MigrateReset};
 use crate::consensus::config::CONFIG_LOG;
+use crate::consensus::lease;
 use crate::consensus::{
     decide_vote, demote, heartbeat_poll_task, local_log_tails, log_summary, ReplicationMeta,
     VoteRequest, VoteResponse,
@@ -19,6 +20,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tracing::{info, warn};
 
 pub async fn replicate_handler(
@@ -499,10 +501,30 @@ pub async fn data_summary_handler(
     }))).into_response()
 }
 
+/// What a polling follower tells the leader about itself. Absent from a peer that predates leases,
+/// which costs nothing but a confirmation round on the reads this node answers.
+#[derive(Deserialize)]
+pub struct HeartbeatQuery {
+    pub from: Option<String>,
+    pub term: Option<u64>,
+    pub novote_ms: Option<u64>,
+}
+
 pub async fn heartbeat_handler(
     State(state): State<AppState>,
+    Query(q): Query<HeartbeatQuery>,
 ) -> impl axum::response::IntoResponse {
     let term = state.current_term();
+
+    // Only from a voter no further along than we are: one at a higher term discards this answer, so
+    // its contact clock never resets on it and the promise it computed from that clock is not ours.
+    if let (Some(from), Some(their_term), Some(ms)) = (&q.from, q.term, q.novote_ms) {
+        if ms > 0 && their_term <= term {
+            let timeout = Duration::from_secs(state.config.heartbeat_timeout_secs);
+            state.note_lease_promise(from, lease::accept_promise(Duration::from_millis(ms), timeout));
+        }
+    }
+
     let role = if state.is_leader() { "primary" } else { "replica" };
     let mut load = state.metrics.node_load();
     load.inflight = load.inflight.saturating_sub(1);
@@ -543,14 +565,22 @@ pub async fn vote_handler(
     // Collected before the replication lock: local_log_tails reaches the collections lock.
     let my_logs = local_log_tails(&state);
     let my_summary = log_summary(&state, &my_logs);
-    let my_config = repl.read().unwrap().configuration.clone();
+    let (my_config, contact, since_boot) = {
+        let g = repl.read().unwrap();
+        (g.configuration.clone(),
+         lease::contact_age(g.last_heartbeat, g.last_replication),
+         g.booted_at.elapsed())
+    };
+    let must_withhold = lease::withholds_vote(
+        contact, since_boot, Duration::from_secs(state.config.heartbeat_timeout_secs));
 
     let (granted, resp_term, restart_poll, persist) = {
         let mut g = repl.write().unwrap();
         let was_leader = g.is_leader;
         let old_term = g.term;
 
-        let d = decide_vote(g.term, &g.voted_for, &my_logs, my_summary, my_config.as_ref(), &req);
+        let d = decide_vote(g.term, &g.voted_for, &my_logs, my_summary, my_config.as_ref(),
+            &req, must_withhold);
 
         let mut restart = false;
         g.term = d.term;
@@ -560,6 +590,7 @@ pub async fn vote_handler(
             g.is_leader = false;
             // Standing down by granting a vote is still standing down; same rule as apply_demotion.
             g.progress.reset();
+            g.leases.clear();
             restart = !g.heartbeat_running;
             g.heartbeat_running = true;
         }
@@ -655,6 +686,89 @@ mod tests {
         assert!(hb["commit_index"].as_u64().unwrap() > 0, "the write is committed and advertised");
         assert!(hb["committed"]["t"].as_u64().unwrap() > 0);
         leader
+    }
+
+    /// The promise a leader's lease is built on, at the handler that has to keep it. Nothing here
+    /// is about this node's own election: it is the round the leader is no longer paying for.
+    #[tokio::test]
+    async fn a_follower_with_fresh_leader_contact_refuses_a_vote_it_would_otherwise_grant() {
+        let root = temp_root();
+        let mut follower = TestNode::new("replica", next_test_port(), &root, "replica");
+        follower.heartbeat_timeout_secs = 30;
+        // A primary that does not answer, so nothing but this test moves the contact clock.
+        follower.primary_addr = Some("http://127.0.0.1:1".to_string());
+        follower.start();
+        let state = follower.state.clone().unwrap();
+        let repl = state.replication.clone().unwrap();
+        let term = state.current_term();
+
+        let body = serde_json::json!({
+            "term": term + 4, "candidate_id": "challenger", "last_lsn": 100, "last_term": term + 4});
+        let ask = || async {
+            reqwest::Client::new()
+                .post(format!("{}/internal/vote", follower.url()))
+                .json(&body).send().await.unwrap()
+                .json::<VoteResponse>().await.unwrap()
+        };
+
+        repl.write().unwrap().last_heartbeat = Some(std::time::Instant::now());
+        let refused = ask().await;
+        assert!(!refused.vote_granted,
+            "a leader is answering reads on this node's promise not to vote for the next candidate");
+        assert!(state.current_term() >= term + 4,
+            "refusing is not following: the term still advances, so this node stops trusting \
+             the leader it just protected, and is campaigning within the timeout");
+
+        {
+            let mut g = repl.write().unwrap();
+            g.last_heartbeat = Some(std::time::Instant::now() - Duration::from_secs(60));
+            g.booted_at = std::time::Instant::now() - Duration::from_secs(60);
+        }
+        assert!(ask().await.vote_granted,
+            "and the same request wins once the leader has gone quiet, or nothing could ever elect");
+
+        follower.kill();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The restart hole. A promise the process before this one made can still be counted by a
+    /// leader, and nothing on disk remembers making it, so boot withholds exactly as contact does.
+    #[tokio::test]
+    async fn a_node_that_has_just_booted_refuses_a_vote_even_having_heard_from_nobody() {
+        let root = temp_root();
+        let mut follower = TestNode::new("replica", next_test_port(), &root, "replica");
+        follower.heartbeat_timeout_secs = 30;
+        follower.primary_addr = Some("http://127.0.0.1:1".to_string());
+        follower.start();
+        let state = follower.state.clone().unwrap();
+        let repl = state.replication.clone().unwrap();
+        let term = state.current_term();
+
+        let body = serde_json::json!({
+            "term": term + 4, "candidate_id": "challenger", "last_lsn": 100, "last_term": term + 4});
+        let ask = || async {
+            reqwest::Client::new()
+                .post(format!("{}/internal/vote", follower.url()))
+                .json(&body).send().await.unwrap()
+                .json::<VoteResponse>().await.unwrap()
+        };
+
+        // No contact of any kind: whatever this refuses on is the boot clock and nothing else.
+        {
+            let mut g = repl.write().unwrap();
+            g.last_heartbeat = None;
+            g.last_replication = None;
+        }
+        assert!(!ask().await.vote_granted,
+            "a leader can still be counting the promise this node's previous process made");
+
+        // Up longer than the window, so any promise that process made has certainly run out.
+        repl.write().unwrap().booted_at = std::time::Instant::now() - Duration::from_secs(60);
+        assert!(ask().await.vote_granted,
+            "and a node that has been up and heard nothing is exactly who has to elect the leader");
+
+        follower.kill();
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn assert_no_watermark(hb: &serde_json::Value) {
@@ -871,6 +985,11 @@ mod tests {
     async fn granting_a_vote_at_a_higher_term_clears_the_watermark_too() {
         let root = temp_root();
         let mut leader = leader_with_one_committed_write(&root).await;
+
+        // Out of the boot window, which this test has no stake in: a node that just came up
+        // withholds its vote for one refusal window, and the path under test is the grant.
+        leader.state.as_ref().unwrap().replication.as_ref().unwrap().write().unwrap()
+            .booted_at = std::time::Instant::now() - Duration::from_secs(60);
 
         // Stands down without ever going through demote(), which is why the vote path needs the
         // same reset rather than relying on apply_demotion to have done it.

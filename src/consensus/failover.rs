@@ -1,6 +1,7 @@
 //! Follower watchdog: detect leader silence, find the new leader, step down.
 
 use super::election::run_election;
+use super::lease;
 use super::progress::{ProgressMeta, PROGRESS_FLUSH_INTERVAL_SECS};
 use super::state::{apply_demotion, ReplicationMeta};
 use crate::cluster::metadata::Adoption;
@@ -12,7 +13,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{info, warn};
 
-const HEARTBEAT_POLL_INTERVAL_MS: u64 = 500;
+pub(super) const HEARTBEAT_POLL_INTERVAL_MS: u64 = 500;
 const PEER_PROBE_TIMEOUT_MS: u64 = 400;
 const BOOT_DISCOVERY_RETRY_MS: u64 = 300;
 
@@ -288,17 +289,25 @@ pub fn heartbeat_poll_task(state: AppState) {
                 break;
             }
 
-            let primary_addr = {
+            let (primary_addr, own_term, promise) = {
                 let repl = state.replication.as_ref().unwrap().read().unwrap();
                 if !repl.heartbeat_running {
                     break;
                 }
-                repl.primary_addr.clone()
+                let age = lease::contact_age(repl.last_heartbeat, repl.last_replication);
+                (repl.primary_addr.clone(), repl.term, lease::promise(age, timeout))
             };
 
             if let Some(primary_addr) = primary_addr {
                 let url = format!("{}/internal/heartbeat", primary_addr);
-                match state.client.get(&url).send().await {
+                // Rides along on the poll a follower sends anyway: how long this node will go on
+                // withholding its vote, which is the round the leader's reads no longer have to pay.
+                let query = [
+                    ("from".to_string(), state.own_url()),
+                    ("term".to_string(), own_term.to_string()),
+                    ("novote_ms".to_string(), promise.as_millis().to_string()),
+                ];
+                match state.client.get(&url).query(&query).send().await {
                     Ok(r) if r.status().is_success() => {
                         if let Ok(hb) = r.json::<serde_json::Value>().await {
                             let their_term = hb.get("term").and_then(|v| v.as_u64()).unwrap_or(0);

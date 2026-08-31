@@ -218,6 +218,34 @@ impl AppState {
         }
     }
 
+    /// Records a voter's promise not to grant a vote, taken from its heartbeat poll. A promise from
+    /// outside the configuration is dropped: it buys nothing, and keeping the map to the voting set
+    /// is also what bounds it.
+    pub fn note_lease_promise(&self, voter: &str, promise: std::time::Duration) {
+        if !self.quorum_config().contains(voter) {
+            return;
+        }
+        if let Some(repl) = self.replication.as_ref() {
+            let mut g = repl.write().unwrap();
+            if g.is_leader {
+                g.leases.note_promise(
+                    voter, std::time::Instant::now(), std::time::SystemTime::now(), promise);
+            }
+        }
+    }
+
+    /// Whether a majority is still promising not to vote, which is the fact a quorum read would
+    /// otherwise spend a heartbeat round establishing.
+    pub fn holds_read_lease(&self) -> bool {
+        let config = self.quorum_config();
+        let own = self.own_url();
+        match self.replication.as_ref() {
+            Some(r) => r.read().unwrap().leases.held(
+                &config, &own, std::time::Instant::now(), std::time::SystemTime::now()),
+            None => false,
+        }
+    }
+
     pub fn matched_lsn(&self, replica: &str, collection: &str) -> u64 {
         match self.replication.as_ref() {
             Some(r) => r.read().unwrap().progress.matched(replica, collection),
@@ -345,6 +373,8 @@ impl AppState {
                 replicas: Vec::new(),
                 last_known_primary_position: None,
                 progress: Progress::new(),
+                leases: Default::default(),
+                booted_at: std::time::Instant::now(),
                 leader_committed: HashMap::new(),
                 configuration: None,
             }))),
