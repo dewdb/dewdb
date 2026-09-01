@@ -10,8 +10,8 @@ pub mod reconfigure;
 pub mod state;
 
 pub use election::{
-    decide_vote, local_log_tails, log_summary, publish_inherited_tails, seed_leader_progress,
-    VoteRequest, VoteResponse,
+    decide_pre_vote, decide_vote, local_log_tails, log_summary, publish_inherited_tails,
+    seed_leader_progress, VoteRequest, VoteResponse,
 };
 pub use failover::{boot_resync, demote, heartbeat_poll_task, progress_flush_task};
 pub use progress::Progress;

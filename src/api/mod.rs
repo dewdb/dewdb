@@ -17,7 +17,7 @@ use internal::{
     cluster_update_handler, cluster_view_handler, data_summary_handler, heartbeat_handler,
     migrate_cleanup_handler, migrate_handler, migrate_reset_handler,
     migration_status_handler,
-    replicate_handler, resync_handler, snapshot_handler, vote_handler,
+    pre_vote_handler, replicate_handler, resync_handler, snapshot_handler, vote_handler,
 };
 use members::{configuration_handler, join_handler, leave_handler, set_configuration_handler};
 use migrate::{abort_migration_handler, migration_status, start_migration_handler};
@@ -60,6 +60,7 @@ pub fn build_app(state: &AppState) -> Router {
             .route("/internal/snapshot", get(snapshot_handler))
             .route("/internal/resync", post(resync_handler))
             .route("/internal/vote", post(vote_handler))
+            .route("/internal/pre-vote", post(pre_vote_handler))
             .route("/internal/heartbeat", get(heartbeat_handler))
             .route("/internal/data-summary", get(data_summary_handler))
             .route("/internal/migrate", post(migrate_handler))

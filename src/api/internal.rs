@@ -6,8 +6,8 @@ use crate::cluster::migration::{MigrateBatch, MigrateReset};
 use crate::consensus::config::CONFIG_LOG;
 use crate::consensus::lease;
 use crate::consensus::{
-    decide_vote, demote, heartbeat_poll_task, local_log_tails, log_summary, ReplicationMeta,
-    VoteRequest, VoteResponse,
+    decide_pre_vote, decide_vote, demote, heartbeat_poll_task, local_log_tails, log_summary,
+    ReplicationMeta, VoteRequest, VoteResponse,
 };
 use crate::model::err_json;
 use crate::replication::snapshot::{replica_sync_from_primary, snapshot_body, SNAPSHOT_CONTENT_TYPE};
@@ -547,6 +547,39 @@ pub async fn heartbeat_handler(
     }))).into_response()
 }
 
+/// Raft §9.6. Answers the vote handler's question and touches nothing: no term, no recorded vote,
+/// no disk. A candidate that could not win learns so without costing the group an election.
+pub async fn pre_vote_handler(
+    State(state): State<AppState>,
+    Json(req): Json<VoteRequest>,
+) -> impl axum::response::IntoResponse {
+    if !state.is_shard() || !state.in_quorum() {
+        return (StatusCode::FORBIDDEN, "Not a voting node").into_response();
+    }
+
+    let repl = match state.replication.as_ref() {
+        Some(r) => r,
+        None => return (StatusCode::FORBIDDEN, "No replication state").into_response(),
+    };
+
+    // Collected before the replication lock: local_log_tails reaches the collections lock.
+    let my_logs = local_log_tails(&state);
+    let my_summary = log_summary(&state, &my_logs);
+
+    let (term, granted) = {
+        let g = repl.read().unwrap();
+        let must_withhold = lease::withholds_vote(
+            lease::contact_age(g.last_heartbeat, g.last_replication),
+            g.booted_at.elapsed(),
+            Duration::from_secs(state.config.heartbeat_timeout_secs));
+        let granted = decide_pre_vote(
+            g.term, &my_logs, my_summary, g.configuration.as_ref(), &req, must_withhold);
+        (g.term, granted)
+    };
+
+    (StatusCode::OK, Json(VoteResponse { term, vote_granted: granted })).into_response()
+}
+
 pub async fn vote_handler(
     State(state): State<AppState>,
     Json(req): Json<VoteRequest>,
@@ -766,6 +799,49 @@ mod tests {
         repl.write().unwrap().booted_at = std::time::Instant::now() - Duration::from_secs(60);
         assert!(ask().await.vote_granted,
             "and a node that has been up and heard nothing is exactly who has to elect the leader");
+
+        follower.kill();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Raft §9.6 and bugs.md C20. The refusal itself is commit 48's; what is new is that reaching it
+    /// costs the voter nothing, so a candidate that cannot win no longer deposes a leader on its way.
+    #[tokio::test]
+    async fn a_pre_vote_leaves_the_voters_term_and_vote_exactly_where_they_were() {
+        let root = temp_root();
+        let mut follower = TestNode::new("replica", next_test_port(), &root, "replica");
+        follower.heartbeat_timeout_secs = 30;
+        follower.primary_addr = Some("http://127.0.0.1:1".to_string());
+        follower.start();
+        let state = follower.state.clone().unwrap();
+        let repl = state.replication.clone().unwrap();
+        let term = state.current_term();
+        let voted_before = repl.read().unwrap().voted_for.clone();
+
+        let body = serde_json::json!({
+            "term": term + 7, "candidate_id": "challenger", "last_lsn": 100, "last_term": term + 7});
+        let ask = || async {
+            reqwest::Client::new()
+                .post(format!("{}/internal/pre-vote", follower.url()))
+                .json(&body).send().await.unwrap()
+                .json::<VoteResponse>().await.unwrap()
+        };
+
+        repl.write().unwrap().last_heartbeat = Some(std::time::Instant::now());
+        let refused = ask().await;
+        assert!(!refused.vote_granted, "a voter still hearing from its leader would not vote either");
+        assert_eq!(refused.term, term, "and it answers with the term it still holds");
+        assert_eq!(state.current_term(), term,
+            "the term is the whole point: raising it here is what used to depose the leader");
+        assert_eq!(repl.read().unwrap().voted_for, voted_before, "and no vote is spent either");
+
+        {
+            let mut g = repl.write().unwrap();
+            g.last_heartbeat = Some(std::time::Instant::now() - Duration::from_secs(60));
+            g.booted_at = std::time::Instant::now() - Duration::from_secs(60);
+        }
+        assert!(ask().await.vote_granted, "once the leader is quiet the same candidate is told yes");
+        assert_eq!(state.current_term(), term, "still without a term moving, which the real vote does");
 
         follower.kill();
         let _ = fs::remove_dir_all(&root);

@@ -125,8 +125,48 @@ fn candidate_is_a_member(my_config: Option<&Configuration>, req: &VoteRequest) -
     }
 }
 
-// Election invariant: at most one vote per term, never for a candidate whose log is behind, and
-// never for one this voter's configuration does not name.
+/// The grant itself, given the vote this node would hold once `req`'s term is applied. Shared with
+/// the pre-vote, which asks exactly this and keeps the answer to itself. `must_withhold` is the
+/// lease's other half: a voter that owes a leader silence refuses whatever the candidate offers.
+fn grants(
+    voted_for: &Option<String>,
+    my_logs: &HashMap<String, LogTail>,
+    my_summary: LogTail,
+    my_config: Option<&Configuration>,
+    req: &VoteRequest,
+    must_withhold: bool,
+) -> bool {
+    let can_vote = match voted_for {
+        None => true,
+        Some(v) => v == &req.candidate_id,
+    };
+    can_vote
+        && candidate_is_current(my_logs, my_summary, req)
+        && candidate_is_a_member(my_config, req)
+        && !must_withhold
+}
+
+/// Raft §9.6. The question the real vote answers, decided against nothing and changing nothing: a
+/// candidate that could not win never raises anyone's term, so a node that has been removed or
+/// partitioned stops costing the group an election every cycle (bugs.md C20).
+pub fn decide_pre_vote(
+    cur_term: u64,
+    my_logs: &HashMap<String, LogTail>,
+    my_summary: LogTail,
+    my_config: Option<&Configuration>,
+    req: &VoteRequest,
+    must_withhold: bool,
+) -> bool {
+    // The real request would raise us to `req.term` first, so at or below our own term it either
+    // loses on the term or lands in one this node may already have voted in.
+    if req.term <= cur_term {
+        return false;
+    }
+    grants(&None, my_logs, my_summary, my_config, req, must_withhold)
+}
+
+// Election invariant: at most one vote per term, never for a candidate whose log is behind or that
+// this voter's configuration does not name. A refusal still adopts the term: withholding is not following.
 pub fn decide_vote(
     cur_term: u64,
     cur_voted_for: &Option<String>,
@@ -147,19 +187,99 @@ pub fn decide_vote(
         voted_for = None;
     }
 
-    let can_vote = match &voted_for {
-        None => true,
-        Some(v) => v == &req.candidate_id,
-    };
-    let up_to_date = candidate_is_current(my_logs, my_summary, req);
-
-    // The lease's other half: a voter that owes a leader silence withholds its vote, which is what
-    // makes a majority of promises a window no election can complete in. The term is still adopted.
-    if can_vote && up_to_date && candidate_is_a_member(my_config, req) && !must_withhold {
+    if grants(&voted_for, my_logs, my_summary, my_config, req, must_withhold) {
         VoteDecision { granted: true, term, voted_for: Some(req.candidate_id.clone()) }
     } else {
         VoteDecision { granted: false, term, voted_for }
     }
+}
+
+fn vote_request(
+    term: u64,
+    candidate_id: &str,
+    logs: &HashMap<String, LogTail>,
+    tail: LogTail,
+    own: &str,
+) -> VoteRequest {
+    VoteRequest {
+        term,
+        candidate_id: candidate_id.to_string(),
+        last_lsn: tail.last_lsn,
+        last_term: tail.last_term,
+        logs: logs.clone(),
+        candidate_url: Some(own.to_string()),
+    }
+}
+
+/// One round of asking every peer the same question, stopping as soon as the answers carry a quorum.
+/// Returns who granted -- this node included, since it answers for itself -- and the highest term
+/// any peer reported, or 0 if none did.
+///
+/// Who granted, not how many: while joint a tally cannot tell a majority of both halves from the
+/// same count spread across one of them.
+async fn ask_peers(
+    state: &AppState,
+    req: &VoteRequest,
+    peers: Vec<String>,
+    quorum: &Configuration,
+    endpoint: &'static str,
+    absent_grants: bool,
+    deadline: Duration,
+) -> (Vec<String>, u64) {
+    let own = state.own_url();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, bool, u64)>(peers.len());
+    for peer in peers {
+        let client = state.client.clone();
+        let req = req.clone();
+        let tx = tx.clone();
+        let voter = peer.clone();
+        let url = format!("{}{}", peer, endpoint);
+        tokio::spawn(async move {
+            let sent = client.post(&url)
+                .timeout(Duration::from_millis(VOTE_REQUEST_TIMEOUT_MS))
+                .json(&req).send().await;
+            let (granted, term) = match sent {
+                Ok(r) if r.status().is_success() => {
+                    match r.json::<VoteResponse>().await {
+                        Ok(v) => (v.vote_granted, v.term),
+                        Err(_) => (false, 0),
+                    }
+                },
+                // A peer that predates the endpoint. Counted as willing where the caller says so,
+                // which leaves a mixed-version cluster exactly where it was without this round.
+                Ok(r) if r.status() == reqwest::StatusCode::NOT_FOUND => (absent_grants, 0),
+                _ => (false, 0),
+            };
+            let _ = tx.send((voter, granted, term)).await;
+        });
+    }
+    drop(tx);
+
+    let granted = Arc::new(std::sync::Mutex::new(vec![own]));
+    let highest_term = Arc::new(AtomicU64::new(0));
+    let granted_inner = granted.clone();
+    let ht_inner = highest_term.clone();
+    let quorum_inner = quorum.clone();
+    let _ = tokio::time::timeout(deadline, async move {
+        loop {
+            if quorum_inner.has_quorum(&granted_inner.lock().unwrap()) {
+                return;
+            }
+            match rx.recv().await {
+                Some((voter, vote_granted, term)) => {
+                    if term > ht_inner.load(Ordering::Relaxed) {
+                        ht_inner.store(term, Ordering::Relaxed);
+                    }
+                    if vote_granted {
+                        granted_inner.lock().unwrap().push(voter);
+                    }
+                },
+                None => break,
+            }
+        }
+    }).await;
+
+    (granted.lock().unwrap().clone(), highest_term.load(Ordering::Relaxed))
 }
 
 pub async fn run_election(state: &AppState, max_delay_ms: u64) {
@@ -190,6 +310,33 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64) {
     let my_tail = log_summary(state, &my_logs);
     let candidate_id = state.config.node_id.clone();
 
+    let quorum = state.quorum_config();
+    let own = state.own_url();
+    let peers: Vec<String> = quorum.members().into_iter().filter(|v| !same_endpoint(v, &own)).collect();
+    // The self-vote alone can carry a lone voter; while joint it cannot carry a half it is not in.
+    let lone_voter = quorum.has_quorum(std::slice::from_ref(&own));
+    let round_deadline = Duration::from_millis(max_delay_ms.max(1000) + 2000);
+
+    // Raft §9.6: a term this node raises and then loses with deposes a leader that was serving
+    // fine, so ask whether it could win before standing costs the group anything (bugs.md C20).
+    if !lone_voter && !peers.is_empty() {
+        let asking = state.current_term() + 1;
+        let probe = vote_request(asking, &candidate_id, &my_logs, my_tail, &own);
+        let (willing, seen_term) = ask_peers(
+            state, &probe, peers.clone(), &quorum, "/internal/pre-vote", true, round_deadline).await;
+
+        if seen_term > state.current_term() {
+            info!(target: "election", "Pre-vote saw term {}; adopting it rather than standing", seen_term);
+            demote(state, seen_term).await;
+            return;
+        }
+        if !quorum.has_quorum(&willing) {
+            info!(target: "election", "Pre-vote {:?} is short of a quorum for term {}; not standing",
+                willing, asking);
+            return;
+        }
+    }
+
     let new_term = {
         let mut repl = state.replication.as_ref().unwrap().write().unwrap();
         repl.term += 1;
@@ -204,15 +351,10 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64) {
             "Could not persist candidacy for term {}; abandoning this election", new_term);
         return;
     }
-
-    let quorum = state.quorum_config();
-    let own = state.own_url();
-    let peers: Vec<String> = quorum.members().into_iter().filter(|v| !same_endpoint(v, &own)).collect();
     info!(target: "election", "Node {} standing for term {} (voters {:?}, outgoing {:?})",
         candidate_id, new_term, quorum.voters, quorum.outgoing);
 
-    // The self-vote alone can carry a lone voter; while joint it cannot carry a half it is not in.
-    if quorum.has_quorum(std::slice::from_ref(&own)) {
+    if lone_voter {
         become_leader(state, new_term, &candidate_id).await;
         return;
     }
@@ -221,73 +363,15 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64) {
         return;
     }
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, bool, u64)>(peers.len());
-    for peer in peers {
-        let client = state.client.clone();
-        let req = VoteRequest {
-            term: new_term,
-            candidate_id: candidate_id.clone(),
-            last_lsn: my_tail.last_lsn,
-            last_term: my_tail.last_term,
-            logs: my_logs.clone(),
-            candidate_url: Some(own.clone()),
-        };
-        let tx = tx.clone();
-        let voter = peer.clone();
-        tokio::spawn(async move {
-            let url = format!("{}/internal/vote", peer);
-            let sent = client.post(&url)
-                .timeout(Duration::from_millis(VOTE_REQUEST_TIMEOUT_MS))
-                .json(&req).send().await;
-            let (granted, term) = match sent {
-                Ok(r) if r.status().is_success() => {
-                    match r.json::<VoteResponse>().await {
-                        Ok(v) => (v.vote_granted, v.term),
-                        Err(_) => (false, 0),
-                    }
-                },
-                _ => (false, 0),
-            };
-            let _ = tx.send((voter, granted, term)).await;
-        });
-    }
-    drop(tx);
+    let req = vote_request(new_term, &candidate_id, &my_logs, my_tail, &own);
+    let (granted, seen_term) = ask_peers(
+        state, &req, peers, &quorum, "/internal/vote", false, round_deadline).await;
 
-    // Who granted, not how many: while joint a tally cannot tell a majority of both halves from
-    // the same count spread across one of them.
-    let granted = Arc::new(std::sync::Mutex::new(vec![own.clone()]));
-    let highest_term = Arc::new(AtomicU64::new(new_term));
-    let granted_inner = granted.clone();
-    let ht_inner = highest_term.clone();
-    let quorum_inner = quorum.clone();
-    let election_timeout = Duration::from_millis(max_delay_ms.max(1000) + 2000);
-    let _ = tokio::time::timeout(election_timeout, async move {
-        loop {
-            if quorum_inner.has_quorum(&granted_inner.lock().unwrap()) {
-                return;
-            }
-            match rx.recv().await {
-                Some((voter, vote_granted, term)) => {
-                    if term > ht_inner.load(Ordering::Relaxed) {
-                        ht_inner.store(term, Ordering::Relaxed);
-                    }
-                    if vote_granted {
-                        granted_inner.lock().unwrap().push(voter);
-                    }
-                },
-                None => break,
-            }
-        }
-    }).await;
-
-    let seen_term = highest_term.load(Ordering::Relaxed);
     if seen_term > new_term {
         info!(target: "election", "Saw higher term {} during election; stepping down", seen_term);
         demote(state, seen_term).await;
         return;
     }
-
-    let granted = granted.lock().unwrap().clone();
     if quorum.has_quorum(&granted) {
         become_leader(state, new_term, &candidate_id).await;
     } else {
@@ -648,6 +732,115 @@ mod tests {
 
         assert!(decide_vote(4, &None, &mine, scalar(4, 10), None, &req, false).granted,
             "the same request wins once the leader has gone quiet, which is the whole liveness story");
+    }
+
+    #[test]
+    fn a_pre_vote_answers_the_same_question_the_real_vote_would() {
+        let mine: HashMap<String, LogTail> = HashMap::new();
+
+        assert!(decide_pre_vote(4, &mine, scalar(4, 100), None, &vote_req(5, "n1", 4, 100), false));
+        assert!(!decide_pre_vote(4, &mine, scalar(4, 100), None, &vote_req(5, "n1", 4, 99), false),
+            "a candidate that would lose the real vote on its log is not worth encouraging to stand");
+
+        let config = Configuration::simple(vec!["http://a".into(), "http://b".into()]);
+        let mut stranger = vote_req(5, "n3", 4, 100);
+        stranger.candidate_url = Some("http://c".to_string());
+        assert!(!decide_pre_vote(4, &mine, scalar(4, 100), Some(&config), &stranger, false),
+            "nor one this voter's configuration does not name");
+    }
+
+    #[test]
+    fn a_pre_vote_at_or_below_our_own_term_is_refused() {
+        let mine: HashMap<String, LogTail> = HashMap::new();
+
+        assert!(!decide_pre_vote(5, &mine, scalar(4, 100), None, &vote_req(5, "n1", 4, 100), false),
+            "our own term may already hold this node's vote, so there is nothing to pre-approve");
+        assert!(!decide_pre_vote(5, &mine, scalar(4, 100), None, &vote_req(4, "n1", 4, 100), false));
+        assert!(decide_pre_vote(5, &mine, scalar(4, 100), None, &vote_req(6, "n1", 4, 100), false),
+            "and a term above ours is the one a candidate would actually stand at");
+    }
+
+    /// C20's fix. The refusal a leader's lease rests on now happens before any term moves, so a
+    /// candidate that cannot win stops costing the group an election every cycle.
+    #[test]
+    fn a_voter_that_owes_a_leader_silence_refuses_the_pre_vote() {
+        let mine: HashMap<String, LogTail> = HashMap::new();
+        let req = vote_req(9, "n1", 9, 500);
+
+        assert!(decide_pre_vote(4, &mine, scalar(4, 10), None, &req, false),
+            "a fresher candidate takes this outright once the leader has gone quiet");
+        assert!(!decide_pre_vote(4, &mine, scalar(4, 10), None, &req, true));
+    }
+
+    /// A node isolated from its voters used to raise its term on every cycle, so by the time it
+    /// rejoined it deposed whatever leader had been elected without it. Nothing rate-limited that.
+    #[tokio::test]
+    async fn an_isolated_candidate_stops_inflating_its_term() {
+        let root = crate::test_support::temp_root();
+        let port = crate::test_support::next_test_port();
+        let mut node = crate::test_support::TestNode::new("lonely", port, &root, "replica");
+        node.primary_addr = Some("http://127.0.0.1:1".to_string());
+        node.start();
+        let state = node.state.clone().unwrap();
+
+        // Two voters that do not exist: a majority of three this node can never reach.
+        state.install_configuration(Configuration::simple(vec![
+            state.own_url(),
+            format!("http://127.0.0.1:{}", crate::test_support::next_test_port()),
+            format!("http://127.0.0.1:{}", crate::test_support::next_test_port()),
+        ]));
+        assert!(state.in_quorum(), "vacuous unless this node would really stand");
+
+        let before = state.current_term();
+        for _ in 0..3 {
+            run_election(&state, 0).await;
+        }
+
+        assert_eq!(state.current_term(), before,
+            "three rounds of standing used to be three terms, each one deposing a live leader");
+        assert!(!state.is_leader(), "and it must not be able to elect itself either");
+
+        node.kill();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A peer with no route for the endpoint, which is what a node predating pre-vote answers with.
+    async fn serve_nothing(port: u16) {
+        let app = axum::Router::new()
+            .route("/elsewhere", axum::routing::get(|| async { "" }));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+    }
+
+    /// Pre-vote is an optimization, so a peer that has never heard of it is counted as willing:
+    /// a half-upgraded cluster elects exactly as it did before the round existed. The real vote
+    /// gets the opposite treatment, because there nobody answered.
+    #[tokio::test]
+    async fn a_peer_that_does_not_know_the_pre_vote_endpoint_is_counted_as_willing() {
+        let root = crate::test_support::temp_root();
+        let mut node = crate::test_support::TestNode::new(
+            "candidate", crate::test_support::next_test_port(), &root, "replica");
+        node.start();
+        let state = node.state.clone().unwrap();
+
+        let old_port = crate::test_support::next_test_port();
+        serve_nothing(old_port).await;
+        let old_peer = format!("http://127.0.0.1:{}", old_port);
+        let quorum = Configuration::simple(vec![state.own_url(), old_peer.clone()]);
+        let req = vote_request(9, "candidate", &HashMap::new(), LogTail::default(), &state.own_url());
+        let deadline = Duration::from_secs(3);
+
+        let (willing, _) = ask_peers(&state, &req, vec![old_peer.clone()], &quorum,
+            "/internal/pre-vote", true, deadline).await;
+        assert!(quorum.has_quorum(&willing),
+            "failing open on a 404 is what keeps a rolling upgrade able to elect anything");
+
+        let (granted, _) = ask_peers(&state, &req, vec![old_peer], &quorum,
+            "/internal/vote", false, deadline).await;
+        assert!(!quorum.has_quorum(&granted), "a real vote nobody answered is not a vote");
+
+        node.kill();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
