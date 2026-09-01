@@ -211,7 +211,7 @@ mod tests {
     use crate::config::NodeConfig;
     use crate::storage::Database;
     use crate::test_support::{
-        live_put, put_doc_http, temp_root, three_node_cluster, wait_for, wait_for_doc, TestNode,
+        live_put, put_doc_http, temp_root, three_node_cluster, three_node_cluster_with_timeout, wait_for, wait_for_doc, TestNode,
     };
     use std::sync::Arc;
     use std::time::Duration;
@@ -300,7 +300,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_drop_that_misses_its_quorum_is_staged_not_applied() {
         let root = temp_root();
-        let (n1, mut n2, mut n3) = three_node_cluster(&root).await;
+        let (n1, mut n2, mut n3) = three_node_cluster_with_timeout(&root, 30).await;
         let client = reqwest::Client::new();
 
         assert_eq!(put_doc_http(&client, &n1.url(), "k", 1).await, StatusCode::CREATED);

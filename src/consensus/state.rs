@@ -117,6 +117,25 @@ impl ReplicationMeta {
     }
 }
 
+/// Step down inside the current term, which is what CheckQuorum does: nothing is contested, this
+/// node just stops claiming a leadership it can no longer prove.
+pub fn relinquish_leadership(repl: &mut ReplicationState) -> Option<bool> {
+    if !repl.is_leader {
+        return None;
+    }
+    repl.is_leader = false;
+    repl.progress.reset();
+    repl.leases.clear();
+    // Cleared rather than stamped: a node that records contact it never had would then withhold
+    // its vote from the successor this step-down exists to let the others elect.
+    repl.last_heartbeat = None;
+    repl.last_replication = None;
+    repl.was_receiving_replication = false;
+    let restart = !repl.heartbeat_running;
+    repl.heartbeat_running = true;
+    Some(restart)
+}
+
 // Strictly higher only: on equal terms a peer bounces the leader with every message.
 pub fn apply_demotion(repl: &mut ReplicationState, new_term: u64) -> Option<bool> {
     if new_term <= repl.term {

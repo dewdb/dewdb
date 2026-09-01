@@ -20,6 +20,8 @@ mod util;
 #[cfg(test)]
 mod bench;
 #[cfg(test)]
+mod chaos;
+#[cfg(test)]
 mod test_support;
 
 use crate::api::build_app;
@@ -30,7 +32,7 @@ use crate::cluster::probe::{router_probe_task, ROUTER_PROBE_INTERVAL_SECS};
 use crate::cluster::rebalance::rebalance_task;
 use crate::config::{config_warnings, NodeConfig};
 use crate::consensus::{
-    boot_resync, heartbeat_poll_task, progress_flush_task, publish_inherited_tails,
+    boot_resync, heartbeat_poll_task, leader_contact_task, progress_flush_task, publish_inherited_tails,
     seed_leader_progress, Progress, ReplicationMeta, ReplicationState,
 };
 use crate::logging::init_logging;
@@ -186,7 +188,7 @@ async fn main() -> io::Result<()> {
         None
     };
 
-    let client = build_client(&config.auth);
+    let client = build_client(&config.auth, &config.own_url());
 
     if config.auth.internal_secret.is_none() && config.role == "shard" {
         warn!(target: "boot", "auth.internal_secret is not set; /internal/* endpoints accept unauthenticated requests");
@@ -238,6 +240,7 @@ async fn main() -> io::Result<()> {
             crate::consensus::reconfigure::resume_change(&state);
         }
         progress_flush_task(state.clone());
+        leader_contact_task(state.clone());
         replication_drive_task(state.clone());
         if config.rebalance.enabled {
             rebalance_task(state.clone(), config.rebalance.clone());

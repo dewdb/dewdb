@@ -265,7 +265,7 @@ impl TestNode {
                 let state = AppState {
                     db,
                     config: Arc::new(config.clone()),
-                    client: build_client(&config.auth),
+                    client: build_client(&config.auth, &config.own_url()),
                     replication: (!is_router).then_some(replication),
                     primary_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),
                     shard_failover_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -305,6 +305,7 @@ impl TestNode {
                         heartbeat_poll_task(state.clone());
                     }
                     progress_flush_task(state.clone());
+                    crate::consensus::leader_contact_task(state.clone());
                     crate::replication::stream::replication_drive_task(state.clone());
                 }
 
@@ -496,6 +497,16 @@ pub async fn put_value(
 }
 
 pub async fn three_node_cluster(root: &Path) -> (TestNode, TestNode, TestNode) {
+    three_node_cluster_with_timeout(root, 1).await
+}
+
+/// A longer contact timeout than the default 1s, for tests that deliberately leave the leader
+/// without a quorum: CheckQuorum steps such a leader down, and one second is not enough runway to
+/// assert what it does while it still holds office.
+pub async fn three_node_cluster_with_timeout(
+    root: &Path,
+    heartbeat_timeout_secs: u64,
+) -> (TestNode, TestNode, TestNode) {
     let (p1, p2, p3) = (free_port(), free_port(), free_port());
     let (u1, u2, u3) = (
         format!("http://127.0.0.1:{}", p1),
@@ -514,6 +525,10 @@ pub async fn three_node_cluster(root: &Path) -> (TestNode, TestNode, TestNode) {
     let mut n3 = TestNode::new("n3", p3, root, "replica");
     n3.peers = vec![u1.clone(), u2.clone()];
     n3.primary_addr = Some(u1.clone());
+
+    for n in [&mut n1, &mut n2, &mut n3] {
+        n.heartbeat_timeout_secs = heartbeat_timeout_secs;
+    }
 
     n1.start();
     n2.start();

@@ -99,6 +99,14 @@ fn default_heartbeat_timeout() -> u64 { 6 }
 fn default_election_delay() -> u64 { 2000 }
 
 impl NodeConfig {
+    pub fn own_url(&self) -> String {
+        if self.listen_addr.contains("://") {
+            self.listen_addr.clone()
+        } else {
+            format!("http://{}", self.listen_addr)
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if let Some(ring) = &self.ring {
             ring.validate()?;

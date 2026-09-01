@@ -89,3 +89,26 @@ pub async fn auth_middleware(
         }
     }
 }
+
+/// Applies `chaos`'s link faults at the receiving end, where the sender is known from its
+/// `NODE_HEADER`. A cut hangs rather than answering, so the sender fails the way a partition makes
+/// it fail -- on its own timeout -- instead of learning that the peer is up and refusing.
+#[cfg(test)]
+pub async fn chaos_middleware(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let from = req.headers().get(crate::auth::NODE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    if let Some(from) = from {
+        match crate::chaos::lookup(&from, &state.own_url()) {
+            Some(crate::chaos::Fault::Cut) => std::future::pending::<()>().await,
+            Some(crate::chaos::Fault::Delay(by)) => tokio::time::sleep(by).await,
+            None => {},
+        }
+    }
+    next.run(req).await
+}

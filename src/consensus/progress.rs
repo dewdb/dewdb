@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 const PROGRESS_FILE: &str = "progress.meta";
 
@@ -50,6 +51,9 @@ pub struct Progress {
     sent_through: HashMap<String, HashMap<String, u64>>,
     /// Per collection, the first LSN this leader appended in its own term.
     term_floor: HashMap<String, u64>,
+    /// Last time a request of ours reached this replica and came back. The only outbound evidence
+    /// this node has, and the only signal an asymmetric partition breaks (bugs.md H10).
+    contacted: HashMap<String, Instant>,
 }
 
 impl Progress {
@@ -63,6 +67,7 @@ impl Progress {
         self.committed.clear();
         self.sent_through.clear();
         self.term_floor.clear();
+        self.contacted.clear();
     }
 
     /// Exclusive lower bound for the next send: frames after this LSN are what the replica still
@@ -105,9 +110,14 @@ impl Progress {
         self.matched.clear();
         self.sent_through.clear();
         self.term_floor.clear();
+        self.contacted.clear();
         self.committed = applied.iter().map(|(c, lsn)| (c.clone(), *lsn)).collect();
 
+        // A new leader has reached nobody yet. Counting from promotion rather than from never gives
+        // it one contact timeout to prove its outbound path before `contact_quorum` turns on it.
+        let now = Instant::now();
         for replica in replicas {
+            self.contacted.insert(replica.clone(), now);
             let per_collection = self.sent_through.entry(replica.clone()).or_default();
             for (collection, tail) in own_tails {
                 let hinted = hints.get(replica).and_then(|m| m.get(collection)).copied();
@@ -122,6 +132,9 @@ impl Progress {
     /// top would leave the driver seeing no gap and shipping nothing until the next write.
     /// Existing cursors are left alone so a re-add cannot rewind a catch-up in flight.
     pub fn begin_tracking(&mut self, replica: &str, collections: &[String]) {
+        // Same grace `reinit_as_leader` gives: a member admitted mid-term has not answered us yet,
+        // and counting it as long-silent would push a healthy leader under `contact_quorum`.
+        self.contacted.entry(replica.to_string()).or_insert_with(Instant::now);
         let per_collection = self.sent_through.entry(replica.to_string()).or_default();
         for collection in collections {
             per_collection.entry(collection.clone()).or_insert(0);
@@ -158,6 +171,36 @@ impl Progress {
     /// one. Read by the quorum-read path: below it the commit index is a floor, not the answer.
     pub fn term_floor(&self, collection: &str) -> Option<u64> {
         self.term_floor.get(collection).copied()
+    }
+
+    pub fn note_contact(&mut self, replica: &str, at: Instant) {
+        let slot = self.contacted.entry(replica.to_string()).or_insert(at);
+        if at > *slot {
+            *slot = at;
+        }
+    }
+
+    /// Raft's CheckQuorum, from the leader's side of the wire: a majority of the configuration
+    /// answered us inside `within`. Counts this node for itself, so a lone voter always holds.
+    ///
+    /// A member seen here for the first time is stamped now, not treated as long silent: joining
+    /// the configuration is not the same as having gone quiet, and a config change that admits two
+    /// voters would otherwise depose the leader that installed it.
+    pub fn contact_quorum(&mut self, config: &Configuration, own_url: &str, now: Instant, within: Duration) -> bool {
+        let outgoing = config.outgoing.iter().flatten();
+        for member in config.voters.iter().chain(outgoing) {
+            if !same_endpoint(member, own_url) {
+                self.contacted.entry(member.clone()).or_insert(now);
+            }
+        }
+
+        let mut reached: Vec<String> = vec![own_url.to_string()];
+        for (replica, at) in &self.contacted {
+            if now.saturating_duration_since(*at) < within && !same_endpoint(replica, own_url) {
+                reached.push(replica.clone());
+            }
+        }
+        config.has_quorum(&reached)
     }
 
     pub fn committed(&self, collection: &str) -> u64 {

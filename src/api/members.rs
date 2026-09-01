@@ -213,7 +213,7 @@ pub async fn leave_handler(
 #[cfg(test)]
 mod tests {
     use crate::test_support::{
-        put_doc_at, read_doc_http, temp_root, three_node_cluster, wait_for, TestNode,
+        put_doc_at, read_doc_http, temp_root, three_node_cluster, three_node_cluster_with_timeout, wait_for, TestNode,
     };
     use axum::http::StatusCode;
     use std::time::Duration;
@@ -368,7 +368,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_learner_cannot_satisfy_a_write_concern_it_is_not_counted_in() {
         let root = temp_root();
-        let (n1, mut n2, mut n3) = three_node_cluster(&root).await;
+        let (n1, mut n2, mut n3) = three_node_cluster_with_timeout(&root, 30).await;
         let c = client();
 
         let n4 = fresh_node(&root, "n4");

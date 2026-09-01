@@ -346,7 +346,7 @@ pub async fn local_write_batch(
 
 #[cfg(test)]
 mod tests {
-    use crate::test_support::{temp_root, three_node_cluster};
+    use crate::test_support::{temp_root, three_node_cluster_with_timeout};
     use axum::http::StatusCode;
     use std::time::Duration;
 
@@ -355,7 +355,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn created_or_replaced_is_decided_against_the_uncommitted_tail() {
         let root = temp_root();
-        let (n1, mut n2, mut n3) = three_node_cluster(&root).await;
+        let (n1, mut n2, mut n3) = three_node_cluster_with_timeout(&root, 30).await;
         let client = reqwest::Client::new();
 
         n2.kill();

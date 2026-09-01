@@ -158,6 +158,10 @@ impl AppState {
         let committed = {
             let mut g = repl.write().unwrap();
             g.progress.observe_ack(replica, collection, lsn);
+            // An ack is a reply, so it is outbound contact as much as a probe is.
+            if g.is_leader {
+                g.progress.note_contact(replica, std::time::Instant::now());
+            }
             if !g.is_leader || ack_term != g.term {
                 g.progress.committed(collection)
             } else {
@@ -243,6 +247,28 @@ impl AppState {
             Some(r) => r.read().unwrap().leases.held(
                 &config, &own, std::time::Instant::now(), std::time::SystemTime::now()),
             None => false,
+        }
+    }
+
+    /// A request of ours reached `replica` and came back, whatever it asked. The only evidence
+    /// this node has that its own outbound path works.
+    pub fn note_replica_contact(&self, replica: &str) {
+        if let Some(repl) = self.replication.as_ref() {
+            let mut g = repl.write().unwrap();
+            if g.is_leader {
+                g.progress.note_contact(replica, std::time::Instant::now());
+            }
+        }
+    }
+
+    /// CheckQuorum: a majority of the configuration has answered us within `within`.
+    pub fn holds_contact_quorum(&self, within: std::time::Duration) -> bool {
+        let config = self.quorum_config();
+        let own = self.own_url();
+        match self.replication.as_ref() {
+            Some(r) => r.write().unwrap().progress.contact_quorum(
+                &config, &own, std::time::Instant::now(), within),
+            None => true,
         }
     }
 
@@ -507,8 +533,7 @@ impl AppState {
     }
 
     pub fn own_url(&self) -> String {
-        let addr = &self.config.listen_addr;
-        if addr.contains("://") { addr.clone() } else { format!("http://{}", addr) }
+        self.config.own_url()
     }
 
     /// Learners in the live view that named this node as their primary.

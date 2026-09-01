@@ -69,6 +69,10 @@ pub fn build_app(state: &AppState) -> Router {
             .route("/internal/migration-status", get(migration_status_handler));
     }
 
+    #[cfg(test)]
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        state.clone(), middleware::chaos_middleware));
+
     app.layer(axum::middleware::from_fn(reserved_name_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), metrics_middleware))

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 pub const INTERNAL_SECRET_HEADER: &str = "x-dew-internal-secret";
 pub const API_KEY_HEADER: &str = "x-api-key";
+pub const NODE_HEADER: &str = "x-dew-node";
 
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct AuthConfig {
@@ -106,8 +107,14 @@ pub fn authorize(
     }
 }
 
-pub fn build_client(auth: &AuthConfig) -> reqwest::Client {
+/// `from` names this node on every internal request it makes: attribution in a peer's logs, and
+/// the key a test fault injector cuts a link on.
+pub fn build_client(auth: &AuthConfig, from: &str) -> reqwest::Client {
     let mut headers = reqwest::header::HeaderMap::new();
+
+    if let Ok(v) = reqwest::header::HeaderValue::from_str(from) {
+        headers.insert(NODE_HEADER, v);
+    }
 
     if let Some(secret) = &auth.internal_secret {
         if let Ok(v) = reqwest::header::HeaderValue::from_str(secret) {

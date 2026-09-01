@@ -275,6 +275,93 @@ async fn follow_cluster_view(state: &AppState, from: &str) {
     }
 }
 
+/// Raft's CheckQuorum, which this architecture cannot get for free: a follower's poll proves the
+/// leader's *inbound* path, and so do the lease promises those polls carry, so an asymmetric
+/// partition leaves every inbound signal healthy while nothing the leader sends arrives. The probe
+/// is the only outbound evidence an idle leader has (bugs.md H10).
+pub fn leader_contact_task(state: AppState) {
+    tokio::spawn(async move {
+        let timeout = Duration::from_secs(state.config.heartbeat_timeout_secs);
+        // Four chances inside the window whatever the timeout is configured to, so a leader is
+        // never deposed by two scheduler hiccups on a short one.
+        let interval = (timeout / 4).min(Duration::from_millis(HEARTBEAT_POLL_INTERVAL_MS));
+
+        loop {
+            tokio::time::sleep(interval).await;
+            if !state.is_leader() {
+                continue;
+            }
+
+            // Detached: awaiting a probe into a cut link would age every healthy replica's contact
+            // by its timeout before the check reads them, deposing a leader over someone else's
+            // partition.
+            for replica in state.replication_targets() {
+                probe_replica(state.clone(), replica);
+            }
+
+            if state.holds_contact_quorum(timeout) {
+                continue;
+            }
+            step_down_without_quorum(&state, timeout).await;
+        }
+    });
+}
+
+fn probe_replica(state: AppState, replica: String) {
+    tokio::spawn(async move {
+        let url = format!("{}/internal/heartbeat", replica);
+        let answer = state.client.get(&url)
+            .timeout(Duration::from_millis(PEER_PROBE_TIMEOUT_MS))
+            .send().await;
+        let body = match answer {
+            // Any answer is contact; only a reachable peer can refuse one.
+            Ok(r) => { state.note_replica_contact(&replica); r.json::<serde_json::Value>().await.ok() },
+            Err(_) => return,
+        };
+        let their_term = body.as_ref()
+            .and_then(|v| v.get("term").and_then(|t| t.as_u64()))
+            .unwrap_or(0);
+        if their_term > state.current_term() {
+            warn!(target: "checkquorum", "Replica {} reports term {}; stepping down", replica, their_term);
+            demote(&state, their_term).await;
+        }
+    });
+}
+
+/// Gives up leadership at the current term, so the voters this node can no longer reach are free to
+/// elect one that can. Writes were already failing at `w=majority`; what this ends is the leader
+/// going on answering reads and blocking a successor indefinitely.
+async fn step_down_without_quorum(state: &AppState, timeout: Duration) {
+    let restart = {
+        let repl = match state.replication.as_ref() {
+            Some(r) => r,
+            None => return,
+        };
+        match super::state::relinquish_leadership(&mut repl.write().unwrap()) {
+            Some(r) => r,
+            None => return,
+        }
+    };
+
+    // The vote is kept: the term has not moved, and a node that forgot voting for itself could
+    // seat a second leader in it.
+    let (term, voted_for) = {
+        let g = state.replication.as_ref().unwrap().read().unwrap();
+        (g.term, g.voted_for.clone())
+    };
+    if let Err(e) = (ReplicationMeta { term, is_leader: false, voted_for })
+        .save(&state.config.data_dir)
+    {
+        warn!(target: "checkquorum", error = %e, "Stepped down in memory but could not persist it");
+    }
+    warn!(target: "checkquorum",
+        "No reply from a majority in {}s; stepping down as leader of term {}", timeout.as_secs(), term);
+
+    if restart {
+        heartbeat_poll_task(state.clone());
+    }
+}
+
 pub fn heartbeat_poll_task(state: AppState) {
     tokio::spawn(async move {
         let timeout = Duration::from_secs(state.config.heartbeat_timeout_secs);
@@ -307,7 +394,7 @@ pub fn heartbeat_poll_task(state: AppState) {
                     ("term".to_string(), own_term.to_string()),
                     ("novote_ms".to_string(), promise.as_millis().to_string()),
                 ];
-                match state.client.get(&url).query(&query).send().await {
+                match state.client.get(&url).query(&query).timeout(timeout).send().await {
                     Ok(r) if r.status().is_success() => {
                         if let Ok(hb) = r.json::<serde_json::Value>().await {
                             let their_term = hb.get("term").and_then(|v| v.as_u64()).unwrap_or(0);
