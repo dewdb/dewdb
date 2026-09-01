@@ -616,6 +616,56 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// The half a process crash cannot reach: a machine losing power drops what the page cache
+    /// still held, so recovery meets a WAL cut off mid-record. Everything the cut did not reach
+    /// has to survive it, and the collection has to go on accepting writes.
+    #[tokio::test]
+    async fn a_wal_cut_off_mid_frame_keeps_every_record_before_the_cut() {
+        let root = temp_root();
+        let wal_path;
+
+        {
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("torn").unwrap();
+            let mut last = 0;
+            for i in 0..50 {
+                last = col.put(format!("key:{}", i), serde_json::json!({"n": i}), 1).unwrap().3;
+            }
+            col.enqueue_commit().await.unwrap().unwrap();
+            col.apply_committed(last);
+            let writer = col.wal_writer.lock().unwrap();
+            wal_path = col.root_path.join(format!("wal-{:05}.log", writer.current_wal_id));
+        }
+
+        let full = fs::metadata(&wal_path).unwrap().len();
+        let cut = OpenOptions::new().write(true).open(&wal_path).unwrap();
+        // Mid-record rather than on a boundary: a clean boundary is the easy case and the one a
+        // length check already handles.
+        cut.set_len(full - 37).unwrap();
+        cut.sync_all().unwrap();
+        drop(cut);
+
+        let db2 = Database::new(&root).unwrap();
+        let col2 = db2.get_collection("torn").unwrap();
+
+        let survivors = (0..50)
+            .filter(|i| col2.get(&format!("key:{}", i)).unwrap().is_some())
+            .collect::<Vec<_>>();
+        assert!(!survivors.is_empty(), "a cut tail took the whole log with it");
+        // Records here are about 100 bytes, so 37 lands inside the last one. Asserted so a change
+        // in record size cannot quietly turn this into a test that cuts nothing.
+        assert!(survivors.len() < 50, "the cut fell on a record boundary and tested nothing");
+        assert_eq!(survivors, (0..survivors.len() as i32).collect::<Vec<_>>(),
+            "recovery kept a record written after one it dropped, so the loss was not a tail");
+
+        let lsn = col2.put("after".to_string(), serde_json::json!({"n": -1}), 1).unwrap().3;
+        col2.enqueue_commit().await.unwrap().unwrap();
+        col2.apply_committed(lsn);
+        assert!(col2.get("after").unwrap().is_some(), "writes did not resume past a cut tail");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn a_read_refuses_a_frame_that_is_not_the_one_the_index_recorded() {
         let root = temp_root();

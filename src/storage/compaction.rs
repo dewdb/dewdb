@@ -602,4 +602,40 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
     }
+
+    /// The two recovery inputs meeting: a compaction retires the WALs a crash would have replayed,
+    /// so what boot reads is the snapshot plus whatever was written after it. Both halves have to
+    /// be there, and the newer value has to win.
+    #[tokio::test]
+    async fn a_value_survives_a_compaction_and_the_crash_that_follows_it() {
+        let root = temp_root();
+
+        {
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("c").unwrap();
+            for i in 0..40 {
+                live_put(&col, &format!("k{}", i % 10), i);
+            }
+            col.enqueue_commit().await.unwrap().unwrap();
+            col.compact().unwrap();
+
+            // Written after the compaction, so it lives only in the WAL the snapshot does not cover.
+            live_put(&col, "after", 99);
+            live_put(&col, "k3", 500);
+            col.enqueue_commit().await.unwrap().unwrap();
+        }
+
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+        for i in 0..10 {
+            assert!(col.get(&format!("k{}", i)).unwrap().is_some(),
+                "k{} was compacted away rather than into the snapshot", i);
+        }
+        assert_eq!(col.get("after").unwrap().and_then(|v| v.get("v").and_then(|n| n.as_i64())),
+            Some(99), "a write after the compaction did not survive the crash");
+        assert_eq!(col.get("k3").unwrap().and_then(|v| v.get("v").and_then(|n| n.as_i64())),
+            Some(500), "recovery preferred the snapshot's value over the newer WAL frame");
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

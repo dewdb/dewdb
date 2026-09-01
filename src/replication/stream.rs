@@ -302,7 +302,13 @@ async fn repair_replica(
     let lock = repair_lock(&state, &replica_url, &collection);
     let _guard = match lock.try_lock() {
         Ok(g) => g,
-        Err(_) => return false,
+        // Coalesced behind a repair already running for this replica and collection. Its frames
+        // are ours too, so wait it out and answer from what the replica acknowledged: reporting a
+        // miss here fails the write concern of a frame that landed (bugs.md H11).
+        Err(_) => {
+            let _queued = lock.lock().await;
+            return needed_lsn > 0 && state.matched_lsn(&replica_url, &collection) >= needed_lsn;
+        },
     };
 
     let mut after = reported_last_lsn;
@@ -1104,6 +1110,36 @@ mod tests {
                 "k{} must reach the returning replica without a write to trigger it; replication that \
                  only runs on client traffic leaves an idle cluster permanently diverged", i);
         }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// bugs.md H11, found by the churn soak: concurrent writes to one collection all take the
+    /// repair path, because each one's send cursor still sits behind its own predecessor. All but
+    /// the first coalesced onto the running repair and reported a miss, so a frame a majority held
+    /// came back 202 after the full wtimeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn concurrent_writes_are_not_reported_as_missing_a_quorum_that_held() {
+        let root = temp_root();
+        let (n1, _n2, _n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(20)).build().unwrap();
+
+        assert!(put_doc_at(&client, &n1.url(), "t", "warm", 0, "?w=majority&wtimeout=4000").await.is_success());
+
+        let statuses = futures::future::join_all((1..=12).map(|i| {
+            let (c, base) = (client.clone(), n1.url());
+            async move {
+                put_doc_at(&c, &base, "t", &format!("k{}", i), i, "?w=majority&wtimeout=4000").await
+            }
+        })).await;
+
+        let staged: Vec<_> = statuses.iter().enumerate()
+            .filter(|(_, s)| **s == StatusCode::ACCEPTED)
+            .map(|(i, _)| i + 1)
+            .collect();
+        assert!(staged.is_empty(),
+            "a healthy three-node cluster met no quorum for concurrent writes {:?}: {:?}",
+            staged, statuses);
 
         let _ = fs::remove_dir_all(&root);
     }

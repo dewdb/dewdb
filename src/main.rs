@@ -22,6 +22,8 @@ mod bench;
 #[cfg(test)]
 mod chaos;
 #[cfg(test)]
+mod soak;
+#[cfg(test)]
 mod test_support;
 
 use crate::api::build_app;
