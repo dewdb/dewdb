@@ -4,6 +4,7 @@ use serde::Deserialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     #[serde(default = "default_log_level")]
     pub level: String,

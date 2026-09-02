@@ -302,12 +302,21 @@ async fn repair_replica(
     let lock = repair_lock(&state, &replica_url, &collection);
     let _guard = match lock.try_lock() {
         Ok(g) => g,
-        // Coalesced behind a repair already running for this replica and collection. Its frames
-        // are ours too, so wait it out and answer from what the replica acknowledged: reporting a
-        // miss here fails the write concern of a frame that landed (bugs.md H11).
+        // Coalesced behind a repair already running for this replica and collection. A caller with
+        // no LSN to answer about -- gap, divergence, the periodic driver -- wanted the work done,
+        // and it is being done, so it leaves. Waiting here for an answer nobody reads serialises
+        // every frame of a bulk write behind a full repair pass (bugs.md H12).
+        Err(_) if needed_lsn == 0 => return false,
+        // A write concern does need the answer, and the running repair's frames are usually its
+        // frames too: reporting a miss without waiting fails a write a majority holds (H11). But
+        // a repair that read its target before this frame was appended never carried it, so if it
+        // came back short we keep the lock we just took and do the work ourselves.
         Err(_) => {
-            let _queued = lock.lock().await;
-            return needed_lsn > 0 && state.matched_lsn(&replica_url, &collection) >= needed_lsn;
+            let queued = lock.lock().await;
+            if state.matched_lsn(&replica_url, &collection) >= needed_lsn {
+                return true;
+            }
+            queued
         },
     };
 

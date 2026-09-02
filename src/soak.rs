@@ -13,7 +13,7 @@
 //! It is not a machine crash: writes that reached the OS but were never fsynced still survive,
 //! because the page cache does. `truncated_tail` is what covers that half.
 
-use crate::test_support::{next_test_port, temp_root, three_node_cluster, TestNode};
+use crate::test_support::{cleanup, next_test_port, temp_root, three_node_cluster, TestNode};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
@@ -212,7 +212,7 @@ async fn soak_a_single_node_survives_repeated_crashes() {
     }
 
     node.kill();
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup(&root).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -316,7 +316,7 @@ async fn soak_a_cluster_under_churn_loses_no_acknowledged_write() {
     n1.kill();
     n2.kill();
     n3.kill();
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup(&root).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -370,7 +370,7 @@ async fn soak_compaction_and_crashes_interleave_without_losing_writes() {
     assert_durable("compaction/final", &ledger, &final_view);
 
     node.kill();
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup(&root).await;
 }
 
 /// The half `kill` cannot reach: a machine losing power drops whatever the page cache still held,
@@ -433,7 +433,7 @@ async fn soak_a_truncated_wal_tail_costs_only_the_frames_it_cuts() {
         "writes did not resume after the last truncation: {:?}", status);
 
     node.kill();
-    let _ = std::fs::remove_dir_all(&root);
+    cleanup(&root).await;
 }
 
 /// What a cut tail may cost: entries the WAL no longer ends with. Keys are written in value order

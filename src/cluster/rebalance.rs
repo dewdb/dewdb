@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
 #[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct RebalanceConfig {
     /// Opt-in because legacy membership may omit current shards.
     #[serde(default)]

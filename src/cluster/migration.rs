@@ -15,6 +15,7 @@ use tracing::{info, warn};
 const MIGRATION_FILE: &str = "migration.meta";
 
 #[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct DataMovementConfig {
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,

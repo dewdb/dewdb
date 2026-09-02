@@ -5,7 +5,8 @@
 //! cluster varies by more than most of the effects being measured, so one number proves nothing.
 
 use crate::test_support::{
-    get_raw, put_doc_at, put_value, single_node, temp_root, three_node_cluster, TestNode,
+    cleanup, get_raw, put_doc_at, put_value, sharded_cluster, single_node, temp_root, three_node_cluster,
+    voter_group, TestNode,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -115,9 +116,10 @@ async fn write_sample(node: &TestNode, client: Arc<reqwest::Client>, query: &'st
         let client = client.clone();
         let url = url.clone();
         async move {
-            put_doc_at(&client, &url, "bench", &format!("{}-{}-{}", tag, w, i), i as i64, query)
-                .await
-                .is_success()
+            // 202 is a write that did not meet its concern, and counting it as completed is how a
+            // replication path that stopped acknowledging would show up here as faster.
+            let status = put_doc_at(&client, &url, "bench", &format!("{}-{}-{}", tag, w, i), i as i64, query).await;
+            status.is_success() && status != axum::http::StatusCode::ACCEPTED
         }
     }).await;
     assert_eq!(fails, 0, "{}: {} writes failed", tag, fails);
@@ -140,8 +142,8 @@ async fn bench_write_concern() {
             let client = bench_client();
             let _ = put_doc_at(&client, &n1.url(), "bench", "warm", 0, "?w=all&wtimeout=15000").await;
             samples.push(write_sample(&n1, client, query, 16, 40, tag).await);
-            drop(n1);
-            let _ = std::fs::remove_dir_all(&root);
+            drop((n1, _n2, _n3));
+            cleanup(&root).await;
         }
         report(label, samples);
     }
@@ -160,7 +162,7 @@ async fn bench_replication_cost() {
         let _ = put_doc_at(&client, &n.url(), "bench", "warm", 0, "?w=1").await;
         solo.push(write_sample(&n, client, "?w=1", 16, 40, "solo").await);
         drop(n);
-        let _ = std::fs::remove_dir_all(&root);
+        cleanup(&root).await;
     }
     report("single node", solo);
 
@@ -171,8 +173,8 @@ async fn bench_replication_cost() {
         let client = bench_client();
         let _ = put_doc_at(&client, &n1.url(), "bench", "warm", 0, "?w=1").await;
         clustered.push(write_sample(&n1, client, "?w=1", 16, 40, "clus").await);
-        drop(n1);
-        let _ = std::fs::remove_dir_all(&root);
+        drop((n1, _n2, _n3));
+        cleanup(&root).await;
     }
     report("3 nodes (2 replicas)", clustered);
 }
@@ -192,8 +194,8 @@ async fn bench_concurrency_scaling() {
             let client = bench_client();
             let _ = put_doc_at(&client, &n1.url(), "bench", "warm", 0, "?w=all&wtimeout=15000").await;
             samples.push(write_sample(&n1, client, "?w=majority&wtimeout=15000", conc, per, "cs").await);
-            drop(n1);
-            let _ = std::fs::remove_dir_all(&root);
+            drop((n1, _n2, _n3));
+            cleanup(&root).await;
         }
         report(&format!("concurrency {}", conc), samples);
     }
@@ -211,8 +213,8 @@ async fn bench_batch_writes() {
         let client = bench_client();
         let _ = put_doc_at(&client, &n1.url(), "bench", "warm", 0, "?w=all&wtimeout=15000").await;
         singles.push(write_sample(&n1, client, "?w=majority&wtimeout=15000", 8, 40, "sg").await);
-        drop(n1);
-        let _ = std::fs::remove_dir_all(&root);
+        drop((n1, _n2, _n3));
+        cleanup(&root).await;
     }
     report("320 single writes", singles);
 
@@ -224,6 +226,9 @@ async fn bench_batch_writes() {
         let root = temp_root();
         let (n1, _n2, _n3) = three_node_cluster(&root).await;
         let client = bench_client();
+        // The row above warms the collection before timing; without the same warm-up this one
+        // measures a first write to a collection the replicas have never seen instead of a bulk.
+        let _ = put_doc_at(&client, &n1.url(), "bench", "warm", 0, "?w=all&wtimeout=15000").await;
         let url = n1.url();
         let started = Instant::now();
         let mut lat = Vec::new();
@@ -250,8 +255,8 @@ async fn bench_batch_writes() {
             }
         }
         batched.push(summarize(lat, started.elapsed().as_secs_f64()));
-        drop(n1);
-        let _ = std::fs::remove_dir_all(&root);
+        drop((n1, _n2, _n3));
+        cleanup(&root).await;
     }
     report(&format!("320 writes, bulks of {}", batch_of), batched);
 }
@@ -294,8 +299,8 @@ async fn bench_reads() {
             }).await;
             assert_eq!(fails, 0, "{} reads failed", fails);
             samples.push(summarize(lat, started.elapsed().as_secs_f64()));
-            drop(n1);
-            let _ = std::fs::remove_dir_all(&root);
+            drop((n1, _n2, _n3));
+            cleanup(&root).await;
         }
         report(label, samples);
     }
@@ -335,9 +340,98 @@ async fn bench_queries() {
             }).await;
             assert_eq!(fails, 0, "{} queries failed", fails);
             samples.push(summarize(lat, started.elapsed().as_secs_f64()));
-            drop(n1);
-            let _ = std::fs::remove_dir_all(&root);
+            drop((n1, _n2, _n3));
+            cleanup(&root).await;
         }
         report(label, samples);
+    }
+}
+
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn bench_quorum_width() {
+    println!("\n=== w=majority by group size, 16 concurrent ===");
+    // A majority is still whichever ceil(n/2) replicas answer first, so what widening costs is the
+    // leader's outbound fan-out, not the latency it waits on.
+    for voters in [3usize, 5, 7] {
+        let mut samples = Vec::new();
+        for _ in 0..SAMPLES {
+            let root = temp_root();
+            let nodes = voter_group(&root, voters, 5).await;
+            let client = bench_client();
+            let _ = put_doc_at(&client, &nodes[0].url(), "bench", "warm", 0, "?w=majority&wtimeout=15000").await;
+            samples.push(write_sample(&nodes[0], client, "?w=majority&wtimeout=15000", 16, 40, "qw").await);
+            drop(nodes);
+            cleanup(&root).await;
+        }
+        report(&format!("{} voters (majority {})", voters, voters / 2 + 1), samples);
+    }
+}
+
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn bench_shard_scaling() {
+    println!("\n=== routed writes by shard count, 32 concurrent ===");
+    // Each shard is one node, so nothing replicates and the only thing changing is how many
+    // independent write paths the router spreads a key space over.
+    for shards in [1usize, 2, 4, 8] {
+        let mut samples = Vec::new();
+        for _ in 0..SAMPLES {
+            let root = temp_root();
+            let (owners, router) = sharded_cluster(&root, shards).await;
+            let client = bench_client();
+            let _ = put_doc_at(&client, &router.url(), "bench", "warm", 0, "").await;
+            samples.push(write_sample(&router, client, "", 32, 20, "sh").await);
+            drop(owners);
+            drop(router);
+            cleanup(&root).await;
+        }
+        report(&format!("{} shards", shards), samples);
+    }
+}
+
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn bench_cross_shard_query() {
+    println!("\n=== cross-shard query by shard count, 1000 docs, 8 concurrent ===");
+    // The unsorted fan-out concatenates whatever each shard returns; the sorted one has to merge
+    // on the sort key, which is the cost this measures against it.
+    for shards in [1usize, 2, 4, 8] {
+        for (label, suffix) in [("plain", ""), ("sorted", "&sort=v:asc")] {
+            let mut samples = Vec::new();
+            for _ in 0..SAMPLES {
+                let root = temp_root();
+                let (owners, router) = sharded_cluster(&root, shards).await;
+                let client = bench_client();
+                for k in 0..1000 {
+                    let st = put_value(&client, &router.url(), "bench", &format!("q{:05}", k),
+                        serde_json::json!({"v": k}), "").await;
+                    assert!(st.is_success(), "seed write failed: {}", st);
+                }
+
+                let url = router.url();
+                for _ in 0..10 {
+                    let _ = client.get(format!("{}/collections/bench/query?limit=100{}", url, suffix))
+                        .send().await;
+                }
+
+                let c2 = client.clone();
+                let started = Instant::now();
+                let (lat, fails) = drive(8, 20, move |_w, _i| {
+                    let client = c2.clone();
+                    let url = url.clone();
+                    async move {
+                        client.get(format!("{}/collections/bench/query?limit=100{}", url, suffix))
+                            .send().await.map(|r| r.status().is_success()).unwrap_or(false)
+                    }
+                }).await;
+                assert_eq!(fails, 0, "{} queries failed", fails);
+                samples.push(summarize(lat, started.elapsed().as_secs_f64()));
+                drop(owners);
+                drop(router);
+                cleanup(&root).await;
+            }
+            report(&format!("{} shards, {}", shards, label), samples);
+        }
     }
 }

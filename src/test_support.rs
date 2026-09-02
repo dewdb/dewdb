@@ -27,6 +27,19 @@ pub fn idx(frame: &[u8], wal_id: u64, offset: u64) -> IndexEntry {
     IndexEntry { wal_id, offset, len: (frame.len() - HEADER_LEN) as u32, inline: None }
 }
 
+/// Removes a `temp_root`, and says so when it cannot: Windows refuses to unlink a file a live node
+/// still holds, so a swallowed failure here leaks a cluster's WAL per sample (bugs.md L13).
+pub async fn cleanup(root: &Path) {
+    for _ in 0..40 {
+        match fs::remove_dir_all(root) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    }
+    println!("LEAKED {} -- a node under it is still holding a file", root.display());
+}
+
 pub fn temp_root() -> PathBuf {
     let p = std::env::temp_dir().join(format!("dewdb-test-{}", Uuid::new_v4()));
     fs::create_dir_all(&p).unwrap();
@@ -347,10 +360,10 @@ impl TestNode {
 }
 
 impl Drop for TestNode {
+    // Joined, not just signalled: a notify alone leaves the runtime winding down on its own
+    // schedule, and a run that drops clusters in a loop ends up with all of them still competing.
     fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            stop.notify_one();
-        }
+        self.kill();
     }
 }
 
@@ -507,32 +520,51 @@ pub async fn three_node_cluster_with_timeout(
     root: &Path,
     heartbeat_timeout_secs: u64,
 ) -> (TestNode, TestNode, TestNode) {
-    let (p1, p2, p3) = (free_port(), free_port(), free_port());
-    let (u1, u2, u3) = (
-        format!("http://127.0.0.1:{}", p1),
-        format!("http://127.0.0.1:{}", p2),
-        format!("http://127.0.0.1:{}", p3),
-    );
+    let mut nodes = voter_group(root, 3, heartbeat_timeout_secs).await;
+    let n3 = nodes.pop().unwrap();
+    let n2 = nodes.pop().unwrap();
+    let n1 = nodes.pop().unwrap();
+    (n1, n2, n3)
+}
 
-    let mut n1 = TestNode::new("n1", p1, root, "primary");
-    n1.peers = vec![u2.clone(), u3.clone()];
-    n1.replicas = vec![u2.clone(), u3.clone()];
+/// One shard group of `n` voters, `n1` leading and the rest following it. `w=majority` needs
+/// `n / 2 + 1`, so this is how a wider quorum's cost is measured against a narrower one.
+pub async fn voter_group(root: &Path, n: usize, heartbeat_timeout_secs: u64) -> Vec<TestNode> {
+    let ports: Vec<u16> = (0..n).map(|_| free_port()).collect();
+    let urls: Vec<String> = ports.iter().map(|p| format!("http://127.0.0.1:{}", p)).collect();
 
-    let mut n2 = TestNode::new("n2", p2, root, "replica");
-    n2.peers = vec![u1.clone(), u3.clone()];
-    n2.primary_addr = Some(u1.clone());
-
-    let mut n3 = TestNode::new("n3", p3, root, "replica");
-    n3.peers = vec![u1.clone(), u2.clone()];
-    n3.primary_addr = Some(u1.clone());
-
-    for n in [&mut n1, &mut n2, &mut n3] {
-        n.heartbeat_timeout_secs = heartbeat_timeout_secs;
+    let mut nodes = Vec::with_capacity(n);
+    for (i, port) in ports.iter().enumerate() {
+        let role = if i == 0 { "primary" } else { "replica" };
+        let mut node = TestNode::new(&format!("n{}", i + 1), *port, root, role);
+        node.peers = urls.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, u)| u.clone()).collect();
+        if i == 0 {
+            node.replicas = urls[1..].to_vec();
+        } else {
+            node.primary_addr = Some(urls[0].clone());
+        }
+        node.heartbeat_timeout_secs = heartbeat_timeout_secs;
+        nodes.push(node);
     }
 
-    n1.start();
-    n2.start();
-    n3.start();
+    for node in nodes.iter_mut() {
+        node.start();
+    }
     tokio::time::sleep(Duration::from_millis(300)).await;
-    (n1, n2, n3)
+    nodes
+}
+
+/// `shards` single-node shard groups behind one router, one hash range each. A write pays the
+/// routing hop and a query pays a fan-out across every range.
+pub async fn sharded_cluster(root: &Path, shards: usize) -> (Vec<TestNode>, TestNode) {
+    let mut owners = Vec::with_capacity(shards);
+    for i in 0..shards {
+        let mut node = TestNode::new(&format!("s{}", i + 1), free_port(), root, "primary");
+        node.start();
+        owners.push(node);
+    }
+    let groups: Vec<(String, Vec<String>)> =
+        owners.iter().map(|n| (n.url(), Vec::new())).collect();
+    let router = router_for(root, &groups).await;
+    (owners, router)
 }

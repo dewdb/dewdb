@@ -123,6 +123,7 @@ impl Collection {
         let mut index = BTreeMap::new();
         let mut pending: BTreeMap<u64, StagedApply> = BTreeMap::new();
         let mut inline_used: u64 = 0;
+        let mut staged_inline: u64 = 0;
         let mut wal_files = Vec::new();
 
         let index_path = root_path.join(INDEX_FILENAME);
@@ -183,7 +184,7 @@ impl Collection {
         if !snapshot_loaded {
             info!(target: "storage", collection = %name, "Replaying all WALs");
              for (id, path) in &wal_files {
-                let r = Self::replay_file_from(*id, path, 0, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut dropped, &mut committed_config)?;
+                let r = Self::replay_file_from(*id, path, 0, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut staged_inline, &mut dropped, &mut committed_config)?;
                 fold(r, &mut max_lsn, &mut max_term);
             }
         } else {
@@ -192,10 +193,10 @@ impl Collection {
                      continue;
                  } else if *id == snapshot_wal_id {
                      info!(target: "storage", collection = %name, wal_id = id, offset = snapshot_offset, "Resuming WAL from snapshot offset");
-                     let r = Self::replay_file_from(*id, path, snapshot_offset, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut dropped, &mut committed_config)?;
+                     let r = Self::replay_file_from(*id, path, snapshot_offset, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut staged_inline, &mut dropped, &mut committed_config)?;
                      fold(r, &mut max_lsn, &mut max_term);
                  } else {
-                     let r = Self::replay_file_from(*id, path, 0, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut dropped, &mut committed_config)?;
+                     let r = Self::replay_file_from(*id, path, 0, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut staged_inline, &mut dropped, &mut committed_config)?;
                      fold(r, &mut max_lsn, &mut max_term);
                  }
              }
@@ -1381,6 +1382,46 @@ mod tests {
         }
         assert!(col.get("k").unwrap().is_none(), "a deleted key must not be served from cache");
         assert_eq!(col.inline_bytes.load(Ordering::Relaxed), 0);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// bugs.md M11: replay inlined a staged frame on value size alone, so a node restarting on a
+    /// large uncommitted tail came back over its configured budget, and committing those frames
+    /// pushed the tracked total over it too.
+    #[tokio::test]
+    async fn a_restart_on_an_uncommitted_tail_stays_inside_the_inline_budget() {
+        let root = temp_root();
+        const BUDGET: u64 = 400;
+
+        {
+            let db = Database::with_cache(&root, cache_cfg(512, BUDGET)).unwrap();
+            let col = db.get_collection("c").unwrap();
+            // Durable and never committed, which is what a leader that lost its quorum leaves.
+            for i in 0..40 {
+                stage_put(&col, &format!("k{}", i), i);
+            }
+            col.enqueue_commit().await.unwrap().unwrap();
+        }
+
+        let db2 = Database::with_cache(&root, cache_cfg(512, BUDGET)).unwrap();
+        let col2 = db2.get_collection("c").unwrap();
+        assert_eq!(col2.pending_len(), 40, "the tail must come back staged, not applied");
+
+        let staged: u64 = col2.pending.lock().unwrap().values()
+            .filter_map(|s| match &s.effect {
+                StagedEffect::Put { entry, .. } => Some(entry.inline_bytes()),
+                _ => None,
+            })
+            .sum();
+        assert!(staged > 0, "some staged frames must still be inlined, or this tests nothing");
+        assert!(staged <= BUDGET,
+            "replay inlined {} bytes of staged frames against a {} byte budget", staged, BUDGET);
+
+        col2.apply_committed(col2.last_appended_lsn());
+        assert!(col2.inline_bytes.load(Ordering::Relaxed) <= BUDGET,
+            "committing the tail pushed tracked inline memory to {} over a {} byte budget",
+            col2.inline_bytes.load(Ordering::Relaxed), BUDGET);
 
         let _ = fs::remove_dir_all(&root);
     }

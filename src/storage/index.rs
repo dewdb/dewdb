@@ -29,6 +29,7 @@ impl IndexEntry {
 }
 
 #[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct ReadCacheConfig {
     #[serde(default = "default_inline_max_bytes")]
     pub inline_max_value_bytes: u32,

@@ -32,6 +32,9 @@ impl Collection {
         applied_through: u64,
         cache: &ReadCacheConfig,
         inline_used: &mut u64,
+        // Inline bytes held by staged frames: the same budget, since it is the same memory, but
+        // kept out of `inline_used` because `apply_index_put` charges them when they commit (M11).
+        staged_inline: &mut u64,
         dropped: &mut bool,
         config: &mut Option<Configuration>,
     ) -> io::Result<(u64, u64)> {
@@ -84,7 +87,10 @@ impl Collection {
                     // Uncommitted at the last shutdown: keep it durable but unpublished.
                     let effect = match entry {
                         LogEntry::Put { key, .. } => {
-                            let inline = if len <= cache.inline_max_value_bytes {
+                            let inline = if len <= cache.inline_max_value_bytes
+                                && *inline_used + *staged_inline + len as u64 <= cache.inline_budget_bytes
+                            {
+                                *staged_inline += len as u64;
                                 Some(payload.clone().into_boxed_slice())
                             } else {
                                 None

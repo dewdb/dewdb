@@ -11,7 +11,11 @@ use crate::util::{endpoint_of, same_endpoint};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
 
+/// `deny_unknown_fields` throughout the config tree: a typo taking a default silently is a node
+/// running something other than what the file says (L1). Deliberately not on `ShardInfo` or
+/// `HashRing`, which are also the wire format of the cluster view and have to survive version skew.
 #[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     pub node_id: String,
     pub role: String,
@@ -66,6 +70,7 @@ pub struct NodeConfig {
 /// Without `max_uncommitted_frames` a leader that has lost quorum keeps staging frames in memory
 /// forever, since the staging buffer only drains on commit.
 #[derive(Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct FlowControlConfig {
     #[serde(default = "default_max_uncommitted")]
     pub max_uncommitted_frames: usize,
@@ -108,6 +113,18 @@ impl NodeConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        // Every role check downstream is `== "shard"` or `== "router"`, so a typo boots as neither:
+        // no storage, the public routes registered anyway, and a panic on the first read (L2).
+        if self.role != "shard" && self.role != "router" {
+            return Err(format!("role must be 'shard' or 'router', got '{}'", self.role));
+        }
+        if self.role == "shard" {
+            match self.shard_role.as_deref() {
+                None | Some("primary") | Some("replica") => {},
+                Some(other) => return Err(format!(
+                    "shard_role must be 'primary' or 'replica', got '{}'", other)),
+            }
+        }
         if let Some(ring) = &self.ring {
             ring.validate()?;
             if !self.shard_map.is_empty() {
@@ -257,6 +274,42 @@ mod tests {
     fn warn_cfg(json: &str) -> Vec<String> {
         let cfg: NodeConfig = serde_json::from_str(json).unwrap();
         config_warnings(&cfg)
+    }
+
+    fn parse(json: &str) -> Result<NodeConfig, String> {
+        serde_json::from_str::<NodeConfig>(json).map_err(|e| e.to_string())
+    }
+
+    /// L1: a key nobody reads is a setting that did not take, and defaulting silently is how a
+    /// node ends up running something other than what its file says.
+    #[test]
+    fn a_misspelled_config_key_is_refused_rather_than_defaulted() {
+        let typo = parse(r#"{"node_id":"n1","role":"shard","listen_addr":"127.0.0.1:9601",
+            "heartbeat_timeout_sec":30}"#);
+        assert!(typo.is_err(), "a typo booted on defaults");
+
+        let nested = parse(r#"{"node_id":"n1","role":"shard","listen_addr":"127.0.0.1:9601",
+            "maintenance":{"enabled":true,"interval_sec":30}}"#);
+        assert!(nested.is_err(), "a typo in a nested section booted on defaults");
+
+        assert!(parse(r#"{"node_id":"n1","role":"shard","listen_addr":"127.0.0.1:9601",
+            "heartbeat_timeout_secs":30}"#).is_ok(), "the spelled-right key must still parse");
+    }
+
+    /// L2: nothing downstream matches a third role, so `db` stays `None`, the public routes are
+    /// registered anyway, and the first read unwraps it.
+    #[test]
+    fn an_unknown_role_fails_at_boot_instead_of_on_the_first_read() {
+        let cfg = parse(r#"{"node_id":"n1","role":"shrad","listen_addr":"127.0.0.1:9602"}"#).unwrap();
+        assert!(cfg.validate().unwrap_err().contains("role"), "an unknown role validated");
+
+        let bad_shard_role = parse(r#"{"node_id":"n1","role":"shard","listen_addr":"127.0.0.1:9603",
+            "shard_role":"leader"}"#).unwrap();
+        assert!(bad_shard_role.validate().unwrap_err().contains("shard_role"));
+
+        let ok = parse(r#"{"node_id":"n1","role":"shard","listen_addr":"127.0.0.1:9604",
+            "shard_role":"primary"}"#).unwrap();
+        assert!(ok.validate().is_ok());
     }
 
     #[test]

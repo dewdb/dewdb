@@ -8,6 +8,7 @@ pub const API_KEY_HEADER: &str = "x-api-key";
 pub const NODE_HEADER: &str = "x-dew-node";
 
 #[derive(Deserialize, Clone, Debug, Default)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     #[serde(default)]
     pub internal_secret: Option<String>,

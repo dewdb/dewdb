@@ -11,6 +11,7 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 
 #[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct MaintenanceConfig {
     #[serde(default = "default_maintenance_enabled")]
     pub enabled: bool,
