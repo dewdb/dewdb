@@ -245,6 +245,7 @@ fn stream_snapshot(
                 applied_lsn: collection.applied_lsn(),
                 dropped: collection.is_dropped(),
                 config: collection.committed_config(),
+                handover: collection.committed_handover(),
             },
         )
         .map_err(io::Error::other)?;
@@ -491,6 +492,11 @@ pub async fn replica_sync_from_primary(
         .await
         .map_err(|e| format!("Snapshot request failed: {}", e))?;
 
+    // Named apart from the rest because it is a disagreement about what exists, not a transfer
+    // that failed: retrying reaches the same answer, and the local copy is what to look at.
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(format!("{} holds no collection '{}'", primary_addr, collection_name));
+    }
     if !resp.status().is_success() {
         return Err(format!("Primary returned {}", resp.status()));
     }
@@ -542,7 +548,7 @@ pub async fn replica_sync_from_primary(
 mod tests {
     use super::*;
     use crate::replication::ReplicateRequest;
-    use crate::test_support::{TestNode, live_put, make_frame, next_test_port, temp_root};
+    use crate::test_support::{TestNode, live_put, make_frame, next_test_port, put_doc_http, temp_root};
     use futures::StreamExt;
     use std::io::Cursor;
 
@@ -734,6 +740,44 @@ mod tests {
             "a successful installation consumes the staging directory"
         );
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// H18: `snapshot_handler` resolved with `get_collection`, so being *asked* for a collection
+    /// created it -- a directory, a wal and an `Arc<Collection>` nothing evicts, per distinct name,
+    /// on a tier that is unauthenticated on the default config.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_snapshot_of_a_collection_the_leader_does_not_have_is_refused() {
+        let root = temp_root();
+        let mut leader = TestNode::new("solo", next_test_port(), &root, "primary");
+        leader.start();
+        let client = reqwest::Client::new();
+
+        // A real collection alongside it, so "nothing was created" is not just "nothing exists".
+        assert!(put_doc_http(&client, &leader.url(), "k1", 1).await.is_success());
+
+        let served = client.get(format!("{}/internal/snapshot?collection=ghost", leader.url()))
+            .send().await.unwrap();
+        assert_eq!(served.status(), reqwest::StatusCode::NOT_FOUND,
+            "an empty snapshot cannot be told apart from one of a collection this node really holds");
+
+        let live = leader.state.as_ref().unwrap().db.as_ref().unwrap().live_collections().unwrap();
+        assert_eq!(live, vec!["t".to_string()], "serving a snapshot invented a collection: {:?}", live);
+
+        // The asking half: named apart from a transfer that failed, and nothing local is touched.
+        let replica_db = Database::new(root.join("replica")).unwrap();
+        let local = replica_db.get_collection("ghost").unwrap();
+        live_put(&local, "mine", 1);
+
+        let error = replica_sync_from_primary(&client, &leader.url(), &replica_db, "ghost")
+            .await.expect_err("there is nothing there to install");
+        assert!(error.contains("holds no collection 'ghost'"), "unexpected refusal: {}", error);
+        assert_eq!(replica_db.get_collection("ghost").unwrap().get("mine").unwrap(),
+            Some(serde_json::json!({"v": 1})), "a refusal must leave the local copy alone");
+        assert!(!replica_db.root_path.join("ghost.tmp").exists(),
+            "and must not leave a staging directory behind");
+
+        leader.kill();
         let _ = fs::remove_dir_all(&root);
     }
 

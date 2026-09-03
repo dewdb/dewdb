@@ -100,7 +100,7 @@ pub fn router_probe_task(state: AppState) {
             let mut target_endpoints = HashSet::new();
             for (original, replicas, effective) in &groups {
                 for url in probe_targets(original, replicas).into_iter().chain([effective.clone()]) {
-                    if target_endpoints.insert(crate::util::endpoint_of(&url).to_string()) {
+                    if target_endpoints.insert(crate::util::node_key(&url)) {
                         targets.push(url);
                     }
                 }
@@ -121,7 +121,7 @@ pub fn router_probe_task(state: AppState) {
                     Some(load) => state.note_node_load(url, load),
                     None => state.clear_node_load(url),
                 }
-                by_endpoint.insert(crate::util::endpoint_of(url).to_string(), probe.clone());
+                by_endpoint.insert(crate::util::node_key(url), probe.clone());
             }
 
             for (original, replicas, effective) in groups {
@@ -131,7 +131,7 @@ pub fn router_probe_task(state: AppState) {
                 }
                 let group_probes: Vec<(String, Option<Probe>)> = candidates.into_iter()
                     .map(|url| {
-                        let probe = by_endpoint.get(crate::util::endpoint_of(&url)).cloned().flatten();
+                        let probe = by_endpoint.get(&crate::util::node_key(&url)).cloned().flatten();
                         (url, probe)
                     })
                     .collect();

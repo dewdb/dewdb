@@ -6,7 +6,6 @@
 //! fires -- a partition the sender sees as `Err`, which is what distinguishes it from a node that
 //! is up and refusing.
 
-use crate::util::endpoint_of;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -25,7 +24,7 @@ fn table() -> &'static Mutex<HashMap<(String, String), Fault>> {
 }
 
 fn key(from: &str, to: &str) -> (String, String) {
-    (endpoint_of(from).to_string(), endpoint_of(to).to_string())
+    (crate::util::node_key(from), crate::util::node_key(to))
 }
 
 fn set(from: &str, to: &str, fault: Fault) {

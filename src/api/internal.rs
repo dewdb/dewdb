@@ -445,6 +445,12 @@ pub async fn migrate_cleanup_handler(
     State(state): State<AppState>,
     Json(req): Json<CleanupRequest>,
 ) -> impl axum::response::IntoResponse {
+    // The only migration handler that had no leadership check, so cleanup could be accepted by a
+    // follower that holds no record and answer `200 cleaned, removed: 0` (bugs.md H16).
+    if !state.is_shard() || !state.is_leader() {
+        return err_json(StatusCode::CONFLICT,
+            "handover cleanup goes to the source group's leader".to_string());
+    }
     if state.migration().is_some() {
         return err_json(StatusCode::CONFLICT,
             "the handover is still in the view here; ownership has not moved yet".to_string());
@@ -672,8 +678,13 @@ pub async fn snapshot_handler(
         None => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "No database".to_string()),
     };
 
-    let col = match db.get_collection(&params.collection) {
-        Ok(c) => c,
+    // Serving with `get_collection` created what it was asked for, so any name a caller sent cost
+    // a directory, a wal and a commit task here (bugs.md H18). Empty is also the wrong answer: the
+    // asker cannot tell it from a collection this node genuinely holds nothing of.
+    let col = match db.lookup_collection(&params.collection) {
+        Ok(Some(c)) => c,
+        Ok(None) => return err_json(StatusCode::NOT_FOUND,
+            format!("no collection '{}' on this node", params.collection)),
         Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
 

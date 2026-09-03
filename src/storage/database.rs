@@ -106,12 +106,22 @@ impl Database {
 
     /// Opens a collection only if it is already there. `get_collection` creates the directory, so
     /// probing a system log with it would put an empty one on every node that never used it.
-    pub fn existing_collection(&self, name: &str) -> Option<Arc<Collection>> {
+    ///
+    /// `Ok(None)` is absent; a directory that is there and will not open stays an error, so a
+    /// caller answering a client does not report a broken collection as a missing one.
+    pub fn lookup_collection(&self, name: &str) -> io::Result<Option<Arc<Collection>>> {
         if let Some(col) = self.collections.read().unwrap().get(name) {
-            return Some(col.clone());
+            return Ok(Some(col.clone()));
         }
-        let dir = self.collection_dir(name).ok()?;
-        dir.is_dir().then(|| self.get_collection(name).ok()).flatten()
+        if !self.collection_dir(name)?.is_dir() {
+            return Ok(None);
+        }
+        self.get_collection(name).map(Some)
+    }
+
+    /// `lookup_collection` for callers with one fallback for absent and broken alike.
+    pub fn existing_collection(&self, name: &str) -> Option<Arc<Collection>> {
+        self.lookup_collection(name).ok().flatten()
     }
 
     /// Holds the collection map write lock across release, directory swap, and reopen.
@@ -258,8 +268,17 @@ impl Database {
         if let Some(col) = self.collections.read().unwrap().get(name) {
             return col.is_dropped();
         }
-        self.collection_dir(name).ok()
-            .is_some_and(|dir| AppliedMeta::load(&dir).is_some_and(|m| m.dropped))
+        let Some(dir) = self.collection_dir(name).ok() else { return false };
+        match AppliedMeta::load(&dir) {
+            Ok(meta) => meta.is_some_and(|m| m.dropped),
+            // Unopenable either way, since `Collection::open` propagates the same error. Hidden
+            // rather than listed, because the other reading resurrects a dropped collection.
+            Err(e) => {
+                warn!(target: "storage", collection = %name, error = %e,
+                    "Cannot read the applied watermark; treating the collection as dropped");
+                true
+            },
+        }
     }
 
     pub fn release_collection(&self, name: &str) -> io::Result<Option<PathBuf>> {
@@ -318,6 +337,9 @@ impl Database {
             if let Err(e) = wal.current_wal.sync_data() {
                 error!(target: "storage", collection = %name, error = %e, "Failed to force sync WAL on shutdown");
             }
+            // Both, the way `sync_wal` raises both: the senders below tell a waiter its write is
+            // durable, and `finish_write` then reads the collection's own watermark to count it.
+            col.durable_lsn.fetch_max(wal.last_appended_lsn, Ordering::SeqCst);
             self.durable_lsn.fetch_max(wal.last_appended_lsn, Ordering::SeqCst);
             drop(wal);
             let notifiers: Vec<_> = {

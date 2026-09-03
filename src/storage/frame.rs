@@ -80,6 +80,21 @@ pub enum LogEntry {
         config: Configuration,
         ts: u64,
     },
+    /// What this shard group handed over, so cleanup survives the group electing someone else.
+    Handover {
+        handover: HandoverRecord,
+        ts: u64,
+    },
+}
+
+/// A completed handover as it travels in the log: the plan's id and the ring it moved keys *for*.
+/// The keys themselves are deliberately absent -- nothing bounds how many moved, and one frame
+/// carrying them all would pass neither `MAX_RECORD_SIZE` nor the replicate body limit on a real
+/// rebalance. Cleanup derives them by asking this ring which of the keys it holds are not its own.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HandoverRecord {
+    pub id: String,
+    pub target: crate::ring::HashRing,
 }
 
 /// A quorum membership, as it travels in the log. `outgoing` is present only between the two

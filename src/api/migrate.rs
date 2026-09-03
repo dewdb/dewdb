@@ -148,7 +148,7 @@ fn broadcast(state: &AppState, view: &crate::cluster::metadata::ClusterMetadata,
             std::iter::once(shard.node_url.clone()).chain(shard.replica_urls.clone())
         })))
         .filter(|url| !crate::util::same_endpoint(url, &own))
-        .filter(|url| seen.insert(crate::util::endpoint_of(url).to_string()))
+        .filter(|url| seen.insert(crate::util::node_key(url)))
         .collect();
 
     for url in targets {
@@ -362,10 +362,22 @@ async fn cleanup(state: &AppState, id: &str, sources: &[String]) {
 
     let nodes: Vec<String> = sources.iter().cloned()
         .chain(view.shard_owners().into_iter().map(|(url, _)| url))
-        .filter(|url| seen.insert(crate::util::endpoint_of(url).to_string()))
+        .filter(|url| seen.insert(crate::util::node_key(url)))
         .collect();
 
     for node in nodes {
+        // The ring names a group by its configured primary, which is not necessarily the node
+        // leading it now, and only the leader can commit the deletions (bugs.md H16). Resolved the
+        // same way `sources_pending` resolves it, rather than trusting `node_url`.
+        let node = match source_leader(state, &node).await {
+            Some(leader) => leader,
+            None => {
+                warn!(target: "migration", node = %node,
+                    "No reachable primary in that shard group; handed-over keys are still on disk");
+                continue;
+            },
+        };
+
         // The final view first, and awaited. A node still holding the plan refuses to clean up --
         // correctly, since from where it stands ownership has not moved yet. Relying on ordinary
         // propagation to get there first would make cleanup a race it usually loses.
@@ -443,6 +455,7 @@ mod tests {
         MigrationProgress, MigrationRuns,
     };
     use crate::ring::{hash_key, HashRing, RingShard};
+    use crate::storage::frame::HandoverRecord;
     use std::collections::HashSet;
     use crate::test_support::{next_test_port, temp_root, wait_for, wait_for_doc, TestNode};
     use axum::http::StatusCode;
@@ -733,9 +746,15 @@ mod tests {
 
         assert_eq!(cl.holder(&kept).await.as_deref(), Some(source.as_str()),
             "a key the plan never moved must still be where it was");
+        // Polled, not sampled once: the ring flip is what ends the handover, and the destination
+        // applying the last copied batch can trail it. Sampling here is bugs.md L10.
         for key in keys.iter().filter(|key| owner_of(&three, key) == c) {
-            assert_eq!(cl.holder(key).await.as_deref(), Some(c.as_str()),
-                "key {} was reassigned but never arrived", key);
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while cl.holder(key).await.as_deref() != Some(c.as_str()) {
+                assert!(std::time::Instant::now() < deadline,
+                    "key {} was reassigned but never arrived", key);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
         }
 
         let _ = std::fs::remove_dir_all(&root);
@@ -1135,6 +1154,89 @@ mod tests {
             "a replay after a restart erased the copy the reset was meant to precede");
 
         h.node.kill();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+
+    /// C18: the handover record went to the node-local `migration.meta`, so it came back through a
+    /// restart of the same process but never reached a peer elected in its place. After the flip
+    /// the plan is out of the view, so that peer has nothing to re-derive it from and its group
+    /// keeps the stale copies. H16 is the same hole from the other end, and once cleanup is
+    /// addressed to the current leader this is what decides whether that leader can act.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_handover_record_reaches_a_node_that_never_pushed_anything() {
+        let root = temp_root();
+        let mut replica = TestNode::new("h-replica", next_test_port(), &root, "replica");
+        let mut source = TestNode::new("h", next_test_port(), &root, "primary");
+        source.replicas = vec![replica.url()];
+        source.start();
+        replica.primary_addr = Some(source.url());
+        replica.start();
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
+
+        assert_eq!(client.put(format!("{}/collections/t/docs/k1?w=majority&wtimeout=4000",
+            source.url())).json(&serde_json::json!({"value": {"v": 1}}))
+            .send().await.unwrap().status(), StatusCode::CREATED);
+        assert!(wait_for_doc(&client, &replica.url(), "t", "k1", 1, Duration::from_secs(5)).await);
+
+        // The ring this group has just been dropped from, adopted by both nodes.
+        let gone = HashRing { vnodes: 128, shards: shards(&["http://other-a", "http://other-b"]) };
+        for node in [&source, &replica] {
+            let state = node.state.as_ref().unwrap();
+            let mut view = state.cluster_view();
+            view.version += 1;
+            view.seeded = false;
+            view.updated_by = "operator".into();
+            view.ring = Some(gone.clone());
+            assert!(matches!(state.adopt_cluster(view), Adoption::Adopted { .. }));
+        }
+
+        let source_state = source.state.as_ref().unwrap();
+        crate::cluster::migration::replicate_handover(source_state, HandoverRecord {
+            id: "m1".into(), target: gone.clone(),
+        }).await;
+
+        let replica_state = replica.state.as_ref().unwrap();
+        assert!(wait_for(Duration::from_secs(10), || {
+            !crate::cluster::migration::handed_over_after_flip(replica_state, "m1").is_empty()
+        }).await, "the record never reached the node that would have to act on it");
+
+        assert!(replica_state.migrations.lock().unwrap().current.is_none(),
+            "the premise: this node pushed nothing, so nothing local could have told it");
+        assert!(crate::cluster::migration::handed_over_after_flip(replica_state, "m1")
+            .contains(&("t".to_string(), "k1".to_string())),
+            "the ring it recorded is what says which of the keys it holds are no longer its own");
+
+        // An id nobody recorded stays inert, so the derivation is not a licence to delete.
+        assert!(crate::cluster::migration::handed_over_after_flip(replica_state, "m2").is_empty());
+
+        source.kill();
+        replica.kill();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// H16: the only migration handler with no leadership check, so cleanup addressed to the ring's
+    /// nominal primary could be accepted by a follower and answered `200 cleaned, removed: 0`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_follower_refuses_cleanup_rather_than_reporting_it_done() {
+        let root = temp_root();
+        let mut replica = TestNode::new("f-replica", next_test_port(), &root, "replica");
+        let mut source = TestNode::new("f", next_test_port(), &root, "primary");
+        source.replicas = vec![replica.url()];
+        source.start();
+        replica.primary_addr = Some(source.url());
+        replica.start();
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
+
+        let response = client.post(format!("{}/internal/migrate-cleanup", replica.url()))
+            .json(&serde_json::json!({"migration_id": "m1"})).send().await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT,
+            "a follower holds no record and cannot commit a tombstone, so reporting the cleanup \
+             done is how the coordinator stops asking the node that could");
+
+        source.kill();
+        replica.kill();
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -71,7 +71,7 @@ fn broadcast(state: &AppState, view: &ClusterMetadata, extra: Option<&str>) {
         .chain(view.shard_owners().into_iter().map(|(url, _)| url))
         .chain(extra.into_iter().map(str::to_string))
         .filter(|url| !crate::util::same_endpoint(url, &own))
-        .filter(|url| seen.insert(crate::util::endpoint_of(url).to_string()))
+        .filter(|url| seen.insert(crate::util::node_key(url)))
         .collect();
     for target in targets {
         nudge(state, &target, view);

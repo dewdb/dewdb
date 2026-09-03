@@ -1,6 +1,6 @@
 //! A collection's index, key locks, group commit, and read path.
 
-use super::frame::{Configuration, LogEntry};
+use super::frame::{Configuration, HandoverRecord, LogEntry};
 use super::index::{AppliedMeta, IndexEntry, IndexSnapshot, LsnMeta, ReadCacheConfig, INDEX_FILENAME};
 use super::wal::WalsState;
 use crate::model::MAX_QUERY_LIMIT;
@@ -46,6 +46,7 @@ pub struct Collection {
     pub dropped: AtomicBool,
     /// Newest committed `Config`. Rides `applied.meta` for the same reason `dropped` does.
     committed_config: std::sync::Mutex<Option<Configuration>>,
+    committed_handover: std::sync::Mutex<Option<HandoverRecord>>,
     pub compacting: AtomicBool,
     /// Prevents compaction from retiring WAL files during snapshot streaming.
     pub snapshot_boundary: std::sync::Mutex<()>,
@@ -60,6 +61,10 @@ pub struct Collection {
     pub pending: std::sync::Mutex<BTreeMap<u64, StagedApply>>,
     pub applied_lsn: AtomicU64,
     watermark_recorded: AtomicBool,
+    /// Highest `applied_lsn` `applied.meta` is known to cover, and the lock that serializes writers
+    /// to it. Together they collapse concurrent commits into one fsync -- see `persist_watermark`.
+    watermark_saved: AtomicU64,
+    watermark_write: std::sync::Mutex<()>,
     pub db_durable_lsn: Arc<AtomicU64>,
     pub db_next_lsn: Arc<AtomicU64>,
     pub db_last_log_term: Arc<AtomicU64>,
@@ -84,6 +89,8 @@ pub enum StagedEffect {
     Clear,
     /// A configuration. Like a barrier it touches no key; unlike one it leaves something behind.
     Configure(Configuration),
+    /// A completed handover. Same shape as a configuration: no key, but state that outlives it.
+    RecordHandover(HandoverRecord),
 }
 
 impl StagedEffect {
@@ -113,12 +120,13 @@ impl Collection {
         let data_root = root_path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
         // Absent means no consensus history (fresh node, or standalone engine): replay everything.
-        let applied = AppliedMeta::load(&root_path);
+        let applied = AppliedMeta::load(&root_path)?;
         let applied_through = applied.as_ref().map(|m| m.applied_lsn).unwrap_or(u64::MAX);
         // Seeded from the watermark because compaction retires the drop and config frames replay
         // would otherwise find them in.
         let mut dropped = applied.as_ref().is_some_and(|m| m.dropped);
-        let mut committed_config = applied.and_then(|m| m.config);
+        let mut committed_config = applied.as_ref().and_then(|m| m.config.clone());
+        let mut committed_handover = applied.and_then(|m| m.handover);
 
         let mut index = BTreeMap::new();
         let mut pending: BTreeMap<u64, StagedApply> = BTreeMap::new();
@@ -184,7 +192,7 @@ impl Collection {
         if !snapshot_loaded {
             info!(target: "storage", collection = %name, "Replaying all WALs");
              for (id, path) in &wal_files {
-                let r = Self::replay_file_from(*id, path, 0, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut staged_inline, &mut dropped, &mut committed_config)?;
+                let r = Self::replay_file_from(*id, path, 0, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut staged_inline, &mut dropped, &mut committed_config, &mut committed_handover)?;
                 fold(r, &mut max_lsn, &mut max_term);
             }
         } else {
@@ -193,10 +201,10 @@ impl Collection {
                      continue;
                  } else if *id == snapshot_wal_id {
                      info!(target: "storage", collection = %name, wal_id = id, offset = snapshot_offset, "Resuming WAL from snapshot offset");
-                     let r = Self::replay_file_from(*id, path, snapshot_offset, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut staged_inline, &mut dropped, &mut committed_config)?;
+                     let r = Self::replay_file_from(*id, path, snapshot_offset, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut staged_inline, &mut dropped, &mut committed_config, &mut committed_handover)?;
                      fold(r, &mut max_lsn, &mut max_term);
                  } else {
-                     let r = Self::replay_file_from(*id, path, 0, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut staged_inline, &mut dropped, &mut committed_config)?;
+                     let r = Self::replay_file_from(*id, path, 0, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut staged_inline, &mut dropped, &mut committed_config, &mut committed_handover)?;
                      fold(r, &mut max_lsn, &mut max_term);
                  }
              }
@@ -241,6 +249,7 @@ impl Collection {
             released: AtomicBool::new(false),
             dropped: AtomicBool::new(dropped),
             committed_config: std::sync::Mutex::new(committed_config),
+            committed_handover: std::sync::Mutex::new(committed_handover),
             compacting: AtomicBool::new(false),
             snapshot_boundary: std::sync::Mutex::new(()),
             rewriting: std::sync::Mutex::new(()),
@@ -250,6 +259,8 @@ impl Collection {
             pending: std::sync::Mutex::new(pending),
             applied_lsn: AtomicU64::new(if applied_through == u64::MAX { boot_lsn } else { applied_through }),
             watermark_recorded: AtomicBool::new(applied_through != u64::MAX),
+            watermark_saved: AtomicU64::new(if applied_through == u64::MAX { 0 } else { applied_through }),
+            watermark_write: std::sync::Mutex::new(()),
             db_durable_lsn,
             db_next_lsn,
             db_last_log_term,
@@ -350,6 +361,16 @@ impl Collection {
     /// re-read `latest_config` the moment this returns rather than waiting for the apply.
     pub fn configure(&self, config: Configuration, term: u64) -> io::Result<(Vec<u8>, u64, u64, u64)> {
         self.append(LogEntry::Config { config, ts: Self::current_timestamp() }, term)
+    }
+
+    /// A completed handover. Unlike a configuration this one waits for its commit like an ordinary
+    /// entry: nothing acts on it until cleanup, which runs after the ring has already flipped.
+    pub fn record_handover(&self, handover: HandoverRecord, term: u64) -> io::Result<(Vec<u8>, u64, u64, u64)> {
+        self.append(LogEntry::Handover { handover, ts: Self::current_timestamp() }, term)
+    }
+
+    pub fn committed_handover(&self) -> Option<HandoverRecord> {
+        self.committed_handover.lock().unwrap().clone()
     }
 
     pub fn is_dropped(&self) -> bool {
@@ -547,6 +568,9 @@ impl Collection {
         filter: &Option<Filter>,
         limit: usize,
     ) -> io::Result<(Vec<SortedRow>, Option<String>)> {
+        // Ahead of the walk, not inside it: a cleared index yields no keys, so a scan of a released
+        // handle never reaches the check inside `get` and answers an empty page.
+        self.check_live()?;
         // Capacity is capped independently of the caller: the vector still grows to `limit`.
         let mut items = Vec::with_capacity(limit.min(MAX_QUERY_LIMIT));
         let mut last_key: Option<String> = None;
@@ -594,6 +618,7 @@ impl Collection {
         after: Option<&SortCursor>,
         limit: usize,
     ) -> io::Result<(Vec<SortedRow>, bool)> {
+        self.check_live()?;
         let keep = limit.min(MAX_QUERY_LIMIT);
         let spill = keep.saturating_mul(2).max(1);
         let mut rows: Vec<SortedRow> = Vec::new();
@@ -671,7 +696,20 @@ impl Collection {
             format!("Key '{}' kept moving while being read", key)))
     }
 
+    /// A handle whose directory a snapshot install has replaced. `release_handles` clears the index
+    /// and parks the writer, and the append path already refuses; without the same check here a
+    /// caller that took the handle before the install reads the cleared index and is told the
+    /// collection is empty (M14). A silent wrong answer here reads as data loss somewhere else.
+    fn check_live(&self) -> io::Result<()> {
+        if self.released.load(Ordering::SeqCst) {
+            return Err(io::Error::new(io::ErrorKind::NotFound,
+                "collection handle is no longer active"));
+        }
+        Ok(())
+    }
+
     pub fn get(&self, key: &str) -> io::Result<Option<serde_json::Value>> {
+        self.check_live()?;
         let at = {
             let index = self.index.read().unwrap();
             match index.get(key) {
@@ -687,6 +725,7 @@ impl Collection {
     }
 
     pub fn list_all(&self) -> io::Result<Vec<serde_json::Value>> {
+        self.check_live()?;
         let mut resolved = Vec::new();
         let mut pending = Vec::new();
 
@@ -740,6 +779,7 @@ impl Collection {
             LogEntry::Barrier { .. } => StagedEffect::Nothing,
             LogEntry::Drop { .. } => StagedEffect::Clear,
             LogEntry::Config { config, .. } => StagedEffect::Configure(config.clone()),
+            LogEntry::Handover { handover, .. } => StagedEffect::RecordHandover(handover.clone()),
         };
         self.pending.lock().unwrap().insert(lsn, StagedApply { wal_id, offset, term, effect });
     }
@@ -750,14 +790,52 @@ impl Collection {
     pub(super) fn record_watermark_once(&self) {
         if !self.watermark_recorded.swap(true, Ordering::SeqCst) {
             let applied_lsn = self.applied_lsn();
-            if let Err(e) = (AppliedMeta { applied_lsn, dropped: self.is_dropped(), config: self.committed_config() })
-                .save(&self.root_path)
+            if let Err(e) = (AppliedMeta {
+                applied_lsn,
+                dropped: self.is_dropped(),
+                config: self.committed_config(),
+                handover: self.committed_handover(),
+            }).save(&self.root_path)
             {
                 error!(target: "storage", collection = %self.name, error = %e,
                     "Failed to record applied watermark");
                 self.watermark_recorded.store(false, Ordering::SeqCst);
             }
         }
+    }
+
+    /// Durable `applied.meta` covering at least `through`, atomically. `dropped` and `config` ride
+    /// this file because compaction retires the frames they came from, so a torn or unsynced copy
+    /// loses state no replay can rebuild (bugs.md C27).
+    ///
+    /// Concurrent commits coalesce onto one fsync: the first writer covers the rest. The check is
+    /// "is my position covered", never "did someone else just run" — a writer whose entry landed
+    /// after the running save read the watermark is not covered by it and takes its own turn. That
+    /// distinction is what H11 and H12 were both about.
+    fn persist_watermark(&self, through: u64) -> io::Result<()> {
+        if self.watermark_saved.load(Ordering::SeqCst) >= through {
+            return Ok(());
+        }
+        let _one_writer = self.watermark_write.lock().unwrap();
+        if self.watermark_saved.load(Ordering::SeqCst) >= through {
+            return Ok(());
+        }
+
+        // Under the index lock: `apply_committed` moves them together under its write lock, so this
+        // is the only way to record a watermark matching the drop, config and handover beside it.
+        let meta = {
+            let _consistent = self.index.read().unwrap();
+            AppliedMeta {
+                applied_lsn: self.applied_lsn(),
+                dropped: self.is_dropped(),
+                config: self.committed_config(),
+                handover: self.committed_handover(),
+            }
+        };
+        let covered = meta.applied_lsn;
+        meta.save(&self.root_path)?;
+        self.watermark_saved.fetch_max(covered, Ordering::SeqCst);
+        Ok(())
     }
 
     /// The term we recorded for a staged frame, or `None` if we hold no uncommitted frame there.
@@ -801,6 +879,11 @@ impl Collection {
                         StagedEffect::Configure(config) => {
                             *self.committed_config.lock().unwrap() = Some(config.clone());
                         },
+                        // Replaces rather than accumulates: one handover is in flight at a time,
+                        // and an older one is inert as soon as the ring it names is not the live one.
+                        StagedEffect::RecordHandover(handover) => {
+                            *self.committed_handover.lock().unwrap() = Some(handover.clone());
+                        },
                     }
                 }
             }
@@ -810,13 +893,7 @@ impl Collection {
         };
 
         if advanced {
-            if let Err(e) = (AppliedMeta {
-                applied_lsn: committed_lsn,
-                dropped: self.is_dropped(),
-                config: self.committed_config(),
-            })
-                .save(&self.root_path)
-            {
+            if let Err(e) = self.persist_watermark(committed_lsn) {
                 error!(target: "storage", collection = %self.name, error = %e,
                     "Failed to persist applied watermark; a restart will re-stage these entries");
             }
@@ -826,6 +903,7 @@ impl Collection {
 
     /// Read-modify-write must read the newest durable value; the committed one drops a racing write.
     pub fn get_including_staged(&self, key: &str) -> io::Result<Option<serde_json::Value>> {
+        self.check_live()?;
         let staged = {
             let pending = self.pending.lock().unwrap();
             pending
@@ -1201,6 +1279,63 @@ mod tests {
         let (p2, c2) = col.query_page(c1.as_deref(), None, None, &None, 2).unwrap();
         assert_eq!(p2.len(), 2);
         assert_eq!(c2, None, "a full final page with nothing after must not emit a cursor");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// C27: `applied.meta` was a bare `fs::write` — no temp file, no rename, no fsync — and
+    /// `load` read anything unparseable as "no consensus history", which means replay everything.
+    /// A crash inside that write therefore published entries no client was ever promised.
+    #[tokio::test]
+    async fn a_damaged_watermark_is_refused_rather_than_read_as_a_fresh_collection() {
+        let root = temp_root();
+        {
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("c").unwrap();
+            col.put("k".into(), serde_json::json!({"v": 1}), 1).unwrap();
+            col.enqueue_commit().await.unwrap().unwrap();
+            assert_eq!(col.applied_lsn(), 0, "durable, but never committed");
+            drop(col);
+            drop(db);
+        }
+
+        let meta = root.join("c").join("applied.meta");
+        assert!(meta.exists(), "staging marks the collection consensus-managed");
+        assert!(!root.join("c").join("applied.meta.tmp").exists(),
+            "the atomic write leaves no staging file behind");
+        fs::write(&meta, "{\"applied_l").unwrap();
+
+        let err = match Database::new(&root) {
+            Err(e) => e,
+            Ok(_) => panic!("a torn watermark read as absent publishes every staged entry"),
+        };
+        assert!(err.to_string().contains("applied.meta"), "{}", err);
+
+        // Intact again, and the entry is still staged rather than published.
+        fs::write(&meta, "{\"applied_lsn\":0}").unwrap();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+        assert_eq!(col.get("k").unwrap(), None, "an uncommitted entry stays staged across a restart");
+        drop(col);
+        drop(db);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The watermark is the one file whose absence and whose damage mean opposite things.
+    #[test]
+    fn an_absent_watermark_is_a_fresh_collection_and_a_damaged_one_is_an_error() {
+        let root = temp_root();
+        fs::create_dir_all(&root).unwrap();
+
+        assert!(AppliedMeta::load(&root).unwrap().is_none(), "absent is 'no consensus history'");
+
+        AppliedMeta { applied_lsn: 7, dropped: true, config: None, handover: None }.save(&root).unwrap();
+        let back = AppliedMeta::load(&root).unwrap().unwrap();
+        assert_eq!((back.applied_lsn, back.dropped), (7, true));
+
+        fs::write(root.join("applied.meta"), "{\"applied_l").unwrap();
+        assert!(AppliedMeta::load(&root).is_err(), "damage is not absence");
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -1849,6 +1984,36 @@ mod tests {
         }
         assert_eq!(col2.pending_len(), 0);
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// M14: `release_handles` clears the index, and only the append path checked `released`. A
+    /// caller that took the handle before a snapshot install then read the cleared index and was
+    /// told the collection was empty -- which reads as data loss somewhere else, and cost three
+    /// debugging rounds looking like a consensus bug when it turned up in the C17 test.
+    #[tokio::test]
+    async fn a_released_handle_fails_reads_rather_than_answering_empty() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+        live_put(&col, "k", 1);
+        assert_eq!(col.get("k").unwrap(), Some(serde_json::json!({"v": 1})));
+
+        let stale = col.clone();
+        db.release_collection("c").unwrap();
+
+        for (what, err) in [
+            ("get", stale.get("k").err()),
+            ("list_all", stale.list_all().err()),
+            ("query_page", stale.query_page(None, None, None, &None, 10).err()),
+            ("get_including_staged", stale.get_including_staged("k").err()),
+        ] {
+            let err = err.unwrap_or_else(|| panic!("{} answered for a released handle", what));
+            assert_eq!(err.kind(), io::ErrorKind::NotFound, "{}", what);
+        }
+
+        drop(stale);
+        drop(col);
         let _ = fs::remove_dir_all(&root);
     }
 }

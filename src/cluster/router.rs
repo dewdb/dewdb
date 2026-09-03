@@ -259,7 +259,12 @@ pub async fn bulk_router_forward(
         }
     }
 
-    (StatusCode::CREATED, Json(serde_json::json!({"results": ordered}))).into_response()
+    // A group that was entirely unreachable put `{"status":"error"}` in its items and the answer
+    // was still `201 Created`; so was a group whose writes did not meet their concern (M19).
+    let all_created = ordered.iter().all(|r| r.get("status").and_then(|s| s.as_str()) == Some("created")
+        && r.get("warning").is_none());
+    let status = if all_created { StatusCode::CREATED } else { StatusCode::MULTI_STATUS };
+    (status, Json(serde_json::json!({"results": ordered}))).into_response()
 }
 
 pub enum ReadPreference {
@@ -316,6 +321,23 @@ fn no_primary_response() -> axum::response::Response {
     ).into_response()
 }
 
+/// The primary's own refusal when it is the one that refused, rather than the router's guess at
+/// what every refusal meant. `read=primary` failing really is "no reachable primary", but
+/// `read=quorum` can be refused by a leader that answered and said it could not confirm leadership
+/// with a majority, or that its term is too new to read at -- a partition on the *leader's* side,
+/// which is the opposite diagnosis (L11). Same status class and same remedy either way, so this
+/// costs diagnosability only; `Retry-After` is kept because the remedy is still to retry.
+fn refusal_response(from_primary: Option<ShardReply>) -> axum::response::Response {
+    match from_primary {
+        Some(reply) => {
+            let json: serde_json::Value = serde_json::from_str(&reply.body)
+                .unwrap_or(serde_json::Value::String(reply.body));
+            (reply.status, [(axum::http::header::RETRY_AFTER, "1")], Json(json)).into_response()
+        },
+        None => no_primary_response(),
+    }
+}
+
 fn load_score(load: NodeLoad, unknown_latency_us: u64) -> u64 {
     let latency = if load.latency_ewma_us == 0 {
         unknown_latency_us
@@ -348,7 +370,7 @@ fn read_targets(
                 targets.push(effective_primary.to_string());
             } else {
                 let measured: Vec<u64> = replicas.iter()
-                    .filter_map(|url| loads.get(crate::util::endpoint_of(url)))
+                    .filter_map(|url| loads.get(&crate::util::node_key(url)))
                     .map(|load| load.latency_ewma_us)
                     .filter(|latency| *latency > 0)
                     .collect();
@@ -362,7 +384,7 @@ fn read_targets(
                     .map(|i| (i, replicas[(rr + i) % n].clone()))
                     .collect();
                 ranked.sort_by_key(|(tie, url)| {
-                    match loads.get(crate::util::endpoint_of(url)) {
+                    match loads.get(&crate::util::node_key(url)) {
                         Some(load) => (0u8, load_score(*load, unknown_latency_us), *tie),
                         None => (1u8, 0, *tie),
                     }
@@ -393,6 +415,7 @@ pub async fn router_read_doc(state: &AppState, col_name: &str, id: &str, pref: R
     let loads = state.fresh_node_loads();
     let targets = read_targets(&pref, &effective, &replicas, rr, &loads);
     let mut refused = false;
+    let mut primary_refusal: Option<ShardReply> = None;
 
     for target in targets {
         let _routed = state.track_routed_read(&target);
@@ -416,13 +439,16 @@ pub async fn router_read_doc(state: &AppState, col_name: &str, id: &str, pref: R
             }
             if reply.status == StatusCode::SERVICE_UNAVAILABLE && forwarded_read_pref(&pref).is_some() {
                 refused = true;
+                if crate::util::same_endpoint(&target, &effective) {
+                    primary_refusal = Some(reply);
+                }
             }
         }
         state.clear_node_load(&target);
     }
 
     if refused {
-        return no_primary_response();
+        return refusal_response(primary_refusal);
     }
     (StatusCode::BAD_GATEWAY, "No shard node could serve the read").into_response()
 }
@@ -478,8 +504,16 @@ pub async fn router_fanout_maintenance(state: &AppState, col_name: &str, action:
         }
     })).await;
 
-    let all_ok = results.iter().all(|r| r.get("status").and_then(|s| s.as_u64()).map_or(false, |s| s < 300));
-    let status = if all_ok { StatusCode::OK } else { StatusCode::MULTI_STATUS };
+    // A node whose ring share never took a key for this collection does not hold one, and since
+    // reading stopped creating it on demand that is a normal answer, not a partial failure. Every
+    // node saying so is the collection being nowhere, which is the client's error.
+    let node_status = |r: &serde_json::Value| r.get("status").and_then(|s| s.as_u64());
+    let absent = results.iter().filter(|r| node_status(r) == Some(404)).count();
+    let ok = results.iter().filter(|r| node_status(r).map_or(false, |s| s < 300)).count();
+    if ok == 0 && absent > 0 {
+        return collection_absent_response(col_name);
+    }
+    let status = if ok + absent == results.len() { StatusCode::OK } else { StatusCode::MULTI_STATUS };
     (status, Json(serde_json::json!({"nodes": results}))).into_response()
 }
 
@@ -540,8 +574,18 @@ fn shard_shares(limit: usize, shards: usize) -> Vec<usize> {
 enum ShardQueryOutcome {
     Page(QueryPage),
     /// Every candidate refused a `read=primary` query. Distinct from `Failed`: the shard is up.
-    NoPrimary,
+    /// Carries the effective primary's own refusal when that is who refused, so the router does not
+    /// answer for it (L11).
+    NoPrimary(Option<ShardReply>),
+    /// The shard holds no such collection. Distinct from an empty page only in that it carries no
+    /// position, and from `Failed` in that a collection narrower than the ring is not an error.
+    Absent,
     Failed,
+}
+
+/// No shard holds the collection, so the fan-out is answering for all of them.
+fn collection_absent_response(name: &str) -> axum::response::Response {
+    err_json(StatusCode::NOT_FOUND, format!("collection '{}' does not exist", name))
 }
 
 pub async fn router_query(
@@ -630,8 +674,11 @@ pub async fn router_query(
                 if let Some(c) = &params.cursor { q.push(("cursor".to_string(), c.clone())); }
             }
 
+            let primary = effective.clone();
             futures.push(tokio::spawn(async move {
                 let mut refused = false;
+                let mut primary_refusal: Option<ShardReply> = None;
+                let mut absent = false;
                 for target in targets {
                     let _routed = route_state.track_routed_read(&target);
                     let url = format!("{}/collections/{}/query", target, encode_path_segment(&col));
@@ -642,11 +689,23 @@ pub async fn router_query(
                             }
                         } else if res.status() == StatusCode::SERVICE_UNAVAILABLE && primary_only {
                             refused = true;
+                            if crate::util::same_endpoint(&target, &primary) {
+                                primary_refusal = Some(ShardReply::of(res).await);
+                            }
+                        } else if res.status() == StatusCode::NOT_FOUND {
+                            // Not a failed read: a collection whose keys never hashed here has no
+                            // directory here, and reading used to be what created one.
+                            absent = true;
+                            break;
                         }
                     }
                     route_state.clear_node_load(&target);
                 }
-                let outcome = if refused { ShardQueryOutcome::NoPrimary } else { ShardQueryOutcome::Failed };
+                let outcome = match (refused, absent) {
+                    (true, _) => ShardQueryOutcome::NoPrimary(primary_refusal),
+                    (_, true) => ShardQueryOutcome::Absent,
+                    _ => ShardQueryOutcome::Failed,
+                };
                 (original, outcome)
             }));
         }
@@ -657,6 +716,7 @@ pub async fn router_query(
             let mut lists = Vec::new();
             let mut received = 0usize;
             let mut shard_has_more = false;
+            let (mut present, mut absent) = (0usize, 0usize);
             for res in joined {
                 let (_original, outcome) = match res {
                     Ok(t) => t,
@@ -667,15 +727,20 @@ pub async fn router_query(
                         if p.keys.len() != p.items.len() {
                             return (StatusCode::BAD_GATEWAY, "Shard returned a sorted page without keys").into_response();
                         }
+                        present += 1;
                         shard_has_more |= p.next_cursor.is_some();
                         received += p.items.len();
                         lists.push(p.keys.into_iter().zip(p.items)
                             .map(|(key, value)| SortedRow { key, value })
                             .collect::<Vec<_>>());
                     },
-                    ShardQueryOutcome::NoPrimary => return no_primary_response(),
+                    ShardQueryOutcome::NoPrimary(from_primary) => return refusal_response(from_primary),
+                    ShardQueryOutcome::Absent => absent += 1,
                     ShardQueryOutcome::Failed => return (StatusCode::BAD_GATEWAY, "Shard query failed").into_response(),
                 }
+            }
+            if present == 0 && absent > 0 {
+                return collection_absent_response(col_name);
             }
 
             let merged = kway_merge(lists, sort, limit);
@@ -694,6 +759,7 @@ pub async fn router_query(
 
         let mut merged = Vec::new();
         let mut keys = Vec::new();
+        let (mut present, mut absent) = (0usize, 0usize);
         for res in joined {
             let (original, outcome) = match res {
                 Ok(t) => t,
@@ -701,6 +767,7 @@ pub async fn router_query(
             };
             match outcome {
                 ShardQueryOutcome::Page(p) => {
+                    present += 1;
                     for item in p.items {
                         merged.push(project(&item, fields));
                     }
@@ -710,9 +777,14 @@ pub async fn router_query(
                         positions.insert(original, Some(k));
                     }
                 },
-                ShardQueryOutcome::NoPrimary => return no_primary_response(),
+                ShardQueryOutcome::NoPrimary(from_primary) => return refusal_response(from_primary),
+                // No position carried either: there is nothing here to resume from next page.
+                ShardQueryOutcome::Absent => absent += 1,
                 ShardQueryOutcome::Failed => return (StatusCode::BAD_GATEWAY, "Shard query failed").into_response(),
             }
+        }
+        if present == 0 && absent > 0 {
+            return collection_absent_response(col_name);
         }
 
         let next_cursor = if positions.is_empty() {
@@ -916,6 +988,58 @@ mod tests {
         let mut want = keys.to_vec();
         want.sort();
         assert_eq!(stored, want, "the shards hold the keys they were written with: {}", listed);
+
+        drop(router);
+        cleanup(&root).await;
+    }
+
+    /// H15's blast radius on a router. Reads stopped creating collections on demand, so a shard
+    /// whose ring share never took a key for one now answers `404` — which the fan-outs used to
+    /// read as a failed shard (`502`) and as a partial maintenance failure (`207`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_collection_narrower_than_the_ring_still_reads_through_the_router() {
+        use crate::test_support::{cleanup, put_value, temp_root, two_shard_cluster};
+
+        let root = temp_root();
+        let (s1, s2, router) = two_shard_cluster(&root).await;
+        let c = reqwest::Client::new();
+
+        // One key, so exactly one of the two shards ends up holding the collection at all.
+        assert_eq!(put_value(&c, &router.url(), "narrow", "only", serde_json::json!({"v": 1}), "").await,
+            StatusCode::CREATED);
+
+        let mut direct = Vec::new();
+        for base in [s1.url(), s2.url()] {
+            direct.push(c.get(format!("{}/collections/narrow/docs", base))
+                .send().await.unwrap().status());
+        }
+        assert_eq!(direct.iter().filter(|s| **s == StatusCode::NOT_FOUND).count(), 1,
+            "the premise: one shard owns the key, the other has no such collection; got {:?}", direct);
+
+        let page = c.get(format!("{}/collections/narrow/query?limit=10", router.url()))
+            .send().await.unwrap();
+        assert_eq!(page.status(), StatusCode::OK,
+            "a shard holding none of the collection is not a shard that failed the read");
+        let body = page.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(body["items"].as_array().unwrap().len(), 1, "{}", body);
+
+        for action in ["compact", "snapshot"] {
+            let r = c.post(format!("{}/collections/narrow/{}", router.url(), action))
+                .send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK,
+                "{} reported a partial failure for a node with nothing to do", action);
+        }
+
+        // Nowhere at all is the client's error, and the fan-out answers it for every shard.
+        for url in [format!("{}/collections/ghost/query", router.url()),
+                    format!("{}/collections/ghost/docs/k", router.url())] {
+            assert_eq!(c.get(&url).send().await.unwrap().status(), StatusCode::NOT_FOUND, "{}", url);
+        }
+        for action in ["compact", "snapshot"] {
+            let r = c.post(format!("{}/collections/ghost/{}", router.url(), action))
+                .send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::NOT_FOUND, "{} of a collection no shard holds", action);
+        }
 
         drop(router);
         cleanup(&root).await;

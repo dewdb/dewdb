@@ -1,6 +1,7 @@
 //! Index entries, their persisted snapshot, and the commit watermark file.
 
-use super::frame::{Configuration, HEADER_LEN};
+use super::frame::{Configuration, HandoverRecord, HEADER_LEN};
+use crate::util::write_atomic;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -78,17 +79,35 @@ pub struct AppliedMeta {
     /// is never in the index, so compaction retires its frame and replay cannot find it again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<Configuration>,
+    /// The newest committed `Handover`, kept for the same reason as `config`. One at a time: a
+    /// migration is cluster-wide, so a later plan replaces an earlier one rather than joining it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handover: Option<HandoverRecord>,
 }
 
+pub const APPLIED_FILENAME: &str = "applied.meta";
+
 impl AppliedMeta {
-    pub fn load(col_dir: &Path) -> Option<Self> {
-        serde_json::from_str(&fs::read_to_string(col_dir.join("applied.meta")).ok()?).ok()
+    /// `Ok(None)` is "this collection has no consensus history", which the caller replays in full.
+    /// A file that exists but does not parse is an error, never `None`: the two answers differ by
+    /// the whole log, and reading damage as absence publishes every entry above the watermark.
+    pub fn load(col_dir: &Path) -> io::Result<Option<Self>> {
+        let path = col_dir.join(APPLIED_FILENAME);
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        serde_json::from_str(&content)
+            .map(Some)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!(
+                "{} is unreadable ({}); it records which of this collection's durable frames are committed", path.display(), e)))
     }
 
     pub fn save(&self, col_dir: &Path) -> io::Result<()> {
         let content = serde_json::to_string(self)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        fs::write(col_dir.join("applied.meta"), content)
+        write_atomic(col_dir, APPLIED_FILENAME, content.as_bytes())
     }
 }
 

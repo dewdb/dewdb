@@ -15,15 +15,28 @@ use std::collections::{BTreeMap, HashMap};
 /// per shard, so a key moving between shards mid-scan puts it behind a position it was never
 /// covered by; the fingerprint is what makes that visible instead of a silently short answer.
 #[derive(Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ShardCursor {
     pub ring: u64,
     pub positions: BTreeMap<String, Option<String>>,
+}
+
+/// Where an unsorted scan stopped on one shard: a position in that shard's keyspace. It was a bare
+/// key on the wire, which any string is a valid one of, so a sorted or router-issued cursor handed
+/// to an unsorted query was read as a start key and answered `200` with rows after whatever that
+/// string sorts as (L18). Encoded like the other two so the three are told apart rather than
+/// guessed at; `deny_unknown_fields` on all of them is what makes that work.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyCursor {
+    pub key: String,
 }
 
 /// Where a sorted scan stopped, as a position in the sort order rather than in the keyspace. One
 /// of these covers the whole cluster: "after this row" is the same question on every shard, so a
 /// sorted page needs no per-shard state and survives a shard joining mid-scan.
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SortCursor {
     pub value: serde_json::Value,
     pub key: String,
@@ -39,7 +52,7 @@ pub struct SortedRow {
 
 pub fn encode_cursor<T: Serialize>(c: &T) -> String {
     let json = serde_json::to_vec(c).unwrap_or_default();
-    base64_bytes::base64_encode(&json)
+    base64_bytes::base64_encode_url(&json)
 }
 
 pub fn decode_cursor<T: DeserializeOwned>(s: &str) -> Option<T> {

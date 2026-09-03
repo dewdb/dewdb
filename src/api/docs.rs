@@ -11,10 +11,10 @@ use crate::model::{
     err_json, BulkDoc, CreateDoc, QueryPage, QueryParams, ReadParams, DEFAULT_QUERY_LIMIT,
     MAX_QUERY_LIMIT,
 };
-use crate::query::{decode_cursor, encode_cursor, parse_filter, parse_sort, sort_value, SortCursor, SortedRow};
+use crate::query::{decode_cursor, encode_cursor, parse_filter, parse_sort, sort_value, KeyCursor, SortCursor, SortedRow};
 use crate::replication::{parse_write_concern, wc_query_string, WriteConcernParams, DEFAULT_WTIMEOUT_MS};
 use crate::cluster::ownership::Ownership;
-use crate::api::middleware::CollectionPath;
+use crate::api::middleware::{client_collection, CollectionPath};
 use crate::state::AppState;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -105,7 +105,10 @@ pub async fn create_doc(
             "could not generate a key this shard owns; retry".to_string()),
     };
 
-    let wc = parse_write_concern(wcp.w.as_deref());
+    let wc = match parse_write_concern(wcp.w.as_deref()) {
+        Ok(wc) => wc,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
+    };
     let wtimeout = Duration::from_millis(wcp.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
 
     match local_write(&state, &col_name, id.clone(), Some(payload.value), wc, wtimeout).await {
@@ -145,7 +148,10 @@ pub async fn put_doc(
         return refusal;
     }
 
-    let wc = parse_write_concern(wcp.w.as_deref());
+    let wc = match parse_write_concern(wcp.w.as_deref()) {
+        Ok(wc) => wc,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
+    };
     let wtimeout = Duration::from_millis(wcp.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
 
     match local_write(&state, &col_name, id.clone(), Some(payload.value), wc, wtimeout).await {
@@ -187,7 +193,10 @@ pub async fn bulk_create_docs(
 
     let _movement_guard = state.migration_write_gate.read().await;
 
-    let wc = parse_write_concern(wcp.w.as_deref());
+    let wc = match parse_write_concern(wcp.w.as_deref()) {
+        Ok(wc) => wc,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
+    };
     let wtimeout = Duration::from_millis(wcp.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
 
     let ids: Vec<String> = payload.iter()
@@ -207,6 +216,7 @@ pub async fn bulk_create_docs(
 
     match local_write_batch(&state, &col_name, items, wc, wtimeout).await {
         Ok(outcomes) => {
+            let met = outcomes.iter().all(|o| o.met);
             let results: Vec<serde_json::Value> = ids.into_iter().zip(outcomes.into_iter()).map(|(id, o)| {
                 if o.met {
                     serde_json::json!({"id": id, "status": "created"})
@@ -220,7 +230,12 @@ pub async fn bulk_create_docs(
                     })
                 }
             }).collect();
-            (StatusCode::CREATED, Json(serde_json::json!({"results": results}))).into_response()
+            // `207` when the batch is not uniformly what `201` promises, the way the fan-outs
+            // already answer it. The status is the part a client acts on, and a per-item `warning`
+            // it has to go looking for is not one -- every single-document path answers `202` for
+            // exactly this (M19).
+            let status = if met { StatusCode::CREATED } else { StatusCode::MULTI_STATUS };
+            (status, Json(serde_json::json!({"results": results}))).into_response()
         }
         Err(resp) => resp,
     }
@@ -278,9 +293,9 @@ pub async fn get_doc(
         }))).into_response();
     }
 
-    let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
+    let col = match client_collection(&state, &col_name) {
         Ok(c) => c,
-        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(resp) => return resp,
     };
 
     let key = id.clone();
@@ -322,7 +337,10 @@ pub async fn update_doc(
         return refusal;
     }
 
-    let wc = parse_write_concern(wcp.w.as_deref());
+    let wc = match parse_write_concern(wcp.w.as_deref()) {
+        Ok(wc) => wc,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
+    };
     let wtimeout = Duration::from_millis(wcp.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
 
     match local_patch(&state, &col_name, id.clone(), payload.value, wc, wtimeout).await {
@@ -362,7 +380,10 @@ pub async fn delete_doc(
         return refusal;
     }
 
-    let wc = parse_write_concern(wcp.w.as_deref());
+    let wc = match parse_write_concern(wcp.w.as_deref()) {
+        Ok(wc) => wc,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
+    };
     let wtimeout = Duration::from_millis(wcp.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
 
     match local_write(&state, &col_name, id.clone(), None, wc, wtimeout).await {
@@ -386,9 +407,9 @@ pub async fn list_docs(
         return (StatusCode::NOT_IMPLEMENTED, "Use /query for cross-shard iteration").into_response();
     }
 
-    let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
+    let col = match client_collection(&state, &col_name) {
         Ok(c) => c,
-        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(resp) => return resp,
     };
 
     let col_clone = col.clone();
@@ -421,8 +442,10 @@ pub async fn query_docs(
         Ok(p) => p,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
     };
-    // A sorted cursor is a position in the sort order and an unsorted one is a key, so a cursor
-    // carried over from a differently-shaped query cannot be honoured and must not be ignored.
+    // A sorted cursor is a position in the sort order and an unsorted one is a position in one
+    // shard's keyspace, so a cursor carried over from a differently-shaped query cannot be honoured
+    // and must not be ignored. Both are checked: the unsorted one used to be a bare key, which any
+    // string is a valid one of, so the mix-up in that direction was answered rather than refused.
     let sort_cursor = match (&sort, params.cursor.as_deref()) {
         (Some(_), Some(c)) => match decode_cursor::<SortCursor>(c) {
             Some(c) => Some(c),
@@ -445,13 +468,24 @@ pub async fn query_docs(
         return refusal;
     }
 
-    let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
+    // Below the router branch: a router carries its own `ShardCursor` here, and this shape is the
+    // one a shard issues for itself.
+    let key_cursor = match (&sort, params.cursor.as_deref()) {
+        (None, Some(c)) => match decode_cursor::<KeyCursor>(c) {
+            Some(c) => Some(c.key),
+            None => return err_json(StatusCode::BAD_REQUEST,
+                "cursor does not belong to this unsorted query".to_string()),
+        },
+        _ => None,
+    };
+
+    let col = match client_collection(&state, &col_name) {
         Ok(c) => c,
-        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(resp) => return resp,
     };
 
     let col_clone = col.clone();
-    let after = params.cursor.clone();
+    let after = key_cursor;
     let start = params.start.clone();
     let end = params.end.clone();
     let want_keys = params.keys.unwrap_or(false);
@@ -471,8 +505,11 @@ pub async fn query_docs(
                 };
                 Ok((rows, next))
             },
-            None => col_clone.query_page(
-                after.as_deref(), start.as_deref(), end.as_deref(), &filter_obj, limit),
+            None => {
+                let (rows, next) = col_clone.query_page(
+                    after.as_deref(), start.as_deref(), end.as_deref(), &filter_obj, limit)?;
+                Ok((rows, next.map(|key| encode_cursor(&KeyCursor { key }))))
+            },
         }
     }).await;
 
@@ -490,8 +527,8 @@ pub async fn query_docs(
 #[cfg(test)]
 mod tests {
     use crate::test_support::{
-        node_by_id, put_value, router_for, single_node, temp_root, three_node_cluster,
-        two_shard_cluster, wait_for,
+        next_test_port, node_by_id, put_doc_http, put_value, router_for, single_node, temp_root,
+        three_node_cluster, two_shard_cluster, wait_for, TestNode,
     };
     use axum::http::StatusCode;
     use std::time::Duration;
@@ -966,6 +1003,80 @@ mod tests {
         assert_eq!(query("100".into()).await.ok(), Some(StatusCode::OK),
             "the node is still serving, which is the half of this that the status code cannot show");
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M18: anything that was not `1`, `majority`, `all` or a number became `w=1`, so a client that
+    /// asked for durability was told `200` and had no way to find out it got none. M19: the bulk
+    /// path answered `201` whatever the concern did, with the shortfall buried in each item.
+    /// L18: an unsorted `/query` took any string as a start key, so a cursor from a differently
+    /// shaped query was answered instead of refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_request_that_asks_for_something_unknown_is_refused_not_reinterpreted() {
+        let root = temp_root();
+        let mut node = TestNode::new("hyg", next_test_port(), &root, "primary");
+        node.start();
+        let c = reqwest::Client::new();
+        let base = node.url();
+
+        for spelling in ["quorum", "majorty", "abc", "-1"] {
+            let url = format!("{}/collections/t/docs/k?w={}", base, spelling);
+            let r = c.put(&url).json(&serde_json::json!({"value": {"v": 1}})).send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST,
+                "`w={}` silently asked for no replication at all", spelling);
+        }
+
+        // A real write, so the cursor below is a real one.
+        for i in 0..3 {
+            assert!(put_doc_http(&c, &base, &format!("k{}", i), i as i64).await.is_success());
+        }
+
+        let page = c.get(format!("{}/collections/t/query?limit=1", base))
+            .send().await.unwrap().json::<serde_json::Value>().await.unwrap();
+        let cursor = page["next_cursor"].as_str().expect("a page with more behind it").to_string();
+        let resumed = c.get(format!("{}/collections/t/query?limit=10", base))
+            .query(&[("cursor", &cursor)]).send().await.unwrap();
+        assert_eq!(resumed.status(), StatusCode::OK, "its own cursor must still resume the scan");
+
+        for bogus in ["k1", "not-a-cursor", "eyJyaW5nIjoxLCJwb3NpdGlvbnMiOnt9fQ=="] {
+            let r = c.get(format!("{}/collections/t/query?limit=10", base))
+                .query(&[("cursor", bogus)]).send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST,
+                "`{}` was read as a start key and answered with rows after whatever it sorts as",
+                bogus);
+        }
+
+        node.kill();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// M19, the bulk half: `local_write_batch` at `w=majority` against replicas that are not there
+    /// reports every item short, and the status is the part a client acts on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_bulk_write_that_missed_its_concern_does_not_answer_created() {
+        let root = temp_root();
+        let mut node = TestNode::new("blk", next_test_port(), &root, "primary");
+        node.replicas = vec![
+            format!("http://127.0.0.1:{}", next_test_port()),
+            format!("http://127.0.0.1:{}", next_test_port()),
+        ];
+        node.start();
+        let c = reqwest::Client::new();
+
+        let r = c.post(format!("{}/collections/t/docs/bulk?w=majority&wtimeout=300", node.url()))
+            .json(&serde_json::json!([{"value": {"v": 1}}, {"value": {"v": 2}}]))
+            .send().await.unwrap();
+        let status = r.status();
+        let body = r.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(status, StatusCode::MULTI_STATUS,
+            "a `201` for a batch no quorum holds is the one signal a bulk caller has: {}", body);
+        assert_eq!(body["results"][0]["required"], 2, "{}", body);
+
+        let met = c.post(format!("{}/collections/t/docs/bulk?w=1", node.url()))
+            .json(&serde_json::json!([{"value": {"v": 3}}])).send().await.unwrap();
+        assert_eq!(met.status(), StatusCode::CREATED, "a batch that met its concern is still 201");
+
+        node.kill();
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -178,7 +178,7 @@ impl ClusterMetadata {
             if member.url.trim().is_empty() {
                 return Err("member url must not be empty".to_string());
             }
-            if !seen.insert(endpoint_of(&member.url)) {
+            if !seen.insert(crate::util::node_key(&member.url)) {
                 return Err(format!("member {} appears more than once", member.url));
             }
             if member.role != "shard" && member.role != "router" {
@@ -295,7 +295,7 @@ impl ClusterMetadata {
         let mut parts: Vec<String> = match &self.ring {
             // Vnode tokens come from endpoint and index alone, so the owning set fixes the mapping.
             Some(ring) => std::iter::once(format!("vnodes={}", ring.vnodes))
-                .chain(ring.shards.iter().map(|s| endpoint_of(&s.node_url).to_string()))
+                .chain(ring.shards.iter().map(|s| crate::util::node_key(&s.node_url)))
                 .collect(),
             None => self.shards.iter()
                 .map(|s| format!("{}-{}@{}", s.start_hash, s.end_hash, endpoint_of(&s.node_url)))
@@ -381,7 +381,7 @@ impl ClusterMetadata {
 }
 
 fn same_url(a: &str, b: &str) -> bool {
-    endpoint_of(a) == endpoint_of(b)
+    crate::util::same_endpoint(a, b)
 }
 
 // listen_addr is a bind address, not a URL; peers and shard maps always carry a scheme.

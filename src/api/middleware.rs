@@ -1,4 +1,4 @@
-//! Authentication and latency-recording middleware, and the gate on collection names.
+//! Authentication and latency-recording middleware, and the gates on collection names.
 
 use crate::auth::{authorize, AuthOutcome, API_KEY_HEADER, INTERNAL_SECRET_HEADER};
 use crate::consensus::config::{is_system_collection, valid_collection_name, MAX_COLLECTION_NAME_LEN};
@@ -88,6 +88,23 @@ where
                 "invalid collection name: expected 1-{} of [A-Za-z0-9._-]", MAX_COLLECTION_NAME_LEN)));
         }
         Ok(Self(captured))
+    }
+}
+
+/// The second gate on a client-supplied name, after `CollectionPath` has judged its shape.
+/// `get_collection` opens on miss, so resolving with it let a typo in a read create a directory, a
+/// commit task and a map entry that nothing evicts (bugs.md `H15`).
+pub fn client_collection(
+    state: &AppState,
+    name: &str,
+) -> Result<std::sync::Arc<crate::storage::Collection>, axum::response::Response> {
+    let db = state.db.as_ref()
+        .ok_or_else(|| err_json(StatusCode::INTERNAL_SERVER_ERROR, "No database on this node".to_string()))?;
+    match db.lookup_collection(name) {
+        Ok(Some(col)) => Ok(col),
+        Ok(None) => Err(err_json(StatusCode::NOT_FOUND,
+            format!("collection '{}' does not exist", name))),
+        Err(e) => Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
 }
 

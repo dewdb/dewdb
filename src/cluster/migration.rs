@@ -2,8 +2,13 @@
 //! Sources drive idempotent batches while cluster metadata coordinates cutover.
 
 use crate::cluster::metadata::{Migration, MigrationPhase};
+use crate::consensus::config::CONFIG_LOG;
+use crate::replication::stream::replicate_and_await;
+use crate::replication::write_concern::WriteQuorum;
 use crate::ring::{hash_key, keyspace_movement, HashRing};
 use crate::state::AppState;
+use crate::storage::frame::HandoverRecord;
+use crate::storage::FrameHeader;
 use crate::util::{same_endpoint, write_atomic};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -301,6 +306,10 @@ async fn push_until_done(state: AppState, migration: Migration) {
                     }
                 }
                 persist(&state);
+                replicate_handover(&state, HandoverRecord {
+                    id: id.clone(),
+                    target: migration.target.clone(),
+                }).await;
                 return;
             },
             Err(e) => {
@@ -376,7 +385,7 @@ fn destinations(state: &AppState, migration: &Migration) -> Result<Vec<String>, 
     Ok(keyspace_movement(&ring.build(), &migration.target.build()).transfers.into_iter()
         .filter(|transfer| same_endpoint(&transfer.from, &mine))
         .map(|transfer| transfer.to)
-        .filter(|destination| seen.insert(crate::util::endpoint_of(destination).to_string()))
+        .filter(|destination| seen.insert(crate::util::node_key(destination)))
         .collect())
 }
 
@@ -476,17 +485,131 @@ async fn push_all(
     Ok(())
 }
 
+/// Per record, which is one per phase completion and small: an id and a ring.
+const HANDOVER_COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Puts the handover record in this group's replicated log. `migration.meta` brings it back through
+/// a restart of the same process but not to a peer elected in its place, and after the flip the plan
+/// is out of the view, so a new leader has nothing to re-derive it from (bugs.md `C18`).
+///
+/// Not awaited by the caller's success: the handover itself is already done, and a record that did
+/// not commit leaves cleanup exactly where it was before this existed rather than worse.
+pub(crate) async fn replicate_handover(state: &AppState, record: HandoverRecord) {
+    let db = match state.db.as_ref() {
+        Some(db) => db.clone(),
+        None => return,
+    };
+    let col = match db.get_collection(CONFIG_LOG) {
+        Ok(col) => col,
+        Err(e) => {
+            warn!(target: "migration", error = %e, "Could not open the config log for the handover record");
+            return;
+        },
+    };
+
+    let term = state.current_term();
+    let appended = {
+        let col = col.clone();
+        tokio::task::spawn_blocking(move || col.record_handover(record, term)).await
+    };
+    let (frame, _wal_id, _offset, lsn) = match appended {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => {
+            warn!(target: "migration", error = %e, "Could not append the handover record");
+            return;
+        },
+        Err(e) => {
+            warn!(target: "migration", error = %e, "Handover record append task failed");
+            return;
+        },
+    };
+
+    state.note_leader_append(CONFIG_LOG, lsn);
+    let commit = col.enqueue_commit();
+    let prev_lsn = FrameHeader::parse(&frame).map_or(0, |h| h.prev_lsn);
+    let commit_index = state.committed_lsn(CONFIG_LOG);
+    let quorum = WriteQuorum::Majority(state.quorum_config());
+
+    let replicating = replicate_and_await(
+        state.clone(), CONFIG_LOG.to_string(), frame, term, commit_index, lsn, prev_lsn,
+        quorum.clone(), HANDOVER_COMMIT_TIMEOUT,
+    );
+    let (holders, committed) = tokio::join!(replicating, commit);
+    if !quorum.met(&holders) {
+        warn!(target: "migration", acks = holders.len(),
+            "Handover record did not reach a quorum; a leader change before cleanup strands the copies");
+    }
+    if let Ok(Err(e)) = committed {
+        warn!(target: "migration", error = %e, "Handover record was not made durable here");
+    }
+}
+
+/// The ring this node moved keys for under `id`, from the replicated record if it is there and from
+/// this node's own run if it is not. Both answer the same question; only the first survives the
+/// group electing someone else.
+fn handover_target(state: &AppState, id: &str) -> Option<HashRing> {
+    let recorded = state.db.as_ref()
+        .and_then(|db| db.existing_collection(CONFIG_LOG))
+        .and_then(|col| col.committed_handover())
+        .filter(|record| record.id == id)
+        .map(|record| record.target);
+    recorded.or_else(|| {
+        let runs = state.migrations.lock().unwrap();
+        runs.current.as_ref().filter(|p| p.id == id && p.done).map(|p| p.target.clone())
+    })
+}
+
+/// Every key this node holds that `ring` says belongs to another group. A node the ring does not
+/// name at all owns nothing, which is the shard dropped from the ring -- the one most likely to be
+/// sitting on a whole shard's worth of copies.
+fn keys_not_ours(state: &AppState, ring: &HashRing) -> HashSet<(String, String)> {
+    let db = match state.db.as_ref() {
+        Some(db) => db,
+        None => return HashSet::new(),
+    };
+    let built = ring.build();
+    let mine = source_group(ring, &state.own_url());
+    let mut out = HashSet::new();
+
+    for collection in db.list_collections().unwrap_or_default() {
+        // A system log is this group's own consensus state and is not part of the keyspace.
+        if crate::consensus::config::is_system_collection(&collection) {
+            continue;
+        }
+        let col = match db.get_collection(&collection) {
+            Ok(col) => col,
+            Err(_) => continue,
+        };
+        col.for_each_key(None, None, None, |key| {
+            let hash = hash_key(&collection, key);
+            let ours = mine.as_deref().is_some_and(|mine| {
+                built.owner(hash).is_some_and(|shard| same_endpoint(&shard.node_url, mine))
+            });
+            if !ours {
+                out.insert((collection.clone(), key.to_string()));
+            }
+            true
+        });
+    }
+    out
+}
+
 /// Keys this node handed over, but only once the ring it was handing them over *for* is the ring
 /// actually in force. An abandoned plan leaves the same record behind, and acting on it would
 /// delete keys this node still owns.
+///
+/// Derived rather than remembered: the set of moved keys has no bound, so a log entry carrying it
+/// would fit in neither a frame nor a replicate body, and the ring that moved them answers the same
+/// question in one small record. The caller re-checks live ownership per key regardless.
 pub fn handed_over_after_flip(state: &AppState, id: &str) -> HashSet<(String, String)> {
-    let live = state.cluster_view().ring;
-    let runs = state.migrations.lock().unwrap();
-    runs.current.as_ref()
-        .filter(|p| p.id == id && p.done)
-        .filter(|p| live.as_ref() == Some(&p.target))
-        .map(|p| p.handed_over.clone())
-        .unwrap_or_default()
+    let live = match state.cluster_view().ring {
+        Some(ring) => ring,
+        None => return HashSet::new(),
+    };
+    match handover_target(state, id) {
+        Some(target) if target == live => keys_not_ours(state, &live),
+        _ => HashSet::new(),
+    }
 }
 
 pub fn progress(state: &AppState) -> Option<MigrationProgress> {
@@ -495,12 +618,12 @@ pub fn progress(state: &AppState) -> Option<MigrationProgress> {
 
 pub fn reset_completed(state: &AppState, id: &str, source: &str) -> bool {
     state.migrations.lock().unwrap().completed_resets
-        .contains(&(id.to_string(), crate::util::endpoint_of(source).to_string()))
+        .contains(&(id.to_string(), crate::util::node_key(source)))
 }
 
 pub fn mark_reset_completed(state: &AppState, id: &str, source: &str) {
     state.migrations.lock().unwrap().completed_resets
-        .insert((id.to_string(), crate::util::endpoint_of(source).to_string()));
+        .insert((id.to_string(), crate::util::node_key(source)));
     persist(state);
 }
 

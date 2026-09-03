@@ -1,6 +1,6 @@
 //! Collection administration endpoints.
 
-use crate::api::middleware::CollectionPath;
+use crate::api::middleware::{client_collection, CollectionPath};
 use crate::api::write::local_drop;
 use crate::cluster::metadata::MigrationPhase;
 use crate::cluster::probe::unique_shards;
@@ -110,7 +110,10 @@ pub async fn drop_collection(
         }))).into_response();
     }
 
-    let wc = parse_write_concern(params.w.as_deref());
+    let wc = match parse_write_concern(params.w.as_deref()) {
+        Ok(wc) => wc,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
+    };
     let wtimeout = Duration::from_millis(params.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
 
     let outcome = match local_drop(&state, &col_name, wc, wtimeout).await {
@@ -148,9 +151,9 @@ pub async fn compact_collection(
             .into_response();
     }
 
-    let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
+    let col = match client_collection(&state, &col_name) {
         Ok(c) => c,
-        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(resp) => return resp,
     };
 
     let before = col.space_usage().ok();
@@ -186,9 +189,9 @@ pub async fn snapshot_collection(
         return router_fanout_maintenance(&state, &col_name, "snapshot").await;
     }
 
-    let col = match state.db.as_ref().unwrap().get_collection(&col_name) {
+    let col = match client_collection(&state, &col_name) {
         Ok(c) => c,
-        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(resp) => return resp,
     };
 
     let col_clone = col.clone();
@@ -212,7 +215,8 @@ mod tests {
     use crate::config::NodeConfig;
     use crate::storage::Database;
     use crate::test_support::{
-        live_put, put_doc_http, temp_root, three_node_cluster, three_node_cluster_with_timeout, wait_for, wait_for_doc, TestNode,
+        live_put, next_test_port, put_doc_http, temp_root, three_node_cluster,
+        three_node_cluster_with_timeout, wait_for, wait_for_doc, TestNode,
     };
     use std::sync::Arc;
     use std::time::Duration;
@@ -248,6 +252,40 @@ mod tests {
         assert_eq!(snapshotted.status(), StatusCode::OK,
             "snapshots add a file and remove nothing, so a replica is free to take one");
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// H15: all five resolved the name with `get_collection`, which opens on miss, so a typo in a
+    /// read left a directory, a commit task and a map entry behind for the process's life.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reading_a_collection_that_does_not_exist_does_not_create_it() {
+        let root = temp_root();
+        let mut node = TestNode::new("solo", next_test_port(), &root, "primary");
+        node.start();
+        let client = reqwest::Client::new();
+        let base = node.url();
+
+        // A real collection alongside it, so "nothing was created" is not just "nothing exists".
+        assert!(put_doc_http(&client, &base, "k1", 1).await.is_success());
+
+        for path in ["docs/k1", "docs", "query"] {
+            let url = format!("{}/collections/ghost/{}", base, path);
+            assert_eq!(client.get(&url).send().await.unwrap().status(), StatusCode::NOT_FOUND,
+                "GET {} answered for a collection that is not there", url);
+        }
+        for action in ["compact", "snapshot"] {
+            let url = format!("{}/collections/ghost/{}", base, action);
+            assert_eq!(client.post(&url).send().await.unwrap().status(), StatusCode::NOT_FOUND,
+                "POST {} answered for a collection that is not there", url);
+        }
+
+        let listed = collections_on(&client, &base).await.unwrap();
+        assert_eq!(listed, vec!["t".to_string()],
+            "a probe invented a collection and every client can see it now: {:?}", listed);
+        assert!(!root.join("ghost").exists(),
+            "and left the directory, the wal and a commit task behind with it");
+
+        node.kill();
         let _ = std::fs::remove_dir_all(&root);
     }
 

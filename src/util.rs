@@ -7,7 +7,8 @@ use std::time::Duration;
 
 const DIR_REMOVE_ATTEMPTS: usize = 5;
 
-/// Node identity: the `host:port` of `url`, with scheme, path, query and fragment cut away.
+/// The `host:port` of `url`, with scheme, path, query and fragment cut away. Parsing only: two
+/// nodes are the same node by `same_endpoint`, and identity as a map key is `node_key`.
 /// Configs mix "http://host:port" and "host:port", and one port has one listener, so a scheme
 /// cannot name a second node — a path can, which is why it is cut rather than compared.
 pub fn endpoint_of(url: &str) -> &str {
@@ -15,8 +16,18 @@ pub fn endpoint_of(url: &str) -> &str {
     authority.split(['/', '?', '#']).next().unwrap_or(authority)
 }
 
+/// Host case is insensitive per the DNS spec, so `LOCALHOST:8080` and `localhost:8080` are one
+/// node. Two spellings counted as two is `C8`'s failure: a majority over an inflated voter set is
+/// not a majority (L16). Compared rather than lowercased so this stays allocation-free -- it runs
+/// per voter per decision. What no string comparison can settle is name versus address.
 pub fn same_endpoint(a: &str, b: &str) -> bool {
-    endpoint_of(a) == endpoint_of(b)
+    endpoint_of(a).eq_ignore_ascii_case(endpoint_of(b))
+}
+
+/// The same identity as an owned map key. Anything keyed by node has to agree with
+/// `same_endpoint`, or one node spelled two ways gets two entries.
+pub fn node_key(url: &str) -> String {
+    endpoint_of(url).to_ascii_lowercase()
 }
 
 /// One path segment of a forwarded URL. Anything outside RFC 3986 unreserved is escaped, so a key
@@ -114,23 +125,40 @@ pub mod base64_bytes {
         base64_decode(&s).map_err(de::Error::custom)
     }
 
+    const STANDARD: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const URL_SAFE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+    /// The standard alphabet, for values that travel in a JSON body: replicated WAL frames. Not
+    /// for anything handed back to be put in a URL -- see `base64_encode_url`.
     pub fn base64_encode(input: &[u8]) -> String {
-        const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        encode_with(input, STANDARD)
+    }
+
+    /// `+` in a query string is a space, and a pagination cursor exists to be pasted into one
+    /// (M20). Roughly one character in 32 encodes to `+` or `/`, so most cursors carry at least
+    /// one. Kept separate from `base64_encode` rather than replacing it: the replication frame
+    /// encoding is on the wire between nodes, and changing it would break a rolling upgrade in the
+    /// direction where a new leader ships to a peer that has not restarted.
+    pub fn base64_encode_url(input: &[u8]) -> String {
+        encode_with(input, URL_SAFE)
+    }
+
+    fn encode_with(input: &[u8], chars: &[u8]) -> String {
         let mut result = String::new();
         for chunk in input.chunks(3) {
             let b0 = chunk[0] as u32;
             let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
             let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
             let combined = (b0 << 16) | (b1 << 8) | b2;
-            result.push(CHARS[((combined >> 18) & 0x3F) as usize] as char);
-            result.push(CHARS[((combined >> 12) & 0x3F) as usize] as char);
+            result.push(chars[((combined >> 18) & 0x3F) as usize] as char);
+            result.push(chars[((combined >> 12) & 0x3F) as usize] as char);
             if chunk.len() > 1 {
-                result.push(CHARS[((combined >> 6) & 0x3F) as usize] as char);
+                result.push(chars[((combined >> 6) & 0x3F) as usize] as char);
             } else {
                 result.push('=');
             }
             if chunk.len() > 2 {
-                result.push(CHARS[(combined & 0x3F) as usize] as char);
+                result.push(chars[(combined & 0x3F) as usize] as char);
             } else {
                 result.push('=');
             }
@@ -148,8 +176,10 @@ pub mod base64_bytes {
                 'A'..='Z' => c as u32 - 'A' as u32,
                 'a'..='z' => c as u32 - 'a' as u32 + 26,
                 '0'..='9' => c as u32 - '0' as u32 + 52,
-                '+' => 62,
-                '/' => 63,
+                // Both alphabets: a cursor issued before the URL-safe change still decodes, so
+                // the one page of a scan in flight across an upgrade is not lost.
+                '+' | '-' => 62,
+                '/' | '_' => 63,
                 _ => return Err(format!("Invalid base64 char: {}", c)),
             };
             buf = (buf << 6) | val;
@@ -203,5 +233,39 @@ mod tests {
         for url in ["http://127.0.0.1:9501", "127.0.0.1:9501", "https://h", "http://h/"] {
             assert_eq!(endpoint_of(url), url.trim_end_matches('/').rsplit("//").next().unwrap());
         }
+    }
+
+    /// L16: `same_endpoint` was `==` on the authority, so one node spelled two ways counted twice.
+    /// The consequence is `C8`'s -- a majority over an inflated voter set is not a majority.
+    #[test]
+    fn one_node_spelled_two_ways_is_one_node() {
+        assert!(same_endpoint("http://LOCALHOST:8080", "localhost:8080"));
+        assert!(same_endpoint("HTTP://Host.Example:9000/x", "host.example:9000"));
+        assert_eq!(node_key("http://LOCALHOST:8080/x"), node_key("localhost:8080"));
+        assert_eq!(node_key("HOST:1"), "host:1", "keys have to agree with the comparison");
+
+        // What no string comparison settles, and the entry does not claim to.
+        assert!(!same_endpoint("localhost:8080", "127.0.0.1:8080"));
+        assert!(!same_endpoint("host:8080", "host:8081"), "the port is not case, it is identity");
+    }
+
+    /// M20: the standard alphabet's `+` is a space in a query string, and a cursor exists to be put
+    /// in one. Only the cursor encoding moved -- replicated frames travel in a JSON body, where
+    /// `+/` is fine, and changing that would break a rolling upgrade.
+    #[test]
+    fn cursor_encoding_survives_a_query_string_and_still_reads_the_old_one() {
+        use base64_bytes::{base64_decode, base64_encode, base64_encode_url};
+
+        // Bytes chosen to hit index 62 and 63, which are `+/` in one alphabet and `-_` in the other.
+        let bytes: Vec<u8> = vec![0xFB, 0xFF, 0xFE, 0xFF];
+        let url = base64_encode_url(&bytes);
+        assert!(!url.contains('+') && !url.contains('/'), "cursor alphabet leaked `+` or `/`: {}", url);
+        assert_eq!(base64_decode(&url).unwrap(), bytes);
+
+        let standard = base64_encode(&bytes);
+        assert!(standard.contains('+') || standard.contains('/'),
+            "the fixture must exercise the characters that differ: {}", standard);
+        assert_eq!(base64_decode(&standard).unwrap(), bytes,
+            "a cursor issued before the change is still one page of a scan in flight");
     }
 }

@@ -95,7 +95,7 @@ impl AppState {
     }
 
     pub fn migration_reset_lock(&self, id: &str, source: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let key = format!("migration-reset:{}:{}", id, crate::util::endpoint_of(source));
+        let key = format!("migration-reset:{}:{}", id, crate::util::node_key(source));
         let mut locks = self.repair_locks.lock().unwrap();
         locks.entry(key)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
@@ -118,7 +118,9 @@ impl AppState {
     /// drains on commit, so admitting here is the last point where growth can still be refused.
     pub fn admit_write(&self, collection: &str) -> Result<(), usize> {
         let bound = self.config.flow_control.max_uncommitted_frames;
-        if bound == 0 || !self.is_leader() {
+        // Not `!is_leader()`: a leader deposed mid-write still holds staged frames that no quorum
+        // will ever commit, which is when the bound matters most rather than least (bugs.md C26).
+        if bound == 0 || self.replication.is_none() {
             return Ok(());
         }
         let pending = self
@@ -813,13 +815,13 @@ impl AppState {
 
     pub fn note_node_load(&self, url: &str, load: NodeLoad) {
         self.node_loads.lock().unwrap().insert(
-            crate::util::endpoint_of(url).to_string(),
+            crate::util::node_key(url),
             NodeLoadSample { load, sampled_at: std::time::Instant::now() },
         );
     }
 
     pub fn clear_node_load(&self, url: &str) {
-        self.node_loads.lock().unwrap().remove(crate::util::endpoint_of(url));
+        self.node_loads.lock().unwrap().remove(&crate::util::node_key(url));
     }
 
     pub fn fresh_node_loads(&self) -> HashMap<String, NodeLoad> {
@@ -840,7 +842,7 @@ impl AppState {
     }
 
     pub fn track_routed_read(&self, url: &str) -> RoutedRead {
-        let url = crate::util::endpoint_of(url).to_string();
+        let url = crate::util::node_key(url);
         let mut counts = self.routed_reads.lock().unwrap();
         let count = counts.entry(url.clone()).or_insert(0);
         *count = count.saturating_add(1);
@@ -891,8 +893,13 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// C26: this asserted the opposite, reasoning that a follower refusing replicated frames would
+    /// look like a gap to the leader. Nothing on the replication path calls `admit_write` -- a
+    /// replica's frames arrive through `replicate_handler` -- so the skip only ever reached the
+    /// four local write paths, where a non-leader is either refused at the handler or is a leader
+    /// deposed mid-write. The bound is what that node needs most, not least.
     #[tokio::test]
-    async fn a_follower_is_never_backpressured_and_zero_disables_the_bound() {
+    async fn a_deposed_leader_is_still_backpressured_and_zero_disables_the_bound() {
         let root = temp_root();
         let db = Arc::new(Database::new(&root).unwrap());
         let col = db.get_collection("t").unwrap();
@@ -900,10 +907,10 @@ mod tests {
             stage_put(&col, &format!("k{}", i), i);
         }
 
-        let follower = AppState::for_admission_test(config_with_bound(&root, 1), db.clone(), false);
-        assert!(follower.admit_write("t").is_ok(),
-            "a follower refusing replicated frames would look like a gap to the leader; its buffer \
-             is bounded by the leader's own admission control instead");
+        let deposed = AppState::for_admission_test(config_with_bound(&root, 1), db.clone(), false);
+        assert_eq!(deposed.admit_write("t"), Err(5),
+            "losing leadership stopped the bound applying to a buffer that can no longer drain: \
+             nothing this node still accepts will ever reach a quorum");
 
         let unbounded = AppState::for_admission_test(config_with_bound(&root, 0), db.clone(), true);
         assert!(unbounded.admit_write("t").is_ok(), "0 opts out of the bound");
@@ -981,7 +988,7 @@ mod tests {
         state.replication.as_ref().unwrap().write().unwrap().replicas =
             vec!["http://127.0.0.1:9502".into(), "http://127.0.0.1:9503".into()];
 
-        let majority = parse_write_concern(Some("majority"));
+        let majority = parse_write_concern(Some("majority")).unwrap();
         let before = required_acks(&majority, state.voting_replicas().len());
         assert_eq!(before, 2, "two of three");
         assert_eq!(state.replication_targets().len(), 2);

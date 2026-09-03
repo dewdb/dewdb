@@ -4,7 +4,7 @@ use crate::api::migrate::{begin_migration, resume_migration_coordination, Migrat
 use crate::cluster::metadata::ClusterMetadata;
 use crate::ring::{keyspace_movement, HashRing, RingShard};
 use crate::state::AppState;
-use crate::util::{endpoint_of, same_endpoint};
+use crate::util::{endpoint_of, node_key, same_endpoint};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -58,42 +58,45 @@ fn replica_placements(
     current: &HashRing,
     primaries: &[String],
 ) -> BTreeMap<String, Vec<String>> {
-    let primary_endpoints: HashSet<&str> = primaries
+    // Keyed by `node_key` throughout, not `endpoint_of`: the ring and the member list are two
+    // places one node can be spelled, and a case difference between them is a node that silently
+    // has no replicas rather than a node with two identities (L16).
+    let primary_endpoints: HashSet<String> = primaries
         .iter()
-        .map(|url| endpoint_of(url))
+        .map(|url| node_key(url))
         .collect();
-    let replicas: BTreeMap<&str, _> = view
+    let replicas: BTreeMap<String, _> = view
         .members
         .iter()
         .filter(|member| {
             member.role == "shard" && member.shard_role.as_deref() == Some("replica")
         })
-        .map(|member| (endpoint_of(&member.url), member))
+        .map(|member| (node_key(&member.url), member))
         .collect();
     let mut placements: BTreeMap<String, Vec<String>> = primaries
         .iter()
-        .map(|primary| (endpoint_of(primary).to_string(), Vec::new()))
+        .map(|primary| (node_key(primary), Vec::new()))
         .collect();
 
     for shard in &current.shards {
-        let primary = endpoint_of(&shard.node_url);
-        if !primary_endpoints.contains(primary) {
+        let primary = node_key(&shard.node_url);
+        if !primary_endpoints.contains(&primary) {
             continue;
         }
         for replica_url in &shard.replica_urls {
-            let replica = match replicas.get(endpoint_of(replica_url)) {
+            let replica = match replicas.get(&node_key(replica_url)) {
                 Some(replica) => replica,
                 None => continue,
             };
             if replica
                 .follows
                 .as_deref()
-                .is_some_and(|follows| endpoint_of(follows) != primary)
+                .is_some_and(|follows| !same_endpoint(follows, &shard.node_url))
             {
                 continue;
             }
             placements
-                .get_mut(primary)
+                .get_mut(&primary)
                 .unwrap()
                 .push(replica.url.clone());
         }
@@ -101,13 +104,13 @@ fn replica_placements(
 
     for replica in replicas.values() {
         let primary = match replica.follows.as_deref() {
-            Some(primary) if primary_endpoints.contains(endpoint_of(primary)) => {
-                endpoint_of(primary)
+            Some(primary) if primary_endpoints.contains(&node_key(primary)) => {
+                node_key(primary)
             }
             _ => continue,
         };
         placements
-            .get_mut(primary)
+            .get_mut(&primary)
             .unwrap()
             .push(replica.url.clone());
     }

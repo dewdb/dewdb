@@ -148,6 +148,12 @@ impl NodeConfig {
             return Err("membership_mode 'learner' cannot be combined with shard_role 'primary'; \
                         a learner is never a leader".to_string());
         }
+        // Not clamped at the point of use like the flow_control knobs: at 0 this is not a slow
+        // setting but a different program -- `leader_contact_task` sleeps `ZERO` and pins a core,
+        // and `contact_lost` is permanently true, so every follower campaigns on every poll (L15).
+        if self.heartbeat_timeout_secs == 0 {
+            return Err("heartbeat_timeout_secs must be at least 1".to_string());
+        }
         self.maintenance.validate()?;
         self.rebalance.validate()?;
         self.data_movement.validate()?;
@@ -415,5 +421,22 @@ mod tests {
         let blank: NodeConfig = serde_json::from_str(
             r#"{"node_id":"n","role":"shard","listen_addr":"127.0.0.1:1","data_dir":"  "}"#).unwrap();
         assert!(blank.validate().is_err(), "a blank data_dir would write into the process cwd");
+    }
+
+    /// L15: `NodeConfig::validate` bounded every other knob. At 0 this one turns
+    /// `leader_contact_task` into `sleep(ZERO)` on every shard node and makes `contact_lost`
+    /// permanently true, so it is not a slow setting but a different program.
+    #[test]
+    fn a_zero_heartbeat_timeout_is_refused_at_boot() {
+        let cfg = |secs: u64| -> Result<(), String> {
+            let c: NodeConfig = serde_json::from_value(serde_json::json!({
+                "node_id": "n1", "role": "shard", "shard_role": "primary",
+                "listen_addr": "127.0.0.1:1", "data_dir": "/tmp/x",
+                "heartbeat_timeout_secs": secs,
+            })).unwrap();
+            c.validate()
+        };
+        assert!(cfg(0).is_err(), "0 pins a core for the life of the process");
+        assert!(cfg(1).is_ok());
     }
 }

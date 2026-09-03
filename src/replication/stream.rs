@@ -464,8 +464,14 @@ async fn stream_chain_once(
                 }
                 return None;
             },
+            // A refusal that is not a conflict refuses the same frames on every later pass, so
+            // only a snapshot gets past it. 503 is a snapshot already installing there.
             Ok(r) => {
-                warn!(target: "repair", "Replica {} returned {} during backfill", replica_url, r.status());
+                let status = r.status();
+                warn!(target: "repair", "Replica {} returned {} during backfill", replica_url, status);
+                if status != StatusCode::SERVICE_UNAVAILABLE {
+                    trigger_resync(&state, &replica_url, &collection).await;
+                }
                 return None;
             },
             Err(e) => {
@@ -823,6 +829,68 @@ mod tests {
         assert_eq!(stub.resyncs.load(Ordering::SeqCst), 0);
         assert_eq!(resyncs, 0,
             "a divergence above the replica's watermark costs a backfill, not a whole collection");
+
+        leader.kill();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Answers every batch with one fixed status, and counts the resyncs it is asked for.
+    struct RefusingStub {
+        status: StatusCode,
+        resyncs: AtomicUsize,
+    }
+
+    async fn refuse_batch(
+        axum::extract::State(stub): axum::extract::State<Arc<RefusingStub>>,
+    ) -> StatusCode {
+        stub.status
+    }
+
+    async fn count_stub_resync(
+        axum::extract::State(stub): axum::extract::State<Arc<RefusingStub>>,
+    ) -> StatusCode {
+        stub.resyncs.fetch_add(1, Ordering::SeqCst);
+        StatusCode::OK
+    }
+
+    async fn refusing_stub(status: StatusCode) -> (String, Arc<RefusingStub>) {
+        let stub = Arc::new(RefusingStub { status, resyncs: AtomicUsize::new(0) });
+        let port = next_test_port();
+        let app = axum::Router::new()
+            .route("/internal/replicate", axum::routing::post(refuse_batch))
+            .route("/internal/resync", axum::routing::post(count_stub_resync))
+            .with_state(stub.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
+        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        (format!("http://127.0.0.1:{}", port), stub)
+    }
+
+    /// H13: a frame the write path accepts can exceed the replicate body limit, and the refusal is
+    /// the same on every later pass, so returning `None` here wedged the collection at one copy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refused_batch_escalates_to_a_snapshot() {
+        let root = temp_root();
+        let (too_large, refuser) = refusing_stub(StatusCode::PAYLOAD_TOO_LARGE).await;
+        let (installing, installer) = refusing_stub(StatusCode::SERVICE_UNAVAILABLE).await;
+
+        // Not in the config, so the repairs below are the only traffic to either stub.
+        let mut leader = TestNode::new("solo", next_test_port(), &root, "primary");
+        leader.start();
+        let state = leader.state.clone().unwrap();
+        let client = reqwest::Client::new();
+        for i in 1..=3 {
+            assert!(put_doc_http(&client, &leader.url(), &format!("k{}", i), i).await.is_success());
+        }
+        let tail = state.db.as_ref().unwrap().get_collection("t").unwrap().last_appended_lsn();
+
+        assert!(!repair_replica(state.clone(), too_large, "t".into(), 0, None, tail).await,
+            "a refused batch is not an ack");
+        assert_eq!(refuser.resyncs.load(Ordering::SeqCst), 1,
+            "no retry changes this answer, so the frames have to travel as a snapshot instead");
+
+        assert!(!repair_replica(state.clone(), installing, "t".into(), 0, None, tail).await);
+        assert_eq!(installer.resyncs.load(Ordering::SeqCst), 0,
+            "503 is a snapshot already installing there; asking for a second one buys nothing");
 
         leader.kill();
         let _ = fs::remove_dir_all(&root);

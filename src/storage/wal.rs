@@ -1,7 +1,7 @@
 //! WAL append, replicated-frame apply, boot replay, and frame read-back.
 
 use super::collection::{Collection, StagedApply, StagedEffect, READ_POOL_HANDLES};
-use super::frame::{Configuration, FrameHeader, LogEntry, ReplicaApply, HEADER_LEN, MAX_RECORD_SIZE};
+use super::frame::{Configuration, FrameHeader, HandoverRecord, LogEntry, ReplicaApply, HEADER_LEN, MAX_RECORD_SIZE};
 use super::index::{IndexEntry, ReadCacheConfig};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -37,6 +37,7 @@ impl Collection {
         staged_inline: &mut u64,
         dropped: &mut bool,
         config: &mut Option<Configuration>,
+        handover: &mut Option<HandoverRecord>,
     ) -> io::Result<(u64, u64)> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         let file_len = file.metadata()?.len();
@@ -101,6 +102,7 @@ impl Collection {
                         LogEntry::Barrier { .. } => StagedEffect::Nothing,
                         LogEntry::Drop { .. } => StagedEffect::Clear,
                         LogEntry::Config { config, .. } => StagedEffect::Configure(config),
+                        LogEntry::Handover { handover, .. } => StagedEffect::RecordHandover(handover),
                     };
                     pending.insert(lsn, StagedApply { wal_id, offset, term, effect });
                     if lsn > max_lsn {
@@ -142,6 +144,7 @@ impl Collection {
                     },
                     // Append order again: the last one below the watermark is the committed one.
                     LogEntry::Config { config: c, .. } => *config = Some(c),
+                    LogEntry::Handover { handover: h, .. } => *handover = Some(h),
                 }
                 if lsn > max_lsn {
                     max_lsn = lsn;
@@ -184,14 +187,7 @@ impl Collection {
 
         if wal.current_wal_size >= WAL_ROTATION_LIMIT {
             wal.current_wal.sync_all()?;
-            wal.current_wal_id += 1;
-            let new_path = self.root_path.join(format!("wal-{:05}.log", wal.current_wal_id));
-            wal.current_wal = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .read(true)
-                .open(&new_path)?;
-            wal.current_wal_size = 0;
+            self.open_next_wal(&mut wal)?;
         }
 
         let lsn = self.db_next_lsn.fetch_add(1, Ordering::SeqCst) + 1;
@@ -210,8 +206,11 @@ impl Collection {
         frame.extend_from_slice(&header);
         frame.extend_from_slice(&json_bytes);
 
-        wal.current_wal.write_all(&header)?;
-        wal.current_wal.write_all(&json_bytes)?;
+        if let Err(e) = wal.current_wal.write_all(&header)
+            .and_then(|()| wal.current_wal.write_all(&json_bytes))
+        {
+            return Err(self.rotate_past_torn_write(&mut wal, e));
+        }
 
         let offset = wal.current_wal_size;
         wal.current_wal_size += frame_len;
@@ -225,6 +224,33 @@ impl Collection {
         drop(wal);
 
         Ok((frame, wal_id, offset, lsn))
+    }
+
+    fn open_next_wal(&self, wal: &mut WalsState) -> io::Result<()> {
+        wal.current_wal_id += 1;
+        let new_path = self.root_path.join(format!("wal-{:05}.log", wal.current_wal_id));
+        wal.current_wal = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .read(true)
+            .open(&new_path)?;
+        wal.current_wal_size = 0;
+        Ok(())
+    }
+
+    /// `write_all` can write some bytes and then fail, leaving a frame on disk that the size counter
+    /// is not past. Carrying that counter forward records every later frame at an offset that is not
+    /// its own, and replay stops at the tear and truncates everything above it -- including frames
+    /// whose clients were told `200` (M21). Rotating leaves the tear last in its WAL, where replay
+    /// takes it and nothing else, and the writer continues on a clean file.
+    fn rotate_past_torn_write(&self, wal: &mut WalsState, cause: io::Error) -> io::Error {
+        match self.open_next_wal(wal) {
+            Ok(()) => cause,
+            // Nowhere left to write, and the counter is deliberately still behind the tear: the
+            // next append fails the same way rather than landing where nothing can read it back.
+            Err(rotate) => io::Error::other(format!(
+                "{}; the WAL could not be rotated past the partial frame either: {}", cause, rotate)),
+        }
     }
 
     /// Raft §5.3: entries past the leader's position came from a log it does not have, so they are
@@ -354,17 +380,12 @@ impl Collection {
 
         if wal.current_wal_size >= WAL_ROTATION_LIMIT {
             wal.current_wal.sync_all()?;
-            wal.current_wal_id += 1;
-            let new_path = self.root_path.join(format!("wal-{:05}.log", wal.current_wal_id));
-            wal.current_wal = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .read(true)
-                .open(&new_path)?;
-            wal.current_wal_size = 0;
+            self.open_next_wal(&mut wal)?;
         }
 
-        wal.current_wal.write_all(&frame_bytes[..HEADER_LEN + len])?;
+        if let Err(e) = wal.current_wal.write_all(&frame_bytes[..HEADER_LEN + len]) {
+            return Err(self.rotate_past_torn_write(&mut wal, e));
+        }
 
         let offset = wal.current_wal_size;
         let wal_id = wal.current_wal_id;

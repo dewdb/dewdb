@@ -82,7 +82,9 @@ async fn finish_write(
 ) -> Result<WriteOutcome, axum::response::Response> {
     let PendingWrite { frame, term, lsn, existed, commit } = pending;
 
-    if !state.is_leader() {
+    // Nothing to replicate to, not "not currently leading": a node demoted between the handler's
+    // check and here answered `201` for an entry the next leader truncates (bugs.md C26).
+    if state.replication.is_none() {
         if let Some(c) = commit {
             settle_commit(c).await?;
         }
@@ -346,7 +348,13 @@ pub async fn local_write_batch(
 
 #[cfg(test)]
 mod tests {
-    use crate::test_support::{temp_root, three_node_cluster_with_timeout};
+    use super::local_write;
+    use crate::config::NodeConfig;
+    use crate::replication::WriteConcern;
+    use crate::state::AppState;
+    use crate::storage::Database;
+    use crate::test_support::{next_test_port, temp_root, three_node_cluster_with_timeout};
+    use std::sync::Arc;
     use axum::http::StatusCode;
     use std::time::Duration;
 
@@ -385,6 +393,37 @@ mod tests {
 
         let (_status, body) = write(None).await;
         assert_eq!(body["existed"], true, "unfixed this deleted a key it said was not there: {}", body);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// C26: `finish_write` opened with `!state.is_leader()`, meant as "there is nothing to
+    /// replicate to". It is equally true of a leader deposed between the handler's leadership check
+    /// and the fsync after it, and that node answered `201` with `required: 1` whatever was asked,
+    /// for an entry that is unreplicated at a stale term and that the next leader truncates.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_write_that_lost_leadership_mid_flight_does_not_report_its_concern_met() {
+        let root = temp_root();
+        let db = Arc::new(Database::new(&root).unwrap());
+        let peers = vec![
+            format!("http://127.0.0.1:{}", next_test_port()),
+            format!("http://127.0.0.1:{}", next_test_port()),
+        ];
+        let config: NodeConfig = serde_json::from_value(serde_json::json!({
+            "node_id": "n1", "role": "shard", "shard_role": "primary",
+            "listen_addr": "127.0.0.1:1",
+            "data_dir": root.to_string_lossy(),
+            "replicas": peers, "peers": peers,
+        })).unwrap();
+        // Deposed, not standalone: `replication` is present and `is_leader` is not.
+        let state = AppState::for_admission_test(config, db, false);
+
+        let outcome = local_write(&state, "t", "k".into(), Some(serde_json::json!({"v": 1})),
+            WriteConcern::Majority, Duration::from_millis(250)).await.unwrap();
+
+        assert_eq!(outcome.required, 2, "a majority of three voters, whoever is leading");
+        assert_eq!(outcome.acks, 1, "nothing but this node holds it");
+        assert!(!outcome.met, "an acknowledged write the next leader is going to truncate");
 
         let _ = std::fs::remove_dir_all(&root);
     }
