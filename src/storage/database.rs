@@ -1,7 +1,7 @@
 //! Open collections under one data directory and the LSN counters they share.
 
 use super::collection::Collection;
-use crate::consensus::config::is_system_collection;
+use crate::consensus::config::{is_system_collection, valid_collection_name};
 use super::index::{AppliedMeta, LsnMeta, ReadCacheConfig};
 use crate::util::remove_dir_with_retry;
 use std::collections::{HashMap, HashSet};
@@ -24,10 +24,20 @@ pub struct Database {
 }
 
 impl Database {
+    /// The last check before a name becomes a path. Every name that reaches here has come off a
+    /// URL or off the wire, and only the API layer's gate stands in front of the HTTP half.
+    fn collection_dir(&self, name: &str) -> io::Result<PathBuf> {
+        if !valid_collection_name(name) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                format!("invalid collection name '{}'", name)));
+        }
+        Ok(self.root_path.join(name))
+    }
+
     fn open_collection(&self, name: &str) -> io::Result<Arc<Collection>> {
         let col = Arc::new(Collection::open(
             name.to_string(),
-            self.root_path.join(name),
+            self.collection_dir(name)?,
             self.durable_lsn.clone(),
             self.next_lsn.clone(),
             self.last_log_term.clone(),
@@ -100,18 +110,19 @@ impl Database {
         if let Some(col) = self.collections.read().unwrap().get(name) {
             return Some(col.clone());
         }
-        self.root_path.join(name).is_dir().then(|| self.get_collection(name).ok()).flatten()
+        let dir = self.collection_dir(name).ok()?;
+        dir.is_dir().then(|| self.get_collection(name).ok()).flatten()
     }
 
     /// Holds the collection map write lock across release, directory swap, and reopen.
     pub fn install_staged_collection(&self, name: &str, staged_path: &std::path::Path) -> io::Result<()> {
+        let col_path = self.collection_dir(name)?;
         let expected_staging = self.root_path.join(format!("{}.tmp", name));
         if staged_path != expected_staging || !staged_path.is_dir() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput,
                 "staged snapshot is not the expected collection temporary directory"));
         }
 
-        let col_path = self.root_path.join(name);
         let old_path = self.root_path.join(format!("{}.old", name));
         let mut collections = self.collections.write().unwrap();
 
@@ -222,7 +233,7 @@ impl Database {
                 continue;
             }
             if let Some(name) = entry.file_name().to_str() {
-                if name.starts_with('.') || name.ends_with(".tmp") || name.ends_with(".old") {
+                if !valid_collection_name(name) {
                     continue;
                 }
                 names.insert(name.to_string());
@@ -247,7 +258,8 @@ impl Database {
         if let Some(col) = self.collections.read().unwrap().get(name) {
             return col.is_dropped();
         }
-        AppliedMeta::load(&self.root_path.join(name)).is_some_and(|m| m.dropped)
+        self.collection_dir(name).ok()
+            .is_some_and(|dir| AppliedMeta::load(&dir).is_some_and(|m| m.dropped))
     }
 
     pub fn release_collection(&self, name: &str) -> io::Result<Option<PathBuf>> {

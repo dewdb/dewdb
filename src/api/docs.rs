@@ -14,8 +14,9 @@ use crate::model::{
 use crate::query::{decode_cursor, encode_cursor, parse_filter, parse_sort, sort_value, SortCursor, SortedRow};
 use crate::replication::{parse_write_concern, wc_query_string, WriteConcernParams, DEFAULT_WTIMEOUT_MS};
 use crate::cluster::ownership::Ownership;
+use crate::api::middleware::CollectionPath;
 use crate::state::AppState;
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -77,7 +78,7 @@ fn not_the_primary(state: &AppState, pref: &ReadPreference) -> Option<axum::resp
 
 pub async fn create_doc(
     State(state): State<AppState>,
-    AxumPath(col_name): AxumPath<String>,
+    CollectionPath(col_name): CollectionPath<String>,
     Query(wcp): Query<WriteConcernParams>,
     Json(payload): Json<CreateDoc>,
 ) -> impl axum::response::IntoResponse {
@@ -122,7 +123,7 @@ pub async fn create_doc(
 
 pub async fn put_doc(
     State(state): State<AppState>,
-    AxumPath((col_name, id)): AxumPath<(String, String)>,
+    CollectionPath((col_name, id)): CollectionPath<(String, String)>,
     Query(wcp): Query<WriteConcernParams>,
     Json(payload): Json<CreateDoc>,
 ) -> impl axum::response::IntoResponse {
@@ -166,7 +167,7 @@ pub async fn put_doc(
 
 pub async fn bulk_create_docs(
     State(state): State<AppState>,
-    AxumPath(col_name): AxumPath<String>,
+    CollectionPath(col_name): CollectionPath<String>,
     Query(wcp): Query<WriteConcernParams>,
     Json(payload): Json<Vec<BulkDoc>>,
 ) -> impl axum::response::IntoResponse {
@@ -250,7 +251,7 @@ async fn unconfirmed_leader(
 
 pub async fn get_doc(
     State(state): State<AppState>,
-    AxumPath((col_name, id)): AxumPath<(String, String)>,
+    CollectionPath((col_name, id)): CollectionPath<(String, String)>,
     Query(rp): Query<ReadParams>,
 ) -> impl axum::response::IntoResponse {
     let pref = match parse_read_pref(rp.read.as_deref()) {
@@ -295,7 +296,7 @@ pub async fn get_doc(
 
 pub async fn update_doc(
     State(state): State<AppState>,
-    AxumPath((col_name, id)): AxumPath<(String, String)>,
+    CollectionPath((col_name, id)): CollectionPath<(String, String)>,
     Query(wcp): Query<WriteConcernParams>,
     Json(payload): Json<CreateDoc>,
 ) -> impl axum::response::IntoResponse {
@@ -340,7 +341,7 @@ pub async fn update_doc(
 
 pub async fn delete_doc(
     State(state): State<AppState>,
-    AxumPath((col_name, id)): AxumPath<(String, String)>,
+    CollectionPath((col_name, id)): CollectionPath<(String, String)>,
     Query(wcp): Query<WriteConcernParams>,
 ) -> impl axum::response::IntoResponse {
     if state.is_shard() && !state.is_leader() {
@@ -379,7 +380,7 @@ pub async fn delete_doc(
 
 pub async fn list_docs(
     State(state): State<AppState>,
-    AxumPath(col_name): AxumPath<String>,
+    CollectionPath(col_name): CollectionPath<String>,
 ) -> impl axum::response::IntoResponse {
     if state.config.role == "router" {
         return (StatusCode::NOT_IMPLEMENTED, "Use /query for cross-shard iteration").into_response();
@@ -400,7 +401,7 @@ pub async fn list_docs(
 
 pub async fn query_docs(
     State(state): State<AppState>,
-    AxumPath(col_name): AxumPath<String>,
+    CollectionPath(col_name): CollectionPath<String>,
     Query(params): Query<QueryParams>,
     _req: axum::extract::Request,
 ) -> impl axum::response::IntoResponse {

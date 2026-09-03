@@ -1,11 +1,13 @@
-//! Authentication and latency-recording middleware.
+//! Authentication and latency-recording middleware, and the gate on collection names.
 
 use crate::auth::{authorize, AuthOutcome, API_KEY_HEADER, INTERNAL_SECRET_HEADER};
-use crate::consensus::config::is_system_collection;
+use crate::consensus::config::{is_system_collection, valid_collection_name, MAX_COLLECTION_NAME_LEN};
 use crate::model::err_json;
 use crate::state::AppState;
-use axum::extract::State;
+use axum::extract::{FromRequestParts, Path, State};
+use axum::http::request::Parts;
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use tracing::warn;
 
 struct ActiveRequest<'a>(&'a crate::metrics::Metrics);
@@ -41,22 +43,51 @@ pub async fn metrics_middleware(
     response
 }
 
-/// The one gate on reserved names, rather than a check in each of the eleven `/collections/:name`
-/// handlers: a system log is a consensus structure, and a client writing to one moves the quorum.
-/// Internal replication reaches it by collection name in a body, not by path, so it is unaffected.
-pub async fn reserved_name_middleware(
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    let name = req.uri().path()
-        .strip_prefix("/collections/")
-        .map(|rest| rest.split('/').next().unwrap_or(rest));
+/// The one gate on collection names, in place of a check in each of the eleven
+/// `/collections/:name` handlers. It replaces `Path` in their signatures rather than sitting in a
+/// layer, because a layer judges the still-encoded URI while the handler acts on the decoded name:
+/// `%5Fconfig` passed the reserved check and reached `_config`, and `..%2F..%2Fx` reached a
+/// directory outside the data root. Internal replication carries a name in a body, not on a path,
+/// and is gated at `Database::collection_dir` instead.
+pub struct CollectionPath<T>(pub T);
 
-    match name {
-        Some(name) if is_system_collection(name) => err_json(
-            StatusCode::FORBIDDEN,
-            format!("'{}' is a system collection; names beginning with '_' are reserved", name)),
-        _ => next.run(req).await,
+/// Which captured segment is the collection: the whole capture on `/:name` routes, the first of
+/// two on `/:name/docs/:id`.
+pub trait NamedCollection {
+    fn collection(&self) -> &str;
+}
+
+impl NamedCollection for String {
+    fn collection(&self) -> &str { self }
+}
+
+impl NamedCollection for (String, String) {
+    fn collection(&self) -> &str { &self.0 }
+}
+
+#[axum::async_trait]
+impl<S, T> FromRequestParts<S> for CollectionPath<T>
+where
+    S: Send + Sync,
+    T: NamedCollection + serde::de::DeserializeOwned + Send,
+{
+    type Rejection = axum::response::Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Path(captured) = Path::<T>::from_request_parts(parts, state).await
+            .map_err(IntoResponse::into_response)?;
+        let name = captured.collection();
+
+        // A system log is a consensus structure, and a client writing to one moves the quorum.
+        if is_system_collection(name) {
+            return Err(err_json(StatusCode::FORBIDDEN, format!(
+                "'{}' is a system collection; names beginning with '_' are reserved", name)));
+        }
+        if !valid_collection_name(name) {
+            return Err(err_json(StatusCode::BAD_REQUEST, format!(
+                "invalid collection name: expected 1-{} of [A-Za-z0-9._-]", MAX_COLLECTION_NAME_LEN)));
+        }
+        Ok(Self(captured))
     }
 }
 
@@ -111,4 +142,46 @@ pub async fn chaos_middleware(
         }
     }
     next.run(req).await
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::test_support::{cleanup, single_node, temp_root};
+    use axum::http::StatusCode;
+
+    /// C24 and C25: the gate used to read the still-encoded URI and the handler the decoded name,
+    /// so `%5F` reached the config log and `..%2F..%2F` reached a directory outside the data root.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_encoded_name_is_judged_as_the_name_the_handler_would_use() {
+        let root = temp_root();
+        let n = single_node(&root).await;
+        let c = reqwest::Client::new();
+
+        for name in ["_config", "%5Fconfig", "%5f%63onfig"] {
+            let r = c.put(format!("{}/collections/{}/docs/k1", n.url(), name))
+                .json(&serde_json::json!({"value": {"v": 1}})).send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::FORBIDDEN, "{} reached the config log", name);
+        }
+
+        for name in ["..%2Fescaped", "..%2F..%2Fescaped", "%2Fabs", "a%00b", ".hidden", "t.tmp", "t.old", ""] {
+            let r = c.put(format!("{}/collections/{}/docs/k1", n.url(), name))
+                .json(&serde_json::json!({"value": {"v": 1}})).send().await.unwrap();
+            assert!(r.status().is_client_error(), "{} was accepted as a collection name", name);
+        }
+
+        // One level up from the node's data directory is still inside this run's own root.
+        assert!(!root.join("escaped").exists(),
+            "a name off the URL path became a directory outside the data root");
+
+        let listed = c.get(format!("{}/collections", n.url())).send().await.unwrap()
+            .json::<serde_json::Value>().await.unwrap();
+        assert!(listed["collections"].as_array().unwrap().is_empty(), "{}", listed);
+
+        assert_eq!(c.put(format!("{}/collections/app.events-1/docs/k1", n.url()))
+            .json(&serde_json::json!({"value": {"v": 1}})).send().await.unwrap().status(),
+            StatusCode::CREATED, "an ordinary name is still a name");
+
+        drop(n);
+        cleanup(&root).await;
+    }
 }

@@ -19,6 +19,20 @@ pub fn same_endpoint(a: &str, b: &str) -> bool {
     endpoint_of(a) == endpoint_of(b)
 }
 
+/// One path segment of a forwarded URL. Anything outside RFC 3986 unreserved is escaped, so a key
+/// carrying `/`, `?` or `#` stays one segment instead of restructuring the request it is spliced
+/// into -- the shard would otherwise store, and the router would have hashed, different keys.
+pub fn encode_path_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for b in segment.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
 // Windows can briefly hold a closed file open.
 pub fn remove_file_with_retry(path: &Path) -> io::Result<()> {
     let mut last_err = None;
@@ -171,6 +185,16 @@ mod tests {
             "a path names a route on a node, not a different node");
         assert_eq!(endpoint_of("//h:1"), "h:1");
         assert_eq!(endpoint_of("h:1?x=1#f"), "h:1");
+    }
+
+    #[test]
+    fn a_path_segment_survives_the_characters_that_would_restructure_a_url() {
+        assert_eq!(encode_path_segment("a?x=1"), "a%3Fx%3D1");
+        assert_eq!(encode_path_segment("a#frag"), "a%23frag");
+        assert_eq!(encode_path_segment("a/b"), "a%2Fb");
+        assert_eq!(encode_path_segment("a%2Fb"), "a%252Fb");
+        assert_eq!(encode_path_segment("plain-name.1_x~"), "plain-name.1_x~");
+        assert_eq!(encode_path_segment("\u{e9}"), "%C3%A9");
     }
 
     #[test]

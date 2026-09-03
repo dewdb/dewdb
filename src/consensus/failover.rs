@@ -112,7 +112,7 @@ async fn resync_all_from(state: &AppState, leader: &str) {
     };
 
     // A raw directory walk cannot tell `<col>.tmp` / `<col>.old` staging leftovers from a dotted
-    // collection name; list_collections filters on the suffix and merges the open collections in.
+    // collection name; list_collections applies the name rule and merges the open collections in.
     let names = match db.list_collections() {
         Ok(n) => n,
         Err(e) => {

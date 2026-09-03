@@ -15,6 +15,21 @@ pub fn is_system_collection(name: &str) -> bool {
     name.starts_with('_')
 }
 
+pub const MAX_COLLECTION_NAME_LEN: usize = 128;
+
+/// A collection name is both a directory under the data root and a replicated identity, so it is
+/// bounded to one ordinary path component here rather than wherever it is next joined or spliced.
+/// `.`-prefixed and `.tmp` / `.old` names are excluded because the directory walk reads those as
+/// staging leftovers rather than as collections.
+pub fn valid_collection_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_COLLECTION_NAME_LEN
+        && !name.starts_with('.')
+        && !name.ends_with(".tmp")
+        && !name.ends_with(".old")
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
 /// Majority of one half, by endpoint. `held` answers for a member this node has evidence about.
 fn half_quorum_lsn(voters: &[String], held: &impl Fn(&str) -> u64) -> u64 {
     if voters.is_empty() {
@@ -182,5 +197,19 @@ mod tests {
         assert!(is_system_collection(CONFIG_LOG));
         assert!(!is_system_collection("users"));
         assert!(!is_system_collection("my_collection"));
+    }
+
+    #[test]
+    fn a_valid_name_is_one_ordinary_path_component() {
+        for name in ["users", "my_collection", "app.events", "a-b", CONFIG_LOG, "x"] {
+            assert!(valid_collection_name(name), "{}", name);
+        }
+        // The reserved rule is separate: `_config` is a well-formed name that the API refuses.
+        for name in ["", "..", "../x", "a/b", r"a\b", "a b", "a\0b", "caf\u{e9}",
+                     ".hidden", "t.tmp", "t.old", "a:b"] {
+            assert!(!valid_collection_name(name), "{:?}", name);
+        }
+        assert!(valid_collection_name(&"a".repeat(MAX_COLLECTION_NAME_LEN)));
+        assert!(!valid_collection_name(&"a".repeat(MAX_COLLECTION_NAME_LEN + 1)));
     }
 }

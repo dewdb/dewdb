@@ -1,5 +1,6 @@
 //! Collection administration endpoints.
 
+use crate::api::middleware::CollectionPath;
 use crate::api::write::local_drop;
 use crate::cluster::metadata::MigrationPhase;
 use crate::cluster::probe::unique_shards;
@@ -9,7 +10,7 @@ use crate::replication::write_concern::{
     parse_write_concern, WriteConcernParams, DEFAULT_WTIMEOUT_MS,
 };
 use crate::state::AppState;
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -71,7 +72,7 @@ pub async fn list_collections(
 
 pub async fn drop_collection(
     State(state): State<AppState>,
-    AxumPath(col_name): AxumPath<String>,
+    CollectionPath(col_name): CollectionPath<String>,
     Query(params): Query<WriteConcernParams>,
 ) -> impl axum::response::IntoResponse {
     if state.config.role == "router" {
@@ -134,7 +135,7 @@ pub async fn drop_collection(
 
 pub async fn compact_collection(
     State(state): State<AppState>,
-    AxumPath(col_name): AxumPath<String>,
+    CollectionPath(col_name): CollectionPath<String>,
 ) -> impl axum::response::IntoResponse {
     if state.config.role == "router" {
         return router_fanout_maintenance(&state, &col_name, "compact").await;
@@ -179,7 +180,7 @@ pub async fn compact_collection(
 
 pub async fn snapshot_collection(
     State(state): State<AppState>,
-    AxumPath(col_name): AxumPath<String>,
+    CollectionPath(col_name): CollectionPath<String>,
 ) -> impl axum::response::IntoResponse {
     if state.config.role == "router" {
         return router_fanout_maintenance(&state, &col_name, "snapshot").await;
@@ -236,13 +237,13 @@ mod tests {
         let root = temp_root();
 
         let replica = node(&root, false).await;
-        let refused = compact_collection(State(replica.clone()), AxumPath("c".into()))
+        let refused = compact_collection(State(replica.clone()), CollectionPath("c".into()))
             .await.into_response();
         assert_eq!(refused.status(), StatusCode::FORBIDDEN);
         assert!(replica.db.as_ref().unwrap().get_collection("c").unwrap()
             .space_usage().unwrap().dead_bytes() > 0, "and the log is untouched, not just the answer");
 
-        let snapshotted = snapshot_collection(State(replica), AxumPath("c".into()))
+        let snapshotted = snapshot_collection(State(replica), CollectionPath("c".into()))
             .await.into_response();
         assert_eq!(snapshotted.status(), StatusCode::OK,
             "snapshots add a file and remove nothing, so a replica is free to take one");
@@ -346,7 +347,7 @@ mod tests {
         let root = temp_root();
         let leader = node(&root, true).await;
 
-        let res = compact_collection(State(leader.clone()), AxumPath("c".into()))
+        let res = compact_collection(State(leader.clone()), CollectionPath("c".into()))
             .await.into_response();
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(leader.db.as_ref().unwrap().get_collection("c").unwrap()

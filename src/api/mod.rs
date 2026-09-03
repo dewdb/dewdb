@@ -21,7 +21,7 @@ use internal::{
 };
 use members::{configuration_handler, join_handler, leave_handler, set_configuration_handler};
 use migrate::{abort_migration_handler, migration_status, start_migration_handler};
-use middleware::{auth_middleware, metrics_middleware, reserved_name_middleware};
+use middleware::{auth_middleware, metrics_middleware};
 use observe::{cluster_handler, health_handler, metrics_handler};
 use ring::set_ring_handler;
 
@@ -73,8 +73,7 @@ pub fn build_app(state: &AppState) -> Router {
     let app = app.layer(axum::middleware::from_fn_with_state(
         state.clone(), middleware::chaos_middleware));
 
-    app.layer(axum::middleware::from_fn(reserved_name_middleware))
-        .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
+    app.layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), metrics_middleware))
         .with_state(state.clone())
 }

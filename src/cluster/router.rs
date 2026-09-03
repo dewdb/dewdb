@@ -7,6 +7,7 @@ use crate::cluster::probe::unique_shards;
 use crate::metrics::NodeLoad;
 use crate::replication::write_concern::{wc_query_string, WriteConcernParams};
 use crate::ring::hash_key;
+use crate::util::encode_path_segment;
 use crate::state::AppState;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -88,7 +89,12 @@ pub async fn router_forward_write(
         None => return Err((StatusCode::BAD_REQUEST, "Key not owned by any shard").into_response()),
     };
 
-    let full_url = format!("{}/collections/{}/docs/{}{}", effective_url, col_name, key, wc_query);
+    // The ring hashed the decoded key, so the shard has to store that same key: the path it
+    // arrives on is the only thing that can lose it.
+    let path = format!("/collections/{}/docs/{}{}",
+        encode_path_segment(col_name), encode_path_segment(key), wc_query);
+
+    let full_url = format!("{}{}", effective_url, path);
     if let Ok(r) = build_forward(&state.client, &method, &full_url, body).send().await {
         let reply = ShardReply::of(r).await;
         // The shard says the key is not its own, which means this router's ring is behind. Its
@@ -96,7 +102,7 @@ pub async fn router_forward_write(
         // handing the client a conflict it can do nothing about.
         if let Some(owner) = reply.redirect() {
             info!(target: "router", key, %owner, "Shard redirected the write; our ring is stale");
-            let retry = format!("{}/collections/{}/docs/{}{}", owner, col_name, key, wc_query);
+            let retry = format!("{}{}", owner, path);
             if let Ok(r2) = build_forward(&state.client, &method, &retry, body).send().await {
                 let second = ShardReply::of(r2).await;
                 if authoritative_write_status(second.status) && second.redirect().is_none() {
@@ -123,7 +129,7 @@ pub async fn router_forward_write(
 
     if let Some((latest_url, _, _)) = state.get_effective_shard_url(hash) {
         if latest_url != effective_url {
-            let retry_url = format!("{}/collections/{}/docs/{}{}", latest_url, col_name, key, wc_query);
+            let retry_url = format!("{}{}", latest_url, path);
             if let Ok(r) = build_forward(&state.client, &method, &retry_url, body).send().await {
                 let reply = ShardReply::of(r).await;
                 if authoritative_write_status(reply.status) {
@@ -135,7 +141,7 @@ pub async fn router_forward_write(
 
     state.primary_overrides.lock().unwrap().remove(&original_url);
     for replica in &replica_urls {
-        let fallback_url = format!("{}/collections/{}/docs/{}{}", replica, col_name, key, wc_query);
+        let fallback_url = format!("{}{}", replica, path);
         if let Ok(r) = build_forward(&state.client, &method, &fallback_url, body).send().await {
             let reply = ShardReply::of(r).await;
             if authoritative_write_status(reply.status) {
@@ -158,7 +164,8 @@ async fn router_forward_bulk(
     body: &[serde_json::Value],
     wc_query: &str,
 ) -> Result<reqwest::Response, String> {
-    let full_url = format!("{}/collections/{}/docs/bulk{}", effective_url, col_name, wc_query);
+    let path = format!("/collections/{}/docs/bulk{}", encode_path_segment(col_name), wc_query);
+    let full_url = format!("{}{}", effective_url, path);
     if let Ok(r) = state.client.post(&full_url).json(body).send().await {
         if authoritative_write_status(r.status()) {
             if effective_url != original_url {
@@ -178,7 +185,7 @@ async fn router_forward_bulk(
 
     state.primary_overrides.lock().unwrap().remove(original_url);
     for replica in replica_urls {
-        let fallback_url = format!("{}/collections/{}/docs/bulk{}", replica, col_name, wc_query);
+        let fallback_url = format!("{}{}", replica, path);
         if let Ok(r) = state.client.post(&fallback_url).json(body).send().await {
             if authoritative_write_status(r.status()) {
                 state.set_primary_override(original_url, replica);
@@ -377,9 +384,10 @@ pub async fn router_read_doc(state: &AppState, col_name: &str, id: &str, pref: R
         None => return (StatusCode::BAD_REQUEST, "Key not owned by any shard").into_response(),
     };
 
+    let doc = format!("/collections/{}/docs/{}", encode_path_segment(col_name), encode_path_segment(id));
     let path = match forwarded_read_pref(&pref) {
-        Some(v) => format!("/collections/{}/docs/{}?read={}", col_name, id, v),
-        None => format!("/collections/{}/docs/{}", col_name, id),
+        Some(v) => format!("{}?read={}", doc, v),
+        None => doc,
     };
     let rr = state.read_rr.fetch_add(1, Ordering::Relaxed);
     let loads = state.fresh_node_loads();
@@ -464,7 +472,7 @@ pub async fn router_fanout_maintenance(state: &AppState, col_name: &str, action:
         let col_name = col_name.to_string();
         let action = action.to_string();
         async move {
-            let url = format!("{}/collections/{}/{}", node, col_name, action);
+            let url = format!("{}/collections/{}/{}", node, encode_path_segment(&col_name), action);
             let outcome = admin_call(&client, true, &url).await;
             node_result(&node, outcome)
         }
@@ -494,7 +502,7 @@ pub async fn router_fanout_drop(
             candidates.extend(replicas.into_iter().filter(|r| *r != effective));
 
             for node in candidates {
-                let url = format!("{}/collections/{}{}", node, col_name, query);
+                let url = format!("{}/collections/{}{}", node, encode_path_segment(&col_name), query);
                 if let Some((status, body)) = admin_call(&state.client, false, &url).await {
                     if authoritative_write_status(status) {
                         if node != original {
@@ -626,7 +634,7 @@ pub async fn router_query(
                 let mut refused = false;
                 for target in targets {
                     let _routed = route_state.track_routed_read(&target);
-                    let url = format!("{}/collections/{}/query", target, col);
+                    let url = format!("{}/collections/{}/query", target, encode_path_segment(&col));
                     if let Ok(res) = client.get(&url).query(&q).send().await {
                         if res.status().is_success() {
                             if let Ok(page) = res.json::<QueryPage>().await {
@@ -871,5 +879,45 @@ mod tests {
         assert!(!authoritative_write_status(StatusCode::INTERNAL_SERVER_ERROR));
         assert!(!authoritative_write_status(StatusCode::BAD_GATEWAY));
         assert!(!authoritative_write_status(StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    /// C28: the forward spliced the decoded key straight into a URL, so `a?x=1`, `a#frag` and
+    /// `a/b` all stopped being one segment. Two of them landed as the key `a` on two shards -- the
+    /// router having hashed the full key and the shard having stored the truncation -- and the
+    /// third 404'd on a path that matched no route.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_key_the_client_escaped_reaches_the_shard_whole() {
+        use crate::test_support::{cleanup, temp_root, two_shard_cluster};
+
+        let root = temp_root();
+        let (_s1, _s2, router) = two_shard_cluster(&root).await;
+        let c = reqwest::Client::new();
+        let keys = ["a", "a?x=1", "a#frag", "a/b", "a b", "a%2Fb"];
+
+        for (i, key) in keys.iter().enumerate() {
+            let url = format!("{}/collections/t/docs/{}", router.url(), encode_path_segment(key));
+            let r = c.put(&url).json(&serde_json::json!({"value": {"n": i}}))
+                .send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::CREATED, "PUT {:?}", key);
+        }
+
+        for (i, key) in keys.iter().enumerate() {
+            let url = format!("{}/collections/t/docs/{}", router.url(), encode_path_segment(key));
+            let r = c.get(&url).send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK, "GET {:?}", key);
+            let body = r.json::<serde_json::Value>().await.unwrap();
+            assert_eq!(body["n"], i, "{:?} came back holding another key's document", key);
+        }
+
+        let listed = c.get(format!("{}/collections/t/query?limit=100&keys=true", router.url()))
+            .send().await.unwrap().json::<serde_json::Value>().await.unwrap();
+        let stored: Vec<&str> = listed["keys"].as_array().unwrap().iter()
+            .map(|k| k.as_str().unwrap()).collect();
+        let mut want = keys.to_vec();
+        want.sort();
+        assert_eq!(stored, want, "the shards hold the keys they were written with: {}", listed);
+
+        drop(router);
+        cleanup(&root).await;
     }
 }
