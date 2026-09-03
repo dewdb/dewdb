@@ -81,7 +81,15 @@ pub(crate) async fn begin_migration(
             "this node holds no ring to migrate from; publish one with POST /cluster/ring first"
                 .to_string())),
     };
-    let movement = keyspace_movement(&before, &target.build());
+    // Same reasoning as set_ring_handler: bounded, but not cheap enough for a request task.
+    let (target, movement) = match tokio::task::spawn_blocking(move || {
+        let movement = keyspace_movement(&before, &target.build());
+        (target, movement)
+    }).await {
+        Ok(pair) => pair,
+        Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not evaluate the target ring: {}", e))),
+    };
     if movement.moved_fraction == 0.0 {
         let next = current.with_ring(&state.config.node_id, target);
         broadcast(state, &next, next.ring.as_ref());

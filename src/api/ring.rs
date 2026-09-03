@@ -100,9 +100,19 @@ pub async fn set_ring_handler(
         return err_json(StatusCode::UNPROCESSABLE_ENTITY, why);
     }
 
-    // Measured before publishing, so a dry run and the real thing report the same number.
-    let after = proposed.build();
-    let movement = state.built_ring().map(|before| keyspace_movement(&before, &after));
+    // Measured before publishing, so a dry run and the real thing report the same number. Off the
+    // request task: bounded by MAX_RING_TOKENS, this is still ~300 ms of CPU at the ceiling, and a
+    // dry run pays it in full without persisting anything (bugs.md H14).
+    let before = state.built_ring();
+    let (proposed, movement) = match tokio::task::spawn_blocking(move || {
+        let after = proposed.build();
+        let movement = before.map(|before| keyspace_movement(&before, &after));
+        (proposed, movement)
+    }).await {
+        Ok(pair) => pair,
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not evaluate the proposed ring: {}", e)),
+    };
 
     let previous_model = if current.ring.is_some() { "ring" }
                          else if current.shards.is_empty() { "none" }
@@ -377,6 +387,55 @@ mod tests {
             "the warning must point at the endpoint that moves the data too");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// H14: `build` allocates `shards x vnodes` tokens and only `vnodes` was bounded. The refusal
+    /// has to land in `validate`, ahead of the `dry_run` branch -- a dry run paid the cost in full
+    /// and persisted nothing, which is what made it repeatable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_oversized_ring_is_refused_before_it_is_built() {
+        use crate::test_support::{cleanup, single_node};
+        use axum::http::StatusCode;
+        use crate::ring::{MAX_RING_SHARDS, MAX_RING_TOKENS, MAX_VNODES};
+
+        let root = temp_root();
+        let n = single_node(&root).await;
+        let c = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10))
+            .build().unwrap();
+
+        let ring = |shards: usize, vnodes: u32| serde_json::json!({
+            "vnodes": vnodes,
+            "shards": (0..shards).map(|i| serde_json::json!({
+                "node_url": format!("http://10.0.{}.{}:9500", i / 256, i % 256),
+            })).collect::<Vec<_>>(),
+        });
+
+        // 20,000 shards is 769 KB of JSON, inside the 2 MB body limit, and used to be accepted.
+        for (shards, vnodes) in [(20_000usize, 1u32), (MAX_RING_SHARDS + 1, 1), (MAX_RING_SHARDS, MAX_VNODES)] {
+            // Dry run first: it returns straight after `build` and `keyspace_movement` with no
+            // network work, so a failure here is the layout cost and nothing else.
+            for query in ["?dry_run=true", ""] {
+                let started = std::time::Instant::now();
+                let r = c.post(format!("{}/cluster/ring{}", n.url(), query))
+                    .json(&ring(shards, vnodes)).send().await.unwrap();
+                assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY,
+                    "{} shards x {} vnodes{}", shards, vnodes, query);
+                assert!(started.elapsed() < std::time::Duration::from_secs(5),
+                    "refused, but only after building it: {} shards x {} vnodes", shards, vnodes);
+            }
+        }
+
+        // The ceiling itself is a working ring, so the bound is not just refusing everything large.
+        let at_ceiling = MAX_RING_TOKENS / MAX_VNODES as usize;
+        let r = c.post(format!("{}/cluster/ring?dry_run=true", n.url()))
+            .json(&ring(at_ceiling, MAX_VNODES)).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK, "{} shards at the token ceiling", at_ceiling);
+
+        assert_eq!(c.get(format!("{}/health", n.url())).send().await.unwrap().status(),
+            StatusCode::OK, "the node is still serving");
+
+        drop(n);
+        cleanup(&root).await;
     }
 
     /// Ownership moves on publish; this endpoint moves no data. So the whole safety question is

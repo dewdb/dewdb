@@ -24,6 +24,11 @@ pub fn hash_key(col: &str, key: &str) -> u64 {
 pub const DEFAULT_VNODES: u32 = 128;
 // Tokens cost 16 bytes each and are rebuilt on every topology change; this bounds both.
 pub const MAX_VNODES: u32 = 4096;
+pub const MAX_RING_SHARDS: usize = 1024;
+/// `shards x vnodes`, which is what `build` allocates and sorts and what `keyspace_movement` then
+/// sorts twice over. Bounding either factor alone bounds nothing: 1024 shards at 1024 vnodes costs
+/// the same as 256 at 4096. At this ceiling a ring change is ~300 ms of CPU (see docs/bugs.md H14).
+pub const MAX_RING_TOKENS: usize = 1 << 20;
 
 fn default_vnodes() -> u32 { DEFAULT_VNODES }
 
@@ -59,6 +64,16 @@ impl HashRing {
         }
         if self.vnodes > MAX_VNODES {
             return Err(format!("vnodes must be at most {}, got {}", MAX_VNODES, self.vnodes));
+        }
+        if self.shards.len() > MAX_RING_SHARDS {
+            return Err(format!("a ring may hold at most {} shards, got {}",
+                MAX_RING_SHARDS, self.shards.len()));
+        }
+        let tokens = self.shards.len().saturating_mul(self.vnodes as usize);
+        if tokens > MAX_RING_TOKENS {
+            return Err(format!(
+                "shards x vnodes must be at most {}, got {} ({} shards x {} vnodes)",
+                MAX_RING_TOKENS, tokens, self.shards.len(), self.vnodes));
         }
         let mut seen = HashSet::new();
         for shard in &self.shards {
@@ -520,6 +535,42 @@ mod tests {
             node_url: url.to_string(),
             replica_urls: replicas.iter().map(|r| r.to_string()).collect(),
         }
+    }
+
+    fn ring_of(shards: usize, vnodes: u32) -> HashRing {
+        HashRing {
+            vnodes,
+            shards: (0..shards).map(|i| RingShard {
+                node_url: format!("http://10.0.{}.{}:9500", i / 256, i % 256),
+                replica_urls: Vec::new(),
+            }).collect(),
+        }
+    }
+
+    /// H14: `MAX_VNODES` bounded one factor of a `shards x vnodes` allocation and the shard count
+    /// had no bound at all. Neither factor alone is the gate -- the product is what `build`
+    /// allocates and sorts, and what `keyspace_movement` then sorts twice over.
+    #[test]
+    fn ring_layout_is_bounded_on_the_product_not_on_either_factor() {
+        assert!(ring_of(MAX_RING_SHARDS, 1).validate().is_ok());
+        assert!(ring_of(MAX_RING_TOKENS / MAX_VNODES as usize, MAX_VNODES).validate().is_ok());
+
+        let too_many = ring_of(MAX_RING_SHARDS + 1, 1).validate().unwrap_err();
+        assert!(too_many.contains("at most 1024 shards"), "{}", too_many);
+
+        // Both factors legal, product not: this is the case a bound on either one alone misses.
+        let ring = ring_of(MAX_RING_SHARDS, MAX_VNODES / 2);
+        assert!(ring.shards.len() <= MAX_RING_SHARDS && ring.vnodes <= MAX_VNODES);
+        let refused = ring.validate().unwrap_err();
+        assert!(refused.contains("shards x vnodes"), "{}", refused);
+
+        // The product is the gate, so the same token count is legal however it is split.
+        assert!(ring_of(MAX_RING_SHARDS, MAX_RING_TOKENS as u32 / MAX_RING_SHARDS as u32)
+            .validate().is_ok());
+
+        // The 20,000-shard ring the entry measured, and the 2 MB-body ceiling above it.
+        assert!(ring_of(20_000, 1).validate().is_err());
+        assert!(ring_of(50_000, 4096).validate().is_err());
     }
 
     #[test]
