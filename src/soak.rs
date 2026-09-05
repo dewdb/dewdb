@@ -13,7 +13,7 @@
 //! It is not a machine crash: writes that reached the OS but were never fsynced still survive,
 //! because the page cache does. `truncated_tail` is what covers that half.
 
-use crate::test_support::{cleanup, next_test_port, temp_root, three_node_cluster, TestNode};
+use crate::test_support::{cleanup, next_test_port, temp_root, three_node_cluster_with_timeout, TestNode};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
@@ -71,6 +71,14 @@ impl Ledger {
         self.entries.values().filter(|(a, _)| a.is_some()).count()
     }
 
+    /// Acknowledged keys absent from `actual` -- the subset of `check` a later read can settle.
+    fn missing_from(&self, actual: &BTreeMap<String, i64>) -> Vec<String> {
+        self.entries.iter()
+            .filter(|(key, (acked, _))| acked.is_some() && !actual.contains_key(*key))
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
     /// Every complaint, not the first: one lost key and two thousand say different things about
     /// what broke.
     fn check(&self, actual: &BTreeMap<String, i64>) -> Vec<String> {
@@ -112,6 +120,84 @@ fn assert_durable(scenario: &str, ledger: &Ledger, actual: &BTreeMap<String, i64
     let shown: Vec<&String> = problems.iter().take(10).collect();
     panic!("[{}] {} durability violations, first {}: {:#?}",
         scenario, problems.len(), shown.len(), shown);
+}
+
+/// Where a node stands in the terms the replication path uses. A replica that never caught up and
+/// one that dropped a published entry read the same from the contents alone, and this is what
+/// separates them: `last_lsn` is what it holds, `applied_lsn` what it publishes, `pending_apply`
+/// what it holds and cannot yet show.
+async fn node_state(c: &reqwest::Client, base: &str) -> String {
+    let body = match c.get(format!("{}/metrics", base)).send().await.ok() {
+        Some(r) => r.json::<serde_json::Value>().await.ok(),
+        None => None,
+    };
+    let body = match body {
+        Some(b) => b,
+        None => return "unreachable".to_string(),
+    };
+    let field = |v: &serde_json::Value, k: &str| {
+        v.get(k).map_or_else(|| "-".to_string(), |x| x.to_string())
+    };
+    let log = body.get("storage")
+        .and_then(|s| s.get("collections"))
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.iter().find(|c| c.get("name").and_then(|n| n.as_str()) == Some("t")))
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let repl = body.get("replication").cloned().unwrap_or(serde_json::Value::Null);
+    format!(
+        "role={} term={} last_lsn={} applied={} pending={} durable={} commit={} primary_commit={} \
+repairs={} matched={}",
+        field(&repl, "role"), field(&repl, "term"), field(&log, "last_lsn"),
+        field(&log, "applied_lsn"), field(&log, "pending_apply"), field(&repl, "durable_lsn"),
+        field(&repl, "commit_index"), field(&repl, "primary_commit_index"),
+        field(&repl, "repairs"), field(&repl, "replicas"))
+}
+
+/// Keys `mine` is missing against `theirs`, and the ones whose value differs. Capped: a node that
+/// resynced from nothing differs in everything and the first few say the same thing as all of them.
+fn view_diff(mine: &BTreeMap<String, i64>, theirs: &BTreeMap<String, i64>) -> String {
+    let missing: Vec<&String> = theirs.keys().filter(|k| !mine.contains_key(*k)).collect();
+    let stale: Vec<String> = theirs.iter()
+        .filter_map(|(k, v)| mine.get(k).filter(|got| *got != v).map(|got| format!("{}={} not {}", k, got, v)))
+        .collect();
+    format!("{} missing {:?}, {} differing {:?}",
+        missing.len(), missing.iter().take(6).collect::<Vec<_>>(),
+        stale.len(), stale.iter().take(6).collect::<Vec<_>>())
+}
+
+/// Whether keys missing from a view are late or gone: the same read, repeated. A durability
+/// failure and a replica that never caught up print the same complaint, and the only thing that
+/// separates them from outside the node is whether the entry ever arrives.
+async fn linger_probe(
+    c: &reqwest::Client,
+    bases: &[String],
+    missing: &[String],
+    wait: Duration,
+) {
+    let deadline = std::time::Instant::now() + wait;
+    let mut outstanding: Vec<String> = missing.to_vec();
+    while !outstanding.is_empty() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let mut still = Vec::new();
+        for key in outstanding {
+            let mut seen_on = Vec::new();
+            for (i, base) in bases.iter().enumerate() {
+                if contents(c, base).await.is_some_and(|m| m.contains_key(&key)) {
+                    seen_on.push(i + 1);
+                }
+            }
+            if seen_on.is_empty() {
+                still.push(key);
+            } else {
+                println!("[churn] {} appeared on node{:?} after the assertion -- late, not lost", key, seen_on);
+            }
+        }
+        outstanding = still;
+    }
+    if !outstanding.is_empty() {
+        println!("[churn] {:?} never appeared on any node in {:?} -- lost, not late", outstanding, wait);
+    }
 }
 
 fn client() -> reqwest::Client {
@@ -225,7 +311,7 @@ async fn soak_a_cluster_under_churn_loses_no_acknowledged_write() {
     let mut rng = Rng::seeded("churn", 0x5EED_0052);
 
     let root = temp_root();
-    let (mut n1, mut n2, mut n3) = three_node_cluster(&root).await;
+    let (mut n1, mut n2, mut n3) = three_node_cluster_with_timeout(&root, 1).await;
     let bases: Vec<String> = vec![n1.url(), n2.url(), n3.url()];
     let c = client();
     let mut ledger = Ledger::default();
@@ -303,15 +389,39 @@ async fn soak_a_cluster_under_churn_loses_no_acknowledged_write() {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
-    let leader_view = contents(&c, &bases[0]).await.unwrap_or_default();
+    // The node that says it leads, not `bases[0]`: the leader moves under this scenario, and the
+    // durability claim is about whoever is answering as one.
+    let leading = [n1.is_leader(), n2.is_leader(), n3.is_leader()].iter().position(|l| *l);
+    let mut views = Vec::new();
+    for base in &bases {
+        views.push(contents(&c, base).await.expect("node unreadable at the end"));
+    }
+    let leader_view = views[leading.unwrap_or(0)].clone();
     report("churn", &ledger, &leader_view);
+
+    // Printed before any assertion and for either failure: a panic here is expensive to reproduce,
+    // and where each node stood is the evidence that says which of the two broke (bugs.md C30).
+    let problems = ledger.check(&leader_view);
+    if !problems.is_empty() || !converged {
+        for (i, base) in bases.iter().enumerate() {
+            println!("[churn] node{} {}", i + 1, node_state(&c, base).await);
+            println!("[churn] node{} against the leader: {}", i + 1, view_diff(&views[i], &leader_view));
+        }
+        let absent: Vec<String> = ledger.missing_from(&leader_view);
+        linger_probe(&c, &bases, &absent, Duration::from_secs(20)).await;
+    }
+
+    // The leader's view first, and on its own: an acknowledged write missing there is loss with
+    // nothing else it could be. Everything below can also be a node that never caught up.
     assert_durable("churn", &ledger, &leader_view);
 
-    for (i, base) in bases.iter().enumerate() {
-        let view = contents(&c, base).await.expect("node unreadable at the end");
-        assert_durable(&format!("churn/node{}", i + 1), &ledger, &view);
-    }
+    // Convergence before the per-node ledger check: a lagging replica fails both, and run the other
+    // way round this reported a node that never caught up as lost data (bugs.md C30).
     assert!(converged, "[churn] the three nodes never agreed on the same contents");
+
+    for (i, view) in views.iter().enumerate() {
+        assert_durable(&format!("churn/node{}", i + 1), &ledger, view);
+    }
 
     n1.kill();
     n2.kill();

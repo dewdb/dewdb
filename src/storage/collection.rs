@@ -1,7 +1,7 @@
 //! A collection's index, key locks, group commit, and read path.
 
 use super::frame::{Configuration, HandoverRecord, LogEntry};
-use super::index::{AppliedMeta, IndexEntry, IndexSnapshot, LsnMeta, ReadCacheConfig, INDEX_FILENAME};
+use super::index::{AppliedMeta, AppliedPos, IndexEntry, IndexSnapshot, LsnMeta, ReadCacheConfig, INDEX_FILENAME};
 use super::wal::WalsState;
 use crate::model::MAX_QUERY_LIMIT;
 use crate::query::{compare_rows, is_after, matches_filter, Filter, SortCursor, SortSpec, SortedRow};
@@ -65,6 +65,13 @@ pub struct Collection {
     /// to it. Together they collapse concurrent commits into one fsync -- see `persist_watermark`.
     watermark_saved: AtomicU64,
     watermark_write: std::sync::Mutex<()>,
+    /// The position alone, so an ordinary commit does not rewrite `applied.meta`. Absent only if
+    /// the file could not be opened, which falls the hot path back to the full write.
+    applied_pos: std::sync::Mutex<Option<AppliedPos>>,
+    /// Bumped when `dropped`, `config` or `handover` actually changes, and compared against
+    /// `rich_saved` to decide whether a commit needs the full record or only its position.
+    rich_gen: AtomicU64,
+    rich_saved: AtomicU64,
     pub db_durable_lsn: Arc<AtomicU64>,
     pub db_next_lsn: Arc<AtomicU64>,
     pub db_last_log_term: Arc<AtomicU64>,
@@ -121,7 +128,10 @@ impl Collection {
 
         // Absent means no consensus history (fresh node, or standalone engine): replay everything.
         let applied = AppliedMeta::load(&root_path)?;
-        let applied_through = applied.as_ref().map(|m| m.applied_lsn).unwrap_or(u64::MAX);
+        // The position file is normally ahead: `applied.meta` is rewritten only when the drop,
+        // config or handover beside the position changes, and replay re-derives those three from
+        // the frames above it, which compaction cannot have retired for exactly that reason.
+        let applied_through = Self::recorded_watermark(&root_path)?.unwrap_or(u64::MAX);
         // Seeded from the watermark because compaction retires the drop and config frames replay
         // would otherwise find them in.
         let mut dropped = applied.as_ref().is_some_and(|m| m.dropped);
@@ -228,6 +238,13 @@ impl Collection {
         let current_wal_size = file.metadata()?.len();
         let inline_total = inline_used;
 
+        // Failing to open it is not fatal: the hot path falls back to rewriting `applied.meta`,
+        // which is what it did before this file existed.
+        let applied_pos = AppliedPos::open(&root_path)
+            .inspect_err(|e| warn!(target: "storage", collection = %name, error = %e,
+                "Cannot open the applied position file; every commit will rewrite applied.meta"))
+            .ok();
+
         Ok(Self {
             name,
             root_path,
@@ -261,6 +278,9 @@ impl Collection {
             watermark_recorded: AtomicBool::new(applied_through != u64::MAX),
             watermark_saved: AtomicU64::new(if applied_through == u64::MAX { 0 } else { applied_through }),
             watermark_write: std::sync::Mutex::new(()),
+            applied_pos: std::sync::Mutex::new(applied_pos),
+            rich_gen: AtomicU64::new(0),
+            rich_saved: AtomicU64::new(0),
             db_durable_lsn,
             db_next_lsn,
             db_last_log_term,
@@ -804,14 +824,19 @@ impl Collection {
         }
     }
 
-    /// Durable `applied.meta` covering at least `through`, atomically. `dropped` and `config` ride
-    /// this file because compaction retires the frames they came from, so a torn or unsynced copy
-    /// loses state no replay can rebuild (bugs.md C27).
+    /// A durable commit position covering at least `through`, before this returns. `dropped`,
+    /// `config` and `handover` ride `applied.meta` because compaction retires the frames they came
+    /// from, so a torn or unsynced copy loses state no replay can rebuild (bugs.md C27).
     ///
     /// Concurrent commits coalesce onto one fsync: the first writer covers the rest. The check is
     /// "is my position covered", never "did someone else just run" — a writer whose entry landed
     /// after the running save read the watermark is not covered by it and takes its own turn. That
     /// distinction is what H11 and H12 were both about.
+    ///
+    /// Two writes, not one, because the two have different costs and different rates. The position
+    /// moves on every commit and goes to `AppliedPos`, which is one `sync_data` into blocks that
+    /// already exist. The three fields beside it change rarely, and only that takes the full
+    /// `applied.meta` rewrite -- a create, an `fsync` on a new file and a rename (bugs.md H17).
     fn persist_watermark(&self, through: u64) -> io::Result<()> {
         if self.watermark_saved.load(Ordering::SeqCst) >= through {
             return Ok(());
@@ -821,8 +846,37 @@ impl Collection {
             return Ok(());
         }
 
-        // Under the index lock: `apply_committed` moves them together under its write lock, so this
-        // is the only way to record a watermark matching the drop, config and handover beside it.
+        let rich = self.rich_gen.load(Ordering::SeqCst);
+        if rich != self.rich_saved.load(Ordering::SeqCst) {
+            return self.persist_watermark_full(rich);
+        }
+
+        // Sampled under the index lock for the same reason the full write is: `apply_committed`
+        // moves the index and this position together under its write lock.
+        let covered = {
+            let _consistent = self.index.read().unwrap();
+            self.applied_lsn()
+        };
+        let saved = self.applied_pos.lock().unwrap().as_mut().map(|pos| pos.save(covered));
+        match saved {
+            Some(Ok(())) => {
+                self.watermark_saved.fetch_max(covered, Ordering::SeqCst);
+                Ok(())
+            },
+            // No position file, or it would not take the write. The full record carries the
+            // position too, so this is slower rather than a failure to be durable.
+            other => {
+                if let Some(Err(e)) = other {
+                    warn!(target: "storage", collection = %self.name, error = %e,
+                        "Position write failed; falling back to the full applied.meta");
+                }
+                self.persist_watermark_full(rich)
+            },
+        }
+    }
+
+    /// The full record. Caller holds `watermark_write`.
+    fn persist_watermark_full(&self, rich: u64) -> io::Result<()> {
         let meta = {
             let _consistent = self.index.read().unwrap();
             AppliedMeta {
@@ -834,8 +888,29 @@ impl Collection {
         };
         let covered = meta.applied_lsn;
         meta.save(&self.root_path)?;
+        // After the write, so a failure retries rather than being remembered as done.
+        self.rich_saved.store(rich, Ordering::SeqCst);
         self.watermark_saved.fetch_max(covered, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// The position a restart recovers, over both files. `open` reads it through here so a test can
+    /// assert the durability invariant without depending on which of the two is carrying it.
+    ///
+    /// `None` only when there is no `applied.meta`: that is "never consensus-managed, replay
+    /// everything", and a position with no full record beside it is a first write that tore.
+    pub fn recorded_watermark(col_dir: &Path) -> io::Result<Option<u64>> {
+        let meta = AppliedMeta::load(col_dir)?.map(|m| m.applied_lsn);
+        let pos = AppliedPos::read(col_dir)?;
+        Ok(meta.map(|m| m.max(pos.unwrap_or(0))))
+    }
+
+    /// `applied.meta` covering the position on its own, whatever the position file says.
+    /// Compaction needs it: once a drop, config or handover frame is retired, that file is the only
+    /// copy, and replay can only re-derive one from a frame that is still there.
+    pub fn flush_watermark_full(&self) -> io::Result<()> {
+        let _one_writer = self.watermark_write.lock().unwrap();
+        self.persist_watermark_full(self.rich_gen.load(Ordering::SeqCst))
     }
 
     /// The term we recorded for a staged frame, or `None` if we hold no uncommitted frame there.
@@ -852,7 +927,7 @@ impl Collection {
     /// Drains in log order; staged frames can arrive out of order.
     pub fn apply_committed(&self, committed_lsn: u64) -> usize {
         // The pending -> index order keeps index visibility atomic with the snapshot watermark.
-        let (ready_len, advanced) = {
+        let (ready_len, needs_persist) = {
             let mut pending = self.pending.lock().unwrap();
             let mut ready = std::mem::take(&mut *pending);
             *pending = ready.split_off(&(committed_lsn + 1));
@@ -860,39 +935,56 @@ impl Collection {
                 let mut index = self.index.write().unwrap();
                 for (_lsn, staged) in ready.iter() {
                     match &staged.effect {
+                        // `swap` rather than `store`: only a real flip is a change `applied.meta`
+                        // has to be rewritten for, and a keyed write is the common case.
                         StagedEffect::Put { key, entry } => {
                             self.apply_index_put(&mut index, key.clone(), entry.clone());
-                            self.dropped.store(false, Ordering::SeqCst);
+                            if self.dropped.swap(false, Ordering::SeqCst) {
+                                self.rich_gen.fetch_add(1, Ordering::SeqCst);
+                            }
                         },
                         StagedEffect::Remove { key } => {
                             self.apply_index_remove(&mut index, key);
-                            self.dropped.store(false, Ordering::SeqCst);
+                            if self.dropped.swap(false, Ordering::SeqCst) {
+                                self.rich_gen.fetch_add(1, Ordering::SeqCst);
+                            }
                         },
                         // A barrier is committed, never applied: being committed is its whole job.
                         StagedEffect::Nothing => {},
                         StagedEffect::Clear => {
                             self.clear_index(&mut index);
-                            self.dropped.store(true, Ordering::SeqCst);
+                            if !self.dropped.swap(true, Ordering::SeqCst) {
+                                self.rich_gen.fetch_add(1, Ordering::SeqCst);
+                            }
                         },
                         // Already in force since it was appended; committing it is what makes it
                         // survive compaction retiring its frame.
                         StagedEffect::Configure(config) => {
                             *self.committed_config.lock().unwrap() = Some(config.clone());
+                            self.rich_gen.fetch_add(1, Ordering::SeqCst);
                         },
                         // Replaces rather than accumulates: one handover is in flight at a time,
                         // and an older one is inert as soon as the ring it names is not the live one.
                         StagedEffect::RecordHandover(handover) => {
                             *self.committed_handover.lock().unwrap() = Some(handover.clone());
+                            self.rich_gen.fetch_add(1, Ordering::SeqCst);
                         },
                     }
                 }
             }
 
             let previous = self.applied_lsn.fetch_max(committed_lsn, Ordering::SeqCst);
-            (ready.len(), committed_lsn > previous)
+            // The rich test is separate from the position test: a frame staged out of order and
+            // drained at an unchanged commit index still changes what `applied.meta` has to say.
+            let rich_pending = self.rich_gen.load(Ordering::SeqCst)
+                != self.rich_saved.load(Ordering::SeqCst);
+            (ready.len(), committed_lsn > previous || rich_pending)
         };
 
-        if advanced {
+        // Ahead of the reply, not behind it: `rewind_to` reads this file's position as the floor
+        // below which a truncation is refused, so a watermark that lags a crash hands a leader
+        // published entries to delete (bugs.md H17).
+        if needs_persist {
             if let Err(e) = self.persist_watermark(committed_lsn) {
                 error!(target: "storage", collection = %self.name, error = %e,
                     "Failed to persist applied watermark; a restart will re-stage these entries");
@@ -991,6 +1083,9 @@ impl Collection {
         self.drain_read_pool(u64::MAX);
         self.pending.lock().unwrap().clear();
         self.index.write().unwrap().clear();
+        // For the same reason the WAL handle moves to the tombstone: Windows refuses to replace a
+        // directory anything still holds a handle in, and an install renames this one away.
+        *self.applied_pos.lock().unwrap() = None;
 
         Ok(tombstone)
     }
@@ -1000,6 +1095,7 @@ impl Collection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::Retention;
     use crate::json::merge_patch;
     use crate::storage::frame::HEADER_LEN;
     use crate::storage::Database;
@@ -1021,15 +1117,13 @@ mod tests {
         disk_put(&col, "b", "b");
         col.enqueue_commit().await.unwrap().unwrap();
 
-        col.compact().unwrap();
+        col.compact(Retention::none()).unwrap();
         assert!(col.retired_through.load(Ordering::SeqCst) >= stale.0,
             "compaction must retire the WAL the location names");
 
         let value = col.read_located("a", stale).unwrap()
             .expect("a location retired mid-read must be re-resolved, not dropped");
         assert_eq!(value["v"], "a".repeat(600));
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     fn inline_count(col: &Arc<Collection>) -> usize {
@@ -1049,8 +1143,6 @@ mod tests {
         let (items, cursor) = col.query_page(None, None, None, &None, usize::MAX).unwrap();
         assert_eq!(items.len(), 3);
         assert!(cursor.is_none(), "the whole collection fits, so there is no next page");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1093,8 +1185,6 @@ mod tests {
             "durable_lsn reached {} but the fsync covered {}: lsn {} landed after it and is page \
              cache only, yet it counts toward the leader's own vote and the persisted commit_lsn",
             col.durable_lsn(), tail, late);
-
-        let _ = fs::remove_dir_all(&root);
     }
     #[tokio::test]
     async fn durable_lsn_only_moves_for_frames_a_commit_actually_synced() {
@@ -1113,8 +1203,6 @@ mod tests {
 
         col.enqueue_commit().await.unwrap().unwrap();
         assert_eq!(col.durable_lsn(), second);
-
-        let _ = fs::remove_dir_all(&root);
     }
     #[tokio::test]
     async fn range_from_resumes_exclusively() {
@@ -1131,8 +1219,6 @@ mod tests {
 
         let exclusive: Vec<String> = col.range_from(Some("b"), None, None);
         assert_eq!(exclusive, vec!["c", "d"], "cursor resumes strictly after the key");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1179,8 +1265,6 @@ mod tests {
         let (rest, done) = col.query_page(cursor.as_deref(), None, None, &None, 10).unwrap();
         assert_eq!(rest.len(), 2, "the tail past the boundary must still be reachable");
         assert!(done.is_none());
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// H8: the sorted path used to materialize every value in the range and drop `cursor` on the
@@ -1228,8 +1312,6 @@ mod tests {
         let (all, more) = col.sorted_page(None, None, &None, &sort, None, 9).unwrap();
         assert_eq!(all.len(), 9);
         assert!(!more, "a page holding the whole collection has nothing after it");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1257,8 +1339,6 @@ mod tests {
         assert_eq!(p3.len(), 1, "final short page");
         assert_eq!(p3[0].value, serde_json::json!({"i": 5}));
         assert_eq!(c3, None, "no cursor once the range is exhausted");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1279,8 +1359,6 @@ mod tests {
         let (p2, c2) = col.query_page(c1.as_deref(), None, None, &None, 2).unwrap();
         assert_eq!(p2.len(), 2);
         assert_eq!(c2, None, "a full final page with nothing after must not emit a cursor");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// C27: `applied.meta` was a bare `fs::write` — no temp file, no rename, no fsync — and
@@ -1318,8 +1396,6 @@ mod tests {
         assert_eq!(col.get("k").unwrap(), None, "an uncommitted entry stays staged across a restart");
         drop(col);
         drop(db);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// The watermark is the one file whose absence and whose damage mean opposite things.
@@ -1336,8 +1412,6 @@ mod tests {
 
         fs::write(root.join("applied.meta"), "{\"applied_l").unwrap();
         assert!(AppliedMeta::load(&root).is_err(), "damage is not absence");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1369,8 +1443,142 @@ mod tests {
             Some(serde_json::json!({"name": "alpha", "meta": {"v": 2, "owner": "latha"}, "status": "live"})),
             "the merged document survives a restart, with the patched field replaced and the sibling intact"
         );
+    }
 
-        let _ = fs::remove_dir_all(&root);
+    /// H17 was an attempt to take this fsync off the ack path, and a soak run lost 41 acknowledged
+    /// entries to it: `rewind_to`'s floor is this file's position, so a watermark behind a crash
+    /// returns published entries as staged and a leader is then allowed to truncate them.
+    ///
+    /// No `await` between the apply and the read: this must hold at the instant `apply_committed`
+    /// returns, not once some background task catches up.
+    #[tokio::test]
+    async fn the_applied_watermark_is_durable_before_a_commit_is_reported() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        for v in 1..=3 {
+            let lsn = stage_put(&col, "a", v);
+            col.apply_committed(lsn);
+            assert_eq!(Collection::recorded_watermark(&col.root_path).unwrap().unwrap(), col.applied_lsn(),
+                "an entry reported as applied must already be on disk as applied");
+        }
+    }
+
+    /// H17: an ordinary commit records only its position, so a restart has to take the higher of
+    /// the two files. Reading `applied.meta` alone would re-stage everything above it -- which is
+    /// the truncation the entry is about, arriving by a different route.
+    #[tokio::test]
+    async fn a_restart_recovers_the_position_the_commits_recorded_not_the_full_records() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        let first = stage_put(&col, "a", 1);
+        col.apply_committed(first);
+        let mut last = first;
+        for v in 2..=6 {
+            last = stage_put(&col, "a", v);
+            col.apply_committed(last);
+        }
+        assert!(last > first);
+
+        // The point of the split: the full record stayed where the last rich change left it.
+        assert!(AppliedMeta::load(&col.root_path).unwrap().unwrap().applied_lsn < last,
+            "a keyed commit must not have rewritten applied.meta, or nothing was saved");
+        assert_eq!(AppliedPos::read(&col.root_path).unwrap(), Some(last));
+        assert_eq!(Collection::recorded_watermark(&col.root_path).unwrap(), Some(last));
+
+        drop(col);
+        db.release_collection("c").unwrap();
+        let fresh = db.get_collection("c").unwrap();
+        assert_eq!(fresh.applied_lsn(), last,
+            "the watermark has to come back at the position the last commit recorded");
+        assert_eq!(fresh.pending_len(), 0, "nothing above the watermark, so nothing to re-stage");
+    }
+
+    /// The other half of the split: `dropped`, `config` and `handover` are never in the position
+    /// file, so a commit that changes one has to take the full write. Compaction retires the frame
+    /// they came from and then that file is the only copy (bugs.md C27).
+    #[tokio::test]
+    async fn a_committed_drop_still_takes_the_full_record() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        live_put(&col, "a", 1);
+        let dropped_at = col.drop_marker(1).unwrap().3;
+        col.apply_committed(dropped_at);
+
+        let meta = AppliedMeta::load(&col.root_path).unwrap().unwrap();
+        assert!(meta.dropped, "the drop has to be in the record that survives compaction");
+        assert_eq!(meta.applied_lsn, dropped_at,
+            "and the record's own position has to cover the frame it describes");
+
+        // And the reverse transition, which is what makes a keyed write after a drop expensive
+        // exactly once rather than never.
+        let revived = stage_put(&col, "b", 2);
+        col.apply_committed(revived);
+        let after = AppliedMeta::load(&col.root_path).unwrap().unwrap();
+        assert!(!after.dropped, "a put clears the tombstone, and that is a full-record change");
+        assert_eq!(after.applied_lsn, revived);
+    }
+
+    /// Two slots, so a torn write costs the newer position and not the file. Simulated by
+    /// corrupting whichever slot the last save used.
+    #[tokio::test]
+    async fn a_torn_position_slot_falls_back_to_the_other_one() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        let older = stage_put(&col, "a", 1);
+        col.apply_committed(older);
+        let newer = stage_put(&col, "a", 2);
+        col.apply_committed(newer);
+        assert_eq!(AppliedPos::read(&col.root_path).unwrap(), Some(newer));
+
+        drop(col);
+        db.release_collection("c").unwrap();
+
+        // Slots alternate on the sequence, not the lsn: two commits are seq 1 then 2, so the
+        // newer position is in slot 0 and the older is still in slot 1. Corrupting each in turn
+        // pins both the alternation and the fallback -- guessing one slot would pass either way.
+        let dir = root.join("c");
+        let intact = std::fs::read(dir.join("applied.pos")).unwrap();
+        for (slot, survivor, which) in [(0usize, older, "newer"), (512usize, newer, "older")] {
+            let mut bytes = intact.clone();
+            // Inside `applied_lsn`, so the record's own CRC is what refuses it.
+            bytes[slot + 13] ^= 0xFF;
+            std::fs::write(dir.join("applied.pos"), &bytes).unwrap();
+            assert_eq!(AppliedPos::read(&dir).unwrap(), Some(survivor),
+                "a torn {} slot must leave the other one readable", which);
+        }
+
+        let mut both = intact.clone();
+        both[13] ^= 0xFF;
+        both[512 + 13] ^= 0xFF;
+        std::fs::write(dir.join("applied.pos"), &both).unwrap();
+        assert!(AppliedPos::read(&dir).is_err(),
+            "with neither slot readable this is damage, and reading it as absence would retract              the position both slots were holding");
+        assert!(db.get_collection("c").is_err(), "which has to fail the open, not lower the floor");
+
+        std::fs::write(dir.join("applied.pos"), &intact).unwrap();
+        assert_eq!(AppliedPos::read(&dir).unwrap(), Some(newer), "and it opens again once readable");
+    }
+
+    /// A position file that is absent, or created and never written, is "nothing recorded here"
+    /// and not damage: `AppliedPos::open` creates it before the first commit writes to it.
+    #[test]
+    fn an_unwritten_position_file_reads_as_absent() {
+        let root = temp_root();
+        let dir = root.join("c");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(AppliedPos::read(&dir).unwrap(), None, "absent");
+
+        let _pos = AppliedPos::open(&dir).unwrap();
+        assert_eq!(AppliedPos::read(&dir).unwrap(), None,
+            "pre-allocated and unwritten is still nothing recorded, not a position of 0");
     }
 
     #[tokio::test]
@@ -1387,8 +1595,6 @@ mod tests {
             distinct.insert(col.key_lock(&format!("doc-{}", i)) as *const _);
         }
         assert!(distinct.len() > 1, "keys must spread across more than one stripe");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1405,8 +1611,6 @@ mod tests {
 
         col.index.write().unwrap().remove("k");
         assert!(!col.exists("k"), "a deleted key stops existing");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1433,8 +1637,6 @@ mod tests {
         assert_eq!(col.list_all().unwrap().len(), 20,
             "list_all must serve every cached doc without a single random read");
         assert_eq!(col.query_page(None, None, None, &None, 100).unwrap().0.len(), 20);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1457,8 +1659,6 @@ mod tests {
 
         assert_eq!(col.get("big").unwrap(), Some(serde_json::json!({"v": big})),
             "an uncached value still reads correctly from the WAL");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1491,8 +1691,6 @@ mod tests {
         }
         assert_eq!(col.inline_bytes.load(Ordering::Relaxed), 0,
             "removing every key must return the full budget (was {})", before);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1517,8 +1715,6 @@ mod tests {
         }
         assert!(col.get("k").unwrap().is_none(), "a deleted key must not be served from cache");
         assert_eq!(col.inline_bytes.load(Ordering::Relaxed), 0);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// bugs.md M11: replay inlined a staged frame on value size alone, so a node restarting on a
@@ -1557,8 +1753,6 @@ mod tests {
         assert!(col2.inline_bytes.load(Ordering::Relaxed) <= BUDGET,
             "committing the tail pushed tracked inline memory to {} over a {} byte budget",
             col2.inline_bytes.load(Ordering::Relaxed), BUDGET);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1571,7 +1765,7 @@ mod tests {
             for i in 0..10 {
                 live_put(&col, &format!("k{}", i), i);
             }
-            col.compact().unwrap();
+            col.compact(Retention::none()).unwrap();
             assert_eq!(inline_count(&col), 10, "compaction must re-populate the cache as it relocates");
             col.save_index().unwrap();
         }
@@ -1583,8 +1777,6 @@ mod tests {
             col2.index.read().unwrap().values().map(|e| e.inline_bytes()).sum::<u64>(),
             "the budget counter must be rebuilt to match the restored entries");
         assert_eq!(col2.get("k3").unwrap(), Some(serde_json::json!({"v": 3})));
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1611,8 +1803,6 @@ mod tests {
 
         assert!(acquired.is_ok(), "locking a batch must dedupe stripes; locking per key deadlocks on collision");
         assert_eq!(acquired.unwrap(), distinct);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1636,8 +1826,6 @@ mod tests {
         assert_eq!(col.get("b").unwrap(), Some(serde_json::json!({"v": 2})));
         assert_eq!(col.pending_len(), 0);
         assert_eq!(col.applied_lsn(), second);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1652,8 +1840,6 @@ mod tests {
 
         assert_eq!(col.get("k").unwrap(), Some(serde_json::json!({"v": 2})),
             "the later LSN must win regardless of how the staging map was walked");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1671,8 +1857,6 @@ mod tests {
 
         col.apply_committed(del);
         assert!(col.get("k").unwrap().is_none());
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// M9: an uncommitted drop is durable and revocable, exactly like an uncommitted delete. It
@@ -1704,8 +1888,6 @@ mod tests {
         assert!(reopened.is_dropped());
         assert!(reopened.get("k").unwrap().is_none());
         assert_eq!(reopened.pending_len(), 0);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// C17: a barrier occupies an LSN and applies nothing. It has to survive replay, drain from
@@ -1736,8 +1918,6 @@ mod tests {
         assert!(reopened.exists("k"));
         assert_eq!(reopened.index.read().unwrap().len(), 1, "replay must not invent a key for it");
         assert_eq!(reopened.pending_len(), 0);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     fn config_of(names: &[&str]) -> Configuration {
@@ -1775,15 +1955,13 @@ mod tests {
         let tail = col.last_appended_lsn();
         col.enqueue_commit().await.unwrap().unwrap();
         col.apply_committed(tail);
-        col.compact().unwrap();
+        col.compact(Retention::none()).unwrap();
         col.save_index().unwrap();
         drop(col);
 
         let reopened = Database::new(&root).unwrap().get_collection("c").unwrap();
         assert!(reopened.latest_config().is_some_and(|c| c.is_joint()),
             "the watermark is what carries it past a compaction that dropped its frame");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// An uncommitted configuration comes back staged and still in force, the way Raft requires:
@@ -1809,8 +1987,6 @@ mod tests {
         assert_eq!(reopened.committed_config(), Some(committed));
         assert_eq!(reopened.latest_config(), Some(staged),
             "a restart must come back deciding against the entry it last appended");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// An uncommitted barrier comes back staged, the way an uncommitted put does.
@@ -1834,8 +2010,6 @@ mod tests {
         reopened.apply_committed(tail);
         assert!(reopened.exists("k"), "and the barrier still publishes the tail after a replay");
         assert_eq!(reopened.pending_len(), 0);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// M5: created/replaced is decided before the write lands, so the check has to see the staged
@@ -1859,8 +2033,6 @@ mod tests {
 
         col.apply_committed(del);
         assert!(!col.exists_including_staged("k"));
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1881,8 +2053,6 @@ mod tests {
         stage_delete(&col, "k");
         assert!(col.get_including_staged("k").unwrap().is_none(),
             "a staged delete is the newest durable state");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1894,15 +2064,13 @@ mod tests {
         live_put(&col, "a", 1);
         let staged = stage_put(&col, "b", 2);
 
-        let err = col.compact().unwrap_err();
+        let err = col.compact(Retention::none()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock,
             "relocation skips entries missing from the index, so retiring their WAL would lose them");
 
         col.apply_committed(staged);
-        col.compact().unwrap();
+        col.compact(Retention::none()).unwrap();
         assert_eq!(col.get("b").unwrap(), Some(serde_json::json!({"v": 2})));
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1925,8 +2093,6 @@ mod tests {
         assert!(col2.get("staged").unwrap().is_none(),
             "the uncommitted frame is back in the staging buffer, not published");
         assert_eq!(col2.pending_len(), 1);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1959,8 +2125,6 @@ mod tests {
         // The restored node publishes it once the cluster commits it.
         col2.apply_committed(committed + 1);
         assert_eq!(col2.get("risky").unwrap(), Some(serde_json::json!({"v": 2})));
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1983,8 +2147,6 @@ mod tests {
                 "with no watermark on disk the log is the state, so the storage engine                  stays usable on its own");
         }
         assert_eq!(col2.pending_len(), 0);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// M14: `release_handles` clears the index, and only the append path checked `released`. A
@@ -2014,6 +2176,5 @@ mod tests {
 
         drop(stale);
         drop(col);
-        let _ = fs::remove_dir_all(&root);
     }
 }

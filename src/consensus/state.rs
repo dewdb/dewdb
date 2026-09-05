@@ -42,9 +42,17 @@ pub struct ReplicationState {
     pub progress: Progress,
     // Leader side: which voters have promised not to grant a vote, and until when.
     pub leases: Leases,
+    /// Leader side: this node has told a voter to stand for election, so its own leases are
+    /// promises it knows are about to be broken. Set for the length of a handover and no longer;
+    /// `leases` alone cannot say it, because the promises in it are still live and still honest.
+    pub handing_over: bool,
     /// When this process came up. A restart forgets the promise it made a leader, so it is what
     /// tells `lease::withholds_vote` to keep the promise anyway until the window is out.
     pub booted_at: std::time::Instant,
+    /// Voter side: the deadline this node last granted a probing leader. Untouched by demotion and
+    /// step-down -- both clear the contact clock, and a leader on the other side of that probe is
+    /// still counting the deadline. It lapses within one refusal window instead.
+    pub novote_until: Option<std::time::Instant>,
     // Follower side: the commit watermark the leader last told us, per collection.
     pub leader_committed: HashMap<String, u64>,
     /// The newest configuration in the config log, once that log has one. `None` means no
@@ -126,6 +134,7 @@ pub fn relinquish_leadership(repl: &mut ReplicationState) -> Option<bool> {
     repl.is_leader = false;
     repl.progress.reset();
     repl.leases.clear();
+    repl.handing_over = false;
     // Cleared rather than stamped: a node that records contact it never had would then withhold
     // its vote from the successor this step-down exists to let the others elect.
     repl.last_heartbeat = None;
@@ -148,6 +157,7 @@ pub fn apply_demotion(repl: &mut ReplicationState, new_term: u64) -> Option<bool
     // commit watermark by a node that no longer has the standing to have one.
     repl.progress.reset();
     repl.leases.clear();
+    repl.handing_over = false;
     repl.last_heartbeat = Some(std::time::Instant::now());
     repl.last_replication = None;
     repl.was_receiving_replication = false;
@@ -161,7 +171,7 @@ mod tests {
     use super::*;
     use crate::test_support::temp_root;
 
-    fn dir_of(root: &PathBuf) -> String {
+    fn dir_of(root: &Path) -> String {
         root.to_string_lossy().to_string()
     }
 
@@ -176,15 +186,12 @@ mod tests {
         assert_eq!(back.term, 7);
         assert_eq!(back.voted_for.as_deref(), Some("n2"), "the vote is useless if only the term survives");
         assert!(!back.is_leader);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
     fn an_absent_record_reads_as_a_fresh_node() {
         let root = temp_root();
         assert!(ReplicationMeta::load(&dir_of(&root)).unwrap().is_none());
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -199,8 +206,6 @@ mod tests {
             "a truncated record must not read as term 0; that would let this node \
              vote a second time in a term it already voted in");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -215,8 +220,6 @@ mod tests {
             .expect("a record fsynced but not yet renamed is still a complete record");
         assert_eq!(back.term, 4);
         assert_eq!(back.voted_for.as_deref(), Some("n3"));
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -235,8 +238,6 @@ mod tests {
         ReplicationMeta { term: 6, is_leader: true, voted_for: Some("n1".into()) }.save(&dir).unwrap();
         assert!(ReplicationMeta::load(&dir).unwrap().unwrap().is_leader,
             "the same term must still be updatable, or winning an election could not be recorded");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -250,8 +251,6 @@ mod tests {
         assert!(!root.join(META_TMP).exists(),
             "a leftover staging file would be mistaken for an interrupted save on the next boot");
         assert_eq!(ReplicationMeta::load(&dir).unwrap().unwrap().term, 2);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -264,8 +263,6 @@ mod tests {
 
         assert!(err.is_err(),
             "the vote path denies votes on this error, so it must surface rather than be swallowed");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     fn leader_state(term: u64) -> ReplicationState {
@@ -282,7 +279,9 @@ mod tests {
             last_known_primary_position: None,
             progress: Progress::new(),
             leases: Default::default(),
+            handing_over: false,
             booted_at: std::time::Instant::now(),
+            novote_until: None,
             leader_committed: HashMap::new(),
             configuration: None,
         }

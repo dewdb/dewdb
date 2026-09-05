@@ -8,7 +8,7 @@ pub mod index;
 pub mod wal;
 
 pub use collection::Collection;
-pub use compaction::SpaceUsage;
+pub use compaction::{Retention, SpaceUsage};
 pub use database::Database;
 pub use frame::{FrameHeader, ReplicaApply};
 pub use index::ReadCacheConfig;

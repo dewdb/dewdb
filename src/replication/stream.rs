@@ -7,6 +7,7 @@ use crate::consensus::demote;
 use crate::replication::protocol::forbidden_term;
 use crate::replication::write_concern::WriteQuorum;
 use crate::state::AppState;
+use crate::storage::frame::MAX_FRAME_SIZE;
 use crate::storage::FrameHeader;
 use axum::http::StatusCode;
 use std::collections::HashMap;
@@ -14,8 +15,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
-// Bounds one request's size and the receiver's blocking append run, not just the payload.
+// Bounds the receiver's blocking append run. It does not bound the request: frames range over four
+// orders of magnitude, so the size budget below is what keeps a batch inside `MAX_INTERNAL_BODY`.
 const REPLICATION_BATCH_FRAMES: usize = 64;
+
+/// Raw bytes per request, encoded to base64 by `wal_frame`. One max-size frame's worth, so the
+/// encoded body fits `MAX_INTERNAL_BODY` and any single frame the log holds fits a batch alone.
+const REPLICATION_BATCH_BYTES: usize = MAX_FRAME_SIZE as usize;
 
 // A couple of misses are normal under load, so backoff only starts after that. The cap keeps a
 // long-dead replica polled often enough that it rejoins promptly.
@@ -177,12 +183,16 @@ pub fn replication_drive_task(state: AppState) {
                 Some(d) => d.clone(),
                 None => return,
             };
+            // Before the scan, because it is what may give the scan something to send: promotion
+            // is not the only moment a leader holds a tail with no current-term entry (bugs.md C30).
+            crate::consensus::publish_inherited_tails(&state);
+
             let replicas = state.replication_targets();
             if replicas.is_empty() {
                 continue;
             }
 
-            let mut work = Vec::new();
+            let mut work: Vec<(String, String, u64, bool)> = Vec::new();
             for name in db.list_collections().unwrap_or_default() {
                 let tail = match db.get_collection(&name) {
                     Ok(col) => col.last_appended_lsn(),
@@ -200,10 +210,16 @@ pub fn replication_drive_task(state: AppState) {
                     }
                     // No cursor means we have never sent here and have nothing to resume from;
                     // the reactive path still establishes one on the next write.
-                    if let Some(cursor) = state.sent_through(replica, &name) {
-                        if cursor < tail {
-                            work.push((replica.clone(), name.clone(), cursor));
-                        }
+                    let cursor = match state.sent_through(replica, &name) {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    if cursor < tail {
+                        work.push((replica.clone(), name.clone(), cursor, false));
+                    } else if state.matched_lsn(replica, &name) < tail {
+                        // Nothing to send and nothing proving this replica holds the tail. Asking is
+                        // the only way a leader learns that on an idle cluster (bugs.md C30).
+                        work.push((replica.clone(), name.clone(), cursor, true));
                     }
                 }
             }
@@ -212,9 +228,13 @@ pub fn replication_drive_task(state: AppState) {
                 *count = count.saturating_sub(1);
             }
 
-            let outcomes = futures::future::join_all(work.into_iter().map(|(replica, name, cursor)| {
+            let outcomes = futures::future::join_all(work.into_iter().map(|(replica, name, cursor, confirm)| {
                 let state = state.clone();
                 async move {
+                    if confirm {
+                        // Progress here is evidence, not a cursor: the frame was already sent.
+                        return (replica.clone(), confirm_tail(&state, &replica, &name).await);
+                    }
                     let before = state.sent_through(&replica, &name).unwrap_or(cursor);
                     let _ = repair_replica(state.clone(), replica.clone(), name.clone(), cursor, None, 0).await;
                     // Judged on whether the cursor moved, not on the return value: a repair that
@@ -241,6 +261,38 @@ pub fn replication_drive_task(state: AppState) {
     });
 }
 
+/// Drives one replica to this leader's tail on every collection, and reports whether it got there.
+/// What a leadership transfer needs before it hands over: a target short of the tail loses the
+/// election it is told to run, because every voter holding the missing frame refuses it.
+///
+/// One pass. The caller repeats it against a deadline, and holds the write gate while it does, or
+/// the tail moves out from under each pass.
+pub(crate) async fn catch_up_replica(state: &AppState, replica: &str) -> bool {
+    let Some(db) = state.db.as_ref().cloned() else { return false };
+    let mut caught_up = true;
+
+    for name in db.list_collections().unwrap_or_default() {
+        let Ok(col) = db.get_collection(&name) else { continue };
+        let tail = col.last_appended_lsn();
+        if tail == 0 || state.matched_lsn(replica, &name) >= tail {
+            continue;
+        }
+        // Same split the drive task makes: with a backlog we stream it, with none and no ack on
+        // record the tail frame is re-sent to be answered (bugs.md C30).
+        match state.sent_through(replica, &name) {
+            Some(cursor) if cursor >= tail => { confirm_tail(state, replica, &name).await; },
+            cursor => {
+                repair_replica(state.clone(), replica.to_string(), name.clone(),
+                    cursor.unwrap_or(0), None, tail).await;
+            },
+        }
+        if state.matched_lsn(replica, &name) < tail {
+            caught_up = false;
+        }
+    }
+    caught_up
+}
+
 // Repair invariant: an unbroken predecessor chain from the replica's tail.
 // LSNs are sparse per collection, and a chain broken by compaction forces a snapshot.
 fn chain_prefix(after_lsn: u64, after_term: u64, mut frames: Vec<(u64, Vec<u8>)>) -> Vec<(u64, Vec<u8>)> {
@@ -265,16 +317,116 @@ fn chain_prefix(after_lsn: u64, after_term: u64, mut frames: Vec<(u64, Vec<u8>)>
     out
 }
 
-async fn trigger_resync(state: &AppState, replica_url: &str, collection: &str) {
+/// Whether the replica took it, which the caller needs: a snapshot carries our log, so the send
+/// cursor moves with it, and only an accepted resync has earned that.
+async fn trigger_resync(state: &AppState, replica_url: &str, collection: &str) -> bool {
     let url = format!("{}/internal/resync", replica_url);
     let body = ResyncRequest { collection: collection.to_string() };
     match state.client.post(&url).json(&body).send().await {
         Ok(r) if r.status().is_success() => {
             state.metrics.note_resync();
             info!(target: "repair", "Triggered snapshot resync on {} for '{}'", replica_url, collection);
+            true
         },
-        Ok(r) => warn!(target: "repair", "Resync trigger on {} returned {}", replica_url, r.status()),
-        Err(e) => warn!(target: "repair", "Resync trigger on {} failed: {}", replica_url, e),
+        Ok(r) => {
+            warn!(target: "repair", "Resync trigger on {} returned {}", replica_url, r.status());
+            false
+        },
+        Err(e) => {
+            warn!(target: "repair", "Resync trigger on {} failed: {}", replica_url, e);
+            false
+        },
+    }
+}
+
+/// Asks a replica to confirm it holds our tail, by re-sending the tail frame. A leader with nothing
+/// left to send has no other way to learn where a replica is: `matched` is cleared at promotion and
+/// a snapshot install moves a replica without any ack, so the leader can hold a tail a majority
+/// already has and never be able to prove it -- which leaves it uncommitted, and an acknowledged
+/// write invisible on the node that acknowledged it (bugs.md C30).
+///
+/// A `duplicate` is the confirmation. The receiver only answers that after checking the term at
+/// that LSN, so it is evidence about our frame and not merely about its own log length.
+async fn confirm_tail(state: &AppState, replica_url: &str, collection: &str) -> bool {
+    let db = match state.db.as_ref() {
+        Some(d) => d.clone(),
+        None => return false,
+    };
+    let col = match db.get_collection(collection) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let tail = col.last_appended_lsn();
+    if tail == 0 {
+        return false;
+    }
+
+    // The one frame at the tail: the range excludes everything below it, whatever the LSN spacing.
+    let scan = col.clone();
+    let frames = match tokio::task::spawn_blocking(move || scan.read_frames_after(tail - 1, tail)).await {
+        Ok(Ok(f)) => f,
+        _ => return false,
+    };
+    // Retired under us, so the tail has moved; the next tick reads the new one.
+    let (lsn, frame) = match frames.into_iter().next_back() {
+        Some(f) => f,
+        None => return false,
+    };
+    let header = match FrameHeader::parse(&frame) {
+        Some(h) => h,
+        None => return false,
+    };
+
+    let term = state.current_term();
+    let req = ReplicateRequest {
+        collection: collection.to_string(),
+        term,
+        lsn,
+        prev_lsn: header.prev_lsn,
+        commit_index: Some(state.committed_lsn(collection)),
+        wal_frame: frame,
+        frames: Vec::new(),
+    };
+    let url = format!("{}/internal/replicate", replica_url);
+    let _slot = state.replication_slots.acquire().await;
+    match state.client.post(&url).json(&req).send().await {
+        Ok(r) if r.status().is_success() => {
+            let body = r.json::<serde_json::Value>().await.ok();
+            // Never above our own tail: a replica whose log runs past ours is evidence for its own
+            // entries, not for one of ours.
+            let held = applied_through(&body).unwrap_or(lsn).min(lsn);
+            state.note_sent(replica_url, collection, held);
+            state.note_ack(replica_url, collection, held, term);
+            true
+        },
+        Ok(r) if r.status() == StatusCode::CONFLICT => {
+            let body = r.json::<serde_json::Value>().await.ok();
+            match classify_conflict(&body) {
+                ConflictKind::StaleTerm(t) => {
+                    demote(state, t).await;
+                    false
+                },
+                // Where the replica really is, which is what the backlog pass needs; it runs on the
+                // next tick now that the cursor names a position the replica reported.
+                ConflictKind::Divergent { last_lsn, applied } => {
+                    state.rewind_replica(replica_url, collection, applied.unwrap_or(last_lsn));
+                    false
+                },
+                ConflictKind::Gap(last_lsn, _) => {
+                    state.rewind_replica(replica_url, collection, last_lsn);
+                    false
+                },
+            }
+        },
+        Ok(r) if r.status() == StatusCode::FORBIDDEN => {
+            let body = r.json::<serde_json::Value>().await.ok();
+            let their_term = forbidden_term(&body);
+            if their_term > term {
+                demote(state, their_term).await;
+            }
+            false
+        },
+        _ => false,
     }
 }
 
@@ -339,6 +491,27 @@ async fn repair_replica(
     after >= needed_lsn
 }
 
+/// Splits a chained run by frame count and raw bytes both. The first frame of a batch is always
+/// taken, so one over the budget travels alone rather than never -- not sending it is `H13`.
+fn size_bounded_batches(frames: &[(u64, Vec<u8>)]) -> Vec<&[(u64, Vec<u8>)]> {
+    let mut batches = Vec::new();
+    let mut start = 0;
+    while start < frames.len() {
+        let mut end = start + 1;
+        let mut bytes = frames[start].1.len();
+        while end < frames.len()
+            && end - start < REPLICATION_BATCH_FRAMES
+            && bytes + frames[end].1.len() <= REPLICATION_BATCH_BYTES
+        {
+            bytes += frames[end].1.len();
+            end += 1;
+        }
+        batches.push(&frames[start..end]);
+        start = end;
+    }
+    batches
+}
+
 /// One pass: read what the replica is missing, verify it chains, ship it in batches.
 /// `Some(lsn)` is how far it got, `None` means the pass failed and repair should stop.
 async fn stream_chain_once(
@@ -382,7 +555,11 @@ async fn stream_chain_once(
 
     if !reaches_target {
         info!(target: "repair", "Replica {} too far behind for '{}' (last_lsn={}, target={}), falling back to snapshot", replica_url, collection, reported_last_lsn, target);
-        trigger_resync(&state, &replica_url, &collection).await;
+        // The cursor goes with the snapshot, which carries our log through `target`: left below it,
+        // the next pass re-reads the same hole and escalates another one, forever (bugs.md C30).
+        if trigger_resync(&state, &replica_url, &collection).await {
+            state.note_sent(&replica_url, &collection, target);
+        }
         return None;
     }
 
@@ -393,7 +570,7 @@ async fn stream_chain_once(
 
     // Pipelined: one round trip and one remote fsync per batch instead of per frame. The chain is
     // already contiguous here, so the receiver can apply the run without asking for anything else.
-    for batch in chained.chunks(REPLICATION_BATCH_FRAMES) {
+    for batch in size_bounded_batches(&chained) {
         let (lsn, head) = match batch.first() {
             Some((lsn, frame)) => (*lsn, frame.clone()),
             None => break,
@@ -444,13 +621,17 @@ async fn stream_chain_once(
                     ConflictKind::Divergent { last_lsn, .. } => {
                         warn!(target: "repair", "Replica {} diverges from us at lsn {} (its last_lsn={}) during backfill; snapshotting it", replica_url, lsn, last_lsn);
                         state.rewind_replica(&replica_url, &collection, last_lsn);
-                        trigger_resync(&state, &replica_url, &collection).await;
+                        if trigger_resync(&state, &replica_url, &collection).await {
+                            state.note_sent(&replica_url, &collection, target);
+                        }
                         return None;
                     },
                     ConflictKind::Gap(last_lsn, _) => {
                         warn!(target: "repair", "Replica {} still gapped during backfill at lsn {}, falling back to snapshot", replica_url, lsn);
                         state.rewind_replica(&replica_url, &collection, last_lsn);
-                        trigger_resync(&state, &replica_url, &collection).await;
+                        if trigger_resync(&state, &replica_url, &collection).await {
+                            state.note_sent(&replica_url, &collection, target);
+                        }
                         return None;
                     }
                 }
@@ -558,7 +739,9 @@ async fn replicate_one_await(
                         None => {
                             warn!(target: "replication", "Replica {} diverges from us at lsn {} (its last_lsn={}) and reports no watermark; snapshotting it", replica_url, lsn, last_lsn);
                             state.rewind_replica(replica_url, collection, last_lsn);
-                            trigger_resync(state, replica_url, collection).await;
+                            if trigger_resync(state, replica_url, collection).await {
+                                state.note_sent(replica_url, collection, lsn);
+                            }
                             false
                         },
                     }
@@ -642,12 +825,12 @@ pub async fn replicate_and_await(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::Retention;
     use crate::storage::{Database, ReplicaApply};
     use crate::test_support::{
-        live_put, make_frame, next_test_port, put_doc_at, put_doc_http, read_doc_http,
-        temp_root, three_node_cluster, wait_for_doc, TestNode,
+        get_raw, live_put, make_frame, next_test_port, put_doc_at, put_doc_http, put_value,
+        read_doc_http, temp_root, three_node_cluster, wait_for, wait_for_doc, TestNode,
     };
-    use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn repair_state(root: &std::path::Path) -> AppState {
@@ -682,8 +865,6 @@ mod tests {
         let keys: Vec<String> = state.repair_locks.lock().unwrap().keys().cloned().collect();
         assert!(keys.iter().all(|k| k.starts_with("repair:")),
             "repair keys must stay in their own namespace: {:?}", keys);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -750,7 +931,6 @@ mod tests {
             passes, tail);
 
         leader.kill();
-        let _ = fs::remove_dir_all(&root);
     }
     /// Refuses anything that does not resume from its watermark, and counts the resyncs it is
     /// asked for. A real replica's answer to the same frames, with the truncation left out.
@@ -831,7 +1011,6 @@ mod tests {
             "a divergence above the replica's watermark costs a backfill, not a whole collection");
 
         leader.kill();
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// Answers every batch with one fixed status, and counts the resyncs it is asked for.
@@ -893,7 +1072,76 @@ mod tests {
             "503 is a snapshot already installing there; asking for a second one buys nothing");
 
         leader.kill();
-        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn frames_of(sizes: &[usize]) -> Vec<(u64, Vec<u8>)> {
+        sizes.iter().enumerate().map(|(i, n)| (i as u64 + 1, vec![0u8; *n])).collect()
+    }
+
+    /// H13: `chunks(REPLICATION_BATCH_FRAMES)` bounded the count and nothing bounded the size, so
+    /// 64 frames near the write limit was a request no receiver could accept.
+    #[test]
+    fn a_batch_is_bounded_by_bytes_as_well_as_by_frames() {
+        let tiny = frames_of(&[16; 200]);
+        let counts: Vec<usize> = size_bounded_batches(&tiny).iter().map(|b| b.len()).collect();
+        assert_eq!(counts, vec![64, 64, 64, 8],
+            "small frames must still fill the frame budget of {}", REPLICATION_BATCH_FRAMES);
+
+        let third = REPLICATION_BATCH_BYTES / 3;
+        let wide = frames_of(&[third; 7]);
+        let batches = size_bounded_batches(&wide);
+        assert!(batches.iter().all(|b| b.iter().map(|(_, f)| f.len()).sum::<usize>()
+                <= REPLICATION_BATCH_BYTES),
+            "no batch may exceed the byte budget, whatever the frame count says");
+        assert_eq!(batches.iter().map(|b| b.len()).sum::<usize>(), 7, "every frame is sent once");
+        assert_eq!(batches.iter().map(|b| b.len()).collect::<Vec<_>>(), vec![3, 3, 1]);
+    }
+
+    /// The other half of the same bound: refusing to send a frame over the budget is the wedge,
+    /// so it travels alone and the receiver's limit is sized for exactly one.
+    #[test]
+    fn a_frame_over_the_byte_budget_travels_alone() {
+        let mixed = frames_of(&[16, REPLICATION_BATCH_BYTES + 1, 16]);
+        let batches = size_bounded_batches(&mixed);
+        assert_eq!(batches.iter().map(|b| b.len()).collect::<Vec<_>>(), vec![1, 1, 1],
+            "the oversized frame neither absorbs its neighbours nor is dropped; got {:?}",
+            batches.iter().map(|b| b.len()).collect::<Vec<_>>());
+        assert_eq!(batches[1][0].0, 2, "it is the frame it was, at its own lsn");
+    }
+
+    /// H13 end to end. Before the limits agreed this answered `202 acks=1` and left both followers
+    /// without it -- and without every later write, which the chain check put behind it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_document_the_write_path_accepts_replicates_to_a_majority() {
+        let root = temp_root();
+        let (n1, n2, n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::new();
+
+        // Inside MAX_PUBLIC_BODY and above the ~1.5 MB a base64 frame used to fit in a 2 MB body.
+        let wide = serde_json::json!({"pad": "x".repeat(1_900 * 1024)});
+        let status = put_value(&client, &n1.url(), "t", "wide", wide, "?w=majority&wtimeout=15000").await;
+        assert_eq!(status, StatusCode::CREATED,
+            "a body the public limit accepts must meet its write concern, not report acks=1");
+
+        // The head-of-line half: a small write after it was stuck behind it forever.
+        assert!(put_doc_at(&client, &n1.url(), "t", "after", 1, "?w=majority&wtimeout=15000")
+            .await.is_success());
+
+        for follower in [&n2, &n3] {
+            let mut held = false;
+            let start = std::time::Instant::now();
+            while !held && start.elapsed() < Duration::from_secs(15) {
+                held = get_raw(&client, &follower.url(), "t", "wide").await;
+                if !held {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+            assert!(held, "the frame has to reach {} as a frame, not as a snapshot", follower.url());
+        }
+
+        let (_, _, resyncs) = n1.state.as_ref().unwrap().metrics.repair_counts();
+        assert_eq!(resyncs, 0,
+            "the containment half escalated this to a snapshot per repair pass; with the limits              agreeing it costs no snapshot at all");
     }
 
     #[tokio::test]
@@ -947,9 +1195,6 @@ mod tests {
             assert_eq!(rcol2.get(&format!("k{}", i)).unwrap(), Some(serde_json::json!({"i": i})));
         }
         assert_eq!(rdb2.durable_lsn.load(Ordering::SeqCst), 5, "replica must reach primary's LSN after backfill");
-
-        let _ = fs::remove_dir_all(&proot);
-        let _ = fs::remove_dir_all(&rroot);
     }
 
     #[tokio::test]
@@ -965,7 +1210,7 @@ mod tests {
         col.enqueue_commit().await.unwrap().unwrap();
         assert_eq!(db.durable_lsn.load(Ordering::SeqCst), 4);
 
-        col.compact().unwrap();
+        col.compact(Retention::none()).unwrap();
 
         let frames = col.read_frames_after(0, 4).unwrap();
         let mut lsns: Vec<u64> = frames.iter().map(|(l, _)| *l).collect();
@@ -978,8 +1223,42 @@ mod tests {
         let from_two = chain_prefix(2, 1, col.read_frames_after(2, 4).unwrap());
         let two_lsns: Vec<u64> = from_two.iter().map(|(l, _)| *l).collect();
         assert_eq!(two_lsns, vec![3, 4], "a replica already at lsn 2 can still backfill");
+    }
 
-        let _ = fs::remove_dir_all(&root);
+    /// M15, and the other side of the test above: the same overwrites, the same replica three
+    /// frames behind, and a retention floor at its position. Nothing it needs is destroyed, so the
+    /// repair streams frames instead of escalating to a full-collection snapshot.
+    #[tokio::test]
+    async fn a_retained_tail_keeps_the_chain_a_replica_repairs_over() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        live_put(&col, "a", 1);
+        col.enqueue_commit().await.unwrap().unwrap();
+        // Where the replica sits: it holds lsn 1 and nothing after it.
+        let behind = db.durable_lsn.load(Ordering::SeqCst);
+
+        for v in [2, 3] {
+            live_put(&col, "a", v);
+        }
+        live_put(&col, "b", 9);
+        col.enqueue_commit().await.unwrap().unwrap();
+        let tip = db.durable_lsn.load(Ordering::SeqCst);
+
+        col.compact(Retention { above_lsn: behind, max_bytes: 1 << 20, min_reclaim_bytes: 0 })
+            .unwrap();
+
+        let chained = chain_prefix(behind, 1, col.read_frames_after(behind, tip).unwrap());
+        assert_eq!(chained.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+            (behind + 1..=tip).collect::<Vec<_>>(),
+            "every frame above the floor has to survive, superseded ones included, or the chain \
+             breaks exactly where it did before retention existed");
+
+        assert!(chain_prefix(0, 0, col.read_frames_after(0, tip).unwrap()).is_empty(),
+            "and below the floor nothing is promised: that replica still snapshots");
+        assert_eq!(col.get("a").unwrap().unwrap()["v"], 3, "the live value still reads back");
+        assert_eq!(col.get("b").unwrap().unwrap()["v"], 9);
     }
 
     #[test]
@@ -1038,8 +1317,6 @@ mod tests {
             "alternating writes between two collections must replicate directly; \
              chaining on lsn-1 instead of the collection's own predecessor makes \
              every second write look like a gap and drags in a full snapshot resync");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1074,8 +1351,6 @@ mod tests {
             "the leader tracks how far behind each replica is, so it streams the backlog directly; \
              needing a gap report first means the cursor was not consulted");
         assert_eq!(resyncs, 0, "a short backlog must never escalate to a full snapshot");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1113,8 +1388,6 @@ mod tests {
              it; {} frames means the stream is being cut short", REPLICATION_BATCH_FRAMES, widest);
         assert!(frames > batches,
             "{} frames over {} requests averages one per round trip", frames, batches);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1143,8 +1416,6 @@ mod tests {
             other => panic!("expected Gap, got {:?}", other),
         }
         assert_eq!(col.last_appended_lsn(), 3, "a refused frame must not advance the tail");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1187,8 +1458,45 @@ mod tests {
                 "k{} must reach the returning replica without a write to trigger it; replication that \
                  only runs on client traffic leaves an idle cluster permanently diverged", i);
         }
+    }
 
-        let _ = fs::remove_dir_all(&root);
+    /// C30: a snapshot install carries the leader's log to a replica and produces no ack, so the
+    /// leader was left with `matched = 0` for a node holding everything -- and with the send cursor
+    /// still below the range compaction had retired, every drive tick read the same hole and
+    /// escalated the same snapshot again (21 of them in one soak run). On an idle cluster nothing
+    /// then advanced the commit index, so the leader's own tail stayed staged and writes it had
+    /// acknowledged at `w=majority` read back missing on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn a_snapshot_install_leaves_the_leader_a_position_it_can_count() {
+        let root = temp_root();
+        let (n1, _n2, mut n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+
+        assert!(put_doc_at(&client, &n1.url(), "t", "k0", 0, "?w=all&wtimeout=4000").await.is_success());
+        assert!(wait_for_doc(&client, &n3.url(), "t", "k0", 0, Duration::from_secs(10)).await);
+
+        n3.kill();
+        // Overwrites, because compaction drops a superseded frame and relocates a live one: a run
+        // of distinct keys survives it chained, and the returning replica catches up from the WAL.
+        for v in 1..=8 {
+            assert!(put_doc_at(&client, &n1.url(), "t", "hot", v, "?w=majority&wtimeout=4000")
+                .await.is_success(), "the surviving majority must keep accepting writes");
+        }
+
+        let col = n1.state.as_ref().unwrap().db.as_ref().unwrap().get_collection("t").unwrap();
+        assert!(wait_for(Duration::from_secs(10), || col.pending_len() == 0).await,
+            "compaction refuses while anything is still uncommitted");
+        col.compact(Retention::none()).expect("compaction");
+
+        // Deliberately no write after this point: where n3 has got to is the leader's to find out.
+        n3.start();
+        let tail = col.last_appended_lsn();
+        let leader = n1.state.as_ref().unwrap();
+        let counted = wait_for(Duration::from_secs(30),
+            || leader.matched_lsn(&n3.url(), "t") >= tail).await;
+        assert!(counted,
+            "unfixed the leader snapshots {} forever without ever counting it: matched={} against \
+             its own tail {}", n3.url(), leader.matched_lsn(&n3.url(), "t"), tail);
     }
 
     /// bugs.md H11, found by the churn soak: concurrent writes to one collection all take the
@@ -1217,8 +1525,6 @@ mod tests {
         assert!(staged.is_empty(),
             "a healthy three-node cluster met no quorum for concurrent writes {:?}: {:?}",
             staged, statuses);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1239,8 +1545,6 @@ mod tests {
         assert!(wait_for_doc(&client, &n3.url(), "t", "solo", 42, Duration::from_secs(15)).await,
             "a write whose only send attempt failed must still be delivered; without a retry it is \
              lost on that replica until unrelated traffic happens to arrive");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1263,7 +1567,6 @@ mod tests {
 
         drop(n2);
         drop(n3);
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1293,8 +1596,6 @@ mod tests {
             "an uncommitted entry must not be readable: a new leader without it could win              the next election and revoke it");
         assert_eq!(read_doc_http(&client, &n1.url(), "k1").await, Some(1),
             "the committed entry is still served");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1317,7 +1618,6 @@ mod tests {
 
         drop(n2);
         drop(n3);
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1334,8 +1634,6 @@ mod tests {
                 wait_for_doc(&client, &replica.url(), "t", "only", 7, Duration::from_secs(10)).await,
                 "{} never published the entry; an idle cluster must not strand it", replica.node_id);
         }
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1350,6 +1648,5 @@ mod tests {
 
         drop(n2);
         drop(n3);
-        let _ = fs::remove_dir_all(&root);
     }
 }

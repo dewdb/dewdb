@@ -6,6 +6,7 @@
 //! each reach a majority on their own, which is what a one-shot swap of the voter list allows.
 
 use crate::consensus::config::CONFIG_LOG;
+use crate::consensus::transfer;
 use crate::replication::stream::replicate_and_await;
 use crate::replication::write_concern::WriteQuorum;
 use crate::state::AppState;
@@ -19,12 +20,23 @@ use tracing::{info, warn};
 const CONFIG_COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMIT_POLL_MS: u64 = 20;
 
+impl ChangeError {
+    pub fn why(&self) -> &str {
+        match self {
+            ChangeError::Refused(why) | ChangeError::Stalled(why) | ChangeError::Redirect(why) => why,
+        }
+    }
+}
+
 pub enum ChangeError {
     /// The caller can retry elsewhere or later; nothing was appended.
     Refused(String),
     /// An entry is in the log and did not commit. The change is neither applied nor undone, and
     /// the next leader finishes or replaces it from the log.
     Stalled(String),
+    /// The change removes this node, so leadership moved to the named voter and the change belongs
+    /// there now. Nothing was appended here; the same request against that node applies it.
+    Redirect(String),
 }
 
 /// The newest configuration entry when it has not committed yet, which is what makes a second
@@ -55,14 +67,6 @@ fn validate(state: &AppState, current: &Configuration, next: &[String]) -> Resul
         return Err(ChangeError::Refused(
             "the previous configuration entry has not committed yet; retry".to_string()));
     }
-    // Raft allows it and then requires the leader to step down once the target commits. Nothing
-    // here transfers leadership, so the operator demotes this node from its successor instead.
-    let own = state.own_url();
-    if !next.iter().any(|v| same_endpoint(v, &own)) {
-        return Err(ChangeError::Refused(
-            "a leader cannot remove itself; send this change to another voter".to_string()));
-    }
-
     let view = state.cluster_view();
     for voter in next {
         if current.contains(voter) {
@@ -142,6 +146,28 @@ async fn append_and_commit(state: &AppState, config: Configuration) -> Result<u6
     Ok(lsn)
 }
 
+/// A change that removes this node. Raft allows the leader to append it and requires it to step
+/// down once the target commits -- on a log this node would by then have no standing to replicate.
+/// So leadership moves first, to a voter the change keeps, and the change follows it there.
+///
+/// Nothing is appended either way, so a failure leaves the caller exactly where the refusal used to:
+/// still leading, with the same request to send somewhere else (bugs.md C21).
+async fn hand_over_first(state: &AppState, next: &[String]) -> Result<Configuration, ChangeError> {
+    let eligible = transfer::eligible_targets(state, next);
+    let Some(target) = transfer::best_target(state, &eligible) else {
+        return Err(ChangeError::Refused(
+            "this change removes the leader and names no other current voter to hand office to; add one as a voter first".to_string()));
+    };
+
+    info!(target: "membership", to = %target, voters = ?next,
+        "The change removes this node; handing leadership over so it can be made there");
+    match transfer::transfer_leadership(state, Some(target)).await {
+        Ok(leader) => Err(ChangeError::Redirect(leader)),
+        Err(e) => Err(ChangeError::Refused(format!(
+            "this change removes the leader and leadership could not be handed over: {}", e.why()))),
+    }
+}
+
 /// Moves the voting set to `next`. On `Stalled` the joint entry may be in the log and in force;
 /// that is a legal state to be in, and the next leader completes it from the log rather than
 /// rolling it back.
@@ -151,6 +177,9 @@ pub async fn change_membership(
 ) -> Result<Configuration, ChangeError> {
     let current = state.quorum_config();
     validate(state, &current, &next)?;
+    if !next.iter().any(|v| same_endpoint(v, &state.own_url())) {
+        return hand_over_first(state, &next).await;
+    }
 
     let target = Configuration::simple(next);
     if !current.is_joint()
@@ -206,8 +235,9 @@ pub fn resume_change(state: &AppState) {
             "Inherited a joint configuration; appending the target it was heading for");
         match append_and_commit(&state, target.clone()).await {
             Ok(_) => info!(target: "membership", voters = ?target.voters, "Configuration change completed"),
-            Err(ChangeError::Refused(why)) | Err(ChangeError::Stalled(why)) => warn!(
-                target: "membership", error = %why,
+            // A redirect cannot reach here: the target of an inherited joint entry is the half
+            // this node is finishing from, and it is a member of it or it would not be leading.
+            Err(e) => warn!(target: "membership", error = %e.why(),
                 "Could not leave joint consensus; the next promotion will try again"),
         }
     });
@@ -260,7 +290,5 @@ mod tests {
             "and it must land on the target the joint entry named, not back on the old set");
         assert_eq!(col.committed_config().map(|c| c.is_joint()), Some(false),
             "the target has to commit, not just be appended");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -564,6 +564,7 @@ fn bad_frame(wal_id: u64, offset: u64, why: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::Retention;
     use crate::storage::frame::MAX_RECORD_SIZE;
     use crate::storage::Database;
     use crate::test_support::{disk_put, live_put, make_frame, temp_root};
@@ -609,7 +610,6 @@ mod tests {
             col2.enqueue_commit().await.unwrap().unwrap();
             col2.apply_committed(lsn);
         }
-
         let active_wal_path = {
             let wal_writer = col2.wal_writer.lock().unwrap();
             col2.root_path.join(format!("wal-{:05}.log", wal_writer.current_wal_id))
@@ -639,8 +639,6 @@ mod tests {
             col3.apply_committed(lsn);
         }
         assert!(col3.get("key_post_corrupt").unwrap().is_some(), "Writes should continue after recovery");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// The half a process crash cannot reach: a machine losing power drops what the page cache
@@ -689,8 +687,6 @@ mod tests {
         col2.enqueue_commit().await.unwrap().unwrap();
         col2.apply_committed(lsn);
         assert!(col2.get("after").unwrap().is_some(), "writes did not resume past a cut tail");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -717,8 +713,6 @@ mod tests {
 
         let err = col.get("a").expect_err("a frame failing its CRC must not be served as a value");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -739,7 +733,6 @@ mod tests {
         assert!(col.read_pool.lock().unwrap().is_empty());
 
         drop(held);
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -757,7 +750,7 @@ mod tests {
             col.wal_writer.lock().unwrap().current_wal_id));
         let orphan = fs::read(&frozen).unwrap();
 
-        col.compact().unwrap();
+        col.compact(Retention::none()).unwrap();
         assert!(!frozen.exists());
         fs::write(&frozen, &orphan).unwrap();
 
@@ -765,8 +758,6 @@ mod tests {
         let lsns: Vec<u64> = frames.iter().map(|(lsn, _)| *lsn).collect();
         assert_eq!(lsns, vec![1, 2, 3],
             "a frame relocated by compaction must be reported once, not once per surviving copy");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -779,7 +770,7 @@ mod tests {
             live_put(&col, &format!("k{}", i), i);
         }
         col.enqueue_commit().await.unwrap().unwrap();
-        col.compact().unwrap();
+        col.compact(Retention::none()).unwrap();
 
         // The compacted WAL, which is frozen: nothing appends to it, so a short read is a hole.
         let compacted = col.root_path.join(format!("wal-{:05}.log", col.retired_through
@@ -790,8 +781,6 @@ mod tests {
         let err = col.read_frames_after(0, 3)
             .expect_err("a scan that cannot read a frozen WAL out must not report a short set");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -811,8 +800,6 @@ mod tests {
 
         let frames = col.read_frames_after(0, 3).unwrap();
         assert_eq!(frames.len(), 3, "an append caught in flight must not fail the scan");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -825,10 +812,8 @@ mod tests {
 
         assert_eq!(col.pending_len(), 1,
             "a frame the caller has not staged yet is in neither the index nor pending, and              nothing compaction checks can see it");
-        assert!(col.compact().is_err(),
+        assert!(col.compact(Retention::none()).is_err(),
             "so compaction must refuse rather than retire the WAL holding an in-flight write");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -840,9 +825,7 @@ mod tests {
         col.append_raw_frame(&make_frame(1, 1, 0, 0, "k", 1)).unwrap();
 
         assert_eq!(col.pending_len(), 1, "the replica path closes the same window");
-        assert!(col.compact().is_err());
-
-        let _ = fs::remove_dir_all(&root);
+        assert!(col.compact(Retention::none()).is_err());
     }
 
     #[tokio::test]
@@ -858,8 +841,6 @@ mod tests {
         let lsn_in_frame = u64::from_le_bytes(frame[16..24].try_into().unwrap());
         assert_eq!(term_in_frame, 7, "term must be stamped into the frame header");
         assert_eq!(lsn_in_frame, 1, "lsn must be stamped into the frame header");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -913,9 +894,6 @@ mod tests {
         assert_eq!(rcol2.get("k2").unwrap(), Some(serde_json::json!({"v": 2})));
         assert_eq!(rcol2.get("k3").unwrap(), Some(serde_json::json!({"v": 3})));
         assert_eq!(rdb2.durable_lsn.load(Ordering::SeqCst), 3, "Replica LSN must match the frames it applied from the primary");
-
-        let _ = fs::remove_dir_all(&proot);
-        let _ = fs::remove_dir_all(&rroot);
     }
 
     #[tokio::test]
@@ -966,9 +944,6 @@ mod tests {
         let rdb2 = Database::new(&rroot).unwrap();
         assert_eq!(rdb2.get_collection("alpha").unwrap().get("k2").unwrap(), Some(serde_json::json!({"v": 3})));
         assert_eq!(rdb2.get_collection("beta").unwrap().get("k2").unwrap(), Some(serde_json::json!({"v": 4})));
-
-        let _ = fs::remove_dir_all(&proot);
-        let _ = fs::remove_dir_all(&rroot);
     }
 
     /// Replicates `lsn` frames of term 1, chained, and returns the tail as `(lsn, term)`.
@@ -1016,8 +991,6 @@ mod tests {
         let col2 = reopened.get_collection("c").unwrap();
         assert_eq!(col2.last_appended(), (2, 3), "and the truncation must survive a restart");
         assert_eq!(col2.get("k3").unwrap(), Some(serde_json::json!({"v": 99})));
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1036,8 +1009,6 @@ mod tests {
         assert_eq!(col.last_appended(), (1, 3),
             "reading an ordinary resend as a conflicting log would drop lsn 3 on every retry");
         assert_eq!(col.pending_len(), 3);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// The line truncation may not cross. Below the watermark the entries are agreed, and a leader
@@ -1063,8 +1034,6 @@ mod tests {
         assert_eq!(col.last_appended(), (1, 5), "and nothing may be dropped on the way to refusing");
         assert_eq!(col.pending_len(), 2);
         assert_eq!(col.get("k3").unwrap(), Some(serde_json::json!({"v": 3})));
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// The conflict is at our tail rather than above it, so there is nothing to truncate to.
@@ -1083,8 +1052,6 @@ mod tests {
             other => panic!("expected Divergent, got {:?}", other),
         }
         assert_eq!(col.last_appended(), (1, 3));
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1107,7 +1074,5 @@ mod tests {
             ReplicaApply::Applied { lsn, .. } => assert_eq!(lsn, 2),
             other => panic!("a new term appending onto agreed history must apply, got {:?}", other),
         }
-
-        let _ = fs::remove_dir_all(&root);
     }
 }

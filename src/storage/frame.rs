@@ -6,6 +6,30 @@ pub const MAX_RECORD_SIZE: u64 = 10 * 1024 * 1024;
 // Compatibility: no version field, so changing this length or the field order invalidates every WAL.
 pub const HEADER_LEN: usize = 40;
 
+/// A record at the limit with its header: what a transport carrying one frame has to fit.
+pub const MAX_FRAME_SIZE: u64 = HEADER_LEN as u64 + MAX_RECORD_SIZE;
+
+/// Padded base64, which is how `wal_frame` travels. The alphabet needs no JSON escaping, so this
+/// is also the encoded length inside the request body.
+pub const fn base64_len(bytes: u64) -> u64 {
+    (bytes + 2) / 3 * 4
+}
+
+/// One widening chain with `MAX_RECORD_SIZE` and `MAX_INTERNAL_BODY`: a body the public API takes
+/// fits a frame, and any frame the log holds fits one internal request. Disagreeing is `H13`.
+pub const MAX_PUBLIC_BODY: usize = 2 * 1024 * 1024;
+/// One max-size frame encoded, plus the envelope around it. Batches are bounded separately, by
+/// bytes, so raising this does not turn a 64-frame batch into a 900 MB request.
+pub const MAX_INTERNAL_BODY: usize = base64_len(MAX_FRAME_SIZE) as usize + 64 * 1024;
+
+/// A key, a timestamp and the field names around the body. Keys arrive on the URL, so hyper's
+/// header limit is what bounds them; this is that with room to spare.
+const ENVELOPE_HEADROOM: u64 = 64 * 1024;
+
+// Asserted rather than commented: drift here is H13 again, and it went unnoticed for eight phases.
+const _: () = assert!(MAX_PUBLIC_BODY as u64 + ENVELOPE_HEADROOM <= MAX_RECORD_SIZE);
+const _: () = assert!(base64_len(MAX_FRAME_SIZE) <= MAX_INTERNAL_BODY as u64);
+
 // Format invariant: prev_lsn/prev_term name the predecessor in THIS collection, not lsn - 1.
 // LSNs are database-wide, so a collection's frames are sparse and global chaining fakes gaps.
 #[derive(Debug, Clone, Copy)]
@@ -113,4 +137,20 @@ pub enum ReplicaApply {
     Duplicate { last_lsn: u64 },
     Gap { last_lsn: u64, last_term: u64 },
     Divergent { last_lsn: u64, last_term: u64 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::base64_bytes::base64_encode;
+
+    /// The chain's assertions are only as good as this arithmetic, and `base64_len` is a closed
+    /// form for a loop that pads.
+    #[test]
+    fn base64_len_matches_the_encoder_it_predicts() {
+        for n in [0usize, 1, 2, 3, 4, 5, 62, 63, 64, 1000, HEADER_LEN, HEADER_LEN + 1] {
+            assert_eq!(base64_len(n as u64) as usize, base64_encode(&vec![0u8; n]).len(),
+                "predicted length is wrong at {} bytes", n);
+        }
+    }
 }

@@ -4,6 +4,7 @@ use crate::cluster::metadata::{
     plan_configuration, plan_join, plan_leave, Adoption, ClusterMetadata, JoinRequest,
 };
 use crate::consensus::reconfigure::{change_membership, pending_change, ChangeError};
+use crate::consensus::{transfer_leadership, TransferError};
 use crate::model::err_json;
 use crate::state::AppState;
 use axum::extract::{Query, State};
@@ -154,6 +155,12 @@ pub async fn set_configuration_handler(
     let installed = match change_membership(&state, req.voters).await {
         Ok(config) => config,
         Err(ChangeError::Refused(why)) => return err_json(StatusCode::UNPROCESSABLE_ENTITY, why),
+        // The same answer a change sent to a follower gets, because that is now what this node is:
+        // it handed office to a voter the change keeps, and the change belongs there.
+        Err(ChangeError::Redirect(leader)) => return (StatusCode::CONFLICT, Json(serde_json::json!({
+            "error": "this change removes the leader, so leadership was handed over first; send the same change to the node named here",
+            "primary": leader,
+        }))).into_response(),
         // 503, not 500: the entry is durable and in force, and retrying the same change finishes it.
         Err(ChangeError::Stalled(why)) => return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -176,6 +183,37 @@ pub async fn set_configuration_handler(
 
     info!(target: "membership", voters = ?installed.voters, "Configuration changed");
     (StatusCode::OK, Json(configuration_body(&state))).into_response()
+}
+
+/// The ops primitive behind a leader's own removal, and useful on its own: draining a node before
+/// maintenance, or moving leadership off a host that is about to go away. Raft §3.10.
+#[derive(Deserialize)]
+pub struct TransferRequest {
+    /// Which voter to hand to. Omitted, the readiest one takes it.
+    #[serde(default)]
+    pub to: Option<String>,
+}
+
+pub async fn transfer_leadership_handler(
+    State(state): State<AppState>,
+    Json(req): Json<TransferRequest>,
+) -> impl axum::response::IntoResponse {
+    if let Err(resp) = writable(&state) {
+        return resp;
+    }
+
+    match transfer_leadership(&state, req.to).await {
+        Ok(leader) => (StatusCode::OK, Json(serde_json::json!({
+            "status": "transferred",
+            "primary": leader,
+        }))).into_response(),
+        Err(TransferError::Refused(why)) => err_json(StatusCode::UNPROCESSABLE_ENTITY, why),
+        // 503, not 500: this node still leads, so the same request is worth retrying here.
+        Err(TransferError::Failed(why)) => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "error": why,
+            "primary": state.own_url(),
+        }))).into_response(),
+    }
 }
 
 pub async fn leave_handler(
@@ -213,7 +251,8 @@ pub async fn leave_handler(
 #[cfg(test)]
 mod tests {
     use crate::test_support::{
-        put_doc_at, read_doc_http, temp_root, three_node_cluster, three_node_cluster_with_timeout, wait_for, TestNode,
+        put_doc_at, read_doc_http, temp_root, three_node_cluster, three_node_cluster_with_timeout,
+        wait_for, wait_for_doc, TestNode,
     };
     use axum::http::StatusCode;
     use std::time::Duration;
@@ -226,9 +265,14 @@ mod tests {
     /// `membership_mode: learner` is what stops it electing itself; the heartbeat timeout is left
     /// short deliberately, so any test that passes here passes without a timing cushion.
     fn fresh_node(root: &std::path::Path, id: &str) -> TestNode {
+        fresh_node_with_timeout(root, id, crate::test_support::DEFAULT_HEARTBEAT_TIMEOUT_SECS)
+    }
+
+    fn fresh_node_with_timeout(root: &std::path::Path, id: &str, timeout_secs: u64) -> TestNode {
         let port = crate::test_support::next_test_port();
         let mut n = TestNode::new(id, port, root, "replica");
         n.membership_mode = "learner".to_string();
+        n.heartbeat_timeout_secs = timeout_secs;
         n.start();
         n
     }
@@ -249,7 +293,9 @@ mod tests {
         let c = client();
 
         // No cluster at all: nothing to find, nothing to follow, nothing to stop it but the mode.
-        let mut n4 = fresh_node(&root, "n4");
+        // Opting back into the short contact timeout the harness no longer defaults to: this
+        // guard is supposed to hold without a timing cushion, and the sleeps below are sized to it.
+        let mut n4 = fresh_node_with_timeout(&root, "n4", 1);
         assert_eq!(n4.heartbeat_timeout_secs, 1, "the guard must hold without a timing cushion");
         assert!(n4.state.as_ref().unwrap().is_learner(),
             "the mode must apply from boot, before any cluster view exists");
@@ -277,8 +323,6 @@ mod tests {
         let r = c.put(&format!("{}/collections/t/docs/k", n4.url()))
             .json(&serde_json::json!({"value": {"v": 1}})).send().await.unwrap();
         assert_eq!(r.status(), StatusCode::FORBIDDEN);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -318,8 +362,6 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(!n4.is_leader());
         assert!(n4.state.as_ref().unwrap().is_learner());
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -361,8 +403,6 @@ mod tests {
 
         assert!(!n4.is_leader());
         assert_eq!(crate::test_support::leaders(&[&n1, &n2, &n3, &n4]), vec!["n1".to_string()]);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -400,8 +440,6 @@ mod tests {
             n4.state.as_ref().unwrap().db.as_ref().unwrap()
                 .get_collection("t").map(|col| col.last_appended_lsn() > 0).unwrap_or(false)
         }).await, "the learner received nothing at all");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -432,8 +470,6 @@ mod tests {
             "a non-voting node elected itself; it would serve writes no quorum ever agreed to");
         assert!(n4.state.as_ref().unwrap().is_learner(),
             "the learner role must survive the restart that would otherwise let it stand");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     async fn configuration(c: &reqwest::Client, node: &str) -> serde_json::Value {
@@ -450,6 +486,122 @@ mod tests {
             .send().await.unwrap();
         let code = r.status();
         (code, r.json().await.unwrap_or(serde_json::Value::Null))
+    }
+
+    async fn transfer(c: &reqwest::Client, leader: &str, to: Option<&str>)
+        -> (StatusCode, serde_json::Value)
+    {
+        let r = c.post(&format!("{}/cluster/transfer-leadership", leader))
+            .timeout(Duration::from_secs(30))
+            .json(&serde_json::json!({ "to": to }))
+            .send().await.unwrap();
+        let code = r.status();
+        (code, r.json().await.unwrap_or(serde_json::Value::Null))
+    }
+
+    fn node_at<'a>(nodes: &[&'a TestNode], url: &str) -> &'a TestNode {
+        nodes.iter().find(|n| n.url() == url).expect("the answer named a node not in this cluster")
+    }
+
+    /// Raft §3.10, and what bugs.md C21 needed: office moves while the leader is alive and
+    /// reachable, so nothing waits out a contact timeout and no election is contested.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_leader_hands_office_over_without_an_election_timeout() {
+        let root = temp_root();
+        let (n1, n2, n3) = three_node_cluster_with_timeout(&root, 30).await;
+        let c = client();
+
+        assert_eq!(put_doc_at(&c, &n1.url(), "t", "before", 1, "?w=majority").await, StatusCode::CREATED);
+        let term_before = n1.term();
+
+        // Well inside a single contact timeout, which is the whole claim: a handover is not a
+        // failover, and waiting one out is what the operator was doing instead of this.
+        let started = std::time::Instant::now();
+        let (code, body) = transfer(&c, &n1.url(), None).await;
+        assert_eq!(code, StatusCode::OK, "{}", body);
+        assert!(started.elapsed() < Duration::from_secs(30),
+            "the handover took a contact timeout, so it fell back to an ordinary election");
+
+        let successor = body["primary"].as_str().unwrap().to_string();
+        assert!(successor == n2.url() || successor == n3.url(), "handed to {}", successor);
+        assert!(!n1.is_leader(), "the old leader answered OK and still claims the office");
+
+        let taken = node_at(&[&n2, &n3], &successor);
+        assert!(wait_for(Duration::from_secs(10), || taken.is_leader()).await,
+            "{} never took the office it was handed", successor);
+        assert!(taken.term() > term_before, "a handover is still a new term");
+
+        // The successor holds what the old leader had, and leads for real rather than nominally.
+        // Waited on rather than read once: visibility is commit-gated, so an inherited entry
+        // surfaces when the new leader can prove a quorum holds it, not when it takes office.
+        assert!(wait_for_doc(&c, &successor, "t", "before", 1, Duration::from_secs(10)).await,
+            "the target was handed office without the entries that came with it");
+        assert_eq!(put_doc_at(&c, &successor, "t", "after", 2, "?w=majority").await,
+            StatusCode::CREATED, "the new leader cannot reach a quorum");
+        assert!(wait_for(Duration::from_secs(15), || {
+            n1.state.as_ref().unwrap().db.as_ref().unwrap()
+                .get_collection("t").map(|col| col.exists("after")).unwrap_or(false)
+        }).await, "the old leader never applied what the one it handed to wrote; it is holding                     the frame with no primary to tell it the frame committed");
+    }
+
+    /// The operator's own choice of successor, and the two ways it is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_transfer_goes_where_it_is_told_or_is_refused_intact() {
+        let root = temp_root();
+        let (n1, n2, n3) = three_node_cluster_with_timeout(&root, 30).await;
+        let c = client();
+
+        let (code, body) = transfer(&c, &n2.url(), None).await;
+        assert_eq!(code, StatusCode::CONFLICT, "a follower has nothing to hand over: {}", body);
+
+        let (code, body) = transfer(&c, &n1.url(), Some("http://127.0.0.1:1")).await;
+        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{}", body);
+        assert!(body["error"].as_str().unwrap().contains("not a voter"), "{}", body);
+        assert!(n1.is_leader(), "a refused transfer must leave the leader exactly as it was");
+        assert_eq!(put_doc_at(&c, &n1.url(), "t", "k", 1, "?w=majority").await, StatusCode::CREATED,
+            "and the write gate it took has to be released on that path too");
+
+        let (code, body) = transfer(&c, &n1.url(), Some(&n3.url())).await;
+        assert_eq!(code, StatusCode::OK, "{}", body);
+        assert_eq!(body["primary"].as_str(), Some(n3.url().as_str()));
+        assert!(wait_for(Duration::from_secs(10), || n3.is_leader()).await,
+            "the named target did not take office");
+        assert!(!n2.is_leader(), "office went somewhere other than where it was sent");
+    }
+
+    /// C21 itself: the change the leader used to refuse. It hands office over, names where the
+    /// change belongs, and the same request applies there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_change_that_removes_the_leader_hands_over_and_names_where_to_retry() {
+        let root = temp_root();
+        let (n1, n2, n3) = three_node_cluster_with_timeout(&root, 30).await;
+        let c = client();
+
+        let target = vec![n2.url(), n3.url()];
+        let (code, body) = set_voters(&c, &n1.url(), &target).await;
+        assert_eq!(code, StatusCode::CONFLICT, "{}", body);
+        let successor = body["primary"].as_str().expect("the answer has to say where to retry")
+            .to_string();
+        assert!(target.contains(&successor),
+            "office went to a node the change removes: {}", successor);
+
+        // Nothing was appended here: the refusal this replaced left the same state behind.
+        let here = configuration(&c, &n1.url()).await;
+        assert_eq!(here["uncommitted"], false);
+        assert_eq!(here["voters"].as_array().unwrap().len(), 3);
+
+        assert!(wait_for(Duration::from_secs(10), || node_at(&[&n2, &n3], &successor).is_leader()).await,
+            "{} never took over", successor);
+
+        let (code, body) = set_voters(&c, &successor, &target).await;
+        assert_eq!(code, StatusCode::OK, "the same change has to apply where it was sent: {}", body);
+        assert_eq!(body["voters"].as_array().unwrap().len(), 2);
+        assert_eq!(body["joint"], false);
+
+        assert!(wait_for(Duration::from_secs(15), || !n1.state.as_ref().unwrap().in_quorum()).await,
+            "the removed node still counts itself in the quorum it was removed from");
+        assert_eq!(put_doc_at(&c, &successor, "t", "k", 1, "?w=majority").await, StatusCode::CREATED,
+            "the two remaining voters cannot decide on their own");
     }
 
     /// The point of commit 44: a learner becomes a voter without the cluster ever passing through
@@ -500,8 +652,6 @@ mod tests {
             n4.state.as_ref().unwrap().db.as_ref().unwrap()
                 .get_collection("t").map(|col| col.exists("after")).unwrap_or(false)
         }).await);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The other direction, and the reason a demoted node stays a member: it has to stop standing
@@ -536,8 +686,6 @@ mod tests {
         let r = c.delete(&format!("{}/cluster/members?url={}", n1.url(), n3.url()))
             .send().await.unwrap();
         assert_eq!(r.status(), StatusCode::OK, "demotion is what unblocks the removal");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A promotion that does not reach the election path is half a promotion: the node is counted
@@ -577,8 +725,6 @@ mod tests {
         let leader = crate::test_support::node_by_id(&[&n2, &n3, &n4], elected.as_deref().unwrap());
         assert!(wait_for(Duration::from_secs(15),
             || read_doc_http_blocking(leader)).await, "the committed write did not survive");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn read_doc_http_blocking(node: &TestNode) -> bool {
@@ -608,8 +754,6 @@ mod tests {
         assert!(!installed.contains(&n3.url()));
         assert!(!n3.state.as_ref().unwrap().in_quorum(),
             "a demoted node that forgets it on restart campaigns against a quorum it is not in");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -624,11 +768,6 @@ mod tests {
         let (code, body) = set_voters(&c, &n1.url(), &[]).await;
         assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{}", body);
 
-        let (code, body) = set_voters(&c, &n1.url(), &[n2.url(), n3.url()]).await;
-        assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{}", body);
-        assert!(body["error"].as_str().unwrap().contains("cannot remove itself"),
-            "nothing here transfers leadership, so a self-removal has to be refused: {}", body);
-
         let stranger = "http://127.0.0.1:1".to_string();
         let (code, body) = set_voters(&c, &n1.url(),
             &[n1.url(), n2.url(), n3.url(), stranger]).await;
@@ -642,8 +781,6 @@ mod tests {
         assert_eq!(after["uncommitted"], false);
         assert_eq!(after["voters"].as_array().unwrap().len(), 3);
         assert_eq!(put_doc_at(&c, &n1.url(), "t", "k", 1, "?w=majority").await, StatusCode::CREATED);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -666,8 +803,6 @@ mod tests {
             .json::<serde_json::Value>().await.unwrap();
         assert!(!listed["collections"].as_array().unwrap().iter().any(|v| v == "_config"),
             "a system log is not a client collection: {}", listed);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -703,8 +838,6 @@ mod tests {
 
         // Writes are unaffected by any of the refusals.
         assert_eq!(put_doc_at(&c, &n1.url(), "t", "k", 1, "?w=majority").await, StatusCode::CREATED);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -735,7 +868,5 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(3)).await;
         assert!(!holds("after"), "a removed node must stop receiving data");
         assert!(holds("before"), "and keeps what it already had");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -732,8 +732,6 @@ mod tests {
 
         view(5, "n1", vec![shard(0, 0, "http://b", &[])]).save(&dir).unwrap();
         assert_eq!(ClusterMetadata::load(&dir).unwrap().unwrap().shards[0].node_url, "http://b");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -750,8 +748,6 @@ mod tests {
         let holed = serde_json::to_vec(&view(3, "n1", vec![shard(0, HALF, "http://a", &[])])).unwrap();
         fs::write(root.join(CLUSTER_FILE), holed).unwrap();
         assert!(ClusterMetadata::load(&dir).is_err(), "a validated file must be validated on the way in too");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -764,8 +760,6 @@ mod tests {
 
         let back = ClusterMetadata::load(&dir).unwrap().expect("the staging file is complete once fsynced");
         assert_eq!(back.version, 9);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

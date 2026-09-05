@@ -1,7 +1,7 @@
 //! Background compaction and index-snapshot scheduling.
 
 use crate::state::AppState;
-use crate::storage::{Collection, SpaceUsage};
+use crate::storage::{Collection, Retention, SpaceUsage};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io;
@@ -23,6 +23,8 @@ pub struct MaintenanceConfig {
     pub compaction_min_wal_bytes: u64,
     #[serde(default = "default_snapshot_interval")]
     pub snapshot_interval_secs: u64,
+    #[serde(default = "default_wal_retention_bytes")]
+    pub wal_retention_bytes: u64,
 }
 
 fn default_maintenance_enabled() -> bool { true }
@@ -30,6 +32,9 @@ fn default_maintenance_interval() -> u64 { 60 }
 fn default_compaction_dead_ratio() -> f64 { 0.4 }
 fn default_compaction_min_bytes() -> u64 { 8 * 1024 * 1024 }
 fn default_snapshot_interval() -> u64 { 300 }
+// A little over one WAL rotation, so a replica lagging by up to a whole rotation still repairs
+// from frames. Past it the tail costs more to carry than the snapshot it saves.
+fn default_wal_retention_bytes() -> u64 { 64 * 1024 * 1024 }
 
 impl Default for MaintenanceConfig {
     fn default() -> Self {
@@ -39,6 +44,7 @@ impl Default for MaintenanceConfig {
             compaction_dead_ratio: default_compaction_dead_ratio(),
             compaction_min_wal_bytes: default_compaction_min_bytes(),
             snapshot_interval_secs: default_snapshot_interval(),
+            wal_retention_bytes: default_wal_retention_bytes(),
         }
     }
 }
@@ -62,6 +68,26 @@ fn should_compact(usage: &SpaceUsage, cfg: &MaintenanceConfig, is_leader: bool) 
     is_leader
         && usage.total_bytes >= cfg.compaction_min_wal_bytes
         && usage.dead_ratio() >= cfg.compaction_dead_ratio
+}
+
+/// What a compaction of this collection must not destroy: the frames the furthest-behind
+/// replication target still needs. A target this node has heard nothing from for the collection
+/// counts as needing everything, which `max_bytes` is what bounds.
+///
+/// `min_reclaim_bytes` is the scheduler's guard and not an operator's: `/compact` asks for the
+/// space back and gets the rewrite whether or not the tail leaves much to reclaim.
+pub fn retention_for(state: &AppState, collection: &str, cfg: &MaintenanceConfig, scheduled: bool)
+    -> Retention
+{
+    let targets = state.replication_targets();
+    if targets.is_empty() {
+        return Retention::none();
+    }
+    Retention {
+        above_lsn: targets.iter().map(|t| state.matched_lsn(t, collection)).min().unwrap_or(0),
+        max_bytes: cfg.wal_retention_bytes,
+        min_reclaim_bytes: if scheduled { cfg.compaction_min_wal_bytes } else { 0 },
+    }
 }
 
 // Index snapshots are not gated: they add a file and remove nothing, and a replica that never
@@ -110,7 +136,8 @@ pub fn maintenance_task(state: AppState, cfg: MaintenanceConfig) {
                         live_keys = usage.live_keys, "Dead-byte threshold reached; compacting");
 
                     let target = col.clone();
-                    match tokio::task::spawn_blocking(move || target.compact()).await {
+                    let retention = retention_for(&state, &name, &cfg, true);
+                    match tokio::task::spawn_blocking(move || target.compact(retention)).await {
                         Ok(Ok(())) => true,
                         Ok(Err(ref e)) if e.kind() == io::ErrorKind::WouldBlock => false,
                         Ok(Err(e)) => {
@@ -166,7 +193,61 @@ mod tests {
             compaction_dead_ratio: ratio,
             compaction_min_wal_bytes: min_bytes,
             snapshot_interval_secs: 300,
+            wal_retention_bytes: default_wal_retention_bytes(),
         }
+    }
+
+    /// The floor is the *furthest behind* target, not the average or the nearest: keeping frames
+    /// only the fastest replica still needs protects nobody.
+    #[tokio::test]
+    async fn the_floor_is_the_furthest_behind_replication_target() {
+        use crate::test_support::{next_test_port, temp_root, TestNode};
+
+        let root = temp_root();
+        let (ahead, behind) = (
+            format!("http://127.0.0.1:{}", next_test_port()),
+            format!("http://127.0.0.1:{}", next_test_port()),
+        );
+        let mut leader = TestNode::new("solo", next_test_port(), &root, "primary");
+        leader.replicas = vec![ahead.clone(), behind.clone()];
+        leader.start();
+        let state = leader.state.clone().unwrap();
+        let cfg = maint(0.4, 8 << 20);
+
+        {
+            let repl = state.replication.as_ref().unwrap();
+            let mut g = repl.write().unwrap();
+            g.progress.observe_ack(&ahead, "c", 900);
+            g.progress.observe_ack(&behind, "c", 12);
+        }
+
+        let r = retention_for(&state, "c", &cfg, true);
+        assert_eq!(r.above_lsn, 12, "the replica at 900 needs nothing the one at 12 does not");
+        assert_eq!(r.max_bytes, cfg.wal_retention_bytes);
+        assert_eq!(r.min_reclaim_bytes, cfg.compaction_min_wal_bytes);
+
+        assert_eq!(retention_for(&state, "never-written", &cfg, true).above_lsn, 0,
+            "a collection no target has acked counts as needing all of it, and the budget bounds it");
+        assert_eq!(retention_for(&state, "c", &cfg, false).min_reclaim_bytes, 0,
+            "an operator asking for the space back gets the rewrite either way");
+
+        leader.kill();
+    }
+
+    #[tokio::test]
+    async fn a_node_with_no_replication_target_retains_nothing() {
+        use crate::test_support::{next_test_port, temp_root, TestNode};
+
+        let root = temp_root();
+        let mut solo = TestNode::new("solo", next_test_port(), &root, "primary");
+        solo.start();
+        let state = solo.state.clone().unwrap();
+
+        let r = retention_for(&state, "c", &maint(0.4, 8 << 20), true);
+        assert_eq!(r.max_bytes, 0, "nothing downstream to protect is the pre-M15 behaviour");
+        assert_eq!(r.min_reclaim_bytes, 0, "and so nothing to weigh a rewrite against either");
+
+        solo.kill();
     }
 
     #[test]
@@ -235,7 +316,6 @@ mod tests {
 
             let dead = col.space_usage().unwrap().dead_bytes();
             let snapshotted = snapshot.exists();
-            let _ = std::fs::remove_dir_all(&root);
             (dead, snapshotted)
         }
 

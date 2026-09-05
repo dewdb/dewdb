@@ -182,6 +182,8 @@ async fn main() -> io::Result<()> {
             last_known_primary_position: None,
             progress: Progress::new(),
             leases: Default::default(),
+            handing_over: false,
+            novote_until: None,
             booted_at: std::time::Instant::now(),
             leader_committed: HashMap::new(),
             configuration: None,
@@ -197,6 +199,15 @@ async fn main() -> io::Result<()> {
     }
     if !config.auth.public_locked() {
         warn!(target: "boot", "auth.api_keys is empty; the public API accepts unauthenticated requests");
+    }
+    if config.auth.admin_locked() {
+        if !config.auth.public_locked() {
+            warn!(target: "boot",
+                "auth.admin_keys is set but auth.api_keys is empty; only /cluster/* and collection drops need a key");
+        }
+    } else if config.auth.public_locked() {
+        warn!(target: "boot",
+            "auth.admin_keys is empty; any auth.api_keys entry can change cluster topology and drop collections");
     }
 
     let state = AppState {
@@ -217,7 +228,7 @@ async fn main() -> io::Result<()> {
         cluster,
         ring_cache: Arc::new(std::sync::Mutex::new(Default::default())),
         migrations: Arc::new(std::sync::Mutex::new(MigrationRuns::restored(&config.data_dir))),
-        migration_write_gate: Arc::new(tokio::sync::RwLock::new(())),
+        write_gate: Arc::new(tokio::sync::RwLock::new(())),
     };
 
     if config.shard_role.as_deref() == Some("replica") {

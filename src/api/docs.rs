@@ -96,7 +96,7 @@ pub async fn create_doc(
         };
     }
 
-    let _movement_guard = state.migration_write_gate.read().await;
+    let _write_gate = state.write_gate.read().await;
 
     // The id is ours to choose, so choose one this shard owns rather than refuse the write.
     let id = match own_id(&state, &col_name, id) {
@@ -142,7 +142,7 @@ pub async fn put_doc(
         };
     }
 
-    let _movement_guard = state.migration_write_gate.read().await;
+    let _write_gate = state.write_gate.read().await;
 
     if let Some(refusal) = wrong_owner(&state, &col_name, &id) {
         return refusal;
@@ -191,7 +191,7 @@ pub async fn bulk_create_docs(
         return bulk_router_forward(&state, &col_name, payload, &wc_query).await;
     }
 
-    let _movement_guard = state.migration_write_gate.read().await;
+    let _write_gate = state.write_gate.read().await;
 
     let wc = match parse_write_concern(wcp.w.as_deref()) {
         Ok(wc) => wc,
@@ -331,7 +331,7 @@ pub async fn update_doc(
         };
     }
 
-    let _movement_guard = state.migration_write_gate.read().await;
+    let _write_gate = state.write_gate.read().await;
 
     if let Some(refusal) = wrong_owner(&state, &col_name, &id) {
         return refusal;
@@ -374,7 +374,7 @@ pub async fn delete_doc(
         };
     }
 
-    let _movement_guard = state.migration_write_gate.read().await;
+    let _write_gate = state.write_gate.read().await;
 
     if let Some(refusal) = wrong_owner(&state, &col_name, &id) {
         return refusal;
@@ -644,8 +644,6 @@ mod tests {
             .query(&[("sort", "rank:asc"), ("cursor", &key_cursor)])
             .send().await.unwrap();
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "an unsorted cursor is not a sort position");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// M3: `ceil(limit/n)` per shard, concatenated untrimmed, returned up to `n - 1` rows more than
@@ -717,8 +715,6 @@ mod tests {
         }
         ones.sort();
         assert_eq!(ones, keys, "one row per page must still walk the whole ring");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// M13: unsorted positions are per shard, so a key that changes owners mid-scan lands behind a
@@ -796,8 +792,6 @@ mod tests {
         let (status, body) = sorted(Some(sorted_cursor)).await;
         assert_eq!(status, StatusCode::OK, "a sorted cursor is not tied to the layout: {}", body);
         assert_eq!(body["items"].as_array().unwrap()[0]["i"].as_i64(), Some(3));
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// M4: `read=primary` used to be satisfiable by any replica that answered first — the router
@@ -842,8 +836,6 @@ mod tests {
         // A preference nobody implements is refused rather than quietly downgraded to primary.
         assert_eq!(read(n1.url(), "?read=Primary").await, StatusCode::BAD_REQUEST);
         assert_eq!(q(n1.url(), "?read=nearest").await, StatusCode::BAD_REQUEST);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The guarantee `read=primary` cannot give. It asks the node for its own opinion of who leads,
@@ -893,8 +885,6 @@ mod tests {
         let status = client.get(&format!("{}/collections/t/query?read=quorum", base))
             .send().await.unwrap().status();
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The router half: it still lists replicas so a promoted one is found, so the guarantee holds
@@ -946,8 +936,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
         assert!(recovered, "the router never found the new primary");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// M1: a filter the engine cannot evaluate is a client error. Before the fix it was dropped and
@@ -976,8 +964,6 @@ mod tests {
         let page: serde_json::Value = res.json().await.unwrap();
         assert_eq!(page["items"].as_array().map(|a| a.len()), Some(1),
             "a literal object matches by value, not by the field merely being present");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// H1: `Vec::with_capacity(limit)` on a caller-supplied `limit` is an allocation the process
@@ -1002,8 +988,6 @@ mod tests {
 
         assert_eq!(query("100".into()).await.ok(), Some(StatusCode::OK),
             "the node is still serving, which is the half of this that the status code cannot show");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// M18: anything that was not `1`, `majority`, `all` or a number became `w=1`, so a client that
@@ -1047,7 +1031,6 @@ mod tests {
         }
 
         node.kill();
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// M19, the bulk half: `local_write_batch` at `w=majority` against replicas that are not there
@@ -1077,6 +1060,5 @@ mod tests {
         assert_eq!(met.status(), StatusCode::CREATED, "a batch that met its concern is still 201");
 
         node.kill();
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -601,8 +601,6 @@ mod tests {
 
         // Writes to the new owner work.
         assert_eq!(cl.put(&c, moving[0], 7).await, StatusCode::OK);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -668,8 +666,6 @@ mod tests {
             .send().await.unwrap();
         assert_eq!(deleted.status(), StatusCode::NOT_FOUND,
             "a value deleted after the bulk copy must not reappear at cutover");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Finalization has to freeze the keys that are moving. It does not have to freeze the node:
@@ -756,8 +752,6 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -816,7 +810,6 @@ mod tests {
             Some(serde_json::json!({"v": 7})));
 
         node.kill();
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A destination whose group is one node wide accepts a handover no quorum holds. The source
@@ -897,7 +890,6 @@ mod tests {
         assert_eq!(h.held(), None, "a refused batch must not be published either");
 
         h.node.kill();
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -929,11 +921,79 @@ mod tests {
             "an unfinished reset must stay retryable");
 
         h.node.kill();
-        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A group can lose leadership and win it back inside one phase. The push task stops when it
+    /// does, so the run record it leaves behind must not read as "already running" (bugs.md L21).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_re_elected_source_leader_restarts_the_push_its_step_down_stopped() {
+        let root = temp_root();
+        let cl = Cluster::start_with_movement(&root, 1, 100).await;
+        let (a, b, c) = (cl.a.url(), cl.b.url(), cl.c.url());
+        let two: Vec<&str> = vec![&a, &b];
+        let three: Vec<&str> = vec![&a, &b, &c];
+
+        assert_eq!(cl.post(format!("{}/cluster/ring", a), ring_body(&two)).await.0, StatusCode::OK);
+        for node in [&b, &c] {
+            cl.post(format!("{}/internal/cluster", node),
+                serde_json::to_value(cl.a.state.as_ref().unwrap().cluster_view()).unwrap()).await;
+        }
+
+        let keys: Vec<String> = (0..120).map(|i| format!("k{:03}", i)).collect();
+        for key in &keys {
+            assert_eq!(cl.put(&owner_of(&two, key), key, 1).await, StatusCode::CREATED);
+        }
+        assert!(keys.iter().filter(|key| owner_of(&two, key) == a && owner_of(&three, key) == c)
+            .count() >= 5, "the test ring must move a workable number of keys off a");
+
+        assert_eq!(cl.post(format!("{}/cluster/migrate", a), ring_body(&three)).await.0,
+            StatusCode::ACCEPTED);
+        let state = cl.a.state.as_ref().unwrap().clone();
+        assert!(wait_for(Duration::from_secs(20), || {
+            crate::cluster::migration::progress(&state).is_some_and(|p| p.pushed > 0)
+        }).await, "a never started handing over");
+
+        // What a deposition does to the push task, without the churn that usually causes one.
+        {
+            let mut repl = state.replication.as_ref().unwrap().write().unwrap();
+            crate::consensus::state::relinquish_leadership(&mut repl);
+        }
+        assert!(wait_for(Duration::from_secs(20), || {
+            state.migrations.lock().unwrap().pushing.is_none()
+        }).await, "the push task never noticed the step-down");
+        assert!(crate::cluster::migration::progress(&state).is_some_and(|p| !p.done),
+            "the step-down landed after the copy finished, so there is nothing left to resume");
+
+        state.replication.as_ref().unwrap().write().unwrap().is_leader = true;
+        crate::consensus::seed_leader_progress(&state);
+        state.react_to_migration();
+
+        assert!(wait_for(Duration::from_secs(30), || {
+            state.migration().is_none()
+                && state.cluster_view().ring.is_some_and(|ring| ring.shards.len() == 3)
+        }).await, "the handover never resumed after a was re-elected: {:?}",
+            crate::cluster::migration::progress(&state));
+
+        drop(cl);
     }
 
     fn shard_json(node: &str, replicas: &[String]) -> serde_json::Value {
         serde_json::json!({"node_url": node, "replica_urls": replicas})
+    }
+
+    /// Why a survivor is not finishing a handover: what it believes about the plan, whether it is
+    /// leading, and what its own push and coordinator records say (bugs.md L21).
+    fn handover_diagnostic(node: &crate::test_support::TestNode) -> String {
+        let state = node.state.as_ref().unwrap();
+        let runs = state.migrations.lock().unwrap();
+        format!(
+            "{} leader={} term={} view_migration={:?} pushing={:?} progress={:?} coordinating={:?} waiting_on={:?}",
+            node.node_id, node.is_leader(), node.term(),
+            state.migration().map(|m| (m.id, m.phase)),
+            runs.pushing,
+            runs.current.as_ref().map(|p| (p.id.clone(), p.phase, p.pushed, p.total, p.done, p.error.clone())),
+            runs.coordinating, runs.waiting_on,
+        )
     }
 
     /// The ring names one node per shard, but a shard is a group. When its leader dies mid-handover
@@ -967,7 +1027,7 @@ mod tests {
             .collect();
         let mut destination = TestNode::new("dest", ports[3], &root, "primary");
         destination.start();
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        crate::test_support::await_converged(&group.iter().collect::<Vec<_>>()).await;
 
         let b3_node = group.pop().unwrap();
         let b2_node = group.pop().unwrap();
@@ -1023,9 +1083,8 @@ mod tests {
             })
         }).await;
 
-        assert!(landed,
-            "the handover never completed after b1 died; group leaders were {:?}",
-            [&b2_node, &b3_node].map(|node| (node.node_id.clone(), node.is_leader())));
+        assert!(landed, "the handover never completed after b1 died; survivors were {}",
+            [&b2_node, &b3_node].map(handover_diagnostic).join(" | "));
 
         // The reads below go through the destination's own ownership check, so it has to have
         // adopted the flipped ring too.
@@ -1042,7 +1101,6 @@ mod tests {
         }
 
         drop((b2_node, b3_node, destination));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1078,8 +1136,6 @@ mod tests {
 
         assert!(recorded,
             "the source never wrote down what it handed over, so a restart between the flip and              cleanup leaves the copies on both nodes with nothing able to tell them apart");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1125,7 +1181,6 @@ mod tests {
             .get_collection("t").unwrap().get("k1").unwrap(), None);
 
         source.kill();
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1154,7 +1209,6 @@ mod tests {
             "a replay after a restart erased the copy the reset was meant to precede");
 
         h.node.kill();
-        let _ = std::fs::remove_dir_all(&root);
     }
 
 
@@ -1183,12 +1237,17 @@ mod tests {
         let gone = HashRing { vnodes: 128, shards: shards(&["http://other-a", "http://other-b"]) };
         for node in [&source, &replica] {
             let state = node.state.as_ref().unwrap();
-            let mut view = state.cluster_view();
-            view.version += 1;
-            view.seeded = false;
-            view.updated_by = "operator".into();
-            view.ring = Some(gone.clone());
-            assert!(matches!(state.adopt_cluster(view), Adoption::Adopted { .. }));
+            // Re-read per attempt: the group is live and publishes views of its own, so a version
+            // sampled once can be stale by the time it is offered back.
+            let adopted = wait_for(Duration::from_secs(10), || {
+                let mut view = state.cluster_view();
+                view.version += 1;
+                view.seeded = false;
+                view.updated_by = "operator".into();
+                view.ring = Some(gone.clone());
+                matches!(state.adopt_cluster(view), Adoption::Adopted { .. })
+            }).await;
+            assert!(adopted, "{} never adopted the ring its group was dropped from", node.node_id);
         }
 
         let source_state = source.state.as_ref().unwrap();
@@ -1212,7 +1271,6 @@ mod tests {
 
         source.kill();
         replica.kill();
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// H16: the only migration handler with no leadership check, so cleanup addressed to the ring's
@@ -1237,7 +1295,6 @@ mod tests {
 
         source.kill();
         replica.kill();
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1281,7 +1338,6 @@ mod tests {
             "the handover record must survive a partial cleanup, or nothing can finish it later");
 
         source.kill();
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Shrinking is where the tidy-up is easy to get wrong: the departing shard leaves the owner
@@ -1328,8 +1384,6 @@ mod tests {
             assert_eq!(holder.as_deref(), Some(owner_of(&two, key).as_str()),
                 "key {} is not at its new owner", key);
         }
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1369,8 +1423,6 @@ mod tests {
             assert_eq!(cl.put(&owner, key, 2).await, StatusCode::OK,
                 "the source must remain writable after an abort");
         }
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1412,7 +1464,5 @@ mod tests {
         let read = cl.client.get(&format!("{}/collections/t/docs/{}", a, moving))
             .send().await.unwrap();
         assert_eq!(read.status(), StatusCode::OK, "the source still owns it, so it still serves it");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

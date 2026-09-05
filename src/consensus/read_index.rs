@@ -160,18 +160,23 @@ mod tests {
     use super::*;
     use crate::storage::frame::Configuration;
     use crate::test_support::{next_test_port, put_doc_http, temp_root, wait_for, TestNode};
-    use std::fs;
 
-    /// A stub voter, answering the one field the confirmation reads.
-    async fn serve_term(term: u64, role: &'static str, port: u16) {
+    /// A stub voter, answering the one field the confirmation reads, plus whatever silence it is
+    /// told to grant a probing leader.
+    async fn serve_voter(term: u64, role: &'static str, novote_ms: u64, port: u16) {
         let app = axum::Router::new().route(
             "/internal/heartbeat",
             axum::routing::get(move || async move {
-                axum::Json(serde_json::json!({"term": term, "role": role}))
+                axum::Json(serde_json::json!({
+                    "term": term, "role": role, "novote_ms": novote_ms }))
             }),
         );
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
         tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+    }
+
+    async fn serve_term(term: u64, role: &'static str, port: u16) {
+        serve_voter(term, role, 0, port).await;
     }
 
     #[tokio::test]
@@ -187,7 +192,6 @@ mod tests {
         assert!(index > 0, "the write is committed, so the read index has to cover it");
 
         leader.kill();
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -203,7 +207,6 @@ mod tests {
             "and probing must not leave an empty collection behind on every node");
 
         leader.kill();
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// Raft §6.4's first step. Staged entries with nothing of this term committed means the commit
@@ -235,7 +238,6 @@ mod tests {
             "and once an entry of this term is committed the refusal has to clear on its own");
 
         leader.kill();
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -249,7 +251,6 @@ mod tests {
         assert_eq!(read_index(replica.state.as_ref().unwrap(), "t").await, Err(ReadRefusal::NotLeader));
 
         replica.kill();
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -272,17 +273,13 @@ mod tests {
             "a partitioned leader that answers is exactly the stale read this exists to stop");
 
         leader.kill();
-        let _ = fs::remove_dir_all(&root);
     }
 
-    /// Hands the leader the promise a follower's poll would carry, from a peer that does not have
-    /// to exist for it: the promise is the whole of the evidence.
-    async fn promise(state: &AppState, voter: &str, term: u64, ms: u64) {
-        let url = format!("{}/internal/heartbeat", state.own_url());
-        let response = state.client.get(&url)
-            .query(&[("from", voter), ("term", &term.to_string()), ("novote_ms", &ms.to_string())])
-            .send().await.unwrap();
-        assert!(response.status().is_success());
+    /// Records what a probe of `voter` would have brought back, from a peer that does not have to
+    /// exist for it: the grant is the whole of the evidence.
+    fn grant(state: &AppState, voter: &str, term: u64, ms: u64) {
+        state.note_lease_grant(voter, term, Instant::now(), std::time::SystemTime::now(),
+            Duration::from_millis(ms));
     }
 
     /// A solo leader whose two voters are unreachable ports: the same setup that has to refuse a
@@ -313,7 +310,7 @@ mod tests {
             "nothing is reachable, so a read that has to ask cannot be answered at all");
 
         for voter in &voters {
-            promise(&state, voter, term, 10_000).await;
+            grant(&state, voter, term, 10_000);
         }
 
         let index = read_index(&state, "t").await
@@ -321,13 +318,12 @@ mod tests {
         assert!(index > 0);
 
         leader.kill();
-        let _ = fs::remove_dir_all(&root);
     }
 
-    /// The plumbing end to end: a real follower's polls carry the promise and the leader's reads
-    /// stop asking. Killing the follower is what tells a lease from a round -- a round would fail.
+    /// The plumbing end to end: the leader's own probes collect the grants and its reads stop
+    /// asking. Killing the follower is what tells a lease from a round -- a round would fail.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_real_followers_polls_are_the_lease_and_it_outlives_the_follower() {
+    async fn a_real_leaders_probes_are_the_lease_and_it_outlives_the_voter() {
         let root = temp_root();
         let (p1, p2) = (next_test_port(), next_test_port());
         let (u1, u2) = (format!("http://127.0.0.1:{}", p1), format!("http://127.0.0.1:{}", p2));
@@ -348,33 +344,102 @@ mod tests {
         assert!(put_doc_http(&client, &leader.url(), "k1", 1).await.is_success());
 
         assert!(wait_for(Duration::from_secs(10), || state.holds_read_lease()).await,
-            "a voter polling twice a second and promising each time has to add up to a lease");
+            "a leader probing twice a second and being granted each time has to add up to a lease");
 
         follower.kill();
         assert!(read_index(&state, "t").await.is_ok(),
             "the promise was for a window, not for as long as the node making it stays up");
 
         leader.kill();
-        let _ = fs::remove_dir_all(&root);
     }
 
+    /// The lease is a claim that no election can complete, and a handover is this node arranging
+    /// for exactly that. So it surrenders the lease first, and reads go back to asking.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_leader_handing_office_over_stops_resting_reads_on_its_leases() {
+        let root = temp_root();
+        let (p1, p2) = (next_test_port(), next_test_port());
+        let (u1, u2) = (format!("http://127.0.0.1:{}", p1), format!("http://127.0.0.1:{}", p2));
+
+        let mut leader = TestNode::new("n1", p1, &root, "primary");
+        leader.heartbeat_timeout_secs = 30;
+        leader.peers = vec![u2.clone()];
+        leader.replicas = vec![u2.clone()];
+        let mut follower = TestNode::new("n2", p2, &root, "replica");
+        follower.heartbeat_timeout_secs = 30;
+        follower.peers = vec![u1.clone()];
+        follower.primary_addr = Some(u1.clone());
+        leader.start();
+        follower.start();
+
+        let state = leader.state.clone().unwrap();
+        assert!(wait_for(Duration::from_secs(10), || state.holds_read_lease()).await,
+            "vacuous unless there is a lease to give up");
+
+        state.set_handing_over(true);
+        assert!(!state.holds_read_lease(),
+            "the voter this node is about to tell to stand will vote past the promise the lease              is made of, and nothing reports that back before the vote arrives");
+
+        // And the probes running underneath must not put one back while it is in flight.
+        assert!(!wait_for(Duration::from_secs(3), || state.holds_read_lease()).await,
+            "a grant recorded during the handover restores exactly the lease that was surrendered");
+
+        state.set_handing_over(false);
+        assert!(wait_for(Duration::from_secs(10), || state.holds_read_lease()).await,
+            "an abandoned handover leaves this node leading, so its reads have to get cheap again");
+
+        follower.kill();
+        leader.kill();
+    }
+
+    /// The leader's half of the round over the wire: it has to ask for the window, and read the
+    /// grant back out of the reply, without a real follower's contact clock in the way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_leaders_own_probe_collects_the_grant_and_the_read_stops_asking() {
+        let root = temp_root();
+        let mut leader = TestNode::new("solo", next_test_port(), &root, "primary");
+        leader.heartbeat_timeout_secs = 30;
+        leader.start();
+        let state = leader.state.clone().unwrap();
+        let client = reqwest::Client::new();
+        assert!(put_doc_http(&client, &leader.url(), "k1", 1).await.is_success());
+
+        let term = state.current_term();
+        let mut voters = vec![state.own_url()];
+        for _ in 0..2 {
+            let port = next_test_port();
+            serve_voter(term, "replica", 20_000, port).await;
+            voters.push(format!("http://127.0.0.1:{}", port));
+        }
+        state.install_configuration(Configuration::simple(voters));
+
+        assert!(wait_for(Duration::from_secs(10), || state.holds_read_lease()).await,
+            "the probe carries the ask and the reply carries the grant, or neither name is right");
+        assert!(read_index(&state, "t").await.is_ok());
+
+        leader.kill();
+    }
+
+    /// A probe outliving the term it went out at. The transition that ended that term dropped
+    /// every lease with it, and a reply landing afterwards must not put one back.
     #[tokio::test]
-    async fn a_voter_at_a_higher_term_cannot_promise_a_lease() {
+    async fn a_grant_answering_a_probe_from_an_older_term_is_not_a_lease() {
         let root = temp_root();
         let (mut leader, voters) = leader_with_absent_voters(&root).await;
         let state = leader.state.clone().unwrap();
-        let term = state.current_term();
+        state.replication.as_ref().unwrap().write().unwrap().term = 5;
 
-        // It computed that promise off a contact clock our answer will not reset, since it refuses
-        // everything from a term below its own. The promise is real; it is just not ours.
         for voter in &voters {
-            promise(&state, voter, term + 1, 10_000).await;
+            grant(&state, voter, 4, 10_000);
         }
-
         assert_eq!(read_index(&state, "t").await, Err(ReadRefusal::Unconfirmed));
 
+        for voter in &voters {
+            grant(&state, voter, 5, 10_000);
+        }
+        assert!(read_index(&state, "t").await.is_ok(), "and the same grant at our own term is one");
+
         leader.kill();
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -385,7 +450,7 @@ mod tests {
         let term = state.current_term();
 
         for voter in &voters {
-            promise(&state, voter, term, 300).await;
+            grant(&state, voter, term, 300);
         }
         assert!(read_index(&state, "t").await.is_ok());
 
@@ -394,7 +459,6 @@ mod tests {
             "a voter is free again the moment its promise runs out, and so is the leader");
 
         leader.kill();
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -418,7 +482,6 @@ mod tests {
         assert!(!state.is_leader(), "learning of a higher term is a demotion, not just a refusal");
 
         leader.kill();
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -444,6 +507,5 @@ mod tests {
         assert!(state.is_leader(), "and it is not a higher term, so there is nothing to step down to");
 
         leader.kill();
-        let _ = fs::remove_dir_all(&root);
     }
 }

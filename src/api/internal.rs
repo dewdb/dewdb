@@ -5,6 +5,7 @@ use crate::cluster::metadata::MigrationPhase;
 use crate::cluster::migration::{MigrateBatch, MigrateReset};
 use crate::consensus::config::CONFIG_LOG;
 use crate::consensus::lease;
+use crate::consensus::election::run_election;
 use crate::consensus::{
     decide_pre_vote, decide_vote, demote, heartbeat_poll_task, local_log_tails, log_summary,
     ReplicationMeta, VoteRequest, VoteResponse,
@@ -507,13 +508,13 @@ pub async fn data_summary_handler(
     }))).into_response()
 }
 
-/// What a polling follower tells the leader about itself. Absent from a peer that predates leases,
-/// which costs nothing but a confirmation round on the reads this node answers.
+/// A leader's lease round rides on the probe it sends anyway: `lease_ms` is how long it asks this
+/// node to go on refusing votes, at `term`. Absent from a peer that predates leases, which costs
+/// nothing but a confirmation round on the reads that peer answers.
 #[derive(Deserialize)]
 pub struct HeartbeatQuery {
-    pub from: Option<String>,
     pub term: Option<u64>,
-    pub novote_ms: Option<u64>,
+    pub lease_ms: Option<u64>,
 }
 
 pub async fn heartbeat_handler(
@@ -522,14 +523,13 @@ pub async fn heartbeat_handler(
 ) -> impl axum::response::IntoResponse {
     let term = state.current_term();
 
-    // Only from a voter no further along than we are: one at a higher term discards this answer, so
-    // its contact clock never resets on it and the promise it computed from that clock is not ours.
-    if let (Some(from), Some(their_term), Some(ms)) = (&q.from, q.term, q.novote_ms) {
-        if ms > 0 && their_term <= term {
-            let timeout = Duration::from_secs(state.config.heartbeat_timeout_secs);
-            state.note_lease_promise(from, lease::accept_promise(Duration::from_millis(ms), timeout));
-        }
-    }
+    // Answered as a duration, not a deadline: the asker dates it from before it sent this, so the
+    // flight comes off the lease instead of being covered by a margin. See bugs.md M16.
+    let novote_ms = match (q.term, q.lease_ms) {
+        (Some(asker_term), Some(ms)) if ms > 0 =>
+            state.grant_novote(asker_term, Duration::from_millis(ms)).as_millis() as u64,
+        _ => 0,
+    };
 
     let role = if state.is_leader() { "primary" } else { "replica" };
     let mut load = state.metrics.node_load();
@@ -538,6 +538,7 @@ pub async fn heartbeat_handler(
         "term": term,
         "role": role,
         "node_id": state.config.node_id,
+        "novote_ms": novote_ms,
         // Lets a peer notice a topology change without fetching the whole view every poll.
         "cluster_version": state.cluster_version(),
         "durable_lsn": state.db.as_ref().map_or(0, |db| db.durable_lsn.load(Ordering::SeqCst)),
@@ -551,6 +552,38 @@ pub async fn heartbeat_handler(
             .map(|(k, v)| (k, serde_json::Value::from(v)))
             .collect::<serde_json::Map<String, serde_json::Value>>(),
     }))).into_response()
+}
+
+/// Raft §3.10. The leader telling this node to stand for election now, without waiting out a
+/// contact timeout it would never see: the leader is still alive and is stepping aside.
+///
+/// Accepted only from the leader this node is following, which is the same authority the sender
+/// already spends on every heartbeat and replicate. Answered before the election runs, because the
+/// answer is "asked", not "won" -- the leader learns the rest from losing office.
+pub async fn timeout_now_handler(
+    State(state): State<AppState>,
+    Json(req): Json<crate::consensus::transfer::TimeoutNowRequest>,
+) -> impl axum::response::IntoResponse {
+    if !state.is_shard() || !state.in_quorum() {
+        return (StatusCode::FORBIDDEN, "Not a voting node").into_response();
+    }
+    if req.term < state.current_term() {
+        return err_json(StatusCode::CONFLICT, format!(
+            "handover offered at term {}, which this node has already left for {}",
+            req.term, state.current_term()));
+    }
+    if !state.honours_transfer(Some(&req.leader)) {
+        return err_json(StatusCode::CONFLICT, format!(
+            "{} is not the leader this node is following; not standing on its say-so", req.leader));
+    }
+
+    info!(target: "transfer", from = %req.leader, term = req.term,
+        "Told to stand for election; the leader is handing over");
+    let state2 = state.clone();
+    let from = req.leader.clone();
+    tokio::spawn(async move { run_election(&state2, 0, Some(from)).await });
+
+    (StatusCode::ACCEPTED, Json(serde_json::json!({ "status": "standing" }))).into_response()
 }
 
 /// Raft §9.6. Answers the vote handler's question and touches nothing: no term, no recorded vote,
@@ -576,8 +609,10 @@ pub async fn pre_vote_handler(
         let g = repl.read().unwrap();
         let must_withhold = lease::withholds_vote(
             lease::contact_age(g.last_heartbeat, g.last_replication),
+            g.novote_until,
             g.booted_at.elapsed(),
-            Duration::from_secs(state.config.heartbeat_timeout_secs));
+            Duration::from_secs(state.config.heartbeat_timeout_secs),
+            std::time::Instant::now());
         let granted = decide_pre_vote(
             g.term, &my_logs, my_summary, g.configuration.as_ref(), &req, must_withhold);
         (g.term, granted)
@@ -604,14 +639,18 @@ pub async fn vote_handler(
     // Collected before the replication lock: local_log_tails reaches the collections lock.
     let my_logs = local_log_tails(&state);
     let my_summary = log_summary(&state, &my_logs);
-    let (my_config, contact, since_boot) = {
+    let (my_config, contact, granted_until, since_boot) = {
         let g = repl.read().unwrap();
         (g.configuration.clone(),
          lease::contact_age(g.last_heartbeat, g.last_replication),
+         g.novote_until,
          g.booted_at.elapsed())
     };
-    let must_withhold = lease::withholds_vote(
-        contact, since_boot, Duration::from_secs(state.config.heartbeat_timeout_secs));
+    // A leader handing office over is the one case where fresh contact is not a reason to refuse:
+    // the contact is *from* the node standing aside, and only that node's name gets past this.
+    let must_withhold = lease::withholds_vote(contact, granted_until, since_boot,
+        Duration::from_secs(state.config.heartbeat_timeout_secs), std::time::Instant::now())
+        && !state.honours_transfer(req.transfer_from.as_deref());
 
     let (granted, resp_term, restart_poll, persist) = {
         let mut g = repl.write().unwrap();
@@ -702,7 +741,6 @@ mod tests {
         make_drop_frame, make_frame, next_test_port, put_doc_http, temp_root, TestNode,
     };
     use std::collections::HashMap;
-    use std::fs;
 
     async fn heartbeat(node: &TestNode) -> serde_json::Value {
         reqwest::Client::new()
@@ -772,7 +810,142 @@ mod tests {
             "and the same request wins once the leader has gone quiet, or nothing could ever elect");
 
         follower.kill();
-        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The voter half of the leader-initiated round, M16's fix. What is granted is a duration on
+    /// this node's clock, bounded by the ask and by the contact this node already owes silence over,
+    /// and recorded -- so clearing the contact clock does not release it under the leader counting it.
+    #[tokio::test]
+    async fn a_voter_grants_no_more_silence_than_its_own_contact_already_commits_it_to() {
+        let root = temp_root();
+        let mut follower = TestNode::new("replica", next_test_port(), &root, "replica");
+        follower.heartbeat_timeout_secs = 30;
+        follower.primary_addr = Some("http://127.0.0.1:1".to_string());
+        follower.start();
+        let state = follower.state.clone().unwrap();
+        let repl = state.replication.clone().unwrap();
+        let term = 5;
+        repl.write().unwrap().term = term;
+        let window = crate::consensus::lease::refusal_window(Duration::from_secs(30));
+
+        let base = follower.url();
+        let ask = |asker_term: u64, ms: u64| {
+            let url = format!("{}/internal/heartbeat", base);
+            async move {
+                reqwest::Client::new().get(&url)
+                    .query(&[("term", asker_term.to_string()), ("lease_ms", ms.to_string())])
+                    .send().await.unwrap()
+                    .json::<serde_json::Value>().await.unwrap()["novote_ms"].as_u64().unwrap()
+            }
+        };
+
+        // Nothing has been heard from any leader, so there is nothing to grant on the strength of.
+        repl.write().unwrap().last_heartbeat = None;
+        assert_eq!(ask(term, 60_000).await, 0);
+
+        repl.write().unwrap().last_heartbeat = Some(std::time::Instant::now());
+        let granted = ask(term, 60_000).await;
+        assert!(granted > 0 && granted <= window.as_millis() as u64,
+            "a leader asking for more than the voter's own window gets the window, not the ask");
+        assert_eq!(ask(term, 50).await, 50, "and no more than it asked for");
+        assert_eq!(ask(term - 1, 5_000).await, 0,
+            "a leader at a term this node has left may not rest its reads on our silence");
+
+        // The step-down path clears contact; the grant is what the leader is still counting.
+        {
+            let mut g = repl.write().unwrap();
+            g.last_heartbeat = None;
+            g.last_replication = None;
+            g.booted_at = std::time::Instant::now() - Duration::from_secs(60);
+            assert!(g.novote_until.is_some_and(|u| u > std::time::Instant::now()));
+        }
+        let body = serde_json::json!({
+            "term": term + 4, "candidate_id": "challenger", "last_lsn": 100, "last_term": term + 4});
+        let vote = reqwest::Client::new()
+            .post(format!("{}/internal/vote", follower.url()))
+            .json(&body).send().await.unwrap()
+            .json::<VoteResponse>().await.unwrap();
+        assert!(!vote.vote_granted,
+            "the grant outlives the contact it was computed from, or the lease resting on it is not one");
+
+        follower.kill();
+    }
+
+    /// The whole safety of the lease bypass: only the leader a voter is actually following can
+    /// spend its authority to stand something else up. Everything else stays refused, so the
+    /// bypass adds no way to force an election that commit 48 and commit 49 closed.
+    #[tokio::test]
+    async fn only_the_leader_a_voter_follows_can_get_a_vote_past_its_lease() {
+        let root = temp_root();
+        let leader_url = format!("http://127.0.0.1:{}", next_test_port());
+        let mut follower = TestNode::new("replica", next_test_port(), &root, "replica");
+        follower.heartbeat_timeout_secs = 30;
+        follower.primary_addr = Some(leader_url.clone());
+        follower.start();
+        let state = follower.state.clone().unwrap();
+        let repl = state.replication.clone().unwrap();
+        let term = state.current_term();
+
+        // Squarely inside the refusal window, which is where a healthy cluster's voters all sit.
+        repl.write().unwrap().last_heartbeat = Some(std::time::Instant::now());
+
+        let ask = |transfer_from: Option<String>| {
+            let url = follower.url();
+            async move {
+                let mut body = serde_json::json!({
+                    "term": term + 3, "candidate_id": "challenger",
+                    "last_lsn": 100, "last_term": term + 3});
+                if let Some(from) = transfer_from {
+                    body["transfer_from"] = serde_json::Value::from(from);
+                }
+                reqwest::Client::new()
+                    .post(format!("{}/internal/vote", url))
+                    .json(&body).send().await.unwrap()
+                    .json::<VoteResponse>().await.unwrap()
+            }
+        };
+
+        assert!(!ask(None).await.vote_granted, "vacuous unless the lease is holding here");
+        assert!(!ask(Some("http://127.0.0.1:1".to_string())).await.vote_granted,
+            "any node claiming a handover could force an election on a healthy cluster");
+        assert!(!ask(Some(follower.url())).await.vote_granted,
+            "and naming the voter itself is not naming the leader it follows");
+        assert!(ask(Some(leader_url)).await.vote_granted,
+            "the leader standing aside is the one case fresh contact from it must not refuse");
+
+        follower.kill();
+    }
+
+    /// The endpoint is reachable by anything that clears `/internal/*`, so it answers the same
+    /// question the vote does: is the sender the leader this node follows.
+    #[tokio::test]
+    async fn a_node_that_is_not_the_leader_cannot_order_a_voter_to_stand() {
+        let root = temp_root();
+        let leader_url = format!("http://127.0.0.1:{}", next_test_port());
+        let mut follower = TestNode::new("replica", next_test_port(), &root, "replica");
+        follower.heartbeat_timeout_secs = 30;
+        follower.primary_addr = Some(leader_url.clone());
+        follower.start();
+        let state = follower.state.clone().unwrap();
+        let term = state.current_term();
+
+        let tell = |leader: String, at: u64| {
+            let url = follower.url();
+            async move {
+                reqwest::Client::new()
+                    .post(format!("{}/internal/timeout-now", url))
+                    .json(&serde_json::json!({ "term": at, "leader": leader }))
+                    .send().await.unwrap().status()
+            }
+        };
+
+        assert_eq!(tell("http://127.0.0.1:1".to_string(), term).await, StatusCode::CONFLICT,
+            "anyone able to reach this endpoint could otherwise depose a healthy leader at will");
+        assert_eq!(state.current_term(), term, "and a refusal must not cost the voter a term");
+
+        assert_eq!(tell(leader_url, term).await, StatusCode::ACCEPTED,
+            "the leader this node follows is exactly who may hand office away");
+        follower.kill();
     }
 
     /// The restart hole. A promise the process before this one made can still be counted by a
@@ -812,7 +985,6 @@ mod tests {
             "and a node that has been up and heard nothing is exactly who has to elect the leader");
 
         follower.kill();
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// Raft §9.6 and bugs.md C20. The refusal itself is commit 48's; what is new is that reaching it
@@ -855,7 +1027,6 @@ mod tests {
         assert_eq!(state.current_term(), term, "still without a term moving, which the real vote does");
 
         follower.kill();
-        let _ = fs::remove_dir_all(&root);
     }
 
     fn assert_no_watermark(hb: &serde_json::Value) {
@@ -925,7 +1096,6 @@ mod tests {
         assert_eq!(col.pending_len(), 1, "the entry is still staged, not lost");
 
         replica.kill();
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -953,7 +1123,6 @@ mod tests {
         assert_eq!(col.pending_len(), 3, "the superseded frame is gone, not stacked under its replacement");
 
         replica.kill();
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// The whole of commit 46 rests on this field: without it the leader has no point below the
@@ -983,7 +1152,6 @@ mod tests {
         assert_eq!(body["applied"], watermark, "the leader resumes from here instead of snapshotting");
 
         replica.kill();
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1012,7 +1180,6 @@ mod tests {
         assert!(!meta.is_leader, "the step-down has to survive a restart, or it comes back leading");
 
         leader.kill();
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// M9b: `/internal/drop` refused before it read the term, so a deposed leader kept the
@@ -1049,7 +1216,6 @@ mod tests {
         assert!(db.live_collections().unwrap().is_empty());
 
         leader.kill();
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1065,7 +1231,6 @@ mod tests {
         assert_no_watermark(&heartbeat(&leader).await);
 
         leader.kill();
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1087,6 +1252,7 @@ mod tests {
             last_term: 9,
             logs: HashMap::new(),
             candidate_url: None,
+            transfer_from: None,
         };
         let response = reqwest::Client::new()
             .post(format!("{}/internal/vote", leader.url()))
@@ -1103,6 +1269,5 @@ mod tests {
         assert_no_watermark(&heartbeat(&leader).await);
 
         leader.kill();
-        let _ = fs::remove_dir_all(&root);
     }
 }

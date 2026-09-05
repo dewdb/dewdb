@@ -474,7 +474,5 @@ mod tests {
         let (status, _) = health_of(router(&root, empty_ring)).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE,
             "a ring with no shards routes nowhere, so it must not read as healthy");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

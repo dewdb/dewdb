@@ -237,7 +237,10 @@ mod cluster {
         let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
         let slow = others(&refs, &leader_url)[0].to_string();
 
-        delay(&leader_url, &slow, Duration::from_millis(1500));
+        // Wide on purpose: the assertion below separates "did not wait" (milliseconds) from
+        // "waited" (this delay), and a threshold set at the delay itself has no room for a
+        // scheduler stall between them (bugs.md L8b).
+        delay(&leader_url, &slow, Duration::from_secs(6));
         let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
         let started = std::time::Instant::now();
         let wrote = put_doc_http(&client, &leader_url, "k", 1).await;
@@ -246,7 +249,7 @@ mod cluster {
         heal(&leader_url, &slow);
 
         assert!(wrote.is_success(), "write to a leader with one slow voter got {}", wrote);
-        assert!(took < Duration::from_millis(1500),
+        assert!(took < Duration::from_millis(2500),
             "the write waited on the slow voter: {:?}", took);
         assert!(held, "leader {} stepped down over one slow voter", leader);
     }

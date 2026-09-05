@@ -1,9 +1,14 @@
-//! Leader leases: what a voter promises when it polls, and the round it saves the leader.
+//! Leader leases: what a voter grants when its leader asks, and the round it saves that leader.
 //!
 //! Commit 47 confirmed leadership per read, with a heartbeat round. The round asks whether any
 //! voter could have elected someone else; a voter that has heard from a leader recently answers
-//! that in advance by refusing to grant a vote, and its poll already carries the answer. A majority
-//! of those promises is a window in which no election can complete, which is a lease.
+//! that in advance by refusing to grant a vote. A majority of those refusals is a window in which
+//! no election can complete, which is a lease.
+//!
+//! The round is the leader's, Raft's shape: it stamps the interval before it sends the probe and
+//! the voter answers with a duration from its own clock, so the flight shortens the lease instead
+//! of being estimated by a margin. Commit 48 rode the answer along on the follower's poll instead,
+//! which meant converting one clock to the other across an unmeasured delay -- bugs.md M16.
 
 use super::failover::HEARTBEAT_POLL_INTERVAL_MS;
 use crate::storage::frame::Configuration;
@@ -34,33 +39,45 @@ pub fn contact_age(
 /// The other half of the lease, and sound only because it is kept: everything below rests on a voter
 /// with fresh contact not voting, whatever term the candidate offers.
 ///
+/// `granted_until` is a deadline this node handed a probing leader. Contact ageing out is the same
+/// instant by construction, so it adds no obligation -- it holds the one a transition that clears
+/// the contact clock would otherwise release while the leader is still counting it.
+///
 /// Boot counts the same as contact. A restart destroys the knowledge of whether this node was
 /// vote-eligible a moment ago, while a leader can still be counting the promise the process before
 /// it made, so a node that has just come up has to assume it owes that silence. Free at a cold
 /// start: the window is below the contact timeout, so it has lapsed before any candidate asks.
 pub fn withholds_vote(
     contact: Option<Duration>,
+    granted_until: Option<Instant>,
     since_boot: Duration,
     heartbeat_timeout: Duration,
+    now: Instant,
 ) -> bool {
     let window = refusal_window(heartbeat_timeout);
-    since_boot < window || contact.is_some_and(|age| age < window)
+    since_boot < window
+        || contact.is_some_and(|age| age < window)
+        || granted_until.is_some_and(|until| until > now)
 }
 
-/// What a poller may promise: the rest of its refusal window, less a margin for the request's
-/// flight. The leader starts the window when the request lands, which is after the age was read, so
-/// the margin is what keeps starting it late conservative rather than short. See bugs.md M16.
-pub fn promise(age: Option<Duration>, heartbeat_timeout: Duration) -> Duration {
-    let window = refusal_window(heartbeat_timeout);
-    match age {
-        Some(age) => window.saturating_sub(age).saturating_sub(window / 4),
+/// What a voter may grant a probing leader: the rest of its own refusal window, and nothing on
+/// credit. `None` contact is a node that has heard from no leader, which owes silence to none.
+///
+/// Counted from now on the voter's clock, and the leader dates it from before it sent the probe, so
+/// the delay between the two is subtracted from the lease rather than covered by a margin. It is
+/// also why this is never more than a voter is already committed to: a leader cannot buy silence
+/// past the point the voter would otherwise be free to campaign.
+pub fn grantable(contact: Option<Duration>, heartbeat_timeout: Duration) -> Duration {
+    match contact {
+        Some(age) => refusal_window(heartbeat_timeout).saturating_sub(age),
         None => Duration::ZERO,
     }
 }
 
-/// A promise is worth no more than our own window: nothing an honest voter with the same contact
-/// timeout computes exceeds it, and a misconfigured one must not be able to hand out an unbounded
-/// lease. A voter with a longer timeout loses some of its promise, which costs a round, not a read.
+/// A grant is worth no more than our own window, whatever a voter answers: nothing an honest one
+/// with the same contact timeout grants exceeds it, and a misconfigured or lying one must not be
+/// able to hand out an unbounded lease. A voter with a longer timeout loses some of its grant,
+/// which costs a round, not a read.
 pub fn accept_promise(claimed: Duration, heartbeat_timeout: Duration) -> Duration {
     claimed.min(refusal_window(heartbeat_timeout))
 }
@@ -98,9 +115,12 @@ impl Leases {
         self.promises.clear();
     }
 
-    /// `until` extends only: a poll promising less than one still outstanding says the voter's
-    /// contact aged, not that it withdrew anything. The clock pair is always the newest poll's --
-    /// the request arriving is fresh evidence that both clocks are running.
+    /// `now` is when the probe was *sent*, which is at or before the voter started counting: the
+    /// deadline this records is therefore never later than the one the voter will keep.
+    ///
+    /// `until` extends only: a round granting less than one still outstanding says the voter's
+    /// contact aged, not that it withdrew anything. The clock pair is always the newest round's --
+    /// the reply arriving is fresh evidence that both clocks are running.
     pub fn note_promise(
         &mut self,
         voter: &str,
@@ -153,29 +173,56 @@ mod tests {
         TIMEOUT * 10
     }
 
+    /// The whole of M16's arithmetic: a grant is a duration on the voter's clock, and the leader
+    /// dates it from before it asked, so any flight at all leaves the leader's deadline the earlier
+    /// of the two. The old follower-carried promise had to guess that flight with a fixed margin.
     #[test]
-    fn a_promise_is_what_is_left_of_the_window_and_never_all_of_it() {
+    fn a_leaders_deadline_lands_at_or_before_the_voters_however_long_the_probe_took() {
         let window = refusal_window(TIMEOUT);
         assert!(window < TIMEOUT, "a voter must be free to vote before it stands for election");
 
-        let fresh = promise(Some(Duration::ZERO), TIMEOUT);
-        assert!(fresh > Duration::ZERO && fresh < window,
-            "the margin covers the flight the leader cannot measure, so it is never the whole window");
-        assert!(promise(Some(window), TIMEOUT).is_zero(), "a voter at the edge owes nothing");
-        assert!(promise(None, TIMEOUT).is_zero());
-    }
+        let (sent, wall) = (Instant::now(), SystemTime::now());
+        let granted = grantable(Some(Duration::ZERO), TIMEOUT);
+        assert_eq!(granted, window, "a voter with fresh contact grants the whole of it");
+        let config = config(&["http://a", "http://b"]);
+        let at = |t: Instant| wall + t.saturating_duration_since(sent);
 
-    #[test]
-    fn anything_a_voter_promises_it_is_still_withholding_a_vote_over() {
-        for ms in [0, 100, 1000, 4000, 4500, 20_000] {
-            let age = Some(Duration::from_millis(ms));
-            assert!(promise(age, TIMEOUT).is_zero() || withholds_vote(age, booted(), TIMEOUT),
-                "a promise the voter would not honour at age {}ms is a stale read", ms);
+        for flight_ms in [0, 1, 50, 700, 5_000] {
+            let landed = sent + Duration::from_millis(flight_ms);
+            let mut leases = Leases::default();
+            leases.note_promise("http://a", sent, wall, granted);
+
+            assert!(leases.held(&config, OWN, sent, wall), "or the test proves nothing");
+            let voter_free_at = landed + granted;
+            assert!(!leases.held(&config, OWN, voter_free_at, at(voter_free_at)),
+                "the lease must be out by the time the voter is free again, flight {}ms", flight_ms);
         }
     }
 
     #[test]
-    fn a_promise_longer_than_our_own_window_is_taken_as_our_own_window() {
+    fn a_grant_is_what_is_left_of_the_voters_own_window_and_no_more() {
+        let window = refusal_window(TIMEOUT);
+        assert_eq!(grantable(Some(Duration::ZERO), TIMEOUT), window);
+        assert_eq!(grantable(Some(window / 2), TIMEOUT), window / 2);
+        assert!(grantable(Some(window), TIMEOUT).is_zero(), "a voter at the edge owes nothing");
+        assert!(grantable(None, TIMEOUT).is_zero());
+    }
+
+    #[test]
+    fn anything_a_voter_grants_it_is_still_withholding_a_vote_over() {
+        let now = Instant::now();
+        for ms in [0, 100, 1000, 4000, 4500, 20_000] {
+            let age = Some(Duration::from_millis(ms));
+            let granted = grantable(age, TIMEOUT);
+            assert!(granted.is_zero()
+                || withholds_vote(age, Some(now + granted), booted(), TIMEOUT, now + granted
+                    - Duration::from_nanos(1)),
+                "a grant the voter would not honour at age {}ms is a stale read", ms);
+        }
+    }
+
+    #[test]
+    fn a_grant_longer_than_our_own_window_is_taken_as_our_own_window() {
         let window = refusal_window(TIMEOUT);
         assert_eq!(accept_promise(Duration::from_secs(3600), TIMEOUT), window,
             "a voter with a broken timeout must not be able to hand out an unbounded lease");
@@ -186,13 +233,24 @@ mod tests {
     /// and nothing on disk says whether it did.
     #[test]
     fn a_node_that_has_just_booted_withholds_even_though_it_has_heard_from_nobody() {
-        let window = refusal_window(TIMEOUT);
-        assert!(withholds_vote(None, Duration::ZERO, TIMEOUT),
+        let (window, now) = (refusal_window(TIMEOUT), Instant::now());
+        assert!(withholds_vote(None, None, Duration::ZERO, TIMEOUT, now),
             "the promise a restart forgot is one a leader is entitled to still be holding");
-        assert!(withholds_vote(None, window - Duration::from_millis(1), TIMEOUT));
-        assert!(!withholds_vote(None, window, TIMEOUT), "and it is a window, not a state");
+        assert!(withholds_vote(None, None, window - Duration::from_millis(1), TIMEOUT, now));
+        assert!(!withholds_vote(None, None, window, TIMEOUT, now), "and it is a window, not a state");
         assert!(window < TIMEOUT,
             "a candidate only asks after the whole contact timeout, so a cold start waits on nothing");
+    }
+
+    /// A grant outlives the contact clock it was computed from. `relinquish_leadership` clears that
+    /// clock, and a leader on the other side of the probe is still counting the deadline.
+    #[test]
+    fn a_recorded_grant_holds_a_vote_back_after_the_contact_it_came_from_is_gone() {
+        let now = Instant::now();
+        let until = now + Duration::from_secs(2);
+        assert!(withholds_vote(None, Some(until), booted(), TIMEOUT, now));
+        assert!(!withholds_vote(None, Some(until), booted(), TIMEOUT, until),
+            "and it is still a deadline, not a state");
     }
 
     #[test]
@@ -252,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn a_later_poll_promising_less_does_not_shorten_the_lease() {
+    fn a_later_round_granting_less_does_not_shorten_the_lease() {
         let (now, wall) = (Instant::now(), SystemTime::now());
         let mut leases = Leases::default();
         let config = config(&["http://a", "http://b"]);

@@ -11,8 +11,6 @@ use crate::ring::{shard_owns, BuiltRing};
 use crate::storage::frame::Configuration;
 use crate::storage::Database;
 use std::collections::{HashMap, HashSet};
-#[cfg(test)]
-use std::fs;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, RwLock};
 
@@ -74,7 +72,10 @@ pub struct AppState {
     /// Progress of a handover this node is driving. Runtime only: a half-copied shard is this
     /// node's business, not a fact the cluster needs to agree on.
     pub migrations: Arc<std::sync::Mutex<MigrationRuns>>,
-    pub migration_write_gate: Arc<tokio::sync::RwLock<()>>,
+    /// The barrier that holds writes still on this node. Data movement drains it -- taken and
+    /// dropped, to settle writes that decided ownership under the old view -- and a leadership
+    /// transfer holds it, because a target has to reach a tail that is not moving.
+    pub write_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 #[derive(Default)]
@@ -211,6 +212,19 @@ impl AppState {
         }
     }
 
+    /// Whether this leader has appended to the collection in its own term. `advance` needs one
+    /// before it can commit anything a previous leader left behind, so a leader without one holds
+    /// an inherited tail it can never publish.
+    pub fn has_term_floor(&self, collection: &str) -> bool {
+        match self.replication.as_ref() {
+            Some(r) => {
+                let g = r.read().unwrap();
+                g.is_leader && g.progress.term_floor(collection).is_some()
+            },
+            None => false,
+        }
+    }
+
     /// Whether an entry of this leader's own term has committed for the collection. Until one has,
     /// `committed_lsn` can sit below entries a previous leader committed and this node holds staged.
     pub fn has_current_term_commit(&self, collection: &str) -> bool {
@@ -224,31 +238,84 @@ impl AppState {
         }
     }
 
-    /// Records a voter's promise not to grant a vote, taken from its heartbeat poll. A promise from
-    /// outside the configuration is dropped: it buys nothing, and keeping the map to the voting set
-    /// is also what bounds it.
-    pub fn note_lease_promise(&self, voter: &str, promise: std::time::Duration) {
-        if !self.quorum_config().contains(voter) {
+    /// The voter half of a leader's lease round: how long this node goes on refusing votes, and a
+    /// record of the deadline. Never more than the ask, and never more than this node's own contact
+    /// already commits it to, so a leader cannot buy silence past the point the voter would
+    /// otherwise be free to campaign.
+    pub fn grant_novote(&self, asker_term: u64, asked: std::time::Duration) -> std::time::Duration {
+        let repl = match self.replication.as_ref() {
+            Some(r) => r,
+            None => return std::time::Duration::ZERO,
+        };
+        let timeout = std::time::Duration::from_secs(self.config.heartbeat_timeout_secs);
+        let mut g = repl.write().unwrap();
+        // A leader at a term this node has left is not one whose reads may rest on our silence.
+        if asker_term < g.term {
+            return std::time::Duration::ZERO;
+        }
+        let age = crate::consensus::lease::contact_age(g.last_heartbeat, g.last_replication);
+        let granted = asked.min(crate::consensus::lease::grantable(age, timeout));
+        if granted.is_zero() {
+            return std::time::Duration::ZERO;
+        }
+        let until = std::time::Instant::now() + granted;
+        g.novote_until = Some(g.novote_until.map_or(until, |held| held.max(until)));
+        granted
+    }
+
+    /// Records what a voter granted in reply to our probe, dated from before that probe was sent.
+    /// Both ends of the interval are this node's own clock, so nothing is converted between two of
+    /// them. A grant from outside the configuration is dropped: it buys nothing, and keeping the
+    /// map to the voting set is also what bounds it.
+    ///
+    /// `term` is the term the probe went out at. A reply that outlives its term arrives after the
+    /// transition cleared the leases, and would otherwise resurrect one the transition retired.
+    pub fn note_lease_grant(
+        &self,
+        voter: &str,
+        term: u64,
+        sent: std::time::Instant,
+        sent_wall: std::time::SystemTime,
+        granted: std::time::Duration,
+    ) {
+        if granted.is_zero() || !self.quorum_config().contains(voter) {
             return;
         }
+        let capped = crate::consensus::lease::accept_promise(
+            granted, std::time::Duration::from_secs(self.config.heartbeat_timeout_secs));
         if let Some(repl) = self.replication.as_ref() {
             let mut g = repl.write().unwrap();
-            if g.is_leader {
-                g.leases.note_promise(
-                    voter, std::time::Instant::now(), std::time::SystemTime::now(), promise);
+            if g.is_leader && g.term == term && !g.handing_over {
+                g.leases.note_promise(voter, sent, sent_wall, capped);
             }
         }
     }
 
     /// Whether a majority is still promising not to vote, which is the fact a quorum read would
     /// otherwise spend a heartbeat round establishing.
+    ///
+    /// A handover in flight answers no whatever the promises say: this node has told a voter to
+    /// stand, that voter will grant past its own promise, and nothing tells this node the promise
+    /// broke until it is asked for a vote. Reads pay the confirmation round for that window, and
+    /// that round asks the voters themselves -- which is exactly what learns of the new term.
     pub fn holds_read_lease(&self) -> bool {
         let config = self.quorum_config();
         let own = self.own_url();
         match self.replication.as_ref() {
-            Some(r) => r.read().unwrap().leases.held(
-                &config, &own, std::time::Instant::now(), std::time::SystemTime::now()),
+            Some(r) => {
+                let g = r.read().unwrap();
+                !g.handing_over && g.leases.held(
+                    &config, &own, std::time::Instant::now(), std::time::SystemTime::now())
+            },
             None => false,
+        }
+    }
+
+    /// Marks a handover in flight. Set for the length of one, and cleared on every way out of it,
+    /// including the ones that leave this node still leading.
+    pub fn set_handing_over(&self, handing_over: bool) {
+        if let Some(repl) = self.replication.as_ref() {
+            repl.write().unwrap().handing_over = handing_over;
         }
     }
 
@@ -260,6 +327,25 @@ impl AppState {
             if g.is_leader {
                 g.progress.note_contact(replica, std::time::Instant::now());
             }
+        }
+    }
+
+    /// Whether this node would accept `from` handing its own office away: a voter answers for the
+    /// leader it is following, and a leader answers for itself. Nothing else is a leader here, so
+    /// nothing else can spend a leader's authority.
+    ///
+    /// It is what lets a transferred election past `lease::withholds_vote`, which every voter of a
+    /// healthy cluster is otherwise inside. Claiming it buys a node nothing: the only name that
+    /// passes is the leader this voter already obeys, and the vote still has to clear log freshness
+    /// and membership behind it.
+    pub fn honours_transfer(&self, from: Option<&str>) -> bool {
+        let (Some(from), Some(repl)) = (from, self.replication.as_ref()) else { return false };
+        let own = self.own_url();
+        let g = repl.read().unwrap();
+        match g.is_leader {
+            true => crate::util::same_endpoint(from, &own),
+            false => g.primary_addr.as_deref()
+                .is_some_and(|p| crate::util::same_endpoint(p, from)),
         }
     }
 
@@ -375,7 +461,7 @@ impl AppState {
             cluster: Arc::new(RwLock::new(cluster)),
             ring_cache: Arc::new(std::sync::Mutex::new(RingCache::default())),
             migrations: Arc::new(std::sync::Mutex::new(MigrationRuns::default())),
-            migration_write_gate: Arc::new(tokio::sync::RwLock::new(())),
+            write_gate: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
@@ -402,6 +488,8 @@ impl AppState {
                 last_known_primary_position: None,
                 progress: Progress::new(),
                 leases: Default::default(),
+                handing_over: false,
+                novote_until: None,
                 booted_at: std::time::Instant::now(),
                 leader_committed: HashMap::new(),
                 configuration: None,
@@ -421,7 +509,7 @@ impl AppState {
             cluster: Arc::new(RwLock::new(cluster)),
             ring_cache: Arc::new(std::sync::Mutex::new(RingCache::default())),
             migrations: Arc::new(std::sync::Mutex::new(MigrationRuns::default())),
-            migration_write_gate: Arc::new(tokio::sync::RwLock::new(())),
+            write_gate: Arc::new(tokio::sync::RwLock::new(())),
         }
     }
 
@@ -658,13 +746,22 @@ impl AppState {
     /// Driving it from here rather than from the endpoint means a node that learns about a plan by
     /// propagation participates in it exactly as if it had been told directly.
     pub fn react_to_migration(&self) {
-        match self.migration() {
-            Some(m) => crate::cluster::migration::ensure_running(self, &m),
+        let migration = match self.migration() {
+            Some(m) => m,
             // The plan is gone: either it landed as a new ring or it was abandoned. The record
             // stays, because cleanup still needs the list of keys handed over -- and it checks the
             // ring before acting, so an abandoned plan cannot be mistaken for a completed one.
             // Writes unfreeze regardless: the freeze is read from the view, not from this record.
-            None => {},
+            None => return,
+        };
+        crate::cluster::migration::ensure_running(self, &migration);
+        // Coordination resumes from here rather than from promotion alone, so a leader that learns
+        // of the plan afterwards -- by adoption, or by booting into it -- picks it up too. The
+        // rebalancer would, on its tick, but it is off by default (bugs.md L21).
+        if self.is_leader()
+            && crate::cluster::rebalance::is_coordinator(self, &self.cluster_view())
+        {
+            crate::api::migrate::resume_migration_coordination(self);
         }
     }
 
@@ -889,8 +986,6 @@ mod tests {
         // A quorum catching up drains the buffer and reopens the door.
         col.apply_committed(col.last_appended_lsn());
         assert!(state.admit_write("t").is_ok(), "backpressure must lift once commits catch up");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// C26: this asserted the opposite, reasoning that a follower refusing replicated frames would
@@ -914,8 +1009,6 @@ mod tests {
 
         let unbounded = AppState::for_admission_test(config_with_bound(&root, 0), db.clone(), true);
         assert!(unbounded.admit_write("t").is_ok(), "0 opts out of the bound");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -964,8 +1057,6 @@ mod tests {
             "http://127.0.0.1:9603".to_string(),
         ], "counting all five makes an election need three votes from a group that has three \
             nodes, and become_leader would replicate this group's frames into the other one");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1027,8 +1118,6 @@ mod tests {
 
         state.note_ack("http://127.0.0.1:9502", "t", lsn, state.current_term());
         assert_eq!(state.committed_lsn("t"), lsn, "leader plus a voter is a majority");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1057,8 +1146,6 @@ mod tests {
 
         assert!(state.is_learner(),
             "once the view says non-voting, this node must recognise itself as a learner");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
 
@@ -1082,8 +1169,6 @@ mod tests {
         let alone = shard_state(&root, serde_json::json!([]), serde_json::json!([]));
         assert!(alone.voting_peers().is_empty());
         assert_eq!(alone.voting_set().len(), 1, "a sole node is still its own quorum");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1094,8 +1179,6 @@ mod tests {
 
         assert_eq!(state.voting_set().len(), 3,
             "counting only `peers` here makes this a majority of one while its writes still              need two acks, so every such node elects itself");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1114,8 +1197,6 @@ mod tests {
 
         assert_eq!(state.voting_set().len(), 2,
             "an agreed view is what stops two nodes computing different majorities from              their own configs");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1136,8 +1217,6 @@ mod tests {
 
         assert_eq!(state.voting_set().len(), 3,
             "a view that does not name this node a voter must not strip its quorum to nothing");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     const HALF: u64 = 9223372036854775808;
@@ -1184,7 +1263,6 @@ mod tests {
 
         drop(routed);
         assert_eq!(state.fresh_node_loads()["a"].inflight, 2);
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1227,8 +1305,6 @@ mod tests {
 
         assert_eq!(state.shard_owners().len(), 2);
         assert_eq!(state.cluster_version(), 2);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1256,7 +1332,5 @@ mod tests {
             "keys must keep routing where they did before the bad update");
         assert!(ClusterMetadata::load(&dir).unwrap().map_or(true, |v| v.version == 1),
             "a refused view must not reach disk, or the next boot adopts what we just rejected");
-
-        let _ = fs::remove_dir_all(&root);
     }
 }

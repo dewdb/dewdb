@@ -484,8 +484,6 @@ mod tests {
         fs::write(root.join(PROGRESS_FILE), b"{ truncated").unwrap();
         assert!(ProgressMeta::load(&dir).sent_through.is_empty(),
             "an unreadable hint costs a probe, so it must not block startup");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

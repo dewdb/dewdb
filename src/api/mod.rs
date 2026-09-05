@@ -17,15 +17,21 @@ use internal::{
     cluster_update_handler, cluster_view_handler, data_summary_handler, heartbeat_handler,
     migrate_cleanup_handler, migrate_handler, migrate_reset_handler,
     migration_status_handler,
-    pre_vote_handler, replicate_handler, resync_handler, snapshot_handler, vote_handler,
+    pre_vote_handler, replicate_handler, resync_handler, snapshot_handler,
+    timeout_now_handler, vote_handler,
 };
-use members::{configuration_handler, join_handler, leave_handler, set_configuration_handler};
+use members::{
+    configuration_handler, join_handler, leave_handler, set_configuration_handler,
+    transfer_leadership_handler,
+};
 use migrate::{abort_migration_handler, migration_status, start_migration_handler};
 use middleware::{auth_middleware, metrics_middleware};
 use observe::{cluster_handler, health_handler, metrics_handler};
 use ring::set_ring_handler;
 
 use crate::state::AppState;
+use crate::storage::frame::{MAX_INTERNAL_BODY, MAX_PUBLIC_BODY};
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, post};
 use axum::Router;
 
@@ -37,6 +43,7 @@ pub fn build_app(state: &AppState) -> Router {
         .route("/cluster/members", post(join_handler).delete(leave_handler))
         .route("/cluster/configuration", get(configuration_handler).post(set_configuration_handler))
         .route("/cluster/ring", post(set_ring_handler))
+        .route("/cluster/transfer-leadership", post(transfer_leadership_handler))
         .route("/cluster/migrate", post(start_migration_handler)
             .get(migration_status).delete(abort_migration_handler))
         .route("/cluster/rebalance", get(rebalance_status_handler))
@@ -56,14 +63,19 @@ pub fn build_app(state: &AppState) -> Router {
 
     if state.config.role == "shard" {
         app = app
-            .route("/internal/replicate", post(replicate_handler))
+            // Frame-carrying, so bounded by `storage::frame`'s chain, not the public limit: a
+            // frame the log holds has to be shippable or the collection stops replicating (H13).
+            .route("/internal/replicate", post(replicate_handler)
+                .layer(DefaultBodyLimit::max(MAX_INTERNAL_BODY)))
             .route("/internal/snapshot", get(snapshot_handler))
             .route("/internal/resync", post(resync_handler))
             .route("/internal/vote", post(vote_handler))
             .route("/internal/pre-vote", post(pre_vote_handler))
+            .route("/internal/timeout-now", post(timeout_now_handler))
             .route("/internal/heartbeat", get(heartbeat_handler))
             .route("/internal/data-summary", get(data_summary_handler))
-            .route("/internal/migrate", post(migrate_handler))
+            .route("/internal/migrate", post(migrate_handler)
+                .layer(DefaultBodyLimit::max(MAX_INTERNAL_BODY)))
             .route("/internal/migrate-reset", post(migrate_reset_handler))
             .route("/internal/migrate-cleanup", post(migrate_cleanup_handler))
             .route("/internal/migration-status", get(migration_status_handler));
@@ -73,7 +85,9 @@ pub fn build_app(state: &AppState) -> Router {
     let app = app.layer(axum::middleware::from_fn_with_state(
         state.clone(), middleware::chaos_middleware));
 
-    app.layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
+    // Chosen, not inherited from axum's default, and outside the route layers above so those win.
+    app.layer(DefaultBodyLimit::max(MAX_PUBLIC_BODY))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), auth_middleware))
         .layer(axum::middleware::from_fn_with_state(state.clone(), metrics_middleware))
         .with_state(state.clone())
 }

@@ -5,7 +5,8 @@
 //! cluster varies by more than most of the effects being measured, so one number proves nothing.
 
 use crate::test_support::{
-    cleanup, get_raw, put_doc_at, put_value, sharded_cluster, single_node, temp_root, three_node_cluster,
+    cleanup, get_raw, put_doc_at, put_value, sharded_cluster, single_node, temp_root,
+    three_node_cluster_with_timeout,
     voter_group, TestNode,
 };
 use std::sync::Arc;
@@ -138,7 +139,7 @@ async fn bench_write_concern() {
         let mut samples = Vec::new();
         for _ in 0..SAMPLES {
             let root = temp_root();
-            let (n1, _n2, _n3) = three_node_cluster(&root).await;
+            let (n1, _n2, _n3) = three_node_cluster_with_timeout(&root, 1).await;
             let client = bench_client();
             let _ = put_doc_at(&client, &n1.url(), "bench", "warm", 0, "?w=all&wtimeout=15000").await;
             samples.push(write_sample(&n1, client, query, 16, 40, tag).await);
@@ -169,7 +170,7 @@ async fn bench_replication_cost() {
     let mut clustered = Vec::new();
     for _ in 0..SAMPLES {
         let root = temp_root();
-        let (n1, _n2, _n3) = three_node_cluster(&root).await;
+        let (n1, _n2, _n3) = three_node_cluster_with_timeout(&root, 1).await;
         let client = bench_client();
         let _ = put_doc_at(&client, &n1.url(), "bench", "warm", 0, "?w=1").await;
         clustered.push(write_sample(&n1, client, "?w=1", 16, 40, "clus").await);
@@ -190,7 +191,7 @@ async fn bench_concurrency_scaling() {
         let mut samples = Vec::new();
         for _ in 0..SAMPLES {
             let root = temp_root();
-            let (n1, _n2, _n3) = three_node_cluster(&root).await;
+            let (n1, _n2, _n3) = three_node_cluster_with_timeout(&root, 1).await;
             let client = bench_client();
             let _ = put_doc_at(&client, &n1.url(), "bench", "warm", 0, "?w=all&wtimeout=15000").await;
             samples.push(write_sample(&n1, client, "?w=majority&wtimeout=15000", conc, per, "cs").await);
@@ -209,7 +210,7 @@ async fn bench_batch_writes() {
     let mut singles = Vec::new();
     for _ in 0..SAMPLES {
         let root = temp_root();
-        let (n1, _n2, _n3) = three_node_cluster(&root).await;
+        let (n1, _n2, _n3) = three_node_cluster_with_timeout(&root, 1).await;
         let client = bench_client();
         let _ = put_doc_at(&client, &n1.url(), "bench", "warm", 0, "?w=all&wtimeout=15000").await;
         singles.push(write_sample(&n1, client, "?w=majority&wtimeout=15000", 8, 40, "sg").await);
@@ -224,7 +225,7 @@ async fn bench_batch_writes() {
     let mut batched = Vec::new();
     for _ in 0..SAMPLES {
         let root = temp_root();
-        let (n1, _n2, _n3) = three_node_cluster(&root).await;
+        let (n1, _n2, _n3) = three_node_cluster_with_timeout(&root, 1).await;
         let client = bench_client();
         // The row above warms the collection before timing; without the same warm-up this one
         // measures a first write to a collection the replicas have never seen instead of a bulk.
@@ -241,8 +242,10 @@ async fn bench_batch_writes() {
                 .post(format!("{}/collections/bench/docs/bulk?w=majority&wtimeout=15000", url))
                 .json(&docs)
                 .send().await;
+            // `207` is a success status and every document under it missed its concern, so
+            // accepting one benchmarks the batch that did less work (bugs.md H7).
             let ok = match resp {
-                Ok(r) if r.status().is_success() => true,
+                Ok(r) if r.status() == reqwest::StatusCode::CREATED => true,
                 Ok(r) => panic!("bulk write returned {}: {}", r.status(),
                     r.text().await.unwrap_or_default()),
                 Err(e) => panic!("bulk write failed: {}", e),
@@ -274,7 +277,7 @@ async fn bench_reads() {
         let mut samples = Vec::new();
         for _ in 0..SAMPLES {
             let root = temp_root();
-            let (n1, _n2, _n3) = three_node_cluster(&root).await;
+            let (n1, _n2, _n3) = three_node_cluster_with_timeout(&root, 1).await;
             let client = bench_client();
             let keys = 200usize;
             let payload = serde_json::json!({"pad": "x".repeat(filler)});
@@ -314,7 +317,7 @@ async fn bench_queries() {
         let mut samples = Vec::new();
         for _ in 0..SAMPLES {
             let root = temp_root();
-            let (n1, _n2, _n3) = three_node_cluster(&root).await;
+            let (n1, _n2, _n3) = three_node_cluster_with_timeout(&root, 1).await;
             let client = bench_client();
             for k in 0..500 {
                 let st = put_doc_at(&client, &n1.url(), "bench", &format!("q{:04}", k), k as i64,

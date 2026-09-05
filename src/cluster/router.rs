@@ -959,7 +959,7 @@ mod tests {
     /// third 404'd on a path that matched no route.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_key_the_client_escaped_reaches_the_shard_whole() {
-        use crate::test_support::{cleanup, temp_root, two_shard_cluster};
+        use crate::test_support::{temp_root, two_shard_cluster};
 
         let root = temp_root();
         let (_s1, _s2, router) = two_shard_cluster(&root).await;
@@ -989,8 +989,6 @@ mod tests {
         want.sort();
         assert_eq!(stored, want, "the shards hold the keys they were written with: {}", listed);
 
-        drop(router);
-        cleanup(&root).await;
     }
 
     /// H15's blast radius on a router. Reads stopped creating collections on demand, so a shard
@@ -998,7 +996,7 @@ mod tests {
     /// read as a failed shard (`502`) and as a partial maintenance failure (`207`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_collection_narrower_than_the_ring_still_reads_through_the_router() {
-        use crate::test_support::{cleanup, put_value, temp_root, two_shard_cluster};
+        use crate::test_support::{put_value, temp_root, two_shard_cluster};
 
         let root = temp_root();
         let (s1, s2, router) = two_shard_cluster(&root).await;
@@ -1041,7 +1039,5 @@ mod tests {
             assert_eq!(r.status(), StatusCode::NOT_FOUND, "{} of a collection no shard holds", action);
         }
 
-        drop(router);
-        cleanup(&root).await;
     }
 }

@@ -547,6 +547,7 @@ pub async fn replica_sync_from_primary(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::Retention;
     use crate::replication::ReplicateRequest;
     use crate::test_support::{TestNode, live_put, make_frame, next_test_port, put_doc_http, temp_root};
     use futures::StreamExt;
@@ -639,8 +640,6 @@ mod tests {
         let wals: Vec<&String> = names.iter().filter(|n| is_wal_filename(n)).collect();
         assert_eq!(wals, ["wal-00001.log", "wal-99999.log", "wal-100000.log"],
             "sorting by name puts wal-100000 before wal-99999");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -659,8 +658,6 @@ mod tests {
         collect_snapshot(col.clone()).await;
         assert_eq!(wal_ids_on_disk(&col.root_path), settled,
             "a request answered from an untouched active WAL must not rotate");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -680,8 +677,6 @@ mod tests {
         fs::create_dir_all(&staged).unwrap();
         decode_bytes(wire, &staged).await
             .expect("a leftover file at the next id must not take the transfer down with it");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -739,8 +734,6 @@ mod tests {
             !staged.exists(),
             "a successful installation consumes the staging directory"
         );
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// H18: `snapshot_handler` resolved with `get_collection`, so being *asked* for a collection
@@ -778,7 +771,6 @@ mod tests {
             "and must not leave a staging directory behind");
 
         leader.kill();
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -834,7 +826,6 @@ mod tests {
         );
 
         server.abort();
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// The source is a node that was leader and no longer is: its log stops below what this node
@@ -889,7 +880,6 @@ mod tests {
         assert!(!replica_db.root_path.join("events.tmp").exists());
 
         server.abort();
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// Maintenance holds an `Arc` across the install that replaces the directory under it: a
@@ -918,7 +908,7 @@ mod tests {
         let wals_before = wal_ids_on_disk(&installed);
         let index_before = fs::read(installed.join(INDEX_FILENAME)).unwrap();
 
-        let error = previous.compact().unwrap_err();
+        let error = previous.compact(Retention::none()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound,
             "a handle the install released must refuse compaction outright");
         assert_eq!(wal_ids_on_disk(&installed), wals_before,
@@ -930,8 +920,6 @@ mod tests {
         for i in 0..4 {
             assert_eq!(restored.get(&format!("k{}", i)).unwrap(), Some(serde_json::json!({"v": i})));
         }
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// The boot resync enumerates names off disk, and `adopt_collection_tails` has opened every one
@@ -952,8 +940,6 @@ mod tests {
             "a collection reopened at boot still has a watermark an install must clear");
         assert!(reopened.existing_collection("absent").is_none(),
             "and probing a name we have never held must not create it");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -975,8 +961,6 @@ mod tests {
         decode_bytes(wire, &staged).await.unwrap();
         validate_staged_snapshot(&staged, local.applied_lsn())
             .expect("equal watermarks are not a regression; only a lower one is");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1017,8 +1001,6 @@ mod tests {
             "the later write belongs to the new active WAL, beyond this snapshot boundary"
         );
         assert!(source.get("after").unwrap().is_some());
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1064,7 +1046,6 @@ mod tests {
         );
 
         replica.kill();
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -1082,7 +1063,5 @@ mod tests {
         let error = decode_bytes(wire, &target).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(!root.join("x.log").exists());
-
-        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -37,6 +37,11 @@ pub struct VoteRequest {
     /// and not by `candidate_id`. Absent from a peer that predates configuration entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_url: Option<String>,
+    /// The leader that told this candidate to stand, on a transfer. A voter that is following that
+    /// leader votes despite fresh contact from it -- see `AppState::honours_transfer`, and Raft
+    /// §3.10, where the whole point is that a healthy cluster's leader can hand office over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_from: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -200,6 +205,7 @@ fn vote_request(
     logs: &HashMap<String, LogTail>,
     tail: LogTail,
     own: &str,
+    transfer_from: Option<String>,
 ) -> VoteRequest {
     VoteRequest {
         term,
@@ -208,6 +214,7 @@ fn vote_request(
         last_term: tail.last_term,
         logs: logs.clone(),
         candidate_url: Some(own.to_string()),
+        transfer_from,
     }
 }
 
@@ -282,10 +289,16 @@ async fn ask_peers(
     (granted.lock().unwrap().clone(), highest_term.load(Ordering::Relaxed))
 }
 
-pub async fn run_election(state: &AppState, max_delay_ms: u64) {
-    let delay_ms = election_jitter(&state.config.node_id, max_delay_ms);
-    info!(target: "election", "Waiting {}ms before requesting votes...", delay_ms);
-    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+/// `forced_by` is the leader handing office over (Raft §3.10). Everything a timeout election does
+/// to avoid disturbing a live leader is exactly what a transfer must skip -- the jitter, adopting
+/// the leader that is standing aside, and the pre-vote round it would lose by asking.
+pub async fn run_election(state: &AppState, max_delay_ms: u64, forced_by: Option<String>) {
+    let forced = forced_by.is_some();
+    if !forced {
+        let delay_ms = election_jitter(&state.config.node_id, max_delay_ms);
+        info!(target: "election", "Waiting {}ms before requesting votes...", delay_ms);
+        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+    }
 
     if state.is_leader() {
         return;
@@ -296,11 +309,13 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64) {
     if !state.in_quorum() {
         info!(target: "election",
             "This node is a non-voting member; waiting for the leader rather than standing");
-        adopt_existing_leader(state).await;
+        if !forced {
+            adopt_existing_leader(state).await;
+        }
         return;
     }
 
-    if adopt_existing_leader(state).await {
+    if !forced && adopt_existing_leader(state).await {
         info!(target: "election", "A leader is already serving; aborting election and following it");
         return;
     }
@@ -319,9 +334,11 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64) {
 
     // Raft §9.6: a term this node raises and then loses with deposes a leader that was serving
     // fine, so ask whether it could win before standing costs the group anything (bugs.md C20).
-    if !lone_voter && !peers.is_empty() {
+    // A transfer skips it: the leader is standing aside, so every voter still inside its refusal
+    // window would answer no, and the leader has already established this node holds its tail.
+    if !forced && !lone_voter && !peers.is_empty() {
         let asking = state.current_term() + 1;
-        let probe = vote_request(asking, &candidate_id, &my_logs, my_tail, &own);
+        let probe = vote_request(asking, &candidate_id, &my_logs, my_tail, &own, None);
         let (willing, seen_term) = ask_peers(
             state, &probe, peers.clone(), &quorum, "/internal/pre-vote", true, round_deadline).await;
 
@@ -351,8 +368,8 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64) {
             "Could not persist candidacy for term {}; abandoning this election", new_term);
         return;
     }
-    info!(target: "election", "Node {} standing for term {} (voters {:?}, outgoing {:?})",
-        candidate_id, new_term, quorum.voters, quorum.outgoing);
+    info!(target: "election", "Node {} standing for term {} (voters {:?}, outgoing {:?}, handover {:?})",
+        candidate_id, new_term, quorum.voters, quorum.outgoing, forced_by);
 
     if lone_voter {
         become_leader(state, new_term, &candidate_id).await;
@@ -363,7 +380,7 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64) {
         return;
     }
 
-    let req = vote_request(new_term, &candidate_id, &my_logs, my_tail, &own);
+    let req = vote_request(new_term, &candidate_id, &my_logs, my_tail, &own, forced_by);
     let (granted, seen_term) = ask_peers(
         state, &req, peers, &quorum, "/internal/vote", false, round_deadline).await;
 
@@ -405,11 +422,17 @@ pub fn seed_leader_progress(state: &AppState) {
     }
 }
 
-/// Raft's no-op, appended once per collection that has one. A collection with a durable-but-
+/// Raft's no-op, appended once per collection that needs one. A collection with a durable-but-
 /// uncommitted tail from a previous leader has no current-term entry, so `advance` has no floor and
 /// will not commit it however many replicas hold it; committing a barrier above it commits it
-/// indirectly. Collections with nothing pending are skipped — the floor a write sets is enough for
-/// the write itself, and a barrier there would be a frame written for no reason on every election.
+/// indirectly. Collections already covered by a current-term append are skipped — the floor a write
+/// sets is enough for the write itself, and a barrier there would be a frame written for no reason
+/// on every election.
+///
+/// Called at promotion and then on every drive tick, because promotion is a moment and the state
+/// this fixes outlives it: a collection mid-resync is absent from the listing, and a term that
+/// moves under the spawned task takes the barrier with it. Missing it once stranded the tail for
+/// the life of the term (bugs.md C30).
 pub fn publish_inherited_tails(state: &AppState) {
     let db = match state.db.as_ref() {
         Some(db) => db.clone(),
@@ -420,8 +443,11 @@ pub fn publish_inherited_tails(state: &AppState) {
 
     tokio::spawn(async move {
         for name in db.list_collections().unwrap_or_default() {
+            // The invariant, not a sample of it: `pending_len` was whatever promotion happened to
+            // see, and a tail over the commit index with no floor is what cannot resolve itself.
             let col = match db.get_collection(&name) {
-                Ok(c) if c.pending_len() > 0 => c,
+                Ok(c) if c.last_appended_lsn() > state.committed_lsn(&name)
+                    && !state.has_term_floor(&name) => c,
                 _ => continue,
             };
             // Leadership is re-checked per collection: this loop outlives a demotion otherwise.
@@ -500,15 +526,8 @@ async fn become_leader(state: &AppState, term: u64, candidate_id: &str) {
     info!(target: "election", "Node {} is now accepting writes", candidate_id);
 
     // A handover in flight is the new leader's to run: the deposed node's copy stopped with it, and
-    // the coordinator polls this group, not that node. The rebalancer does the same on its tick,
-    // but it is off by default, so promotion cannot rely on it.
-    let view = state.cluster_view();
-    if view.migration.is_some() {
-        state.react_to_migration();
-        if crate::cluster::rebalance::is_coordinator(state, &view) {
-            crate::api::migrate::resume_migration_coordination(state);
-        }
-    }
+    // the coordinator polls this group, not that node.
+    state.react_to_migration();
 }
 
 #[cfg(test)]
@@ -524,6 +543,7 @@ mod tests {
             last_lsn,
             logs: HashMap::new(),
             candidate_url: None,
+            transfer_from: None,
         }
     }
 
@@ -543,6 +563,7 @@ mod tests {
             last_lsn: logs.values().map(|t| t.last_lsn).max().unwrap_or(0),
             logs,
             candidate_url: None,
+            transfer_from: None,
         }
     }
 
@@ -793,7 +814,7 @@ mod tests {
 
         let before = state.current_term();
         for _ in 0..3 {
-            run_election(&state, 0).await;
+            run_election(&state, 0, None).await;
         }
 
         assert_eq!(state.current_term(), before,
@@ -801,7 +822,6 @@ mod tests {
         assert!(!state.is_leader(), "and it must not be able to elect itself either");
 
         node.kill();
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A peer with no route for the endpoint, which is what a node predating pre-vote answers with.
@@ -827,7 +847,7 @@ mod tests {
         serve_nothing(old_port).await;
         let old_peer = format!("http://127.0.0.1:{}", old_port);
         let quorum = Configuration::simple(vec![state.own_url(), old_peer.clone()]);
-        let req = vote_request(9, "candidate", &HashMap::new(), LogTail::default(), &state.own_url());
+        let req = vote_request(9, "candidate", &HashMap::new(), LogTail::default(), &state.own_url(), None);
         let deadline = Duration::from_secs(3);
 
         let (willing, _) = ask_peers(&state, &req, vec![old_peer.clone()], &quorum,
@@ -840,7 +860,6 @@ mod tests {
         assert!(!quorum.has_quorum(&granted), "a real vote nobody answered is not a vote");
 
         node.kill();
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -894,8 +913,6 @@ mod tests {
         let my_logs = local_log_tails(&state);
         assert_eq!(log_summary(&state, &my_logs), LogTail { last_term: 7, last_lsn: tail_lsn },
             "the summary must name the newest log tail, not the fsynced prefix, or a candidate              advertises itself as behind and a staler peer wins the vote");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -918,8 +935,6 @@ mod tests {
         assert_eq!(stale, LogTail::default());
         assert!(my_logs.contains_key("late"), "local_log_tails must open collections on disk");
         assert!(after > stale, "sampling the summary after the tails is what makes it complete");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
 }

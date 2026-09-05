@@ -7,7 +7,7 @@ use crate::replication::stream::replicate_and_await;
 use crate::replication::write_concern::WriteQuorum;
 use crate::ring::{hash_key, keyspace_movement, HashRing};
 use crate::state::AppState;
-use crate::storage::frame::HandoverRecord;
+use crate::storage::frame::{HandoverRecord, MAX_FRAME_SIZE};
 use crate::storage::FrameHeader;
 use crate::util::{same_endpoint, write_atomic};
 use serde::{Deserialize, Serialize};
@@ -89,6 +89,9 @@ pub struct MigrationProgress {
 #[derive(Default)]
 pub struct MigrationRuns {
     pub current: Option<MigrationProgress>,
+    /// The phase a `push_until_done` task is alive for right now. `current` cannot stand in for it:
+    /// a task that returns because leadership moved leaves its record behind (bugs.md L21).
+    pub pushing: Option<(String, MigrationPhase)>,
     /// Prevents duplicate coordinator loops after recovery.
     pub coordinating: Option<String>,
     /// Sources the coordinator here is still waiting on. Published so a stalled handover is
@@ -111,6 +114,7 @@ impl MigrationRuns {
                 error: None,
                 handed_over: c.handed_over,
             }),
+            pushing: None,
             coordinating: None,
             waiting_on: Vec::new(),
             completed_resets: meta.completed_resets,
@@ -175,11 +179,14 @@ fn persist(state: &AppState) {
 /// Starts the copy for `migration` unless this node is already running it. Called on every view
 /// adoption, so it must be cheap and idempotent for the common case of no change.
 pub fn ensure_running(state: &AppState, migration: &Migration) {
+    let key = (migration.id.clone(), migration.phase);
     {
         let runs = state.migrations.lock().unwrap();
-        if runs.current.as_ref().is_some_and(|p| {
-            p.id == migration.id && p.phase == migration.phase
-        }) {
+        // A finished phase is not redone; an unfinished record is no evidence that anything is
+        // still pushing it, since the task drops its record where it stopped (bugs.md L21).
+        if runs.pushing.as_ref() == Some(&key) || runs.current.as_ref()
+            .is_some_and(|p| p.id == migration.id && p.phase == migration.phase && p.done)
+        {
             return;
         }
     }
@@ -187,6 +194,17 @@ pub fn ensure_running(state: &AppState, migration: &Migration) {
         // Replicas receive the moved keys through their own leader's replication, not from here.
         return;
     }
+    {
+        // Claimed before the keyspace scan below, so two adoptions racing here cannot both push.
+        // Keyed by phase, not by plan: the next phase must be startable while the last one's task
+        // is still winding down, or the handover stops at the phase boundary.
+        let mut runs = state.migrations.lock().unwrap();
+        if runs.pushing.as_ref() == Some(&key) {
+            return;
+        }
+        runs.pushing = Some(key.clone());
+    }
+    let reservation = PushGuard { state: state.clone(), key };
 
     let outgoing = match plan_outgoing(state, migration) {
         Ok(work) => work,
@@ -221,7 +239,25 @@ pub fn ensure_running(state: &AppState, migration: &Migration) {
     info!(target: "migration", id = %migration.id, keys = total, "Handing over keys");
     let state = state.clone();
     let plan = migration.clone();
-    tokio::spawn(async move { push_until_done(state, plan).await });
+    tokio::spawn(async move {
+        let _reservation = reservation;
+        push_until_done(state, plan).await
+    });
+}
+
+/// Clears `pushing` however the push ends, so a phase whose pusher stopped early is restartable.
+struct PushGuard {
+    state: AppState,
+    key: (String, MigrationPhase),
+}
+
+impl Drop for PushGuard {
+    fn drop(&mut self) {
+        let mut runs = self.state.migrations.lock().unwrap();
+        if runs.pushing.as_ref() == Some(&self.key) {
+            runs.pushing = None;
+        }
+    }
 }
 
 /// Retries for as long as the plan is in the view. A destination that is briefly down, or has not
@@ -249,7 +285,7 @@ async fn push_until_done(state: AppState, migration: Migration) {
         // refused, so the scan and the round trips below cannot be overtaken. Holding it across
         // them instead blocks every write on the node for the length of a keyspace scan.
         if migration.phase == MigrationPhase::Finalizing {
-            drop(state.migration_write_gate.write().await);
+            drop(state.write_gate.write().await);
         }
         if !state.migration().is_some_and(|m| {
             m.id == id && m.phase == migration.phase
@@ -411,6 +447,31 @@ async fn reset_destinations(state: &AppState, migration: &Migration) -> Result<(
     Ok(())
 }
 
+/// Raw JSON bytes per request: `data_movement.batch_size` bounds the count only, so a batch of large
+/// documents is one the destination refuses (`H19`). Conservative -- a second number here is `H13`.
+const MIGRATE_BATCH_BYTES: usize = MAX_FRAME_SIZE as usize;
+
+/// Splits by size, under a count split that already happened. The first document of a group is
+/// always taken: one over the budget still has to travel.
+fn size_bounded_docs(docs: Vec<MigrateDoc>) -> Vec<Vec<MigrateDoc>> {
+    let mut groups: Vec<Vec<MigrateDoc>> = Vec::new();
+    let mut bytes = 0usize;
+    for doc in docs {
+        let size = doc.key.len() + serde_json::to_vec(&doc.value).map_or(0, |v| v.len());
+        match groups.last_mut() {
+            Some(group) if bytes + size <= MIGRATE_BATCH_BYTES => {
+                bytes += size;
+                group.push(doc);
+            },
+            _ => {
+                bytes = size;
+                groups.push(vec![doc]);
+            },
+        }
+    }
+    groups
+}
+
 async fn push_all(
     state: &AppState,
     migration: &Migration,
@@ -443,17 +504,19 @@ async fn push_all(
                 }
 
                 let sent = docs.len();
-                let batch = MigrateBatch {
-                    migration_id: migration.id.clone(),
-                    phase: migration.phase,
-                    collection: collection.clone(),
-                    docs,
-                };
-                let url = format!("{}/internal/migrate", destination);
-                let response = state.client.post(&url).json(&batch).send().await
-                    .map_err(|e| format!("{} unreachable: {}", destination, e))?;
-                if !response.status().is_success() {
-                    return Err(format!("{} refused the batch: {}", destination, response.status()));
+                for group in size_bounded_docs(docs) {
+                    let batch = MigrateBatch {
+                        migration_id: migration.id.clone(),
+                        phase: migration.phase,
+                        collection: collection.clone(),
+                        docs: group,
+                    };
+                    let url = format!("{}/internal/migrate", destination);
+                    let response = state.client.post(&url).json(&batch).send().await
+                        .map_err(|e| format!("{} unreachable: {}", destination, e))?;
+                    if !response.status().is_success() {
+                        return Err(format!("{} refused the batch: {}", destination, response.status()));
+                    }
                 }
 
                 {
@@ -645,6 +708,30 @@ pub fn forget(state: &AppState, id: &str) {
 mod tests {
     use super::*;
 
+    fn docs_of(sizes: &[usize]) -> Vec<MigrateDoc> {
+        sizes.iter().enumerate().map(|(i, n)| MigrateDoc {
+            key: format!("k{}", i),
+            value: serde_json::json!({"pad": "x".repeat(*n)}),
+        }).collect()
+    }
+
+    /// `batch_size` bounds the count only, so a handover of documents near the write limit built a
+    /// request the destination refused and aborted the migration. One over the budget goes alone.
+    #[test]
+    fn a_handover_batch_is_bounded_by_bytes_as_well_as_by_count() {
+        // Short of an exact third: `docs_of` wraps the padding in a key and a field name, and the
+        // budget counts those too.
+        let third = MIGRATE_BATCH_BYTES / 3 - 1024;
+        let groups = size_bounded_docs(docs_of(&[third, third, third, third]));
+        assert_eq!(groups.iter().map(|g| g.len()).collect::<Vec<_>>(), vec![3, 1]);
+
+        let solo = size_bounded_docs(docs_of(&[16, MIGRATE_BATCH_BYTES + 1, 16]));
+        assert_eq!(solo.iter().map(|g| g.len()).collect::<Vec<_>>(), vec![1, 1, 1]);
+        assert_eq!(solo[1][0].key, "k1", "the oversized document is sent, not skipped");
+
+        assert!(size_bounded_docs(Vec::new()).is_empty());
+    }
+
     #[test]
     fn movement_batches_are_bounded_and_existing_configs_get_defaults() {
         let default: DataMovementConfig = serde_json::from_str("{}").unwrap();
@@ -693,8 +780,6 @@ mod tests {
         assert!(current.handed_over.contains(&("t".to_string(), "k2".to_string())));
         assert!(runs.completed_resets.contains(&("m1".to_string(), "127.0.0.1:1".to_string())));
         assert!(runs.coordinating.is_none(), "a coordinator loop is per process, never restored");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

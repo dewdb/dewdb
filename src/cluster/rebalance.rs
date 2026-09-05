@@ -1,6 +1,6 @@
 //! Reconciles primary-shard membership with consistent-hash ownership via safe migrations.
 
-use crate::api::migrate::{begin_migration, resume_migration_coordination, MigrationLaunch};
+use crate::api::migrate::{begin_migration, MigrationLaunch};
 use crate::cluster::metadata::ClusterMetadata;
 use crate::ring::{keyspace_movement, HashRing, RingShard};
 use crate::state::AppState;
@@ -214,9 +214,6 @@ pub fn rebalance_task(state: AppState, cfg: RebalanceConfig) {
             if view.migration.is_some() {
                 // Idempotent recovery restarts source copying and coordinator polling.
                 state.react_to_migration();
-                if is_coordinator(&state, &view) {
-                    resume_migration_coordination(&state);
-                }
                 continue;
             }
             let target = match desired_ring(&view) {
@@ -633,6 +630,5 @@ mod tests {
         a.kill();
         b.kill();
         c.kill();
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

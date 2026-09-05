@@ -27,23 +27,70 @@ pub fn idx(frame: &[u8], wal_id: u64, offset: u64) -> IndexEntry {
     IndexEntry { wal_id, offset, len: (frame.len() - HEADER_LEN) as u32, inline: None }
 }
 
+/// The existence check is the verdict, not the removal's result: a background task still holding an
+/// `Arc<Collection>` recreates its data directory, and the removal reports success either way.
+fn gone(root: &Path) -> bool {
+    let _ = fs::remove_dir_all(root);
+    !root.exists()
+}
+
+/// Named by thread, because the harness names a test's thread after the test and captures this
+/// line unless the run passes `--nocapture`.
+fn leaked(root: &Path) {
+    println!("LEAKED {} in {} -- a node under it is still holding a file",
+        root.display(), std::thread::current().name().unwrap_or("<unnamed>"));
+}
+
 /// Removes a `temp_root`, and says so when it cannot: Windows refuses to unlink a file a live node
 /// still holds, so a swallowed failure here leaks a cluster's WAL per sample (bugs.md L13).
 pub async fn cleanup(root: &Path) {
     for _ in 0..40 {
-        match fs::remove_dir_all(root) {
-            Ok(()) => return,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        if gone(root) {
+            return;
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    println!("LEAKED {} -- a node under it is still holding a file", root.display());
+    leaked(root);
 }
 
-pub fn temp_root() -> PathBuf {
-    let p = std::env::temp_dir().join(format!("dewdb-test-{}", Uuid::new_v4()));
-    fs::create_dir_all(&p).unwrap();
-    p
+/// A `temp_root` that removes itself, so a test that panics or returns early does not leak one
+/// (bugs.md L14). Tests bind it before the nodes under it, and reverse drop order then closes their
+/// files first; a node outliving it prints `LEAKED` instead of failing, since a transient lock is
+/// not the test's own defect.
+pub struct TempRoot {
+    path: PathBuf,
+}
+
+impl std::ops::Deref for TempRoot {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for TempRoot {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        for _ in 0..40 {
+            if gone(&self.path) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        leaked(&self.path);
+    }
+}
+
+pub fn temp_root() -> TempRoot {
+    let path = std::env::temp_dir().join(format!("dewdb-test-{}", Uuid::new_v4()));
+    fs::create_dir_all(&path).unwrap();
+    TempRoot { path }
 }
 
 pub fn make_frame(term: u64, lsn: u64, prev_lsn: u64, prev_term: u64, key: &str, v: i64) -> Vec<u8> {
@@ -130,6 +177,8 @@ pub struct TestNode {
     pub allow_unsafe_ring_changes: bool,
     pub data_movement_batch_size: usize,
     pub data_movement_batch_delay_ms: u64,
+    /// An `AuthConfig` body; `{}` is the default open configuration.
+    pub auth: serde_json::Value,
     pub state: Option<AppState>,
     pub stop: Option<Arc<tokio::sync::Notify>>,
     pub thread: Option<std::thread::JoinHandle<()>>,
@@ -138,6 +187,11 @@ pub struct TestNode {
 // Binding :0 and dropping the listener lets the OS hand the same port to two
 // concurrent callers, so the counter rather than the OS guarantees uniqueness.
 static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(20000);
+
+/// Slack by default, short only where a test opts in. One second leaves a follower less margin
+/// than its own poll interval, so under load the group churns terms and every deadline downstream
+/// ends up racing the scheduler (bugs.md L8b).
+pub const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 5;
 
 pub fn next_test_port() -> u16 {
     free_port()
@@ -183,6 +237,7 @@ fn node_config(n: &TestNode) -> NodeConfig {
         "data_dir": n.data_dir.to_string_lossy(),
         "heartbeat_timeout_secs": n.heartbeat_timeout_secs,
         "election_delay_ms": 200,
+        "auth": n.auth,
         "maintenance": { "enabled": false },
         "data_movement": {
             "batch_size": n.data_movement_batch_size,
@@ -206,11 +261,12 @@ impl TestNode {
             replicas: Vec::new(),
             primary_addr: None,
             shard_role: shard_role.to_string(),
-            heartbeat_timeout_secs: 1,
+            heartbeat_timeout_secs: DEFAULT_HEARTBEAT_TIMEOUT_SECS,
             membership_mode: "voter".to_string(),
             allow_unsafe_ring_changes: false,
             data_movement_batch_size: 64,
             data_movement_batch_delay_ms: 5,
+            auth: serde_json::json!({}),
             state: None,
             stop: None,
             thread: None,
@@ -270,6 +326,8 @@ impl TestNode {
                     last_known_primary_position: None,
                     progress: Progress::new(),
                     leases: Default::default(),
+                    handing_over: false,
+                    novote_until: None,
                     booted_at: std::time::Instant::now(),
                     leader_committed: HashMap::new(),
                     configuration: None,
@@ -300,7 +358,7 @@ impl TestNode {
                             }))),
                     ring_cache: Arc::new(std::sync::Mutex::new(Default::default())),
                     migrations: Arc::new(std::sync::Mutex::new(MigrationRuns::restored(&config.data_dir))),
-                    migration_write_gate: Arc::new(tokio::sync::RwLock::new(())),
+                    write_gate: Arc::new(tokio::sync::RwLock::new(())),
                 };
 
                 let app = build_app(&state);
@@ -331,7 +389,9 @@ impl TestNode {
                 stop_in_node.notified().await;
             });
 
-            rt.shutdown_background();
+            // Bounded, not detached: `shutdown_background` let a handler mid-write outlive the
+            // join, and a cluster-view save then recreated the data directory (bugs.md L14).
+            rt.shutdown_timeout(Duration::from_millis(500));
         });
 
         let state = rx.recv_timeout(Duration::from_secs(10)).expect("node failed to start");
@@ -509,8 +569,12 @@ pub async fn put_value(
     }
 }
 
+/// The default is deliberately slack. A one-second contact timeout leaves a follower 500ms of
+/// margin over its own poll interval, so any test holding a leader across multi-second work was one
+/// scheduler stall away from an election it never asked for (bugs.md L8b). Tests that *wait* for a
+/// failover want the short timeout and say so with `three_node_cluster_with_timeout`.
 pub async fn three_node_cluster(root: &Path) -> (TestNode, TestNode, TestNode) {
-    three_node_cluster_with_timeout(root, 1).await
+    three_node_cluster_with_timeout(root, DEFAULT_HEARTBEAT_TIMEOUT_SECS).await
 }
 
 /// A longer contact timeout than the default 1s, for tests that deliberately leave the leader
@@ -550,8 +614,43 @@ pub async fn voter_group(root: &Path, n: usize, heartbeat_timeout_secs: u64) -> 
     for node in nodes.iter_mut() {
         node.start();
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    await_converged(&nodes.iter().collect::<Vec<_>>()).await;
     nodes
+}
+
+const CONVERGE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Blocks until exactly one of `nodes` leads and every other has heard from it.
+///
+/// Not a sleep, and every hand-rolled group needs it as much as `voter_group` does: a follower
+/// polls 500ms after boot and campaigns at `heartbeat_timeout_secs`, so a fixed wait shorter than
+/// both hands the test a leader that is already being deposed -- and every assertion downstream
+/// then fails on its own subject instead of on the real cause (bugs.md L8b).
+pub async fn await_converged(nodes: &[&TestNode]) {
+    let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
+    while !cluster_converged(nodes) {
+        assert!(std::time::Instant::now() < deadline,
+            "cluster of {} did not converge in {:?}: leading {:?}, in contact {:?}",
+            nodes.len(), CONVERGE_TIMEOUT, ids(nodes, |n| n.is_leader()), ids(nodes, has_leader_contact));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn cluster_converged(nodes: &[&TestNode]) -> bool {
+    nodes.iter().filter(|n| n.is_leader()).count() == 1
+        && nodes.iter().filter(|n| !n.is_leader()).all(|n| has_leader_contact(n))
+}
+
+fn has_leader_contact(node: &TestNode) -> bool {
+    node.state.as_ref().and_then(|s| s.replication.as_ref()).is_some_and(|r| {
+        let g = r.read().unwrap();
+        g.last_heartbeat.is_some() || g.last_replication.is_some()
+    })
+}
+
+fn ids(nodes: &[&TestNode], f: impl Fn(&TestNode) -> bool) -> Vec<String> {
+    nodes.iter().filter(|n| f(n)).map(|n| n.node_id.clone()).collect()
 }
 
 /// `shards` single-node shard groups behind one router, one hash range each. A write pays the

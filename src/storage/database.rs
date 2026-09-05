@@ -402,8 +402,6 @@ mod tests {
             "lsn {} was handed to collection b while collection a already holds it: two frames \
              share an LSN, and the chain, the commit index and every cursor keyed on it disagree",
             lsn);
-
-        let _ = fs::remove_dir_all(&root);
     }
     #[tokio::test]
     async fn lsn_is_monotonic_across_restarts() {
@@ -429,8 +427,6 @@ mod tests {
             col.enqueue_commit().await.unwrap().unwrap();
             assert_eq!(db.durable_lsn.load(Ordering::SeqCst), 15, "LSN must continue from restored value, not reset to zero");
         }
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -458,8 +454,6 @@ mod tests {
             "the persisted watermark must be corrected too, or a restart re-inflates it");
 
         assert_eq!(db.recompute_durable_lsn().unwrap(), real_end, "recomputing is idempotent");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -483,8 +477,6 @@ mod tests {
         assert_eq!(users.last_appended(), (1, 5));
         assert_eq!(orders.last_appended(), (1, 4),
             "a write to one collection must not move another's tail; election freshness reads these");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -504,8 +496,6 @@ mod tests {
             "listing merges the open collection with on-disk dirs, sorted");
         assert!(!names.iter().any(|n| n.ends_with(".tmp") || n.ends_with(".old")),
             "in-flight resync scratch dirs must never surface as collections");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     /// M9: a drop that only unlinks files is invisible to every node but the one that ran it. The
@@ -531,8 +521,6 @@ mod tests {
         assert!(db.live_collections().unwrap().is_empty(), "a tombstone is gone to a client");
         assert_eq!(db.list_collections().unwrap(), vec!["users".to_string()],
             "but still present to replication and compaction, which own its log");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -552,8 +540,6 @@ mod tests {
         assert!(fresh.is_dropped(), "the drop must survive a reopen");
         assert!(fresh.index.read().unwrap().is_empty(), "dropped data must not resurrect on reopen");
         assert!(fresh.get("k").unwrap().is_none());
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -572,8 +558,6 @@ mod tests {
         assert_eq!(db.live_collections().unwrap(), vec!["users".to_string()]);
         assert!(col.get("old").unwrap().is_none(), "the drop still took the keys below it");
         assert_eq!(col.get("new").unwrap(), Some(serde_json::json!({"v": 2})));
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -595,7 +579,5 @@ mod tests {
         assert!(root.join("users").is_dir());
         assert!(staged.is_dir(), "the rejected snapshot goes back to staging for cleanup");
         assert!(!root.join("users.old").exists());
-
-        let _ = fs::remove_dir_all(&root);
     }
 }

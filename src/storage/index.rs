@@ -111,6 +111,135 @@ impl AppliedMeta {
     }
 }
 
+/// The commit position alone, updated in place, because rewriting `AppliedMeta` per commit costs a
+/// create plus an `fsync` on a *new* file -- a metadata transaction, not a data flush (bugs.md H17).
+///
+/// Two sector-sized slots written alternately, newest sequence wins: a torn write damages only the
+/// slot it was writing, which is what replaces the temp file and rename.
+pub struct AppliedPos {
+    file: fs::File,
+    seq: u64,
+}
+
+const POS_FILENAME: &str = "applied.pos";
+const POS_MAGIC: u32 = 0x4450_4F53;
+const POS_SLOT: u64 = 512;
+const POS_RECORD: usize = 24;
+
+fn pos_encode(seq: u64, applied_lsn: u64) -> [u8; POS_RECORD] {
+    let mut out = [0u8; POS_RECORD];
+    out[0..4].copy_from_slice(&POS_MAGIC.to_le_bytes());
+    out[4..12].copy_from_slice(&seq.to_le_bytes());
+    out[12..20].copy_from_slice(&applied_lsn.to_le_bytes());
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&out[0..20]);
+    out[20..24].copy_from_slice(&hasher.finalize().to_le_bytes());
+    out
+}
+
+/// Never written and damaged are different answers, the way they are for `AppliedMeta`: absence
+/// means replay from the full record, and reading damage as absence lowers the watermark, which is
+/// the truncation `H17` is about.
+enum Slot {
+    Empty,
+    Damaged,
+    Written { seq: u64, applied_lsn: u64 },
+}
+
+fn pos_decode(bytes: &[u8]) -> Slot {
+    if bytes.len() < POS_RECORD || u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != POS_MAGIC {
+        return Slot::Empty;
+    }
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&bytes[0..20]);
+    if hasher.finalize() != u32::from_le_bytes(bytes[20..24].try_into().unwrap()) {
+        return Slot::Damaged;
+    }
+    Slot::Written {
+        seq: u64::from_le_bytes(bytes[4..12].try_into().unwrap()),
+        applied_lsn: u64::from_le_bytes(bytes[12..20].try_into().unwrap()),
+    }
+}
+
+impl AppliedPos {
+    /// Pre-allocated here, once, so no later `save` changes the file's size and every one of them
+    /// is a data flush into blocks that already exist.
+    pub fn open(col_dir: &Path) -> io::Result<Self> {
+        let path = col_dir.join(POS_FILENAME);
+        let file = fs::OpenOptions::new().create(true).read(true).write(true).open(&path)?;
+        let seq = Self::newest(&file)?.map_or(0, |(seq, _)| seq);
+        if file.metadata()?.len() != POS_SLOT * 2 {
+            file.set_len(POS_SLOT * 2)?;
+            file.sync_all()?;
+        }
+        Ok(Self { file, seq })
+    }
+
+    /// The higher-sequence slot that verifies. A short read is a file that was created and never
+    /// written, which is `Empty` rather than an error. Both slots damaged is an error: one of them
+    /// held a position, and answering "nothing recorded" would retract it.
+    fn newest(file: &fs::File) -> io::Result<Option<(u64, u64)>> {
+        use std::io::{Read, Seek};
+        let mut handle = file.try_clone()?;
+        handle.seek(io::SeekFrom::Start(0))?;
+        let mut buf = vec![0u8; (POS_SLOT * 2) as usize];
+        let mut filled = 0;
+        while filled < buf.len() {
+            match handle.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
+                Err(e) => return Err(e),
+            }
+        }
+
+        let slots: Vec<Slot> = [0usize, POS_SLOT as usize].iter()
+            .map(|at| match buf.get(*at..at + POS_RECORD) {
+                Some(bytes) if at + POS_RECORD <= filled => pos_decode(bytes),
+                _ => Slot::Empty,
+            })
+            .collect();
+
+        let newest = slots.iter()
+            .filter_map(|s| match s {
+                Slot::Written { seq, applied_lsn } => Some((*seq, *applied_lsn)),
+                _ => None,
+            })
+            .max_by_key(|(seq, _)| *seq);
+
+        match newest {
+            Some(found) => Ok(Some(found)),
+            None if slots.iter().any(|s| matches!(s, Slot::Damaged)) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} has no readable slot; it records which of this collection's durable frames are committed", POS_FILENAME))),
+            None => Ok(None),
+        }
+    }
+
+    /// The position this collection last recorded. `Ok(None)` is "nothing recorded here yet",
+    /// which includes the file being absent and a freshly pre-allocated one.
+    pub fn read(col_dir: &Path) -> io::Result<Option<u64>> {
+        let path = col_dir.join(POS_FILENAME);
+        let file = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        Ok(Self::newest(&file)?.map(|(_, lsn)| lsn))
+    }
+
+    /// One `sync_data` on an open handle, and no metadata change: this is the whole point of the
+    /// file. Durable before it returns, because `apply_committed` runs ahead of the client reply.
+    pub fn save(&mut self, applied_lsn: u64) -> io::Result<()> {
+        use std::io::{Seek, Write};
+        self.seq += 1;
+        let record = pos_encode(self.seq, applied_lsn);
+        self.file.seek(io::SeekFrom::Start((self.seq % 2) * POS_SLOT))?;
+        self.file.write_all(&record)?;
+        self.file.sync_data()
+    }
+}
+
 impl LsnMeta {
     pub fn load(dir: &Path) -> Option<Self> {
         let content = fs::read_to_string(dir.join("lsn.meta")).ok()?;

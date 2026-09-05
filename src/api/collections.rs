@@ -82,7 +82,7 @@ pub async fn drop_collection(
     if state.is_shard() && !state.is_leader() {
         return (StatusCode::FORBIDDEN, "Replica nodes reject direct writes").into_response();
     }
-    let _movement_guard = state.migration_write_gate.read().await;
+    let _write_gate = state.write_gate.read().await;
     if state.migration().is_some_and(|migration| {
         migration.phase == MigrationPhase::Finalizing
     }) {
@@ -159,7 +159,9 @@ pub async fn compact_collection(
     let before = col.space_usage().ok();
 
     let col_clone = col.clone();
-    match tokio::task::spawn_blocking(move || col_clone.compact()).await {
+    let retention = crate::maintenance::retention_for(
+        &state, &col_name, &state.config.maintenance, false);
+    match tokio::task::spawn_blocking(move || col_clone.compact(retention)).await {
         Ok(Ok(())) => {
             let after = col.space_usage().ok();
             let wal_id = col.wal_writer.lock().unwrap().current_wal_id;
@@ -251,8 +253,6 @@ mod tests {
             .await.into_response();
         assert_eq!(snapshotted.status(), StatusCode::OK,
             "snapshots add a file and remove nothing, so a replica is free to take one");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// H15: all five resolved the name with `get_collection`, which opens on miss, so a typo in a
@@ -286,7 +286,6 @@ mod tests {
             "and left the directory, the wal and a commit task behind with it");
 
         node.kill();
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     async fn collections_on(client: &reqwest::Client, base: &str) -> Option<Vec<String>> {
@@ -331,8 +330,6 @@ mod tests {
         assert!(wait_for(Duration::from_secs(20), || {
             collections_of(&n3).map_or(false, |c| c.is_empty())
         }).await, "unfixed the drop reached n3 once, missed it, and was never retried");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// M9: with the drop outside the commit index it applied locally whatever the quorum did.
@@ -360,8 +357,6 @@ mod tests {
             client.get(format!("{}/collections/t/docs/k", n1.url())).send().await.unwrap().status(),
             StatusCode::OK,
             "an uncommitted drop must not hide committed data");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -377,7 +372,6 @@ mod tests {
             "a drop of nothing must not create the collection in order to tombstone it");
 
         node.kill();
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -390,7 +384,5 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(leader.db.as_ref().unwrap().get_collection("c").unwrap()
             .space_usage().unwrap().dead_bytes(), 0);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

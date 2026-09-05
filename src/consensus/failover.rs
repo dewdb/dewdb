@@ -209,6 +209,24 @@ pub async fn demote(state: &AppState, new_term: u64) {
     });
 }
 
+/// Points a node that has just given up leadership at the node that took it.
+///
+/// The poll goes looking on its own once it holds no `primary_addr` (bugs.md L20), but it can only
+/// find a leader that has already won, and it adopts one by resyncing. On a handover the successor
+/// is known the moment office moves, so neither cost is paid.
+///
+/// No resync: this node was the leader, so its log is a prefix of the successor's by construction.
+/// What it lacks is the commit watermark, which the next heartbeat carries.
+pub fn follow_handover(state: &AppState, leader: &str) {
+    let Some(repl) = state.replication.as_ref() else { return };
+    let mut g = repl.write().unwrap();
+    if g.is_leader || g.primary_addr.is_some() {
+        return;
+    }
+    g.primary_addr = Some(leader.to_string());
+    info!(target: "transfer", %leader, "Following the node this one handed office to");
+}
+
 pub async fn adopt_existing_leader(state: &AppState) -> bool {
     let leader = match discover_leader(state).await {
         Some(l) => l,
@@ -285,6 +303,8 @@ pub fn leader_contact_task(state: AppState) {
         // Four chances inside the window whatever the timeout is configured to, so a leader is
         // never deposed by two scheduler hiccups on a short one.
         let interval = (timeout / 4).min(Duration::from_millis(HEARTBEAT_POLL_INTERVAL_MS));
+        // The most this leader will ever count; a voter answers with what it can actually keep.
+        let window = lease::refusal_window(timeout);
 
         loop {
             tokio::time::sleep(interval).await;
@@ -295,8 +315,9 @@ pub fn leader_contact_task(state: AppState) {
             // Detached: awaiting a probe into a cut link would age every healthy replica's contact
             // by its timeout before the check reads them, deposing a leader over someone else's
             // partition.
+            let term = state.current_term();
             for replica in state.replication_targets() {
-                probe_replica(state.clone(), replica);
+                probe_replica(state.clone(), replica, term, window);
             }
 
             if state.holds_contact_quorum(timeout) {
@@ -307,10 +328,16 @@ pub fn leader_contact_task(state: AppState) {
     });
 }
 
-fn probe_replica(state: AppState, replica: String) {
+/// CheckQuorum's outbound probe, and the lease round with it: a voter answers with how long it
+/// will go on refusing votes, and the leader dates that from `sent` -- before the request left --
+/// so a slow link shortens the lease rather than overrunning it. Raft's shape, and why there is no
+/// margin between the two clocks to get wrong. See bugs.md M16.
+fn probe_replica(state: AppState, replica: String, term: u64, window: Duration) {
     tokio::spawn(async move {
         let url = format!("{}/internal/heartbeat", replica);
-        let answer = state.client.get(&url)
+        let query = [("term", term.to_string()), ("lease_ms", window.as_millis().to_string())];
+        let (sent, sent_wall) = (std::time::Instant::now(), std::time::SystemTime::now());
+        let answer = state.client.get(&url).query(&query)
             .timeout(Duration::from_millis(PEER_PROBE_TIMEOUT_MS))
             .send().await;
         let body = match answer {
@@ -318,12 +345,15 @@ fn probe_replica(state: AppState, replica: String) {
             Ok(r) => { state.note_replica_contact(&replica); r.json::<serde_json::Value>().await.ok() },
             Err(_) => return,
         };
-        let their_term = body.as_ref()
-            .and_then(|v| v.get("term").and_then(|t| t.as_u64()))
-            .unwrap_or(0);
+        let field = |name: &str| body.as_ref().and_then(|v| v.get(name)).and_then(|v| v.as_u64());
+        let their_term = field("term").unwrap_or(0);
         if their_term > state.current_term() {
             warn!(target: "checkquorum", "Replica {} reports term {}; stepping down", replica, their_term);
             demote(&state, their_term).await;
+            return;
+        }
+        if let Some(ms) = field("novote_ms") {
+            state.note_lease_grant(&replica, term, sent, sent_wall, Duration::from_millis(ms));
         }
     });
 }
@@ -376,25 +406,18 @@ pub fn heartbeat_poll_task(state: AppState) {
                 break;
             }
 
-            let (primary_addr, own_term, promise) = {
+            let primary_addr = {
                 let repl = state.replication.as_ref().unwrap().read().unwrap();
                 if !repl.heartbeat_running {
                     break;
                 }
-                let age = lease::contact_age(repl.last_heartbeat, repl.last_replication);
-                (repl.primary_addr.clone(), repl.term, lease::promise(age, timeout))
+                repl.primary_addr.clone()
             };
 
+            let mut sought_leader = false;
             if let Some(primary_addr) = primary_addr {
                 let url = format!("{}/internal/heartbeat", primary_addr);
-                // Rides along on the poll a follower sends anyway: how long this node will go on
-                // withholding its vote, which is the round the leader's reads no longer have to pay.
-                let query = [
-                    ("from".to_string(), state.own_url()),
-                    ("term".to_string(), own_term.to_string()),
-                    ("novote_ms".to_string(), promise.as_millis().to_string()),
-                ];
-                match state.client.get(&url).query(&query).timeout(timeout).send().await {
+                match state.client.get(&url).timeout(timeout).send().await {
                     Ok(r) if r.status().is_success() => {
                         if let Ok(hb) = r.json::<serde_json::Value>().await {
                             let their_term = hb.get("term").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -459,6 +482,14 @@ pub fn heartbeat_poll_task(state: AppState) {
                         warn!(target: "heartbeat", "Primary {} unreachable: {}", primary_addr, e);
                     }
                 }
+            } else {
+                // Nothing to poll, and the contact clock can still be fresh: granting a vote at a
+                // higher term deposes a leader without naming one (bugs.md L20). Look for the
+                // successor rather than wait the timeout out; it may not have won yet.
+                sought_leader = true;
+                if adopt_existing_leader(&state).await {
+                    continue;
+                }
             }
 
             let quiet = {
@@ -470,12 +501,12 @@ pub fn heartbeat_poll_task(state: AppState) {
                 continue;
             }
 
-            if adopt_existing_leader(&state).await {
+            if !sought_leader && adopt_existing_leader(&state).await {
                 continue;
             }
 
             info!(target: "election", "No leader contact for {}s; standing for election", timeout.as_secs());
-            run_election(&state, election_delay).await;
+            run_election(&state, election_delay, None).await;
 
             if state.is_leader() {
                 break;
@@ -616,7 +647,6 @@ mod tests {
             "the group's data must survive; a resync from another shard replaces it wholesale");
 
         drop((other_node, b2_node, b3_node));
-        let _ = fs::remove_dir_all(&root);
     }
 
     async fn read_doc_at_col(client: &reqwest::Client, base: &str, col: &str, key: &str)
@@ -656,8 +686,6 @@ mod tests {
             "boot sync must follow the leader it discovered, not the address config seeded");
         assert!(wait_for_doc(&client, &n4.url(), "t", "k1", 1, Duration::from_secs(3)).await,
             "the stale local copy must be replaced by the current leader's snapshot");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -683,8 +711,6 @@ mod tests {
             "a dotted collection name must not be filtered out of the resync set");
         assert!(!n4.data_dir.join("app.events.old").exists(),
             "staging leftovers must be cleared, not resynced as collections of their own");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     fn ago(ms: u64) -> std::time::Instant {
@@ -724,8 +750,6 @@ mod tests {
             "a committed write is readable straight away");
         assert_eq!(read_doc_http(&client, &new_leader.url(), "k1").await, Some(1),
             "data written before the failover must survive it");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -748,7 +772,6 @@ mod tests {
 
             drop(n2);
             drop(n3);
-            let _ = fs::remove_dir_all(&root);
         }
     }
 
@@ -803,8 +826,6 @@ mod tests {
 
         // And it survives as a normal published write.
         assert_eq!(read_doc_http(&client, &leader.url(), "inherited").await, Some(2));
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -839,8 +860,6 @@ mod tests {
         assert!(converged, "the surviving follower must discover the new leader and receive its writes");
         assert!(!follower.is_leader(), "the follower must not also claim leadership");
         assert_eq!(leaders(&[&n2, &n3]).len(), 1, "exactly one leader must remain");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -883,8 +902,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(caught_up, "the rejoined node must receive the writes it missed while down");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -917,8 +934,6 @@ mod tests {
             "the voter must record the term it voted in, or a restart would let it vote again");
         assert!(follower_meta.voted_for.is_some(), "the vote itself must be recorded, not just the term");
         assert!(!follower_meta.is_leader);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -942,8 +957,6 @@ mod tests {
             "a node must resume at the term it last recorded; starting lower would let it \
              grant a second vote in a term it has already voted in");
         assert!(!restarting.is_leader());
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     fn view_of(node: &TestNode) -> ClusterMetadata {
@@ -994,8 +1007,6 @@ mod tests {
             .send().await.unwrap();
         assert_eq!(again.status(), StatusCode::OK);
         assert_eq!(again.json::<serde_json::Value>().await.unwrap()["status"], "stale");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1024,8 +1035,6 @@ mod tests {
         assert_eq!(view_of(&n1).version, 7, "the node that accepted the change applies it inline");
         assert!(wait_for_version(&n2, 7, Duration::from_secs(10)).await,
             "n2 never converged; it is at v{}", view_of(&n2).version);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1060,8 +1069,6 @@ mod tests {
             .json(&published_view(3, "http://shard-ok:9999"))
             .send().await.unwrap();
         assert!(wait_for_version(&n2, 3, Duration::from_secs(10)).await);
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1080,8 +1087,6 @@ mod tests {
         assert_eq!(leaders(&[&n1, &n2, &n3]), vec!["n1".to_string()],
             "followers must not depose a leader that is still answering heartbeats");
         assert_eq!(n1.term(), term_before, "a stable cluster must not churn terms");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1102,8 +1107,6 @@ mod tests {
             "a single survivor out of three must not promote itself; that would allow split brain");
         assert_eq!(put_doc_http(&client, &n2.url(), "k2", 2).await, StatusCode::FORBIDDEN,
             "a node that lost quorum must keep refusing writes");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -1176,8 +1179,6 @@ mod tests {
 
         assert_eq!(leaders(&[&n1, &n2, &n3]), vec!["n1".to_string()],
             "finding the real leader is the resolution; campaigning against a healthy one is not");
-
-        let _ = fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1213,9 +1214,55 @@ mod tests {
             .expect("the cluster must settle on a leader again");
         assert!(node_by_id(&[&n1, &n2, &n3], &winner).term() > ahead,
             "the new term must clear the one n3 was stranded at");
-
-        let _ = fs::remove_dir_all(&root);
     }
+
+    /// bugs.md L20. Granting a vote at a higher term deposes a leader without naming a successor,
+    /// and the grant itself stamps the contact clock, so `contact_lost` stays quiet for a whole
+    /// timeout. Nothing used to go looking in that window, and everything the node was shipped
+    /// last stayed below its applied watermark and invisible for the length of it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_leader_deposed_by_granting_a_vote_goes_looking_for_the_winner() {
+        let root = temp_root();
+
+        let mut winner = TestNode::new("winner", next_test_port(), &root, "primary");
+        winner.heartbeat_timeout_secs = 30;
+        winner.start();
+        assert!(winner.is_leader());
+        // The term the vote below is granted at: `discover_leader` refuses a leader behind us.
+        winner.state.as_ref().unwrap().replication.as_ref().unwrap().write().unwrap().term = 9;
+
+        let mut ex = TestNode::new("ex", next_test_port(), &root, "primary");
+        // Long enough that the contact timeout cannot be what rescues this node.
+        ex.heartbeat_timeout_secs = 30;
+        ex.start();
+        assert!(ex.is_leader());
+        {
+            let mut g = ex.state.as_ref().unwrap().replication.as_ref().unwrap().write().unwrap();
+            // Reachable without being a voter: a configured peer would put this node's own boot
+            // quorum at two, and the vote below is the only election this test wants.
+            g.replicas.push(winner.url());
+            g.booted_at = std::time::Instant::now() - Duration::from_secs(60);
+        }
+
+        let granted = reqwest::Client::new()
+            .post(format!("{}/internal/vote", ex.url()))
+            .json(&serde_json::json!({
+                "term": 9, "candidate_id": "winner", "last_lsn": 100, "last_term": 9 }))
+            .send().await.unwrap()
+            .json::<serde_json::Value>().await.unwrap()["vote_granted"].as_bool().unwrap();
+        assert!(granted, "a fresher candidate at a higher term wins the vote");
+        assert!(!ex.is_leader());
+        assert_eq!(primary_of(&ex), None, "granting a vote names nobody, which is the whole entry");
+
+        assert!(wait_for(Duration::from_secs(8), || primary_of(&ex) == Some(winner.url())).await,
+            "the deposed leader still follows {:?}: it has nothing to poll and a contact clock the \
+             grant just stamped, so it waits out {}s before it looks",
+            primary_of(&ex), ex.heartbeat_timeout_secs);
+
+        ex.kill();
+        winner.kill();
+    }
+
     #[test]
     fn a_node_that_never_heard_from_anyone_still_elects() {
         let timeout = Duration::from_secs(3);

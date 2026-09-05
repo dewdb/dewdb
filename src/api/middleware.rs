@@ -114,6 +114,7 @@ pub async fn auth_middleware(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let path = req.uri().path().to_string();
+    let method = req.method().as_str().to_string();
 
     let headers = req.headers();
     let secret = headers.get(INTERNAL_SECRET_HEADER).and_then(|v| v.to_str().ok()).map(str::to_string);
@@ -123,6 +124,7 @@ pub async fn auth_middleware(
 
     let outcome = authorize(
         &path,
+        &method,
         &state.config.auth,
         secret.as_deref(),
         api_key.as_deref(),
@@ -132,7 +134,8 @@ pub async fn auth_middleware(
     match outcome {
         AuthOutcome::Allow => next.run(req).await,
         AuthOutcome::Deny(reason) => {
-            warn!(target: "auth", path = %path, reason, "Rejected unauthenticated request");
+            warn!(target: "auth", path = %path, method = %method, reason,
+                "Rejected unauthenticated request");
             err_json(StatusCode::UNAUTHORIZED, reason.to_string())
         }
     }
@@ -163,7 +166,8 @@ pub async fn chaos_middleware(
 
 #[cfg(test)]
 mod tests {
-    use crate::test_support::{cleanup, single_node, temp_root};
+    use crate::auth::API_KEY_HEADER;
+    use crate::test_support::{next_test_port, single_node, temp_root, TestNode};
     use axum::http::StatusCode;
 
     /// C24 and C25: the gate used to read the still-encoded URI and the handler the decoded name,
@@ -198,7 +202,78 @@ mod tests {
             .json(&serde_json::json!({"value": {"v": 1}})).send().await.unwrap().status(),
             StatusCode::CREATED, "an ordinary name is still a name");
 
-        drop(n);
-        cleanup(&root).await;
+    }
+
+    /// L3: the client key and the operator key were the same key, so anything that could write a
+    /// document could also drop the collection and repartition the ring.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_admin_key_is_required_for_topology_and_drops_but_not_for_documents() {
+        let root = temp_root();
+        let mut n = TestNode::new("solo", next_test_port(), &root, "primary");
+        n.auth = serde_json::json!({"api_keys": ["client"], "admin_keys": ["root"]});
+        n.start();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let c = reqwest::Client::new();
+        let doc = format!("{}/collections/c/docs/k1", n.url());
+        let collection = format!("{}/collections/c", n.url());
+        let ring = format!("{}/cluster/ring", n.url());
+        let body = serde_json::json!({"value": {"v": 1}});
+
+        assert_eq!(c.put(&doc).header(API_KEY_HEADER, "client").json(&body)
+            .send().await.unwrap().status(),
+            StatusCode::CREATED, "the client key still writes documents");
+        assert_eq!(c.delete(&doc).header(API_KEY_HEADER, "client").send().await.unwrap().status(),
+            StatusCode::OK, "deleting a document is not an admin action");
+
+        assert_eq!(c.delete(&collection).header(API_KEY_HEADER, "client").send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED, "the client key dropped a collection");
+        assert_eq!(c.post(&ring).header(API_KEY_HEADER, "client")
+            .json(&serde_json::json!({"shards": []})).send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED, "the client key rewrote the ring");
+        assert_eq!(c.delete(&collection).send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED, "no key at all dropped a collection");
+
+        // The admin key reaches both tiers, so one credential inspects and then drops.
+        assert_eq!(c.put(&doc).header(API_KEY_HEADER, "root").json(&body)
+            .send().await.unwrap().status(), StatusCode::CREATED);
+        assert_eq!(c.delete(&collection).header(API_KEY_HEADER, "root").send().await.unwrap().status(),
+            StatusCode::OK);
+
+    }
+
+    /// A routed drop is the one admin route a node calls on another node, so a router's
+    /// `upstream_api_key` has to be an admin key wherever the shards set `admin_keys`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_router_forwards_a_drop_with_its_upstream_key() {
+        let root = temp_root();
+        let mut shard = TestNode::new("s1", next_test_port(), &root, "primary");
+        shard.auth = serde_json::json!({"api_keys": ["client"], "admin_keys": ["root"]});
+        shard.start();
+
+        let mut router = TestNode::new("router", next_test_port(), &root, "primary");
+        router.role = "router".to_string();
+        router.shard_map = vec![(shard.url(), Vec::new())];
+        router.auth = serde_json::json!({
+            "api_keys": ["client"], "admin_keys": ["root"], "upstream_api_key": "root"});
+        router.start();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let c = reqwest::Client::new();
+        let collection = format!("{}/collections/c", router.url());
+
+        assert_eq!(c.put(format!("{}/collections/c/docs/k1", router.url()))
+            .header(API_KEY_HEADER, "client").json(&serde_json::json!({"value": {"v": 1}}))
+            .send().await.unwrap().status(),
+            StatusCode::CREATED);
+        assert_eq!(c.delete(&collection).header(API_KEY_HEADER, "client").send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED, "the router must gate the drop before forwarding it");
+
+        let r = c.delete(&collection).header(API_KEY_HEADER, "root").send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = r.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(body["shards"][0]["status"].as_u64(), Some(200),
+            "the shard refused the router's forwarded credential: {}", body);
+
     }
 }

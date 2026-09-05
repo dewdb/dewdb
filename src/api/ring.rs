@@ -230,8 +230,6 @@ mod tests {
                 keys[i], before[i], after[i]);
         }
         assert_eq!(state.shard_owners().len(), 4);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -255,8 +253,6 @@ mod tests {
             .any(|i| rebuilt.owner(hash_key("docs", &format!("k{}", i)))
                 .is_some_and(|s| s.node_url == "http://z"));
         assert!(reaches_new_shard, "the rebuilt ring must actually route to the added shard");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// H2: `classify` used to call `ring.build()` per key, and `migration.target.build()` again
@@ -292,8 +288,6 @@ mod tests {
         let (_, cleared) = state.rings_for(&after);
         assert!(cleared.is_none(),
             "with_ring completes the migration, so the stale target must not survive in the cache");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -326,8 +320,6 @@ mod tests {
         // Kept, not cleared, so a rollback publish can put the cluster back on ranges.
         assert_eq!(state.cluster_view().shards.len(), 2,
             "the ranges must survive so the change can be undone");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -385,8 +377,6 @@ mod tests {
             "a dry run that disagrees with the real thing is worse than no dry run");
         assert!(applied["warning"].as_str().unwrap().contains("/cluster/migrate"),
             "the warning must point at the endpoint that moves the data too");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// H14: `build` allocates `shards x vnodes` tokens and only `vnodes` was bounded. The refusal
@@ -394,7 +384,7 @@ mod tests {
     /// and persisted nothing, which is what made it repeatable.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_oversized_ring_is_refused_before_it_is_built() {
-        use crate::test_support::{cleanup, single_node};
+        use crate::test_support::single_node;
         use axum::http::StatusCode;
         use crate::ring::{MAX_RING_SHARDS, MAX_RING_TOKENS, MAX_VNODES};
 
@@ -434,8 +424,6 @@ mod tests {
         assert_eq!(c.get(format!("{}/health", n.url())).send().await.unwrap().status(),
             StatusCode::OK, "the node is still serving");
 
-        drop(n);
-        cleanup(&root).await;
     }
 
     /// Ownership moves on publish; this endpoint moves no data. So the whole safety question is
@@ -499,8 +487,6 @@ mod tests {
         let (code, body) = post(format!("{}/cluster/ring", n1.url()), two.clone()).await;
         assert_eq!(code, StatusCode::OK, "a no-op republish must stay allowed on live data: {}", body);
         assert_eq!(body["applied"]["moved_fraction"].as_f64().unwrap(), 0.0);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The override, on a solo primary so the node keeps leadership across the restart that turns
@@ -551,8 +537,6 @@ mod tests {
         assert_eq!(applied["applied"]["moved_fraction"].as_f64().unwrap(), predicted,
             "the override must not change the cost, only whether it is allowed");
         assert_eq!(solo.state.as_ref().unwrap().cluster_view().ring.unwrap().shards.len(), 2);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -583,8 +567,6 @@ mod tests {
         assert_eq!(code, StatusCode::CONFLICT, "an unanswerable owner must fail closed: {}", body);
         assert!(body["error"].as_str().unwrap().contains("cannot confirm"),
             "the refusal must distinguish 'unknown' from 'populated': {}", body);
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -602,7 +584,5 @@ mod tests {
             "a ring with no tokens owns nothing and must not be adopted");
 
         assert_eq!(route(&state, "key-1"), baseline, "routing must be untouched by the refusal");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 }
