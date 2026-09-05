@@ -379,6 +379,7 @@ impl TestNode {
                     crate::consensus::leader_contact_task(state.clone());
                     crate::replication::stream::replication_drive_task(state.clone());
                 }
+                crate::cluster::catalog::index_catalog_task(state.clone());
 
                 let listener = bind_with_retry(&addr).await;
                 tokio::spawn(async move {

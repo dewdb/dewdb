@@ -109,6 +109,13 @@ pub enum LogEntry {
         handover: HandoverRecord,
         ts: u64,
     },
+    /// A secondary index definition. Like `Config` it is in force from the append rather than the
+    /// commit, so every entry above it stages the values that definition asks for; unlike `Config`
+    /// what commits is the *build*, since the postings it names are derived from committed keys.
+    Index {
+        change: crate::storage::secondary::IndexChange,
+        ts: u64,
+    },
 }
 
 /// A completed handover as it travels in the log: the plan's id and the ring it moved keys *for*.

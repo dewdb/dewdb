@@ -372,6 +372,7 @@ mod tests {
                 }],
             }),
             migration: None,
+            index_catalog: Default::default(),
         }
     }
 
@@ -499,6 +500,7 @@ mod tests {
                 ],
             }),
             migration: None,
+            index_catalog: Default::default(),
         };
         assert!(matches!(
             a.state.as_ref().unwrap().adopt_cluster(current.clone()),

@@ -267,6 +267,44 @@ pub async fn local_drop(
     finish_write(state, col_name, pending, wc, wtimeout).await
 }
 
+/// An index definition as a replicated log entry, the way `local_drop` carries a drop. No key
+/// locks: the entry orders against concurrent writes by LSN alone, and both readings are correct
+/// -- a write below it is picked up by the build, one above it stages the values the new index
+/// asks for.
+pub async fn local_index_change(
+    state: &AppState,
+    col_name: &str,
+    change: crate::storage::IndexChange,
+    wc: WriteConcern,
+    wtimeout: Duration,
+) -> Result<WriteOutcome, axum::response::Response> {
+    if let Err(pending) = state.admit_write(col_name) {
+        return Err(backpressure_response(
+            col_name, pending, state.config.flow_control.max_uncommitted_frames));
+    }
+
+    let db = state.db.as_ref().unwrap();
+    let col = match db.get_collection(col_name) {
+        Ok(c) => c,
+        Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    };
+
+    let term = state.current_term();
+    let col_clone = col.clone();
+    let appended = tokio::task::spawn_blocking(move || col_clone.define_index(change, term)).await;
+    let (frame, _wal_id, _offset, lsn) = match appended {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    };
+
+    let commit = col.enqueue_commit();
+    state.note_leader_append(col_name, lsn);
+    let pending = PendingWrite { frame, term, lsn, existed: true, commit: Some(commit) };
+
+    finish_write(state, col_name, pending, wc, wtimeout).await
+}
+
 /// One replication round for a run of frames appended together, rather than the per-document
 /// fan-out `finish_write` gives it (bugs.md H7). Sound because the log is a chain: a replica that
 /// acknowledges the last LSN holds every frame below it, so the run shares one holder set.

@@ -44,6 +44,7 @@ impl Database {
             self.cache.clone(),
         )?);
         Collection::start_commit_task(col.clone());
+        Collection::start_index_task(col.clone());
         Ok(col)
     }
 

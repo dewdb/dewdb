@@ -76,7 +76,11 @@ pub async fn drop_collection(
     Query(params): Query<WriteConcernParams>,
 ) -> impl axum::response::IntoResponse {
     if state.config.role == "router" {
-        return router_fanout_drop(&state, &col_name, &params).await;
+        let reply = router_fanout_drop(&state, &col_name, &params).await;
+        if reply.status().is_success() {
+            state.forget_collection_indexes(&col_name);
+        }
+        return reply;
     }
 
     if state.is_shard() && !state.is_leader() {
@@ -100,6 +104,11 @@ pub async fn drop_collection(
         Ok(Err(e)) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
+
+    // The definitions go with the documents, and the entry is emptied rather than removed: a node
+    // that missed the drop would otherwise win the merge and put them back on whoever recreates
+    // the collection. Ahead of the append, so the log can only be behind the catalogue.
+    state.forget_collection_indexes(&col_name);
 
     // Nothing to log: appending a drop here would create the collection in order to tombstone it.
     if !present {

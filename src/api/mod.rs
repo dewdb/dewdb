@@ -2,6 +2,7 @@
 
 pub mod collections;
 pub mod docs;
+pub mod indexes;
 pub mod internal;
 pub mod members;
 pub mod migrate;
@@ -13,6 +14,7 @@ pub mod write;
 use collections::{compact_collection, drop_collection, list_collections, snapshot_collection};
 use crate::cluster::rebalance::rebalance_status_handler;
 use docs::{bulk_create_docs, create_doc, delete_doc, get_doc, list_docs, put_doc, query_docs, update_doc};
+use indexes::{create_index, drop_index, list_indexes};
 use internal::{
     cluster_update_handler, cluster_view_handler, data_summary_handler, heartbeat_handler,
     migrate_cleanup_handler, migrate_handler, migrate_reset_handler,
@@ -50,6 +52,8 @@ pub fn build_app(state: &AppState) -> Router {
         .route("/collections", get(list_collections))
         .route("/collections/:name", delete(drop_collection))
         .route("/collections/:name/compact", post(compact_collection))
+        .route("/collections/:name/indexes", get(list_indexes).post(create_index))
+        .route("/collections/:name/indexes/:index", delete(drop_index))
         .route("/collections/:name/snapshot", post(snapshot_collection))
         .route("/collections/:name/docs", post(create_doc).get(list_docs))
         .route("/collections/:name/docs/bulk", post(bulk_create_docs))

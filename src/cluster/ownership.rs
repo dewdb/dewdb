@@ -105,6 +105,7 @@ mod tests {
             migration: migration.map(|target| Migration {
                 id: "m1".into(), target, started_by: "op".into(), phase: MigrationPhase::Copy,
             }),
+            index_catalog: Default::default(),
         }
     }
 

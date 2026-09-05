@@ -246,6 +246,9 @@ fn stream_snapshot(
                 dropped: collection.is_dropped(),
                 config: collection.committed_config(),
                 handover: collection.committed_handover(),
+                // Definitions only. The receiver installs the directory and reopens it, and the
+                // reopen rebuilds the postings from the keys the snapshot actually carried.
+                indexes: collection.committed_indexes(),
             },
         )
         .map_err(io::Error::other)?;

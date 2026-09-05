@@ -2,6 +2,7 @@
 
 use super::frame::{Configuration, HandoverRecord, LogEntry};
 use super::index::{AppliedMeta, AppliedPos, IndexEntry, IndexSnapshot, LsnMeta, ReadCacheConfig, INDEX_FILENAME};
+use super::secondary::{index_values, IndexChange, IndexKey, IndexSpec, IndexStatus, Indexes, Selection, BUILD_CHUNK};
 use super::wal::WalsState;
 use crate::model::MAX_QUERY_LIMIT;
 use crate::query::{compare_rows, is_after, matches_filter, Filter, SortCursor, SortSpec, SortedRow};
@@ -19,6 +20,9 @@ pub const READ_POOL_HANDLES: usize = 4;
 const COMMIT_BATCH_THRESHOLD: usize = 32;
 const COMMIT_INTERVAL_MS: u64 = 5;
 const READ_RESOLVE_ATTEMPTS: usize = 3;
+/// Ceiling on how long a newly defined index waits before its build starts. The apply path notifies
+/// as well, so this only covers a notification the builder was mid-run for.
+const INDEX_BUILD_POLL_MS: u64 = 250;
 /// Keys cloned per index-lock acquisition by the chunked walk. Large enough that a scan is not
 /// dominated by lock traffic, small enough that no caller pins a whole keyspace in memory.
 const SCAN_CHUNK: usize = 1024;
@@ -47,6 +51,11 @@ pub struct Collection {
     /// Newest committed `Config`. Rides `applied.meta` for the same reason `dropped` does.
     committed_config: std::sync::Mutex<Option<Configuration>>,
     committed_handover: std::sync::Mutex<Option<HandoverRecord>>,
+    /// Committed secondary index definitions, and the postings derived from them. The definitions
+    /// ride `applied.meta`; the postings are rebuilt by `start_index_task`, never persisted.
+    committed_indexes: std::sync::Mutex<Vec<IndexSpec>>,
+    pub indexes: RwLock<Indexes>,
+    index_signal: Arc<tokio::sync::Notify>,
     pub compacting: AtomicBool,
     /// Prevents compaction from retiring WAL files during snapshot streaming.
     pub snapshot_boundary: std::sync::Mutex<()>,
@@ -88,7 +97,11 @@ pub struct StagedApply {
 
 /// What committing a staged frame does to the index.
 pub enum StagedEffect {
-    Put { key: String, entry: IndexEntry },
+    /// `indexed` is what the secondary indexes in force at *append* time asked of this document,
+    /// computed here because the document is in hand and committing must cost no read. An index
+    /// defined above this frame is not in it, and does not need to be: its own build walks
+    /// everything committed below it, which by then includes this key.
+    Put { key: String, entry: IndexEntry, indexed: Vec<(String, IndexKey)> },
     Remove { key: String },
     /// A barrier: it occupies an LSN and touches nothing.
     Nothing,
@@ -98,6 +111,8 @@ pub enum StagedEffect {
     Configure(Configuration),
     /// A completed handover. Same shape as a configuration: no key, but state that outlives it.
     RecordHandover(HandoverRecord),
+    /// A secondary index definition. Registered on commit, which is where its build starts.
+    DefineIndex(IndexChange),
 }
 
 impl StagedEffect {
@@ -105,7 +120,7 @@ impl StagedEffect {
     /// leaves behind, or `Some(None)` if the key is gone.
     fn resolve<'a>(&'a self, key: &str) -> Option<Option<&'a IndexEntry>> {
         match self {
-            Self::Put { key: k, entry } if k == key => Some(Some(entry)),
+            Self::Put { key: k, entry, .. } if k == key => Some(Some(entry)),
             Self::Remove { key: k } if k == key => Some(None),
             Self::Clear => Some(None),
             _ => None,
@@ -136,6 +151,7 @@ impl Collection {
         // would otherwise find them in.
         let mut dropped = applied.as_ref().is_some_and(|m| m.dropped);
         let mut committed_config = applied.as_ref().and_then(|m| m.config.clone());
+        let mut committed_indexes = applied.as_ref().map(|m| m.indexes.clone()).unwrap_or_default();
         let mut committed_handover = applied.and_then(|m| m.handover);
 
         let mut index = BTreeMap::new();
@@ -202,7 +218,7 @@ impl Collection {
         if !snapshot_loaded {
             info!(target: "storage", collection = %name, "Replaying all WALs");
              for (id, path) in &wal_files {
-                let r = Self::replay_file_from(*id, path, 0, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut staged_inline, &mut dropped, &mut committed_config, &mut committed_handover)?;
+                let r = Self::replay_file_from(*id, path, 0, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut staged_inline, &mut dropped, &mut committed_config, &mut committed_handover, &mut committed_indexes)?;
                 fold(r, &mut max_lsn, &mut max_term);
             }
         } else {
@@ -211,10 +227,10 @@ impl Collection {
                      continue;
                  } else if *id == snapshot_wal_id {
                      info!(target: "storage", collection = %name, wal_id = id, offset = snapshot_offset, "Resuming WAL from snapshot offset");
-                     let r = Self::replay_file_from(*id, path, snapshot_offset, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut staged_inline, &mut dropped, &mut committed_config, &mut committed_handover)?;
+                     let r = Self::replay_file_from(*id, path, snapshot_offset, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut staged_inline, &mut dropped, &mut committed_config, &mut committed_handover, &mut committed_indexes)?;
                      fold(r, &mut max_lsn, &mut max_term);
                  } else {
-                     let r = Self::replay_file_from(*id, path, 0, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut staged_inline, &mut dropped, &mut committed_config, &mut committed_handover)?;
+                     let r = Self::replay_file_from(*id, path, 0, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut staged_inline, &mut dropped, &mut committed_config, &mut committed_handover, &mut committed_indexes)?;
                      fold(r, &mut max_lsn, &mut max_term);
                  }
              }
@@ -265,6 +281,11 @@ impl Collection {
             retired_through: AtomicU64::new(0),
             released: AtomicBool::new(false),
             dropped: AtomicBool::new(dropped),
+            // Seeded as building, always: the postings are derived, so an open rebuilds them from
+            // the keys this replay just published rather than trusting a file beside them.
+            indexes: RwLock::new(Indexes::seed(&committed_indexes)),
+            committed_indexes: std::sync::Mutex::new(committed_indexes),
+            index_signal: Arc::new(tokio::sync::Notify::new()),
             committed_config: std::sync::Mutex::new(committed_config),
             committed_handover: std::sync::Mutex::new(committed_handover),
             compacting: AtomicBool::new(false),
@@ -387,6 +408,46 @@ impl Collection {
     /// entry: nothing acts on it until cleanup, which runs after the ring has already flipped.
     pub fn record_handover(&self, handover: HandoverRecord, term: u64) -> io::Result<(Vec<u8>, u64, u64, u64)> {
         self.append(LogEntry::Handover { handover, ts: Self::current_timestamp() }, term)
+    }
+
+    /// A secondary index definition. Appending it is what puts it in force for later entries, so
+    /// every frame above this one stages the values the new index asks for; the build that fills
+    /// in everything below runs when it commits.
+    pub fn define_index(&self, change: IndexChange, term: u64) -> io::Result<(Vec<u8>, u64, u64, u64)> {
+        self.append(LogEntry::Index { change, ts: Self::current_timestamp() }, term)
+    }
+
+    pub fn committed_indexes(&self) -> Vec<IndexSpec> {
+        self.committed_indexes.lock().unwrap().clone()
+    }
+
+    /// The definitions in force: committed, with every staged change laid over them in log order.
+    /// Same rule `latest_config` follows, and it gets the same thing from it -- a truncation that
+    /// drops a staged `Index` entry drops the definition with it, without a second bookkeeping path.
+    pub fn active_index_specs(&self) -> Vec<IndexSpec> {
+        let pending = self.pending.lock().unwrap();
+        Self::overlay_index_specs(&self.committed_indexes(), &pending)
+    }
+
+    fn overlay_index_specs(
+        committed: &[IndexSpec],
+        pending: &BTreeMap<u64, StagedApply>,
+    ) -> Vec<IndexSpec> {
+        let mut specs = committed.to_vec();
+        for staged in pending.values() {
+            match &staged.effect {
+                StagedEffect::DefineIndex(change) => change.apply_to(&mut specs),
+                // An uncommitted drop takes the definitions with the documents, in the same order
+                // the apply would: a create above it survives, one below it does not.
+                StagedEffect::Clear => specs.clear(),
+                _ => {},
+            }
+        }
+        specs
+    }
+
+    pub fn index_status(&self) -> Vec<IndexStatus> {
+        self.indexes.read().unwrap().status()
     }
 
     pub fn committed_handover(&self) -> Option<HandoverRecord> {
@@ -580,6 +641,147 @@ impl Collection {
         let _ = self.try_for_each_key::<(), _>(after, start, end, |key| Ok(visit(key)));
     }
 
+    /// The keys a secondary index offers for `filter`, or `None` when no index is eligible or the
+    /// candidate set is not narrow enough to be worth materialising. Public so a test can assert
+    /// the plan rather than infer it from how fast the answer came back.
+    pub fn index_plan(&self, filter: &Option<Filter>) -> Option<Selection> {
+        let filter = filter.as_ref()?;
+        let total = self.index.read().unwrap().len();
+        let chosen = self.indexes.read().unwrap().select(filter, total)?;
+        debug!(target: "query", collection = %self.name, index = %chosen.index, field = %chosen.field,
+            candidates = chosen.keys.len(), documents = total, "Query planned on a secondary index");
+        Some(chosen)
+    }
+
+    /// `try_for_each_key` over an index's candidates instead of the whole range. The candidates
+    /// arrive key-ordered and deduplicated, so the bounds apply the same way and a caller's cursor
+    /// resumes exactly where the full walk would have left it.
+    ///
+    /// The candidates are a snapshot and the walk is not, which is the same guarantee
+    /// `try_for_each_key` gives: neither is a consistent view of the collection, and a key written
+    /// during either may or may not be seen.
+    fn scan_candidates<E, F>(
+        &self,
+        candidates: &[String],
+        after: Option<&str>,
+        start: Option<&str>,
+        end: Option<&str>,
+        mut visit: F,
+    ) -> Result<(), E>
+    where
+        F: FnMut(&str) -> Result<bool, E>,
+    {
+        for key in candidates {
+            // Ascending, so the upper bound ends the walk where the lower ones only skip.
+            if end.is_some_and(|e| key.as_str() > e) {
+                return Ok(());
+            }
+            if after.is_some_and(|a| key.as_str() <= a) || start.is_some_and(|s| key.as_str() < s) {
+                continue;
+            }
+            if !visit(key)? {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Whichever of the two walks the planner chose. Every query path goes through here so an
+    /// index can only ever change which keys are *read*, never which rows are returned.
+    fn scan_for<E, F>(
+        &self,
+        plan: Option<&Selection>,
+        after: Option<&str>,
+        start: Option<&str>,
+        end: Option<&str>,
+        visit: F,
+    ) -> Result<(), E>
+    where
+        F: FnMut(&str) -> Result<bool, E>,
+    {
+        match plan {
+            Some(chosen) => self.scan_candidates(&chosen.keys, after, start, end, visit),
+            None => self.try_for_each_key(after, start, end, visit),
+        }
+    }
+
+    /// Fills in the postings for every index the log has defined and this node has not built yet.
+    /// Documents are read without the index lock and filed under it in `BUILD_CHUNK` batches; a
+    /// write landing in between wins, because it holds the value that is current and this walk
+    /// holds the one it replaced.
+    pub fn build_pending_indexes(&self) -> io::Result<()> {
+        loop {
+            let Some((name, field)) = self.indexes.read().unwrap().next_building() else {
+                return Ok(());
+            };
+
+            let mut cursor: Option<String> = None;
+            let mut walked = true;
+            loop {
+                if self.released.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                let chunk = self.range_page(cursor.as_deref(), None, None, BUILD_CHUNK);
+                if chunk.is_empty() {
+                    break;
+                }
+                cursor = chunk.last().cloned();
+
+                let mut rows = Vec::with_capacity(chunk.len());
+                for key in &chunk {
+                    match self.get(key) {
+                        Ok(Some(doc)) => rows.push((key.clone(), doc)),
+                        // Deleted between the range page and the read, or the handle went away.
+                        Ok(None) => {},
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                if !self.indexes.write().unwrap().absorb_build(&name, &field, &rows) {
+                    walked = false;
+                    break;
+                }
+                if chunk.len() < BUILD_CHUNK {
+                    break;
+                }
+            }
+
+            if walked {
+                self.indexes.write().unwrap().finish_build(&name, &field);
+                info!(target: "storage", collection = %self.name, index = %name, field = %field,
+                    "Secondary index built");
+            }
+        }
+    }
+
+    /// One builder per collection. Separate from the commit task because a build is a full walk of
+    /// the keyspace and the commit task's tick bounds write latency.
+    pub fn start_index_task(col: Arc<Collection>) {
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = col.index_signal.notified() => {},
+                    _ = tokio::time::sleep(Duration::from_millis(INDEX_BUILD_POLL_MS)) => {},
+                }
+                if col.released.load(Ordering::SeqCst) {
+                    return;
+                }
+                if !col.indexes.read().unwrap().has_building() {
+                    continue;
+                }
+                let building = col.clone();
+                match tokio::task::spawn_blocking(move || building.build_pending_indexes()).await {
+                    Ok(Ok(())) => {},
+                    Ok(Err(e)) => error!(target: "storage", collection = %col.name, error = %e,
+                        "Secondary index build failed; queries fall back to a scan and it retries"),
+                    Err(e) => error!(target: "storage", collection = %col.name, error = %e,
+                        "Secondary index build panicked"),
+                }
+            }
+        });
+    }
+
     pub fn query_page(
         &self,
         after: Option<&str>,
@@ -595,8 +797,9 @@ impl Collection {
         let mut items = Vec::with_capacity(limit.min(MAX_QUERY_LIMIT));
         let mut last_key: Option<String> = None;
         let mut has_more = false;
+        let plan = self.index_plan(filter);
 
-        self.try_for_each_key::<io::Error, _>(after, start, end, |key| {
+        self.scan_for::<io::Error, _>(plan.as_ref(), after, start, end, |key| {
             if items.len() >= limit {
                 match filter {
                     None => {
@@ -627,8 +830,9 @@ impl Collection {
     }
 
     /// Top `limit` rows of the range in sort order, holding at most `2 * limit` of them at once.
-    /// The scan itself is still the whole range: there is no index on the sort field, so every page
-    /// re-reads it and pagination bounds the memory rather than the work.
+    /// The scan is still the whole range unless the filter has an index to narrow it: nothing
+    /// indexes the sort field's order, so every page re-reads what it covers and pagination bounds
+    /// the memory rather than the work.
     pub fn sorted_page(
         &self,
         start: Option<&str>,
@@ -643,8 +847,11 @@ impl Collection {
         let spill = keep.saturating_mul(2).max(1);
         let mut rows: Vec<SortedRow> = Vec::new();
         let mut matched = 0usize;
+        // The filter's index, not the sort field's: a sorted page re-sorts whatever it reads, so
+        // an index can narrow what that is but cannot supply the order.
+        let plan = self.index_plan(filter);
 
-        self.try_for_each_key::<io::Error, _>(None, start, end, |key| {
+        self.scan_for::<io::Error, _>(plan.as_ref(), None, start, end, |key| {
             let value = match self.get(key)? {
                 Some(v) => v,
                 None => return Ok(true),
@@ -790,18 +997,24 @@ impl Collection {
     /// its WAL would lose a write whose client is still waiting on the fsync. There is deliberately
     /// no public way to stage, so no append path can grow that window back.
     pub(super) fn stage_appended(&self, lsn: u64, term: u64, entry: &LogEntry, wal_id: u64, offset: u64, payload: &[u8]) {
+        let committed_specs = self.committed_indexes();
+        let mut pending = self.pending.lock().unwrap();
         let effect = match entry {
-            LogEntry::Put { key, .. } => StagedEffect::Put {
+            // Specs read inside the lock the frame stages under, and both appends hold
+            // `wal_writer`: a definition just below this frame is already in force for it.
+            LogEntry::Put { key, value, .. } => StagedEffect::Put {
                 key: key.clone(),
                 entry: self.build_entry(wal_id, offset, payload),
+                indexed: index_values(&Self::overlay_index_specs(&committed_specs, &pending), value),
             },
             LogEntry::Del { key, .. } => StagedEffect::Remove { key: key.clone() },
             LogEntry::Barrier { .. } => StagedEffect::Nothing,
             LogEntry::Drop { .. } => StagedEffect::Clear,
             LogEntry::Config { config, .. } => StagedEffect::Configure(config.clone()),
             LogEntry::Handover { handover, .. } => StagedEffect::RecordHandover(handover.clone()),
+            LogEntry::Index { change, .. } => StagedEffect::DefineIndex(change.clone()),
         };
-        self.pending.lock().unwrap().insert(lsn, StagedApply { wal_id, offset, term, effect });
+        pending.insert(lsn, StagedApply { wal_id, offset, term, effect });
     }
 
     /// First stage marks this collection consensus-managed. Without the watermark, a restart before
@@ -815,6 +1028,7 @@ impl Collection {
                 dropped: self.is_dropped(),
                 config: self.committed_config(),
                 handover: self.committed_handover(),
+                indexes: self.committed_indexes(),
             }).save(&self.root_path)
             {
                 error!(target: "storage", collection = %self.name, error = %e,
@@ -825,8 +1039,9 @@ impl Collection {
     }
 
     /// A durable commit position covering at least `through`, before this returns. `dropped`,
-    /// `config` and `handover` ride `applied.meta` because compaction retires the frames they came
-    /// from, so a torn or unsynced copy loses state no replay can rebuild (bugs.md C27).
+    /// `config`, `handover` and the index definitions ride `applied.meta` because compaction
+    /// retires the frames they came from, so a torn or unsynced copy loses state no replay can
+    /// rebuild (bugs.md C27).
     ///
     /// Concurrent commits coalesce onto one fsync: the first writer covers the rest. The check is
     /// "is my position covered", never "did someone else just run" — a writer whose entry landed
@@ -884,6 +1099,7 @@ impl Collection {
                 dropped: self.is_dropped(),
                 config: self.committed_config(),
                 handover: self.committed_handover(),
+                indexes: self.committed_indexes(),
             }
         };
         let covered = meta.applied_lsn;
@@ -926,6 +1142,7 @@ impl Collection {
 
     /// Drains in log order; staged frames can arrive out of order.
     pub fn apply_committed(&self, committed_lsn: u64) -> usize {
+        let mut build_wanted = false;
         // The pending -> index order keeps index visibility atomic with the snapshot watermark.
         let (ready_len, needs_persist) = {
             let mut pending = self.pending.lock().unwrap();
@@ -933,18 +1150,23 @@ impl Collection {
             *pending = ready.split_off(&(committed_lsn + 1));
             if !ready.is_empty() {
                 let mut index = self.index.write().unwrap();
+                // Under the index write lock with the key it indexes, so no reader ever sees a
+                // key published without its postings or a posting without its key.
+                let mut secondary = self.indexes.write().unwrap();
                 for (_lsn, staged) in ready.iter() {
                     match &staged.effect {
                         // `swap` rather than `store`: only a real flip is a change `applied.meta`
                         // has to be rewritten for, and a keyed write is the common case.
-                        StagedEffect::Put { key, entry } => {
+                        StagedEffect::Put { key, entry, indexed } => {
                             self.apply_index_put(&mut index, key.clone(), entry.clone());
+                            secondary.put(key, indexed);
                             if self.dropped.swap(false, Ordering::SeqCst) {
                                 self.rich_gen.fetch_add(1, Ordering::SeqCst);
                             }
                         },
                         StagedEffect::Remove { key } => {
                             self.apply_index_remove(&mut index, key);
+                            secondary.remove(key);
                             if self.dropped.swap(false, Ordering::SeqCst) {
                                 self.rich_gen.fetch_add(1, Ordering::SeqCst);
                             }
@@ -953,9 +1175,24 @@ impl Collection {
                         StagedEffect::Nothing => {},
                         StagedEffect::Clear => {
                             self.clear_index(&mut index);
+                            // The definitions go with the documents: the collection is gone as far
+                            // as a client is concerned, and a schema outliving it is invisible state.
+                            secondary.clear_all();
+                            if !self.committed_indexes.lock().unwrap().is_empty() {
+                                self.committed_indexes.lock().unwrap().clear();
+                                self.rich_gen.fetch_add(1, Ordering::SeqCst);
+                            }
                             if !self.dropped.swap(true, Ordering::SeqCst) {
                                 self.rich_gen.fetch_add(1, Ordering::SeqCst);
                             }
+                        },
+                        // Registered here rather than at the append, unlike the definition itself:
+                        // what commits is the build, and it walks the keys committed below it.
+                        StagedEffect::DefineIndex(change) => {
+                            secondary.apply_change(change);
+                            change.apply_to(&mut self.committed_indexes.lock().unwrap());
+                            self.rich_gen.fetch_add(1, Ordering::SeqCst);
+                            build_wanted = true;
                         },
                         // Already in force since it was appended; committing it is what makes it
                         // survive compaction retiring its frame.
@@ -989,6 +1226,9 @@ impl Collection {
                 error!(target: "storage", collection = %self.name, error = %e,
                     "Failed to persist applied watermark; a restart will re-stage these entries");
             }
+        }
+        if build_wanted {
+            self.index_signal.notify_one();
         }
         ready_len
     }
@@ -1080,9 +1320,13 @@ impl Collection {
         }
 
         self.commit_signal.notify_one();
+        self.index_signal.notify_one();
         self.drain_read_pool(u64::MAX);
         self.pending.lock().unwrap().clear();
         self.index.write().unwrap().clear();
+        // The definitions stay: the log still says they exist, and the collection reopened over
+        // the installed directory rebuilds their postings from whatever it now holds.
+        self.indexes.write().unwrap().clear_entries();
         // For the same reason the WAL handle moves to the tombstone: Windows refuses to replace a
         // directory anything still holds a handle in, and an install renames this one away.
         *self.applied_pos.lock().unwrap() = None;
@@ -1098,13 +1342,43 @@ mod tests {
     use crate::storage::Retention;
     use crate::json::merge_patch;
     use crate::storage::frame::HEADER_LEN;
-    use crate::storage::Database;
+    use crate::storage::{Database, FrameHeader};
     use crate::test_support::{disk_put, idx, live_put, stage_delete, stage_put, temp_root, wait_for};
     use crate::util::remove_file_with_retry;
     use std::collections::HashSet;
 
     fn cache_cfg(max_value: u32, budget: u64) -> ReadCacheConfig {
         ReadCacheConfig { inline_max_value_bytes: max_value, inline_budget_bytes: budget }
+    }
+
+    fn create_spec(name: &str, field: &str) -> IndexChange {
+        IndexChange::Create { spec: IndexSpec { name: name.to_string(), field: field.to_string() } }
+    }
+
+    /// Defines an index the way a committed log entry does, and waits out the build. Every test
+    /// below asserts against a *ready* index: a building one is deliberately not selected, so
+    /// without the wait they would all pass on the fallback scan.
+    async fn ready_index(col: &Arc<Collection>, name: &str, field: &str) {
+        let lsn = col.define_index(create_spec(name, field), 1).unwrap().3;
+        col.apply_committed(lsn);
+        let name = name.to_string();
+        assert!(wait_for(Duration::from_secs(20), || {
+            col.index_status().iter().any(|s| s.name == name && s.state == "ready")
+        }).await, "the build did not finish");
+    }
+
+    fn put_json(col: &Arc<Collection>, key: &str, value: serde_json::Value) {
+        let lsn = col.put(key.to_string(), value, 1).unwrap().3;
+        col.apply_committed(lsn);
+    }
+
+    fn filter_of(s: &str) -> Option<crate::query::Filter> {
+        Some(crate::query::parse_filter(s).unwrap())
+    }
+
+    fn page_keys(col: &Arc<Collection>, filter: &Option<Filter>, limit: usize) -> Vec<String> {
+        col.query_page(None, None, None, filter, limit).unwrap().0
+            .into_iter().map(|r| r.key).collect()
     }
 
     #[tokio::test]
@@ -1406,7 +1680,8 @@ mod tests {
 
         assert!(AppliedMeta::load(&root).unwrap().is_none(), "absent is 'no consensus history'");
 
-        AppliedMeta { applied_lsn: 7, dropped: true, config: None, handover: None }.save(&root).unwrap();
+        AppliedMeta { applied_lsn: 7, dropped: true, config: None, handover: None, indexes: Vec::new() }
+            .save(&root).unwrap();
         let back = AppliedMeta::load(&root).unwrap().unwrap();
         assert_eq!((back.applied_lsn, back.dropped), (7, true));
 
@@ -2176,5 +2451,297 @@ mod tests {
 
         drop(stale);
         drop(col);
+    }
+
+    /// The whole contract in one test: an index changes which keys a query reads, never which
+    /// rows it returns. Every filter is run against a second collection that has no index, and
+    /// the two answers have to agree.
+    #[tokio::test]
+    async fn an_indexed_query_answers_exactly_what_the_scan_would() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let indexed = db.get_collection("indexed").unwrap();
+        let plain = db.get_collection("plain").unwrap();
+
+        let docs: Vec<(String, serde_json::Value)> = (0..40).map(|i| (
+            format!("k{:03}", i),
+            serde_json::json!({"age": i % 7, "tier": if i % 3 == 0 { "gold" } else { "silver" },
+                               "meta": {"rank": i}}),
+        )).collect();
+        for (key, value) in &docs {
+            put_json(&indexed, key, value.clone());
+            put_json(&plain, key, value.clone());
+        }
+        ready_index(&indexed, "by_age", "age").await;
+        ready_index(&indexed, "by_rank", "meta.rank").await;
+
+        for expr in [
+            r#"{"age": 3}"#,
+            r#"{"age": 999}"#,
+            r#"{"age": {"$in": [1, 2]}}"#,
+            r#"{"age": {"$gte": 5}}"#,
+            r#"{"meta.rank": {"$gt": 30, "$lte": 35}}"#,
+            r#"{"meta.rank": {"$gt": 35, "$lt": 30}}"#,
+            r#"{"age": 3, "tier": "gold"}"#,
+            r#"{"age": {"$ne": 3}}"#,
+            r#"{"tier": "gold"}"#,
+        ] {
+            let filter = filter_of(expr);
+            assert_eq!(page_keys(&indexed, &filter, 100), page_keys(&plain, &filter, 100),
+                "the index changed the answer to {}", expr);
+        }
+
+        assert!(indexed.index_plan(&filter_of(r#"{"age": 3}"#)).is_some(), "and it was used");
+        assert!(indexed.index_plan(&filter_of(r#"{"tier": "gold"}"#)).is_none(),
+            "with no index on the field there is nothing to use");
+    }
+
+    /// A page resuming by key has to see the candidates in key order, or its cursor either repeats
+    /// rows or steps over them.
+    #[tokio::test]
+    async fn paging_an_indexed_query_visits_every_row_once() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        for i in 0..30 {
+            put_json(&col, &format!("k{:03}", i), serde_json::json!({"age": i % 2}));
+        }
+        ready_index(&col, "by_age", "age").await;
+
+        let filter = filter_of(r#"{"age": 1}"#);
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let (rows, next) = col.query_page(cursor.as_deref(), None, None, &filter, 4).unwrap();
+            seen.extend(rows.into_iter().map(|r| r.key));
+            match next {
+                Some(k) => cursor = Some(k),
+                None => break,
+            }
+        }
+
+        let expected: Vec<String> = (0..30).filter(|i| i % 2 == 1)
+            .map(|i| format!("k{:03}", i)).collect();
+        assert_eq!(seen, expected, "an indexed page must resume where the scan would have");
+    }
+
+    /// Bounds are applied on top of the candidates, not instead of them.
+    #[tokio::test]
+    async fn key_bounds_still_apply_to_an_indexed_query() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        for i in 0..10 {
+            put_json(&col, &format!("k{}", i), serde_json::json!({"age": 1}));
+        }
+        ready_index(&col, "by_age", "age").await;
+
+        let filter = filter_of(r#"{"age": 1}"#);
+        let (rows, _) = col.query_page(None, Some("k3"), Some("k5"), &filter, 100).unwrap();
+        assert_eq!(rows.iter().map(|r| r.key.clone()).collect::<Vec<_>>(),
+            vec!["k3".to_string(), "k4".to_string(), "k5".to_string()]);
+    }
+
+    /// Every mutation path, against the one structure that decides whether a row is a candidate.
+    #[tokio::test]
+    async fn a_replace_a_delete_and_a_vanished_field_all_reach_the_index() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        put_json(&col, "a", serde_json::json!({"age": 30}));
+        put_json(&col, "b", serde_json::json!({"age": 30}));
+        put_json(&col, "c", serde_json::json!({"age": 30}));
+        ready_index(&col, "by_age", "age").await;
+
+        put_json(&col, "a", serde_json::json!({"age": 40}));
+        col.apply_committed(stage_delete(&col, "b"));
+        put_json(&col, "c", serde_json::json!({"other": 1}));
+
+        assert_eq!(page_keys(&col, &filter_of(r#"{"age": 30}"#), 100), Vec::<String>::new(),
+            "nothing holds 30 any more");
+        assert_eq!(page_keys(&col, &filter_of(r#"{"age": 40}"#), 100), vec!["a".to_string()]);
+        assert_eq!(col.index_status()[0].documents, 1, "and the reverse map moved with them");
+    }
+
+    /// The definitions are durable and the postings are not, so a restart has to rebuild them from
+    /// the keys it replayed. A collection that came back with an empty index would answer `200`
+    /// with no rows.
+    #[tokio::test]
+    async fn a_restart_rebuilds_the_postings_from_a_definition_that_survived() {
+        let root = temp_root();
+        {
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("c").unwrap();
+            for i in 0..5 {
+                put_json(&col, &format!("k{}", i), serde_json::json!({"age": i}));
+            }
+            ready_index(&col, "by_age", "age").await;
+            col.save_index().unwrap();
+        }
+
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+        assert_eq!(col.committed_indexes().len(), 1, "the definition rides applied.meta");
+        assert!(wait_for(Duration::from_secs(20), || {
+            col.index_status().iter().all(|s| s.state == "ready")
+        }).await, "and the postings are rebuilt rather than restored");
+        assert_eq!(page_keys(&col, &filter_of(r#"{"age": 3}"#), 100), vec!["k3".to_string()]);
+        assert!(col.index_plan(&filter_of(r#"{"age": 3}"#)).is_some());
+    }
+
+    /// Compaction retires the frame the definition arrived in, exactly as it does for a drop or a
+    /// configuration. `applied.meta` is the only copy after that.
+    #[tokio::test]
+    async fn compaction_retires_the_index_frame_without_losing_the_definition() {
+        let root = temp_root();
+        {
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("c").unwrap();
+            ready_index(&col, "by_age", "age").await;
+            for i in 0..5 {
+                put_json(&col, &format!("k{}", i), serde_json::json!({"age": i}));
+            }
+            col.compact(Retention::none()).unwrap();
+            assert!(col.read_frames_after(0, u64::MAX).unwrap().iter().all(|(_, frame)| {
+                let payload = &frame[HEADER_LEN..];
+                !matches!(serde_json::from_slice::<LogEntry>(payload), Ok(LogEntry::Index { .. }))
+            }), "the frame has to be gone or the test proves nothing");
+        }
+
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+        assert_eq!(col.committed_indexes(),
+            vec![IndexSpec { name: "by_age".to_string(), field: "age".to_string() }]);
+        assert!(wait_for(Duration::from_secs(20), || {
+            col.index_status().iter().all(|s| s.state == "ready")
+        }).await);
+        assert_eq!(page_keys(&col, &filter_of(r#"{"age": 2}"#), 100), vec!["k2".to_string()]);
+    }
+
+    /// The definition is in force from the append, so a write appended above an uncommitted
+    /// definition indexes for it -- and committing the definition must not need a second pass over
+    /// keys that already staged their values.
+    #[tokio::test]
+    async fn a_write_above_an_uncommitted_definition_is_indexed_when_both_commit() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        put_json(&col, "below", serde_json::json!({"age": 7}));
+        let define = col.define_index(create_spec("by_age", "age"), 1).unwrap().3;
+        assert_eq!(col.active_index_specs().len(), 1, "in force from the append, like a Config");
+        assert!(col.committed_indexes().is_empty(), "and not committed yet");
+        let above = col.put("above".to_string(), serde_json::json!({"age": 7}), 1).unwrap().3;
+
+        col.apply_committed(above.max(define));
+        assert!(wait_for(Duration::from_secs(20), || {
+            col.index_status().iter().all(|s| s.state == "ready")
+        }).await);
+
+        assert_eq!(page_keys(&col, &filter_of(r#"{"age": 7}"#), 100),
+            vec!["above".to_string(), "below".to_string()],
+            "the build covers what was committed below it and the staged values cover the rest");
+    }
+
+    /// A truncation drops staged entries, and a definition is one of them. Nothing separate
+    /// unregisters it: `active_index_specs` reads pending, so the cut takes it.
+    #[tokio::test]
+    async fn a_staged_definition_a_truncation_removes_stops_being_in_force() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        let seed = stage_put(&col, "k", 1);
+        col.apply_committed(seed);
+        let (frame, ..) = col.define_index(create_spec("by_v", "v"), 1).unwrap();
+        assert_eq!(col.active_index_specs().len(), 1);
+
+        // A frame of a later term at the definition's position: the leader we follow does not have
+        // it, so it goes, and the definition goes with it.
+        let prev = FrameHeader::parse(&frame).unwrap().prev_lsn;
+        let replacement = crate::test_support::make_frame(2, prev + 1, prev, 1, "k", 2);
+        col.append_raw_frame(&replacement).unwrap();
+
+        assert!(col.active_index_specs().is_empty(),
+            "unfixed the definition outlives the entry that carried it");
+    }
+
+    #[tokio::test]
+    async fn dropping_the_collection_drops_its_indexes() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        put_json(&col, "a", serde_json::json!({"age": 1}));
+        ready_index(&col, "by_age", "age").await;
+
+        let lsn = col.drop_marker(1).unwrap().3;
+        col.apply_committed(lsn);
+        assert!(col.committed_indexes().is_empty(),
+            "a schema outliving its collection is invisible state");
+        assert!(col.index_status().is_empty());
+        assert!(col.active_index_specs().is_empty());
+    }
+
+    /// A replica applies frames it never appended, so the whole definition path has to work from
+    /// `append_raw_frame` alone.
+    #[tokio::test]
+    async fn a_replica_picks_up_a_definition_and_indexes_the_writes_that_follow_it() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let leader = db.get_collection("leader").unwrap();
+        let replica = db.get_collection("replica").unwrap();
+
+        let mut frames = Vec::new();
+        frames.push(leader.put("a".to_string(), serde_json::json!({"age": 5}), 1).unwrap().0);
+        frames.push(leader.define_index(create_spec("by_age", "age"), 1).unwrap().0);
+        frames.push(leader.put("b".to_string(), serde_json::json!({"age": 5}), 1).unwrap().0);
+
+        for frame in &frames {
+            replica.append_raw_frame(frame).unwrap();
+        }
+        replica.apply_committed(replica.last_appended_lsn());
+
+        assert_eq!(replica.committed_indexes().len(), 1);
+        assert!(wait_for(Duration::from_secs(20), || {
+            replica.index_status().iter().all(|s| s.state == "ready")
+        }).await);
+        assert_eq!(page_keys(&replica, &filter_of(r#"{"age": 5}"#), 100),
+            vec!["a".to_string(), "b".to_string()]);
+    }
+
+    /// The build walks the keyspace while writes continue, and both file into the same postings.
+    #[tokio::test]
+    async fn writes_during_a_build_are_not_lost_to_it() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        for i in 0..600 {
+            put_json(&col, &format!("k{:04}", i), serde_json::json!({"age": 1}));
+        }
+        let lsn = col.define_index(create_spec("by_age", "age"), 1).unwrap().3;
+        col.apply_committed(lsn);
+
+        // Interleaved with the walk rather than before or after it: more than one `BUILD_CHUNK`
+        // of keys, so the build is still running when these land.
+        for i in 0..600 {
+            if i % 3 == 0 {
+                put_json(&col, &format!("k{:04}", i), serde_json::json!({"age": 2}));
+            }
+        }
+
+        assert!(wait_for(Duration::from_secs(30), || {
+            col.index_status().iter().all(|s| s.state == "ready")
+        }).await);
+
+        let twos = page_keys(&col, &filter_of(r#"{"age": 2}"#), 1000);
+        let expected: Vec<String> = (0..600).filter(|i| i % 3 == 0)
+            .map(|i| format!("k{:04}", i)).collect();
+        assert_eq!(twos, expected, "a write during the build must beat what the build read");
+        assert_eq!(page_keys(&col, &filter_of(r#"{"age": 1}"#), 1000).len(), 600 - expected.len());
     }
 }

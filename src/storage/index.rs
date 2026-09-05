@@ -1,6 +1,7 @@
 //! Index entries, their persisted snapshot, and the commit watermark file.
 
 use super::frame::{Configuration, HandoverRecord, HEADER_LEN};
+use super::secondary::IndexSpec;
 use crate::util::write_atomic;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -83,6 +84,11 @@ pub struct AppliedMeta {
     /// migration is cluster-wide, so a later plan replaces an earlier one rather than joining it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handover: Option<HandoverRecord>,
+    /// The committed secondary index definitions, here for the same reason the three above are:
+    /// an `Index` entry is never in the key index, so compaction retires its frame. Only the
+    /// definitions -- the postings are derived and rebuilt when the collection opens.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub indexes: Vec<IndexSpec>,
 }
 
 pub const APPLIED_FILENAME: &str = "applied.meta";

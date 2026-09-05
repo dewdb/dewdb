@@ -454,7 +454,31 @@ pub async fn router_read_doc(state: &AppState, col_name: &str, id: &str, pref: R
 }
 
 async fn admin_call(client: &reqwest::Client, post: bool, url: &str) -> Option<(StatusCode, serde_json::Value)> {
-    let rb = if post { client.post(url) } else { client.delete(url) };
+    admin_call_with(client, if post { AdminMethod::Post } else { AdminMethod::Delete }, url, None).await
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum AdminMethod {
+    Get,
+    Post,
+    Delete,
+}
+
+async fn admin_call_with(
+    client: &reqwest::Client,
+    method: AdminMethod,
+    url: &str,
+    body: Option<&serde_json::Value>,
+) -> Option<(StatusCode, serde_json::Value)> {
+    let rb = match method {
+        AdminMethod::Get => client.get(url),
+        AdminMethod::Post => client.post(url),
+        AdminMethod::Delete => client.delete(url),
+    };
+    let rb = match body {
+        Some(b) => rb.json(b),
+        None => rb,
+    };
     let r = rb.send().await.ok()?;
     let status = r.status();
     let body = r.json::<serde_json::Value>().await.unwrap_or(serde_json::Value::Null);
@@ -517,16 +541,23 @@ pub async fn router_fanout_maintenance(state: &AppState, col_name: &str, action:
     (status, Json(serde_json::json!({"nodes": results}))).into_response()
 }
 
-pub async fn router_fanout_drop(
+/// One replicated admin write per shard group, sent to whichever candidate answers
+/// authoritatively. `suffix` is appended to `/collections/<name>` already encoded, so a caller that
+/// splices a client-supplied segment into it has to encode that segment itself.
+async fn fanout_to_owners(
     state: &AppState,
     col_name: &str,
-    params: &WriteConcernParams,
-) -> axum::response::Response {
-    let query = wc_query_string(params);
-    let results = futures::future::join_all(unique_shards(state).into_iter().map(|(original, replicas)| {
+    suffix: &str,
+    query: &str,
+    method: AdminMethod,
+    body: Option<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    futures::future::join_all(unique_shards(state).into_iter().map(|(original, replicas)| {
         let state = state.clone();
         let col_name = col_name.to_string();
-        let query = query.clone();
+        let query = query.to_string();
+        let suffix = suffix.to_string();
+        let body = body.clone();
         async move {
             let effective = state.effective_primary(&original);
             let mut candidates = vec![effective.clone()];
@@ -536,23 +567,145 @@ pub async fn router_fanout_drop(
             candidates.extend(replicas.into_iter().filter(|r| *r != effective));
 
             for node in candidates {
-                let url = format!("{}/collections/{}{}", node, encode_path_segment(&col_name), query);
-                if let Some((status, body)) = admin_call(&state.client, false, &url).await {
+                let url = format!("{}/collections/{}{}{}",
+                    node, encode_path_segment(&col_name), suffix, query);
+                if let Some((status, reply)) = admin_call_with(&state.client, method, &url, body.as_ref()).await {
                     if authoritative_write_status(status) {
                         if node != original {
                             state.set_primary_override(&original, &node);
                         }
-                        return node_result(&node, Some((status, body)));
+                        return node_result(&node, Some((status, reply)));
                     }
                 }
             }
             node_result(&original, None)
         }
-    })).await;
+    })).await
+}
+
+pub async fn router_fanout_drop(
+    state: &AppState,
+    col_name: &str,
+    params: &WriteConcernParams,
+) -> axum::response::Response {
+    let query = wc_query_string(params);
+    let results = fanout_to_owners(
+        state, col_name, "", &query, AdminMethod::Delete, None).await;
 
     let all_ok = results.iter().all(|r| r.get("status").and_then(|s| s.as_u64()).map_or(false, |s| s < 300));
     let status = if all_ok { StatusCode::OK } else { StatusCode::MULTI_STATUS };
     (status, Json(serde_json::json!({"shards": results}))).into_response()
+}
+
+/// An index definition, to every shard group that holds the collection. A group that holds none of
+/// it answers `404`, which is not a failure here for the same reason it is not one in
+/// `router_fanout_maintenance` -- and not a definition either, which is why the caller records the
+/// change in the cluster index catalogue: that is what reaches a group taking its first key for
+/// this collection later. See `cluster::catalog`.
+pub async fn router_fanout_index(
+    state: &AppState,
+    col_name: &str,
+    suffix: &str,
+    method_is_create: bool,
+    body: Option<serde_json::Value>,
+    params: &WriteConcernParams,
+) -> axum::response::Response {
+    let query = wc_query_string(params);
+    let method = if method_is_create { AdminMethod::Post } else { AdminMethod::Delete };
+    let results = fanout_to_owners(state, col_name, suffix, &query, method, body).await;
+
+    let node_status = |r: &serde_json::Value| r.get("status").and_then(|s| s.as_u64());
+    let absent = results.iter().filter(|r| node_status(r) == Some(404)).count();
+    let ok = results.iter().filter(|r| node_status(r).map_or(false, |s| s < 300)).count();
+    if ok == 0 && absent > 0 {
+        return collection_absent_response(col_name);
+    }
+    let status = if ok + absent == results.len() { StatusCode::OK } else { StatusCode::MULTI_STATUS };
+    (status, Json(serde_json::json!({"shards": results}))).into_response()
+}
+
+/// The union of what each shard group reports, since an index is defined per group and a client
+/// asked the cluster. `state` is the weakest of the groups': one still building answers rows the
+/// planner is not using yet.
+pub async fn router_list_indexes(state: &AppState, col_name: &str) -> axum::response::Response {
+    let mut targets = Vec::new();
+    for (original, _) in unique_shards(state) {
+        targets.push(state.effective_primary(&original));
+    }
+    targets.sort();
+    targets.dedup();
+
+    let per_shard = futures::future::join_all(targets.into_iter().map(|node| {
+        let client = state.client.clone();
+        let col_name = col_name.to_string();
+        async move {
+            let url = format!("{}/collections/{}/indexes", node, encode_path_segment(&col_name));
+            admin_call_with(&client, AdminMethod::Get, &url, None).await
+        }
+    })).await;
+
+    match merge_index_listings(per_shard.into_iter().flatten()) {
+        Some(indexes) => (StatusCode::OK,
+            Json(serde_json::json!({"collection": col_name, "indexes": indexes}))).into_response(),
+        None => collection_absent_response(col_name),
+    }
+}
+
+/// The union across the groups that answered. `None` is every one of them saying the collection is
+/// not theirs, which is the client's error rather than an empty list of indexes.
+fn merge_index_listings(
+    replies: impl Iterator<Item = (StatusCode, serde_json::Value)>,
+) -> Option<Vec<serde_json::Value>> {
+    let mut merged: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let mut holders: HashMap<String, usize> = HashMap::new();
+    let mut answered = 0usize;
+    let mut absent = 0usize;
+
+    for (status, body) in replies {
+        if status == StatusCode::NOT_FOUND {
+            absent += 1;
+            continue;
+        }
+        if !status.is_success() {
+            continue;
+        }
+        answered += 1;
+        for row in body.get("indexes").and_then(|v| v.as_array()).into_iter().flatten() {
+            let Some(name) = row.get("name").and_then(|n| n.as_str()) else { continue };
+            *holders.entry(name.to_string()).or_default() += 1;
+            match merged.get_mut(name) {
+                Some(existing) => merge_index_row(existing, row),
+                None => { merged.insert(name.to_string(), row.clone()); },
+            }
+        }
+    }
+
+    if answered == 0 && absent > 0 {
+        return None;
+    }
+    // A group that does not hold the definition at all is not ready either, and reads as building
+    // for the same reason one still filling its postings does: half the fan-out is on a scan. This
+    // is what a client sees while reconciliation catches a group up that gained the collection
+    // after the index was defined.
+    for (name, row) in merged.iter_mut() {
+        if holders.get(name).copied().unwrap_or(0) < answered {
+            row["state"] = serde_json::json!("building");
+        }
+    }
+    Some(merged.into_values().collect())
+}
+
+/// Counts add; readiness is the weaker of the two, since a client's query only uses the index on
+/// the shard that has finished building it.
+fn merge_index_row(into: &mut serde_json::Value, row: &serde_json::Value) {
+    for field in ["documents", "values"] {
+        let sum = into.get(field).and_then(|v| v.as_u64()).unwrap_or(0)
+            + row.get(field).and_then(|v| v.as_u64()).unwrap_or(0);
+        into[field] = serde_json::json!(sum);
+    }
+    if row.get("state").and_then(|s| s.as_str()) != Some("ready") {
+        into["state"] = serde_json::json!("building");
+    }
 }
 
 /// Rows to ask each shard for, summing to exactly `limit`: `limit / n` each and one more to the
@@ -1039,5 +1192,54 @@ mod tests {
             assert_eq!(r.status(), StatusCode::NOT_FOUND, "{} of a collection no shard holds", action);
         }
 
+    }
+
+    fn listing(rows: serde_json::Value) -> (StatusCode, serde_json::Value) {
+        (StatusCode::OK, serde_json::json!({"indexes": rows}))
+    }
+
+    fn row(name: &str, state: &str, documents: u64) -> serde_json::Value {
+        serde_json::json!({"name": name, "field": "age", "state": state,
+            "documents": documents, "values": 1})
+    }
+
+    #[test]
+    fn a_cluster_wide_listing_sums_the_groups_and_takes_the_weaker_state() {
+        let merged = super::merge_index_listings([
+            listing(serde_json::json!([row("i", "ready", 10)])),
+            listing(serde_json::json!([row("i", "building", 4)])),
+        ].into_iter()).expect("both groups answered");
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["documents"], 14);
+        assert_eq!(merged[0]["state"], "building",
+            "a query only uses the index on the group that finished building it");
+    }
+
+    /// The half `IB-024` showed up in: a group that gained the collection after the index was
+    /// defined has no definition at all, and a listing that called that "ready" would report a
+    /// cluster-wide index while half the fan-out was still scanning.
+    #[test]
+    fn an_index_a_group_has_not_got_yet_reads_as_building() {
+        let merged = super::merge_index_listings([
+            listing(serde_json::json!([row("i", "ready", 10)])),
+            listing(serde_json::json!([])),
+        ].into_iter()).expect("both groups answered");
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["state"], "building");
+    }
+
+    #[test]
+    fn a_group_holding_none_of_the_collection_is_not_a_group_that_lacks_the_index() {
+        let merged = super::merge_index_listings([
+            listing(serde_json::json!([row("i", "ready", 10)])),
+            (StatusCode::NOT_FOUND, serde_json::Value::Null),
+        ].into_iter()).expect("one group answered");
+        assert_eq!(merged[0]["state"], "ready");
+
+        assert!(super::merge_index_listings([
+            (StatusCode::NOT_FOUND, serde_json::Value::Null),
+        ].into_iter()).is_none(), "nowhere at all is the client's error");
     }
 }

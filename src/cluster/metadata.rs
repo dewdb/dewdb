@@ -2,9 +2,12 @@
 
 use crate::config::NodeConfig;
 use crate::ring::{validate_shard_ring, HashRing, ShardInfo};
+use crate::storage::secondary::{
+    valid_field_path, valid_index_name, IndexChange, IndexSpec, MAX_INDEXES_PER_COLLECTION,
+};
 use crate::util::{endpoint_of, write_atomic};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -63,6 +66,59 @@ pub struct ClusterMetadata {
     /// where the keys are going, so every node can agree on which keys are in the middle of moving.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub migration: Option<Migration>,
+    /// What indexes each collection has, cluster-wide. Merged rather than replaced when views
+    /// meet, so it converges on its own clock -- see `IndexCatalog`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub index_catalog: IndexCatalog,
+}
+
+/// Index definitions as a fact about a *collection* rather than about the shard group that happens
+/// to hold its keys today. `LogEntry::Index` stays the durable definition inside each group; this
+/// is what a group consults to find out which ones it is missing.
+///
+/// Versioned per collection and merged rather than replaced, because it changes on a different
+/// clock from the topology. A shard handed its ring by config never adopts anyone's topology --
+/// `supersedes` refuses a seed -- and replacing the catalogue with the winning view's would mean
+/// such a node never learns a definition either.
+pub type IndexCatalog = BTreeMap<String, CollectionIndexes>;
+
+/// One collection's definitions, and how far along they are. `updated_by` is the same tiebreak
+/// `supersedes` uses, for the same reason: two nodes that changed the same collection at the same
+/// version must converge on one of the two rather than alternate.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct CollectionIndexes {
+    pub version: u64,
+    #[serde(default)]
+    pub updated_by: String,
+    #[serde(default)]
+    pub indexes: Vec<IndexSpec>,
+}
+
+impl CollectionIndexes {
+    fn supersedes(&self, other: &Self) -> bool {
+        (self.version, self.updated_by.as_str()) > (other.version, other.updated_by.as_str())
+    }
+}
+
+/// Ceiling on how many collections the catalogue names. It rides every cluster view, and an entry
+/// survives the collection it describes so a drop cannot be resurrected by a stale copy, so the
+/// only bound on its growth is this one.
+pub const MAX_CATALOG_COLLECTIONS: usize = 4096;
+
+/// Takes the newer entry per collection. Returns whether `into` moved, which is what says a
+/// merge is worth persisting or handing on.
+pub fn merge_catalog(into: &mut IndexCatalog, from: &IndexCatalog) -> bool {
+    let mut moved = false;
+    for (collection, incoming) in from {
+        match into.get(collection) {
+            Some(current) if !incoming.supersedes(current) => {},
+            _ => {
+                into.insert(collection.clone(), incoming.clone());
+                moved = true;
+            },
+        }
+    }
+    moved
 }
 
 /// The plan, not the progress. Progress is per node and lives in memory: a half-copied shard is
@@ -135,6 +191,7 @@ impl ClusterMetadata {
             shards: cfg.shard_map.clone(),
             ring: cfg.ring.clone(),
             migration: None,
+            index_catalog: IndexCatalog::new(),
         }
     }
 
@@ -172,6 +229,7 @@ impl ClusterMetadata {
         if !self.shards.is_empty() {
             validate_shard_ring(&self.shards)?;
         }
+        self.validate_catalog()?;
 
         let mut seen = HashSet::new();
         for member in &self.members {
@@ -222,14 +280,20 @@ impl ClusterMetadata {
 
         // Adoption decides under the in-memory lock and persists after releasing it, so saves can
         // arrive out of order. The durable view must move the same direction as the in-memory one.
-        if let Ok(Some(existing)) = Self::load(data_dir) {
+        let mut merged = None;
+        if let Ok(Some(mut existing)) = Self::load(data_dir) {
             if !self.supersedes(&existing) {
-                return Ok(());
+                // The catalogue moves on its own clock, so a view that loses on topology can still
+                // carry a definition the durable copy has not got. Keep that copy's topology.
+                if !merge_catalog(&mut existing.index_catalog, &self.index_catalog) {
+                    return Ok(());
+                }
+                merged = Some(existing);
             }
         }
 
         fs::create_dir_all(&dir)?;
-        let content = serde_json::to_vec(self)
+        let content = serde_json::to_vec(merged.as_ref().unwrap_or(self))
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         write_atomic(&dir, CLUSTER_FILE, &content)
     }
@@ -378,6 +442,100 @@ impl ClusterMetadata {
         next.bump(by);
         next
     }
+
+    /// Records `change` against this collection's entry. Returns whether anything moved: a create
+    /// naming a definition already there is not a version, or the fan-out that reaches every group
+    /// would bump one per group for a single client request.
+    ///
+    /// Deliberately not a `bump`: the topology version is a decision about routing, and a schema
+    /// change is not one. Bumping it would make a shard's seeded view outrank a router's seeded
+    /// ring and route every key nowhere.
+    pub fn record_index_change(&mut self, by: &str, collection: &str, change: &IndexChange) -> bool {
+        let current = self.index_catalog.get(collection);
+        let mut indexes = current.map(|e| e.indexes.clone()).unwrap_or_default();
+        change.apply_to(&mut indexes);
+        if current.is_some_and(|e| e.indexes == indexes) {
+            return false;
+        }
+        // A drop naming an index of a collection the catalogue has never recorded changes nothing,
+        // and an entry would say more than that: an empty entry licenses reconciliation to remove
+        // whatever a group holds, and silence must not turn into that by way of a stray request.
+        if current.is_none() && indexes.is_empty() {
+            return false;
+        }
+        if current.is_none() && self.index_catalog.len() >= MAX_CATALOG_COLLECTIONS {
+            return false;
+        }
+        let version = current.map_or(0, |e| e.version) + 1;
+        self.index_catalog.insert(collection.to_string(), CollectionIndexes {
+            version,
+            updated_by: by.to_string(),
+            indexes,
+        });
+        true
+    }
+
+    /// A dropped collection keeps its entry, emptied. Removing it would let a copy held by a node
+    /// that missed the drop win the merge and put the definitions back on whoever recreates it.
+    pub fn forget_collection_indexes(&mut self, by: &str, collection: &str) -> bool {
+        match self.index_catalog.get(collection) {
+            Some(entry) if entry.indexes.is_empty() => false,
+            Some(entry) => {
+                let version = entry.version + 1;
+                self.index_catalog.insert(collection.to_string(), CollectionIndexes {
+                    version, updated_by: by.to_string(), indexes: Vec::new(),
+                });
+                true
+            },
+            None => false,
+        }
+    }
+
+    /// "Do we hold the same definitions?", in one number. What the gossip loop hands a peer its
+    /// view back over, so two nodes already in step exchange nothing further.
+    pub fn catalog_fingerprint(&self) -> u64 {
+        let mut parts: Vec<String> = self.index_catalog.iter()
+            .map(|(name, entry)| format!("{}@{}:{}", name, entry.version, entry.updated_by))
+            .collect();
+        parts.sort();
+        xxhash_rust::xxh64::xxh64(parts.join("|").as_bytes(), 0)
+    }
+
+    /// The catalogue arrives off the wire and is stored by every node that sees it, so it is
+    /// bounded and shape-checked here rather than where it is read.
+    fn validate_catalog(&self) -> Result<(), String> {
+        if self.index_catalog.len() > MAX_CATALOG_COLLECTIONS {
+            return Err(format!("index catalogue names more than {} collections",
+                MAX_CATALOG_COLLECTIONS));
+        }
+        for (collection, entry) in &self.index_catalog {
+            // The same gate the API puts in front of a name that becomes a directory, applied
+            // where a name arrives off the wire instead.
+            if !crate::consensus::config::valid_collection_name(collection) {
+                return Err(format!("index catalogue names an invalid collection '{}'", collection));
+            }
+            if entry.indexes.len() > MAX_INDEXES_PER_COLLECTION {
+                return Err(format!("index catalogue gives '{}' more than {} indexes",
+                    collection, MAX_INDEXES_PER_COLLECTION));
+            }
+            let mut seen = HashSet::new();
+            for spec in &entry.indexes {
+                if !valid_index_name(&spec.name) {
+                    return Err(format!("index catalogue entry '{}' has an invalid index name",
+                        collection));
+                }
+                if !valid_field_path(&spec.field) {
+                    return Err(format!("index catalogue entry '{}.{}' has an invalid field path",
+                        collection, spec.name));
+                }
+                if !seen.insert(spec.name.as_str()) {
+                    return Err(format!("index catalogue names '{}.{}' more than once",
+                        collection, spec.name));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn same_url(a: &str, b: &str) -> bool {
@@ -408,12 +566,20 @@ pub fn adopt(current: &mut ClusterMetadata, incoming: ClusterMetadata) -> Adopti
     if let Err(why) = incoming.validate() {
         return Adoption::Rejected(why);
     }
+    // Merged before the topology decision and kept across it, in both directions. The catalogue is
+    // versioned per collection, so a view that loses on topology can still carry a definition this
+    // node lacks -- and one that wins must not take away the definitions this node already had.
+    let mut catalog = current.index_catalog.clone();
+    merge_catalog(&mut catalog, &incoming.index_catalog);
+
     if !incoming.supersedes(current) {
+        current.index_catalog = catalog;
         return Adoption::Stale { current: current.version };
     }
     let from = current.version;
     let to = incoming.version;
     *current = incoming;
+    current.index_catalog = catalog;
     Adoption::Adopted { from, to }
 }
 
@@ -563,7 +729,8 @@ mod tests {
 
     fn view(version: u64, by: &str, shards: Vec<ShardInfo>) -> ClusterMetadata {
         ClusterMetadata {
-            version, updated_by: by.to_string(), seeded: false, members: Vec::new(), shards, ring: None, migration: None,
+            version, updated_by: by.to_string(), seeded: false, members: Vec::new(), shards,
+            ring: None, migration: None, index_catalog: Default::default(),
         }
     }
 
@@ -760,6 +927,169 @@ mod tests {
 
         let back = ClusterMetadata::load(&dir).unwrap().expect("the staging file is complete once fsynced");
         assert_eq!(back.version, 9);
+    }
+
+    fn spec(name: &str, field: &str) -> IndexSpec {
+        IndexSpec { name: name.to_string(), field: field.to_string() }
+    }
+
+    fn created(name: &str, field: &str) -> IndexChange {
+        IndexChange::Create { spec: spec(name, field) }
+    }
+
+    #[test]
+    fn a_definition_is_recorded_once_however_many_groups_the_request_reached() {
+        let mut v = view(4, "n1", vec![]);
+        assert!(v.record_index_change("n1", "t", &created("by_age", "age")));
+        assert_eq!(v.index_catalog["t"].version, 1);
+        assert!(!v.record_index_change("n1", "t", &created("by_age", "age")),
+            "a fan-out that reaches three groups is one client request, not three versions");
+        assert_eq!(v.index_catalog["t"].version, 1);
+
+        assert!(v.record_index_change("n1", "t", &created("by_age", "score")),
+            "the same name over a different field is a different definition");
+        assert_eq!(v.index_catalog["t"].version, 2);
+    }
+
+    /// The catalogue is a schema change, and routing must not move because one happened: a bumped
+    /// topology version on a shard's seeded view would outrank a router's seeded ring.
+    #[test]
+    fn recording_a_definition_moves_no_topology_version() {
+        let mut v = ClusterMetadata::seed_from_config(&cfg(serde_json::json!({
+            "node_id": "n1", "role": "shard", "listen_addr": "127.0.0.1:1", "data_dir": "d",
+        })));
+        assert!(v.seeded && v.version == 1);
+        assert!(v.record_index_change("n1", "t", &created("i", "age")));
+        assert_eq!((v.version, v.seeded), (1, true));
+    }
+
+    #[test]
+    fn a_drop_naming_a_collection_the_catalogue_never_recorded_records_nothing() {
+        let mut v = view(4, "n1", vec![]);
+        assert!(!v.record_index_change("n1", "t", &IndexChange::Drop { name: "i".into() }));
+        assert!(v.index_catalog.is_empty(),
+            "an empty entry says the collection has no indexes, which licenses a group to drop \
+             what it holds; a stray request must not say that");
+    }
+
+    #[test]
+    fn a_dropped_collection_keeps_an_emptied_entry_rather_than_losing_it() {
+        let mut v = view(4, "n1", vec![]);
+        v.record_index_change("n1", "t", &created("i", "age"));
+        assert!(v.forget_collection_indexes("n1", "t"));
+        let entry = &v.index_catalog["t"];
+        assert!(entry.indexes.is_empty());
+        assert_eq!(entry.version, 2, "a node that missed the drop must lose the merge");
+        assert!(!v.forget_collection_indexes("n1", "t"), "and dropping it twice is not a version");
+        assert!(!v.forget_collection_indexes("n1", "never_indexed"));
+    }
+
+    #[test]
+    fn merging_takes_the_newer_entry_per_collection_in_both_directions() {
+        let mut a = view(4, "n1", vec![]);
+        a.record_index_change("n1", "orders", &created("i", "age"));
+        let mut b = view(4, "n2", vec![]);
+        b.record_index_change("n2", "users", &created("j", "email"));
+
+        assert!(merge_catalog(&mut a.index_catalog, &b.index_catalog));
+        assert_eq!(a.index_catalog.len(), 2, "neither node knew about the other's collection");
+        assert!(!merge_catalog(&mut a.index_catalog, &b.index_catalog),
+            "a second round has nothing to hand over");
+
+        // A newer entry for the same collection replaces the older one whole.
+        let mut newer = a.clone();
+        newer.record_index_change("n3", "orders", &IndexChange::Drop { name: "i".into() });
+        assert!(merge_catalog(&mut a.index_catalog, &newer.index_catalog));
+        assert!(a.index_catalog["orders"].indexes.is_empty());
+    }
+
+    /// The half of this that a topology-only merge would miss: a shard behind a router never adopts
+    /// anyone's view, so a catalogue carried only by the winner would never reach it.
+    #[test]
+    fn a_view_that_loses_on_topology_still_hands_over_its_definitions() {
+        let mut current = view(9, "n1", vec![]);
+        let mut behind = view(2, "n2", vec![]);
+        behind.record_index_change("n2", "t", &created("i", "age"));
+
+        assert_eq!(adopt(&mut current, behind), Adoption::Stale { current: 9 });
+        assert_eq!(current.version, 9, "the topology it lost with must not travel");
+        assert_eq!(current.index_catalog["t"].indexes, vec![spec("i", "age")]);
+    }
+
+    #[test]
+    fn a_view_that_wins_on_topology_does_not_take_away_definitions_it_never_had() {
+        let mut current = view(2, "n1", vec![]);
+        current.record_index_change("n1", "t", &created("i", "age"));
+        let ahead = view(9, "n2", vec![]);
+
+        assert_eq!(adopt(&mut current, ahead), Adoption::Adopted { from: 2, to: 9 });
+        assert_eq!(current.version, 9);
+        assert_eq!(current.index_catalog["t"].indexes, vec![spec("i", "age")],
+            "a ring change is not a schema change and must not read as one");
+    }
+
+    #[test]
+    fn a_malformed_catalogue_is_refused_the_way_a_malformed_ring_is() {
+        let mut v = view(4, "n1", vec![]);
+        v.index_catalog.insert("t".into(), CollectionIndexes {
+            version: 1, updated_by: "n1".into(), indexes: vec![spec("ok", "a..b")],
+        });
+        assert!(v.validate().is_err(), "a field path off the wire is stored by every node");
+
+        let mut v = view(4, "n1", vec![]);
+        v.index_catalog.insert("../escape".into(), CollectionIndexes {
+            version: 1, updated_by: "n1".into(), indexes: vec![spec("i", "a")],
+        });
+        assert!(v.validate().is_err(), "and the name is what becomes a directory");
+
+        let mut v = view(4, "n1", vec![]);
+        v.index_catalog.insert("t".into(), CollectionIndexes {
+            version: 1, updated_by: "n1".into(), indexes: vec![spec("i", "a"), spec("i", "b")],
+        });
+        assert!(v.validate().is_err(), "one name cannot index two fields");
+
+        let mut v = view(4, "n1", vec![]);
+        v.index_catalog.insert("t".into(), CollectionIndexes {
+            version: 1,
+            updated_by: "n1".into(),
+            indexes: (0..MAX_INDEXES_PER_COLLECTION + 1)
+                .map(|i| spec(&format!("i{}", i), "a")).collect(),
+        });
+        assert!(v.validate().is_err());
+    }
+
+    #[test]
+    fn the_fingerprint_moves_with_the_catalogue_and_with_nothing_else() {
+        let mut v = view(4, "n1", vec![]);
+        let empty = v.catalog_fingerprint();
+        v.record_index_change("n1", "t", &created("i", "age"));
+        let defined = v.catalog_fingerprint();
+        assert_ne!(empty, defined);
+
+        let mut moved = v.clone();
+        moved.bump("n2");
+        assert_eq!(moved.catalog_fingerprint(), defined,
+            "a topology change is not something to exchange catalogues over");
+    }
+
+    #[test]
+    fn the_catalogue_is_persisted_and_survives_a_view_that_does_not_supersede() {
+        let root = temp_root();
+        let dir = root.to_string_lossy().to_string();
+
+        let mut current = view(5, "n1", vec![]);
+        current.record_index_change("n1", "t", &created("i", "age"));
+        current.save(&dir).unwrap();
+
+        // An older view carrying a definition this one has not got: its topology is refused and
+        // its catalogue is kept, which is the same rule `adopt` follows in memory.
+        let mut older = view(2, "n2", vec![]);
+        older.record_index_change("n2", "users", &created("j", "email"));
+        older.save(&dir).unwrap();
+
+        let back = ClusterMetadata::load(&dir).unwrap().unwrap();
+        assert_eq!(back.version, 5, "the durable topology must never rewind");
+        assert_eq!(back.index_catalog.len(), 2);
     }
 
     #[test]

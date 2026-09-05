@@ -1,6 +1,8 @@
 //! AppState: shared handle to storage, config, replication state, router caches.
 
-use crate::cluster::metadata::{adopt, Adoption, ClusterMetadata, Migration};
+use crate::cluster::metadata::{
+    adopt, merge_catalog, Adoption, ClusterMetadata, IndexCatalog, Migration,
+};
 use crate::cluster::migration::MigrationRuns;
 use crate::cluster::ownership::{classify, Ownership};
 use crate::config::NodeConfig;
@@ -76,6 +78,13 @@ pub struct AppState {
     /// dropped, to settle writes that decided ownership under the old view -- and a leadership
     /// transfer holds it, because a target has to reach a tail that is not moving.
     pub write_gate: Arc<tokio::sync::RwLock<()>>,
+}
+
+/// Whether `incoming` carries a catalogue entry `current` does not already hold. Cheaper than the
+/// merge, and the merge itself needs the write lock this answers under a read one.
+fn catalog_adds_to(current: &IndexCatalog, incoming: &IndexCatalog) -> bool {
+    let mut probe = current.clone();
+    merge_catalog(&mut probe, incoming)
 }
 
 #[derive(Default)]
@@ -711,35 +720,106 @@ impl AppState {
     /// would forget on restart, so a crash there silently rewound it to the config seed.
     pub fn adopt_cluster(&self, incoming: ClusterMetadata) -> Adoption {
         // Decided against the current view first, so the fsync below happens outside every lock.
-        {
+        let superseding = {
             if let Err(why) = incoming.validate() {
                 return Adoption::Rejected(why);
             }
             let current = self.cluster.read().unwrap();
-            if !incoming.supersedes(&current) {
+            let superseding = incoming.supersedes(&current);
+            // A view that loses on topology is still worth taking for its catalogue, which is
+            // versioned per collection and merged rather than replaced.
+            if !superseding && !catalog_adds_to(&current.index_catalog, &incoming.index_catalog) {
                 return Adoption::Stale { current: current.version };
             }
-        }
+            superseding
+        };
 
-        if let Err(e) = incoming.save(&self.config.data_dir) {
-            // Still adopted: a lost write costs a re-fetch, while refusing would strand this node
-            // on a topology the cluster has already left.
-            tracing::warn!(target: "cluster", error = %e, version = incoming.version,
-                "Could not persist cluster view; adopting it in memory anyway");
+        if superseding {
+            if let Err(e) = incoming.save(&self.config.data_dir) {
+                // Still adopted: a lost write costs a re-fetch, while refusing would strand this
+                // node on a topology the cluster has already left.
+                tracing::warn!(target: "cluster", error = %e, version = incoming.version,
+                    "Could not persist cluster view; adopting it in memory anyway");
+            }
         }
 
         // Re-checked under the write lock: a newer view may have landed during the write, and that
         // one wins. `adopt` validates and compares again rather than trusting the decision above.
-        let outcome = {
+        let (outcome, catalog_moved) = {
             let mut current = self.cluster.write().unwrap();
-            adopt(&mut current, incoming)
+            let before = current.index_catalog.clone();
+            let outcome = adopt(&mut current, incoming);
+            let moved = current.index_catalog != before;
+            (outcome, moved)
         };
 
+        // What reaches disk is the merge, not what arrived, so this runs after the adoption rather
+        // than before it -- the durable-before-visible rule above covers the topology, which is
+        // the half a restart could serve wrongly.
+        if catalog_moved {
+            self.persist_cluster_view();
+        }
         if matches!(outcome, Adoption::Adopted { .. }) {
             self.follow_from_view();
             self.react_to_migration();
         }
         outcome
+    }
+
+    /// Records an index definition as a fact about the collection rather than about this group.
+    /// Returns whether the catalogue moved. Not a topology publish: it changes no version every
+    /// other node compares against, so it needs no leader and cannot lose a routing view.
+    pub fn record_index_catalog(&self, collection: &str, change: &crate::storage::IndexChange) -> bool {
+        let moved = {
+            let mut view = self.cluster.write().unwrap();
+            view.record_index_change(&self.config.node_id, collection, change)
+        };
+        if moved {
+            self.persist_cluster_view();
+        }
+        moved
+    }
+
+    /// Empties a dropped collection's catalogue entry rather than removing it, so a node that
+    /// missed the drop cannot win the merge and put the definitions back.
+    pub fn forget_collection_indexes(&self, collection: &str) -> bool {
+        let moved = {
+            let mut view = self.cluster.write().unwrap();
+            view.forget_collection_indexes(&self.config.node_id, collection)
+        };
+        if moved {
+            self.persist_cluster_view();
+        }
+        moved
+    }
+
+    /// Takes whatever `incoming` has that this node's catalogue does not. Returns whether anything
+    /// moved, which is what tells the gossip loop it has something new to hand on.
+    pub fn merge_index_catalog(&self, incoming: &IndexCatalog) -> bool {
+        let moved = {
+            let mut view = self.cluster.write().unwrap();
+            merge_catalog(&mut view.index_catalog, incoming)
+        };
+        if moved {
+            self.persist_cluster_view();
+        }
+        moved
+    }
+
+    pub fn index_catalog(&self) -> IndexCatalog {
+        self.cluster.read().unwrap().index_catalog.clone()
+    }
+
+    pub fn catalog_fingerprint(&self) -> u64 {
+        self.cluster.read().unwrap().catalog_fingerprint()
+    }
+
+    fn persist_cluster_view(&self) {
+        let view = self.cluster.read().unwrap().clone();
+        if let Err(e) = view.save(&self.config.data_dir) {
+            tracing::warn!(target: "cluster", error = %e,
+                "Could not persist the cluster view; it stands in memory and re-converges by gossip");
+        }
     }
 
     /// Every view adoption is a chance for a handover to have started, finished, or been abandoned.
@@ -1291,6 +1371,7 @@ mod tests {
                     start_hash: HALF, end_hash: 0,
                     node_url: "http://b".into(), replica_urls: vec!["http://b2".into()] },
             ],
+            index_catalog: Default::default(),
         };
         assert_eq!(state.adopt_cluster(moved), Adoption::Adopted { from: 1, to: 2 });
 
@@ -1324,6 +1405,7 @@ mod tests {
             shards: vec![crate::ring::ShardInfo {
                 start_hash: 0, end_hash: HALF,
                 node_url: "http://c".into(), replica_urls: Vec::new() }],
+            index_catalog: Default::default(),
         };
         assert!(matches!(state.adopt_cluster(holed), Adoption::Rejected(_)));
 

@@ -3,6 +3,7 @@
 use super::collection::{Collection, StagedApply, StagedEffect, READ_POOL_HANDLES};
 use super::frame::{Configuration, FrameHeader, HandoverRecord, LogEntry, ReplicaApply, HEADER_LEN, MAX_RECORD_SIZE};
 use super::index::{IndexEntry, ReadCacheConfig};
+use super::secondary::{index_values, IndexSpec};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -38,6 +39,9 @@ impl Collection {
         dropped: &mut bool,
         config: &mut Option<Configuration>,
         handover: &mut Option<HandoverRecord>,
+        // Committed below the watermark and in force above it, both in one list: a staged `Put`
+        // has to index for every definition the log put in force before it, committed or not.
+        indexes: &mut Vec<IndexSpec>,
     ) -> io::Result<(u64, u64)> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         let file_len = file.metadata()?.len();
@@ -87,7 +91,7 @@ impl Collection {
                 if lsn > applied_through {
                     // Uncommitted at the last shutdown: keep it durable but unpublished.
                     let effect = match entry {
-                        LogEntry::Put { key, .. } => {
+                        LogEntry::Put { key, value, .. } => {
                             let inline = if len <= cache.inline_max_value_bytes
                                 && *inline_used + *staged_inline + len as u64 <= cache.inline_budget_bytes
                             {
@@ -96,13 +100,26 @@ impl Collection {
                             } else {
                                 None
                             };
-                            StagedEffect::Put { key, entry: IndexEntry { wal_id, offset, len, inline } }
+                            StagedEffect::Put {
+                                key,
+                                entry: IndexEntry { wal_id, offset, len, inline },
+                                indexed: index_values(indexes, &value),
+                            }
                         },
                         LogEntry::Del { key, .. } => StagedEffect::Remove { key },
                         LogEntry::Barrier { .. } => StagedEffect::Nothing,
-                        LogEntry::Drop { .. } => StagedEffect::Clear,
+                        LogEntry::Drop { .. } => {
+                            indexes.clear();
+                            StagedEffect::Clear
+                        },
                         LogEntry::Config { config, .. } => StagedEffect::Configure(config),
                         LogEntry::Handover { handover, .. } => StagedEffect::RecordHandover(handover),
+                        // In force from here on, the way the append path puts it in force: every
+                        // staged frame above this one indexes for it.
+                        LogEntry::Index { change, .. } => {
+                            change.apply_to(indexes);
+                            StagedEffect::DefineIndex(change)
+                        },
                     };
                     pending.insert(lsn, StagedApply { wal_id, offset, term, effect });
                     if lsn > max_lsn {
@@ -141,10 +158,12 @@ impl Collection {
                         index.clear();
                         *inline_used = 0;
                         *dropped = true;
+                        indexes.clear();
                     },
                     // Append order again: the last one below the watermark is the committed one.
                     LogEntry::Config { config: c, .. } => *config = Some(c),
                     LogEntry::Handover { handover: h, .. } => *handover = Some(h),
+                    LogEntry::Index { change, .. } => change.apply_to(indexes),
                 }
                 if lsn > max_lsn {
                     max_lsn = lsn;

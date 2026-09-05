@@ -28,6 +28,7 @@ mod test_support;
 
 use crate::api::build_app;
 use crate::auth::build_client;
+use crate::cluster::catalog::index_catalog_task;
 use crate::cluster::metadata::ClusterMetadata;
 use crate::cluster::migration::MigrationRuns;
 use crate::cluster::probe::{router_probe_task, ROUTER_PROBE_INTERVAL_SECS};
@@ -272,6 +273,10 @@ async fn main() -> io::Result<()> {
         info!(target: "boot", "Starting router primary-probe task (interval={}s)", ROUTER_PROBE_INTERVAL_SECS);
         router_probe_task(state.clone());
     }
+
+    // Both roles: a shard reconciles its own definitions, and a router is the only node that can
+    // name every shard group, so it is what carries a definition between them.
+    index_catalog_task(state.clone());
 
     if state.db.is_some() {
         if config.maintenance.enabled {

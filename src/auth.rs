@@ -85,15 +85,35 @@ fn presented_api_key<'a>(api_key_header: Option<&'a str>, authorization: Option<
     authorization.and_then(|a| a.strip_prefix("Bearer ")).map(|k| k.trim())
 }
 
-/// Topology and collection destruction. Segments are counted before percent-decoding, the way axum
-/// routes them, so an encoded slash cannot make a drop look like a document delete.
+/// Topology, collection destruction, and index definitions. Segments are counted before
+/// percent-decoding, the way axum routes them, so an encoded slash cannot make a drop look like a
+/// document delete.
 fn is_admin_route(path: &str, method: &str) -> bool {
     if path == "/cluster" || path.starts_with("/cluster/") {
         return true;
     }
-    method == "DELETE"
+    if method == "DELETE"
         && path.strip_prefix("/collections/")
             .is_some_and(|name| !name.is_empty() && !name.contains('/'))
+    {
+        return true;
+    }
+    // Defining an index is a schema change and a replicated write, so it sits with the drop rather
+    // than with the data path. Listing them does not, the way listing collections does not.
+    matches!(method, "POST" | "DELETE") && is_index_route(path)
+}
+
+/// `/collections/<name>/indexes` and `/collections/<name>/indexes/<index>`, and nothing else under
+/// a collection.
+fn is_index_route(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/collections/") else { return false };
+    let mut parts = rest.split('/');
+    parts.next().is_some_and(|name| !name.is_empty())
+        && parts.next() == Some("indexes")
+        && match parts.next() {
+            None => true,
+            Some(index) => !index.is_empty() && parts.next().is_none(),
+        }
 }
 
 pub fn authorize(
@@ -302,6 +322,29 @@ mod tests {
         assert_eq!(authorize("/collections/c", "DELETE", &cfg, None, Some("client"), None),
             AuthOutcome::Deny("invalid admin key"), "dropping a collection is destructive");
         assert_eq!(authorize("/collections/c", "DELETE", &cfg, None, Some("root"), None), AuthOutcome::Allow);
+    }
+
+    /// Defining an index is a schema change and a replicated write; reading the definitions is not.
+    #[test]
+    fn index_definitions_are_admin_and_listing_them_is_not() {
+        let cfg = with_admin(None, &["client"], &["root"]);
+
+        for (path, method) in [("/collections/c/indexes", "POST"),
+                               ("/collections/c/indexes/by_age", "DELETE")] {
+            assert_eq!(authorize(path, method, &cfg, None, Some("root"), None), AuthOutcome::Allow,
+                "{} {}", method, path);
+            assert_eq!(authorize(path, method, &cfg, None, Some("client"), None),
+                AuthOutcome::Deny("invalid admin key"), "{} {}", method, path);
+        }
+
+        assert_eq!(authorize("/collections/c/indexes", "GET", &cfg, None, Some("client"), None),
+            AuthOutcome::Allow, "listing them is data path, like listing collections");
+
+        // Not the index routes, whatever they contain: only these two shapes are.
+        for path in ["/collections/c/docs/indexes", "/collections/c/indexes/a/b", "/collections//indexes"] {
+            assert_eq!(authorize(path, "POST", &cfg, None, Some("client"), None), AuthOutcome::Allow,
+                "{}", path);
+        }
     }
 
     #[test]
