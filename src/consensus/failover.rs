@@ -453,7 +453,9 @@ pub fn heartbeat_poll_task(state: AppState) {
                             }
                             if trusted {
                                 for (col, lsn) in committed {
-                                    state.note_leader_committed(&col, lsn);
+                                    let install_lock = state.snapshot_install_lock(&col);
+                                    let _install_guard = install_lock.lock().await;
+                                    state.note_leader_committed(&col, their_term, lsn, None);
                                 }
                             }
 

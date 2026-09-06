@@ -83,16 +83,6 @@ pub async fn replicate_handler(
         }
     }
 
-    // Only after the term gate: a deposed leader's watermark publishes staged entries that the
-    // current leader may still revoke, and commit-gated visibility is what makes them revocable.
-    if let Some(idx) = req.commit_index {
-        state.note_leader_committed(&req.collection, idx);
-        if let Some(ref repl) = state.replication {
-            let mut r = repl.write().unwrap();
-            r.last_known_primary_position = Some(idx);
-        }
-    }
-
     let db = match state.db.as_ref() {
         Some(db) => db.clone(),
         None => return (StatusCode::INTERNAL_SERVER_ERROR, "No database on this node").into_response(),
@@ -122,13 +112,24 @@ pub async fn replicate_handler(
     // syncing here is what made catch-up cost a disk flush per entry.
     let appended = tokio::task::spawn_blocking(move || {
         let mut highest_applied = 0u64;
+        let mut matched = None;
+        let mut previous = None;
         let mut refusal = None;
 
         for frame in &batch {
+            let header = match FrameHeader::parse(frame) {
+                Some(h) if h.lsn > h.prev_lsn
+                    && previous.is_none_or(|p| p == (h.prev_term, h.prev_lsn)) => h,
+                _ => {
+                    refusal = Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData, "Invalid replication frame chain")));
+                    break;
+                },
+            };
             match col_clone.append_raw_frame(frame) {
                 Ok(ReplicaApply::Applied { lsn, .. }) => highest_applied = highest_applied.max(lsn),
-                // Already held: keep going, later entries in the batch may still be new.
-                Ok(ReplicaApply::Duplicate { .. }) => continue,
+                // A duplicate proves its own position, not the follower's remaining tail.
+                Ok(ReplicaApply::Duplicate { .. }) => {},
                 Ok(other) => {
                     refusal = Some(Ok(other));
                     break;
@@ -138,11 +139,13 @@ pub async fn replicate_handler(
                     break;
                 },
             }
+            matched = Some(header.lsn);
+            previous = Some((header.term, header.lsn));
         }
-        (highest_applied, refusal)
+        (highest_applied, matched, refusal)
     }).await;
 
-    let (highest, refusal) = match appended {
+    let (highest, matched, refusal) = match appended {
         Ok(v) => v,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
@@ -153,17 +156,23 @@ pub async fn replicate_handler(
             Ok(Err(e)) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         }
-        // The leader's watermark trails this frame by a message; visibility waits for the next one.
-        col.apply_committed(state.committed_hint(&req.collection));
-        // Except a configuration, which is in force where it lands: a replica that waited for the
-        // commit would be answering the vote that decides it with the membership it replaces.
+        // Configuration entries govern voting from append, before they commit.
         if req.collection == CONFIG_LOG {
             state.refresh_configuration();
         }
     }
 
+    if matched.is_some() {
+        state.note_leader_committed(&req.collection, req.term, req.commit_index.unwrap_or(0), matched);
+    }
+
     if let Some(ref repl) = state.replication {
         let mut r = repl.write().unwrap();
+        if matched.is_some() && r.term == req.term {
+            if let Some(idx) = req.commit_index {
+                r.last_known_primary_position = Some(idx);
+            }
+        }
         r.last_replication = Some(std::time::Instant::now());
         r.was_receiving_replication = true;
     }
@@ -1095,6 +1104,117 @@ mod tests {
             "a watermark from a superseded term published an entry the current leader may revoke");
         assert_eq!(col.pending_len(), 1, "the entry is still staged, not lost");
 
+        replica.kill();
+    }
+
+    #[tokio::test]
+    async fn ib001_commit_hint_replaces_conflicting_tail_before_publishing_changes() {
+        let root = temp_root();
+        let mut replica = TestNode::new("replica", next_test_port(), &root, "replica");
+        replica.membership_mode = "learner".to_string();
+        replica.start();
+        assert_eq!(replicate(&replica, 1, 1, 0, 1, make_frame(1, 1, 0, 0, "base", 1)).await.0, StatusCode::OK);
+        assert_eq!(replicate(&replica, 1, 2, 1, 1, make_frame(1, 2, 1, 1, "stale", 2)).await.0, StatusCode::OK);
+        let state = replica.state.as_ref().unwrap();
+        let col = state.db.as_ref().unwrap().get_collection("t").unwrap();
+        let mut feed = col.changefeed.subscribe(Some(1), col.applied_lsn()).unwrap();
+
+        let (status, body) = replicate(&replica, 2, 3, 1, 99, make_frame(2, 3, 1, 1, "correct", 3)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(col.applied_lsn(), 3);
+        assert_eq!(col.last_appended(), (2, 3));
+        assert!(col.get("stale").unwrap().is_none());
+        assert!(col.get("correct").unwrap().is_some());
+        let events = tokio::time::timeout(Duration::from_secs(1), feed.next_batch()).await.unwrap().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].key, "correct");
+        assert_eq!(events[0].lsn, 3);
+        assert_eq!(crate::storage::Collection::recorded_watermark(&col.root_path).unwrap(), Some(3));
+        replica.kill();
+    }
+
+    #[tokio::test]
+    async fn ib001_duplicates_and_heartbeats_commit_only_the_current_terms_matched_prefix() {
+        let root = temp_root();
+        let mut replica = TestNode::new("replica", next_test_port(), &root, "replica");
+        replica.membership_mode = "learner".to_string();
+        replica.start();
+        for lsn in 1..=2 {
+            assert_eq!(replicate(&replica, 1, lsn, lsn - 1, 0,
+                make_frame(1, lsn, lsn - 1, if lsn == 1 { 0 } else { 1 }, &format!("k{lsn}"), lsn as i64)).await.0, StatusCode::OK);
+        }
+        let state = replica.state.as_ref().unwrap();
+        let col = state.db.as_ref().unwrap().get_collection("t").unwrap();
+        let lock = state.snapshot_install_lock("t");
+        {
+            let _guard = lock.lock().await;
+            state.replication.as_ref().unwrap().write().unwrap().term = 2;
+            state.note_leader_committed("t", 2, 99, None);
+            assert_eq!(col.applied_lsn(), 0, "old-term matching is not heartbeat evidence");
+        }
+        assert_eq!(replicate(&replica, 2, 1, 0, 99, make_frame(1, 1, 0, 0, "k1", 1)).await.1["status"], "duplicate");
+        assert_eq!(col.applied_lsn(), 1);
+        assert!(col.get("k2").unwrap().is_none());
+        {
+            let _guard = lock.lock().await;
+            state.note_leader_committed("t", 2, 99, None);
+            assert_eq!(col.applied_lsn(), 1);
+        }
+        assert_eq!(replicate(&replica, 2, 3, 1, 0, make_frame(2, 3, 1, 1, "k3", 3)).await.0, StatusCode::OK);
+        assert_eq!(col.applied_lsn(), 1, "an earlier oversized hint must not commit a later append");
+        {
+            let _guard = lock.lock().await;
+            state.note_leader_committed("t", 1, 99, None);
+            assert_eq!(col.applied_lsn(), 1, "a delayed heartbeat cannot spend newer matching evidence");
+            state.note_leader_committed("t", 2, 99, None);
+            assert_eq!(col.applied_lsn(), 3, "an idle matched tail still commits by heartbeat");
+        }
+        replica.kill();
+    }
+
+    #[tokio::test]
+    async fn ib001_refused_frames_cannot_publish_a_conflicting_tail() {
+        let root = temp_root();
+        let mut replica = TestNode::new("replica", next_test_port(), &root, "replica");
+        replica.membership_mode = "learner".to_string();
+        replica.start();
+        assert_eq!(replicate(&replica, 1, 1, 0, 0, make_frame(1, 1, 0, 0, "staged", 1)).await.0, StatusCode::OK);
+        let col = replica.state.as_ref().unwrap().db.as_ref().unwrap().get_collection("t").unwrap();
+        let mut corrupt = make_frame(2, 2, 1, 1, "bad", 2);
+        *corrupt.last_mut().unwrap() ^= 1;
+        for (lsn, prev, frame) in [
+            (2, 1, vec![0]),
+            (2, 1, corrupt),
+            (3, 1, make_frame(2, 2, 1, 1, "mismatch", 2)),
+            (3, 2, make_frame(2, 3, 2, 2, "gap", 3)),
+            (2, 1, make_frame(2, 2, 1, 2, "divergent", 2)),
+        ] {
+            assert!(!replicate(&replica, 2, lsn, prev, 99, frame).await.0.is_success());
+            assert_eq!(col.applied_lsn(), 0);
+            assert!(col.get("staged").unwrap().is_none());
+        }
+        replica.kill();
+    }
+
+    #[tokio::test]
+    async fn ib001_a_partial_batch_commits_only_its_accepted_prefix() {
+        let root = temp_root();
+        let mut replica = TestNode::new("replica", next_test_port(), &root, "replica");
+        replica.membership_mode = "learner".to_string();
+        replica.start();
+        let mut corrupt = make_frame(2, 3, 2, 2, "bad", 3);
+        *corrupt.last_mut().unwrap() ^= 1;
+        let response = replicate_handler(State(replica.state.as_ref().unwrap().clone()), Json(ReplicateRequest {
+            collection: "t".into(), term: 2, lsn: 1, prev_lsn: 0, commit_index: Some(99),
+            wal_frame: make_frame(2, 1, 0, 0, "k1", 1),
+            frames: vec![make_frame(2, 2, 1, 2, "k2", 2), corrupt],
+        })).await.into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let col = replica.state.as_ref().unwrap().db.as_ref().unwrap().get_collection("t").unwrap();
+        assert_eq!(col.applied_lsn(), 2);
+        assert_eq!(col.durable_lsn(), 2);
+        assert!(col.get("k2").unwrap().is_some());
+        assert!(col.get("bad").unwrap().is_none());
         replica.kill();
     }
 

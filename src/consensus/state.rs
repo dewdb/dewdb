@@ -53,8 +53,8 @@ pub struct ReplicationState {
     /// step-down -- both clear the contact clock, and a leader on the other side of that probe is
     /// still counting the deadline. It lapses within one refusal window instead.
     pub novote_until: Option<std::time::Instant>,
-    // Follower side: the commit watermark the leader last told us, per collection.
-    pub leader_committed: HashMap<String, u64>,
+    // Matching evidence belongs to one leader term and is rebuilt after restart.
+    pub leader_matched: HashMap<String, (u64, u64)>,
     /// The newest configuration in the config log, once that log has one. `None` means no
     /// configuration entry exists anywhere in this group and the view-derived voting set still
     /// speaks; see `AppState::quorum_config`.
@@ -282,7 +282,7 @@ mod tests {
             handing_over: false,
             booted_at: std::time::Instant::now(),
             novote_until: None,
-            leader_committed: HashMap::new(),
+            leader_matched: HashMap::new(),
             configuration: None,
         }
     }

@@ -189,7 +189,7 @@ async fn main() -> io::Result<()> {
             handing_over: false,
             novote_until: None,
             booted_at: std::time::Instant::now(),
-            leader_committed: HashMap::new(),
+            leader_matched: HashMap::new(),
             configuration: None,
         })))
     } else {

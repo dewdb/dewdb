@@ -413,30 +413,26 @@ impl AppState {
         committed
     }
 
-    pub fn note_leader_committed(&self, collection: &str, lsn: u64) {
-        if let Some(repl) = self.replication.as_ref() {
+    // Call under the collection's snapshot-install lock so matching, durability and publication stay ordered.
+    pub fn note_leader_committed(&self, collection: &str, term: u64, lsn: u64, matched: Option<u64>) {
+        let Some(col) = self.db.as_ref()
+            .and_then(|db| db.lookup_collection(collection).ok().flatten()) else { return };
+        let durable = col.durable_lsn();
+        let committed = if let Some(repl) = self.replication.as_ref() {
             let mut g = repl.write().unwrap();
-            let slot = g.leader_committed.entry(collection.to_string()).or_insert(0);
-            if lsn > *slot {
-                *slot = lsn;
+            if g.is_leader || g.term != term {
+                return;
             }
-        }
-        self.apply_committed(collection, lsn);
-    }
-
-    /// Own quorum when leading, the leader's reported watermark when following.
-    pub fn committed_hint(&self, collection: &str) -> u64 {
-        match self.replication.as_ref() {
-            Some(r) => {
-                let g = r.read().unwrap();
-                if g.is_leader {
-                    g.progress.committed(collection)
-                } else {
-                    g.leader_committed.get(collection).copied().unwrap_or(0)
-                }
-            },
-            None => 0,
-        }
+            let prefix = g.leader_matched.entry(collection.to_string()).or_insert((term, 0));
+            if prefix.0 != term {
+                *prefix = (term, 0);
+            }
+            if let Some(matched) = matched {
+                prefix.1 = prefix.1.max(matched.min(durable));
+            }
+            lsn.min(prefix.1).min(durable)
+        } else { return };
+        self.apply_committed(collection, committed);
     }
 
     // Never call with the replication lock held: this takes pending and index,
@@ -504,7 +500,7 @@ impl AppState {
                 handing_over: false,
                 novote_until: None,
                 booted_at: std::time::Instant::now(),
-                leader_committed: HashMap::new(),
+                leader_matched: HashMap::new(),
                 configuration: None,
             }))),
             replication_slots: Arc::new(tokio::sync::Semaphore::new(
