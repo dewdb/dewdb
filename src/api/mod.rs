@@ -10,7 +10,9 @@ pub mod migrate;
 pub mod middleware;
 pub mod observe;
 pub mod ring;
+pub mod webhooks;
 pub mod write;
+pub mod ws;
 
 use changes::stream_changes;
 use collections::{compact_collection, drop_collection, list_collections, snapshot_collection};
@@ -33,6 +35,8 @@ use migrate::{abort_migration_handler, migration_status, start_migration_handler
 use middleware::{auth_middleware, metrics_middleware};
 use observe::{cluster_handler, health_handler, metrics_handler};
 use ring::set_ring_handler;
+use webhooks::{create_webhook, delete_webhook, get_webhook, list_webhooks};
+use ws::ws_changes;
 
 use crate::state::AppState;
 use crate::storage::frame::{MAX_INTERNAL_BODY, MAX_PUBLIC_BODY};
@@ -63,6 +67,9 @@ pub fn build_app(state: &AppState) -> Router {
         .route("/collections/:name/query", get(query_docs))
         .route("/collections/:name/aggregate", get(aggregate_docs))
         .route("/collections/:name/changes", get(stream_changes))
+        .route("/collections/:name/changes/ws", get(ws_changes))
+        .route("/collections/:name/webhooks", get(list_webhooks).post(create_webhook))
+        .route("/collections/:name/webhooks/:id", get(get_webhook).delete(delete_webhook))
         .route("/collections/:name/docs/:id", get(get_doc).put(put_doc).patch(update_doc).delete(delete_doc));
 
     // Every role carries a cluster view, so these are not gated on being a shard the way the

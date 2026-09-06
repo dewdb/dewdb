@@ -14,8 +14,7 @@ use std::sync::Mutex;
 const META_FILE: &str = "replication.meta";
 const META_TMP: &str = "replication.meta.tmp";
 
-// Guards the single staging path against interleaved writers, and orders the
-// renames: last decided wins, not whichever fsync returned first.
+// Serializes validation and publication through the shared staging path.
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 // Raft persistent state. Written only as a pair: a term without its vote permits a double vote.
@@ -111,11 +110,16 @@ impl ReplicationMeta {
         let dir = PathBuf::from(data_dir);
         let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Terms are decided under the replication lock and persisted after releasing it;
-        // saves can arrive out of order and the durable term must never rewind.
-        if let Ok(Some(existing)) = Self::load(data_dir) {
+        // Decisions can reach disk out of order; neither a term nor its recorded vote may rewind.
+        if let Some(existing) = Self::load(data_dir)? {
             if self.term < existing.term {
                 return Ok(());
+            }
+            if self.term == existing.term && existing.voted_for.is_some()
+                && self.voted_for != existing.voted_for
+            {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                    format!("cannot erase or change the persisted vote in term {}", self.term)));
             }
         }
 
@@ -238,6 +242,78 @@ mod tests {
         ReplicationMeta { term: 6, is_leader: true, voted_for: Some("n1".into()) }.save(&dir).unwrap();
         assert!(ReplicationMeta::load(&dir).unwrap().unwrap().is_leader,
             "the same term must still be updatable, or winning an election could not be recorded");
+    }
+
+    #[test]
+    fn ib003_delayed_no_vote_save_cannot_enable_a_second_vote_after_reload() {
+        use crate::consensus::election::{decide_vote, LogTail, VoteRequest};
+
+        let root = temp_root();
+        let dir = dir_of(&root);
+        let delayed = ReplicationMeta { term: 2, is_leader: false, voted_for: None };
+        let (resume, proceed) = std::sync::mpsc::channel();
+        let delayed_dir = dir.clone();
+        let saving = std::thread::spawn(move || {
+            proceed.recv().unwrap();
+            delayed.save(&delayed_dir)
+        });
+        ReplicationMeta { term: 2, is_leader: false, voted_for: Some("A".into()) }
+            .save(&dir).unwrap();
+        resume.send(()).unwrap();
+        assert_eq!(saving.join().unwrap().unwrap_err().kind(), io::ErrorKind::InvalidInput);
+
+        let back = ReplicationMeta::load(&dir).unwrap().unwrap();
+        assert_eq!(back.term, 2);
+        assert_eq!(back.voted_for.as_deref(), Some("A"));
+        for (candidate, granted) in [("B", false), ("A", true)] {
+            let req = VoteRequest { term: 2, candidate_id: candidate.into(), last_lsn: 0,
+                last_term: 0, logs: HashMap::new(), candidate_url: None, transfer_from: None };
+            let decision = decide_vote(back.term, &back.voted_for, &HashMap::new(),
+                LogTail::default(), None, &req, false);
+            assert_eq!(decision.granted, granted);
+        }
+    }
+
+    #[test]
+    fn ib003_votes_are_immutable_within_a_term_but_roles_and_new_terms_can_change() {
+        let root = temp_root();
+        let dir = dir_of(&root);
+        ReplicationMeta { term: 2, is_leader: false, voted_for: None }.save(&dir).unwrap();
+        ReplicationMeta { term: 2, is_leader: false, voted_for: Some("A".into()) }
+            .save(&dir).unwrap();
+
+        for is_leader in [true, false] {
+            ReplicationMeta { term: 2, is_leader, voted_for: Some("A".into()) }
+                .save(&dir).unwrap();
+            let before = fs::read(root.join(META_FILE)).unwrap();
+            for voted_for in [None, Some("B".into())] {
+                let err = ReplicationMeta { term: 2, is_leader: !is_leader, voted_for }
+                    .save(&dir).unwrap_err();
+                assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+                assert_eq!(fs::read(root.join(META_FILE)).unwrap(), before);
+            }
+            assert_eq!(ReplicationMeta::load(&dir).unwrap().unwrap().is_leader, is_leader);
+        }
+
+        for voted_for in [None, Some("B".into())] {
+            ReplicationMeta { term: 3, is_leader: false, voted_for: voted_for.clone() }
+                .save(&dir).unwrap();
+            let back = ReplicationMeta::load(&dir).unwrap().unwrap();
+            assert_eq!(back.term, 3);
+            assert_eq!(back.voted_for, voted_for);
+        }
+    }
+
+    #[test]
+    fn ib003_saving_cannot_discard_unreadable_vote_history() {
+        let root = temp_root();
+        let dir = dir_of(&root);
+        let corrupt = b"{\"term\":2,\"voted_for\":";
+        fs::write(root.join(META_FILE), corrupt).unwrap();
+        let err = ReplicationMeta { term: 2, is_leader: false, voted_for: Some("B".into()) }
+            .save(&dir).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(root.join(META_FILE)).unwrap(), corrupt);
     }
 
     #[test]

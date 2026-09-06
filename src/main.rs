@@ -3,6 +3,7 @@
 mod aggregate;
 mod api;
 mod auth;
+mod cdc;
 mod changefeed;
 mod cluster;
 mod config;
@@ -18,6 +19,7 @@ mod ring;
 mod state;
 mod storage;
 mod util;
+mod webhook;
 
 #[cfg(test)]
 mod bench;
@@ -46,6 +48,7 @@ use crate::metrics::Metrics;
 use crate::replication::stream::replication_drive_task;
 use crate::state::AppState;
 use crate::storage::Database;
+use crate::webhook::{webhook_task, WebhookStore};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
@@ -233,6 +236,7 @@ async fn main() -> io::Result<()> {
         cluster,
         ring_cache: Arc::new(std::sync::Mutex::new(Default::default())),
         migrations: Arc::new(std::sync::Mutex::new(MigrationRuns::restored(&config.data_dir))),
+        webhooks: Arc::new(WebhookStore::restored(&config.data_dir)),
         write_gate: Arc::new(tokio::sync::RwLock::new(())),
     };
 
@@ -281,6 +285,7 @@ async fn main() -> io::Result<()> {
     // Both roles: a shard reconciles its own definitions, and a router is the only node that can
     // name every shard group, so it is what carries a definition between them.
     index_catalog_task(state.clone());
+    webhook_task(state.clone());
 
     if state.db.is_some() {
         if config.maintenance.enabled {

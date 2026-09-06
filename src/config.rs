@@ -8,6 +8,7 @@ use crate::logging::LoggingConfig;
 use crate::maintenance::MaintenanceConfig;
 use crate::ring::{validate_shard_ring, HashRing, ShardInfo};
 use crate::storage::ReadCacheConfig;
+use crate::webhook::WebhookConfig;
 use crate::util::{endpoint_of, same_endpoint};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
@@ -56,6 +57,8 @@ pub struct NodeConfig {
     pub read_cache: ReadCacheConfig,
     #[serde(default)]
     pub changefeed: ChangefeedConfig,
+    #[serde(default)]
+    pub webhooks: WebhookConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
     #[serde(default)]
@@ -166,6 +169,7 @@ impl NodeConfig {
         self.logging.validate()?;
         self.auth.validate()?;
         self.changefeed.validate()?;
+        self.webhooks.validate()?;
         Ok(())
     }
 

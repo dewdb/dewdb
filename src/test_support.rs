@@ -179,6 +179,8 @@ pub struct TestNode {
     pub data_movement_batch_delay_ms: u64,
     /// A `ChangefeedConfig` body; `{}` is the default.
     pub changefeed: serde_json::Value,
+    /// A `WebhookConfig` body; `{}` is the default.
+    pub webhooks: serde_json::Value,
     /// An `AuthConfig` body; `{}` is the default open configuration.
     pub auth: serde_json::Value,
     pub state: Option<AppState>,
@@ -241,6 +243,7 @@ fn node_config(n: &TestNode) -> NodeConfig {
         "election_delay_ms": 200,
         "auth": n.auth,
         "changefeed": n.changefeed,
+        "webhooks": n.webhooks,
         "maintenance": { "enabled": false },
         "data_movement": {
             "batch_size": n.data_movement_batch_size,
@@ -271,6 +274,7 @@ impl TestNode {
             data_movement_batch_delay_ms: 5,
             auth: serde_json::json!({}),
             changefeed: serde_json::json!({}),
+            webhooks: serde_json::json!({}),
             state: None,
             stop: None,
             thread: None,
@@ -364,6 +368,7 @@ impl TestNode {
                             }))),
                     ring_cache: Arc::new(std::sync::Mutex::new(Default::default())),
                     migrations: Arc::new(std::sync::Mutex::new(MigrationRuns::restored(&config.data_dir))),
+                    webhooks: Arc::new(crate::webhook::WebhookStore::restored(&config.data_dir)),
                     write_gate: Arc::new(tokio::sync::RwLock::new(())),
                 };
 
@@ -386,6 +391,7 @@ impl TestNode {
                     crate::replication::stream::replication_drive_task(state.clone());
                 }
                 crate::cluster::catalog::index_catalog_task(state.clone());
+                crate::webhook::webhook_task(state.clone());
 
                 let listener = bind_with_retry(&addr).await;
                 tokio::spawn(async move {
@@ -637,6 +643,160 @@ pub async fn two_shard_cluster(root: &Path) -> (TestNode, TestNode, TestNode) {
 pub async fn get_raw(client: &reqwest::Client, base: &str, col: &str, key: &str) -> bool {
     let url = format!("{}/collections/{}/docs/{}", base, col, key);
     client.get(&url).send().await.map(|r| r.status().is_success()).unwrap_or(false)
+}
+
+/// One delivery as the endpoint saw it, headers included: a signature is only worth asserting on
+/// alongside the exact bytes it was computed over.
+#[derive(Clone, Debug)]
+pub struct Delivered {
+    pub body: serde_json::Value,
+    pub raw: String,
+    pub signature: Option<String>,
+    pub timestamp: Option<String>,
+    pub delivery: Option<String>,
+}
+
+struct SinkState {
+    received: std::sync::Mutex<Vec<Delivered>>,
+    fail_next: std::sync::atomic::AtomicUsize,
+    status: std::sync::atomic::AtomicU16,
+}
+
+/// A webhook endpoint under a test's control: it records what arrives and can be told to fail,
+/// which is how the retry and the backoff are observed from the outside.
+pub struct WebhookSink {
+    pub url: String,
+    state: Arc<SinkState>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for WebhookSink {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn sink_handler(
+    axum::extract::State(sink): axum::extract::State<Arc<SinkState>>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> StatusCode {
+    use std::sync::atomic::Ordering;
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
+    sink.received.lock().unwrap().push(Delivered {
+        body: serde_json::from_str(&body).unwrap_or(serde_json::Value::Null),
+        raw: body,
+        signature: header("x-dew-signature"),
+        timestamp: header("x-dew-timestamp"),
+        delivery: header("x-dew-delivery"),
+    });
+    if sink.fail_next.load(Ordering::SeqCst) > 0 {
+        sink.fail_next.fetch_sub(1, Ordering::SeqCst);
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+    StatusCode::from_u16(sink.status.load(Ordering::SeqCst)).unwrap_or(StatusCode::OK)
+}
+
+impl WebhookSink {
+    pub async fn start() -> Self {
+        use std::sync::atomic::{AtomicU16, AtomicUsize};
+        let port = free_port();
+        let state = Arc::new(SinkState {
+            received: std::sync::Mutex::new(Vec::new()),
+            fail_next: AtomicUsize::new(0),
+            status: AtomicU16::new(200),
+        });
+        let app = axum::Router::new()
+            .route("/hook", axum::routing::post(sink_handler))
+            .with_state(state.clone());
+        let listener = bind_with_retry(&format!("127.0.0.1:{}", port)).await;
+        let task = tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        Self { url: format!("http://127.0.0.1:{}/hook", port), state, task }
+    }
+
+    pub fn fail_next(&self, attempts: usize) {
+        self.state.fail_next.store(attempts, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn answer_with(&self, status: u16) {
+        self.state.status.store(status, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn received(&self) -> Vec<Delivered> {
+        self.state.received.lock().unwrap().clone()
+    }
+
+    /// Every event across every delivery, in arrival order. Redeliveries are included: at-least-once
+    /// is what the sender promises, so a test that hid them would be asserting the wrong thing.
+    pub fn events(&self) -> Vec<serde_json::Value> {
+        self.received().iter()
+            .filter_map(|d| d.body["events"].as_array().cloned())
+            .flatten().collect()
+    }
+
+    pub async fn wait_for_events(&self, want: usize, deadline: Duration) -> Vec<serde_json::Value> {
+        let start = std::time::Instant::now();
+        while start.elapsed() < deadline && self.events().len() < want {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        self.events()
+    }
+}
+
+/// Reads a change-stream WebSocket in the background and collects the JSON frames that arrive.
+/// Dropping it closes the socket, which is how a test plays a subscriber going away.
+pub struct WsTap {
+    seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for WsTap {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl WsTap {
+    /// `Err` is the status the handshake was refused with: every refusal this endpoint owes a
+    /// client is answered before the upgrade, so a test can assert on it as an HTTP status.
+    pub async fn open(url: &str) -> Result<Self, StatusCode> {
+        use futures::StreamExt;
+        let ws_url = url.replacen("http://", "ws://", 1);
+        let socket = match tokio_tungstenite::connect_async(&ws_url).await {
+            Ok((socket, _)) => socket,
+            Err(tokio_tungstenite::tungstenite::Error::Http(res)) => {
+                return Err(StatusCode::from_u16(res.status().as_u16()).unwrap());
+            },
+            Err(e) => panic!("could not open {}: {}", ws_url, e),
+        };
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let task = tokio::spawn(async move {
+            let mut socket = socket;
+            while let Some(Ok(message)) = socket.next().await {
+                if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                    if let Ok(frame) = serde_json::from_str(&text) {
+                        sink.lock().unwrap().push(frame);
+                    }
+                }
+            }
+        });
+        Ok(Self { seen, task })
+    }
+
+    pub fn named(&self, name: &str) -> Vec<serde_json::Value> {
+        self.seen.lock().unwrap().iter()
+            .filter(|f| f["type"].as_str() == Some(name)).cloned().collect()
+    }
+
+    pub async fn wait_for(&self, name: &str, want: usize, deadline: Duration) -> Vec<serde_json::Value> {
+        let start = std::time::Instant::now();
+        while start.elapsed() < deadline && self.named(name).len() < want {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        self.named(name)
+    }
 }
 
 pub async fn put_value(

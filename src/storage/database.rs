@@ -342,24 +342,22 @@ impl Database {
     pub fn force_commit_all(&self) {
         let collections = self.collections.read().unwrap();
         for (name, col) in collections.iter() {
-            let wal = col.wal_writer.lock().unwrap();
-            if let Err(e) = wal.current_wal.sync_data() {
-                error!(target: "storage", collection = %name, error = %e, "Failed to force sync WAL on shutdown");
-            }
-            // Both, the way `sync_wal` raises both: the senders below tell a waiter its write is
-            // durable, and `finish_write` then reads the collection's own watermark to count it.
-            col.durable_lsn.fetch_max(wal.last_appended_lsn, Ordering::SeqCst);
-            self.durable_lsn.fetch_max(wal.last_appended_lsn, Ordering::SeqCst);
-            drop(wal);
+            // Forced flushes obey the same pre-sync batch boundary as the commit worker.
             let notifiers: Vec<_> = {
                 let mut q = col.commit_notifiers.lock().unwrap();
                 std::mem::take(&mut *q)
             };
+            let result = col.sync_wal().map(|_| ()).map_err(|e| {
+                error!(target: "storage", collection = %name, error = %e, "Failed to force sync WAL on shutdown");
+                format!("WAL sync failed: {}", e)
+            });
             let count = notifiers.len();
             for tx in notifiers {
-                let _ = tx.send(Ok(()));
+                let _ = tx.send(result.clone());
             }
-            info!(target: "storage", collection = %name, pending = count, "Flushed pending writes on shutdown");
+            if result.is_ok() {
+                info!(target: "storage", collection = %name, pending = count, "Flushed pending writes on shutdown");
+            }
         }
         let meta = LsnMeta { commit_lsn: self.durable_lsn.load(Ordering::SeqCst) };
         if let Err(e) = meta.save(&self.root_path) {

@@ -8,7 +8,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 uuid = { version = "1.0", features = ["v4"] }
 crc32fast = "1"
-axum = "0.7"
+sha2 = "0.10"
+hmac = "0.12"
+axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 bincode = "1"
 reqwest = { version = "0.12", features = ["json", "stream"] }
@@ -17,3 +19,7 @@ futures = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+# The test suite is in-crate, so a WebSocket client for it is a dev dependency of the binary.
+tokio-tungstenite = "0.24"

@@ -32,6 +32,13 @@ const SCAN_CHUNK: usize = 1024;
 /// A frame's `(wal_id, offset, len)` as the index records it.
 type Located = (u64, u64, u32);
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitSyncPhase { Before, After }
+
+#[cfg(test)]
+type CommitSyncHook = Box<dyn FnMut(CommitSyncPhase) -> io::Result<()> + Send>;
+
 pub struct Collection {
     pub name: String,
     pub root_path: PathBuf,
@@ -41,6 +48,8 @@ pub struct Collection {
     pub key_locks: Vec<tokio::sync::Mutex<()>>,
     pub commit_notifiers: Arc<std::sync::Mutex<Vec<tokio::sync::oneshot::Sender<Result<(), String>>>>>,
     pub commit_signal: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    commit_sync_hook: std::sync::Mutex<Option<CommitSyncHook>>,
     pub read_pool: std::sync::Mutex<HashMap<u64, Vec<Arc<std::sync::Mutex<File>>>>>,
     pub read_pool_counter: AtomicUsize,
     /// Highest WAL id compaction has retired. Set once the index no longer points below it, so a
@@ -294,6 +303,8 @@ impl Collection {
             key_locks: (0..KEY_LOCK_STRIPES).map(|_| tokio::sync::Mutex::new(())).collect(),
             commit_notifiers: Arc::new(std::sync::Mutex::new(Vec::new())),
             commit_signal: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            commit_sync_hook: std::sync::Mutex::new(None),
             read_pool: std::sync::Mutex::new(HashMap::new()),
             read_pool_counter: AtomicUsize::new(0),
             retired_through: AtomicU64::new(0),
@@ -495,7 +506,7 @@ impl Collection {
         staged.or_else(|| self.committed_config())
     }
 
-    // Group commit: one fsync serves every waiter; the tick bounds latency when the batch stays short.
+    // Enqueue only after appending: the next detached batch's fsync must cover this write.
     pub fn enqueue_commit(&self) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let mut q = self.commit_notifiers.lock().unwrap();
@@ -511,7 +522,9 @@ impl Collection {
 
     /// Returns the tail the fsync covers. Sampled under the append lock: a frame landing after the
     /// sync is page cache only, and counting it durable is what lets a crash lose a committed write.
-    fn sync_wal(&self) -> io::Result<u64> {
+    pub(super) fn sync_wal(&self) -> io::Result<u64> {
+        #[cfg(test)]
+        self.commit_sync_checkpoint(CommitSyncPhase::Before)?;
         let wal = self.wal_writer.lock().unwrap();
         let synced_through = wal.last_appended_lsn;
         wal.current_wal.sync_data()?;
@@ -519,7 +532,18 @@ impl Collection {
         // own write, and a truncation holds the same lock so it cannot be re-raised past its cut.
         self.durable_lsn.fetch_max(synced_through, Ordering::SeqCst);
         self.db_durable_lsn.fetch_max(synced_through, Ordering::SeqCst);
+        drop(wal);
+        #[cfg(test)]
+        self.commit_sync_checkpoint(CommitSyncPhase::After)?;
         Ok(synced_through)
+    }
+
+    #[cfg(test)]
+    fn commit_sync_checkpoint(&self, phase: CommitSyncPhase) -> io::Result<()> {
+        if let Some(hook) = self.commit_sync_hook.lock().unwrap().as_mut() {
+            hook(phase)?;
+        }
+        Ok(())
     }
 
     pub fn start_commit_task(col: Arc<Collection>) {
@@ -542,12 +566,13 @@ impl Collection {
                     return;
                 }
 
-                let has_pending = {
-                    let q = col.commit_notifiers.lock().unwrap();
-                    !q.is_empty()
+                // Only waiters detached before the fsync may receive its result.
+                let notifiers = {
+                    let mut q = col.commit_notifiers.lock().unwrap();
+                    std::mem::take(&mut *q)
                 };
 
-                if !has_pending {
+                if notifiers.is_empty() {
                     continue;
                 }
 
@@ -558,11 +583,6 @@ impl Collection {
                     Ok(Ok(_)) => Ok(()),
                     Ok(Err(e)) => Err(format!("WAL sync failed: {}", e)),
                     Err(e) => Err(format!("Commit task panicked: {}", e)),
-                };
-
-                let notifiers: Vec<_> = {
-                    let mut q = col.commit_notifiers.lock().unwrap();
-                    std::mem::take(&mut *q)
                 };
 
                 let count = notifiers.len();
@@ -1566,6 +1586,159 @@ mod tests {
              cache only, yet it counts toward the leader's own vote and the persisted commit_lsn",
             col.durable_lsn(), tail, late);
     }
+
+    struct CommitGate {
+        reached: tokio::sync::mpsc::UnboundedReceiver<CommitSyncPhase>,
+        resume: std::sync::mpsc::Sender<io::Result<()>>,
+    }
+
+    impl CommitGate {
+        fn install(col: &Collection) -> Self {
+            let (notify, reached) = tokio::sync::mpsc::unbounded_channel();
+            let (resume, proceed) = std::sync::mpsc::channel();
+            *col.commit_sync_hook.lock().unwrap() = Some(Box::new(move |phase| {
+                notify.send(phase).map_err(io::Error::other)?;
+                proceed.recv_timeout(Duration::from_secs(10)).map_err(io::Error::other)?
+            }));
+            Self { reached, resume }
+        }
+
+        async fn at(&mut self, phase: CommitSyncPhase) {
+            assert_eq!(tokio::time::timeout(Duration::from_secs(5), self.reached.recv())
+                .await.expect("commit worker did not reach the checkpoint"), Some(phase));
+        }
+
+        fn proceed(&self) {
+            self.resume.send(Ok(())).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn ib002_late_waiters_need_their_own_sync_for_local_and_replica_appends() {
+        for replica in [false, true] {
+            let root = temp_root();
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("c").unwrap();
+            let mut gate = CommitGate::install(&col);
+
+            stage_put(&col, "first", 1);
+            let first = col.enqueue_commit();
+            let covered = stage_put(&col, "second", 2);
+            let second = col.enqueue_commit();
+            drop(col.enqueue_commit());
+            gate.at(CommitSyncPhase::Before).await;
+            gate.proceed();
+            gate.at(CommitSyncPhase::After).await;
+            assert_eq!(col.durable_lsn(), covered);
+            assert_eq!(db.durable_lsn.load(Ordering::SeqCst), covered);
+
+            let late_lsn = if replica {
+                let lsn = covered + 1;
+                let frame = crate::test_support::make_frame(1, lsn, covered, 1, "late", 3);
+                assert!(matches!(col.append_raw_frame(&frame).unwrap(),
+                    crate::storage::ReplicaApply::Applied { .. }));
+                lsn
+            } else {
+                stage_put(&col, "late", 3)
+            };
+            let mut late = col.enqueue_commit();
+            gate.proceed();
+            first.await.unwrap().unwrap();
+            second.await.unwrap().unwrap();
+
+            gate.at(CommitSyncPhase::Before).await;
+            assert!(matches!(late.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+                "a waiter appended after the first sync must still be pending");
+            assert_eq!(col.durable_lsn(), covered);
+            gate.proceed();
+            gate.at(CommitSyncPhase::After).await;
+            assert_eq!(col.durable_lsn(), late_lsn);
+            assert_eq!(db.durable_lsn.load(Ordering::SeqCst), late_lsn);
+            gate.proceed();
+            late.await.unwrap().unwrap();
+            assert!(col.commit_notifiers.lock().unwrap().is_empty());
+            db.release_collection("c").unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn ib002_sync_failure_only_fails_the_detached_batch() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+        let mut gate = CommitGate::install(&col);
+
+        stage_put(&col, "first", 1);
+        let first = col.enqueue_commit();
+        let other = col.enqueue_commit();
+        gate.at(CommitSyncPhase::Before).await;
+        let late_lsn = stage_put(&col, "late", 2);
+        let mut late = col.enqueue_commit();
+        gate.resume.send(Err(io::Error::other("injected sync failure"))).unwrap();
+        for waiter in [first, other] {
+            assert!(waiter.await.unwrap().unwrap_err().contains("injected sync failure"));
+        }
+
+        gate.at(CommitSyncPhase::Before).await;
+        assert!(matches!(late.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        assert_eq!(col.durable_lsn(), 0);
+        assert_eq!(db.durable_lsn.load(Ordering::SeqCst), 0);
+        gate.proceed();
+        gate.at(CommitSyncPhase::After).await;
+        assert_eq!(col.durable_lsn(), late_lsn);
+        gate.proceed();
+        late.await.unwrap().unwrap();
+        db.release_collection("c").unwrap();
+    }
+
+    #[tokio::test]
+    async fn ib002_forced_flush_keeps_late_waiters_and_propagates_sync_failures() {
+        for fail in [false, true] {
+            let root = temp_root();
+            let db = Arc::new(Database::new(&root).unwrap());
+            // No background worker: each round below must be covered by the forced flush alone.
+            let col = Arc::new(Collection::open("c".into(), root.join("c"),
+                db.durable_lsn.clone(), db.next_lsn.clone(), db.last_log_term.clone(),
+                db.cache.clone(), db.changefeed.clone()).unwrap());
+            db.collections.write().unwrap().insert("c".into(), col.clone());
+            let mut gate = CommitGate::install(&col);
+
+            let covered = stage_put(&col, "first", 1);
+            let first = col.enqueue_commit();
+            let flushing_db = db.clone();
+            let flush = tokio::task::spawn_blocking(move || flushing_db.force_commit_all());
+            gate.at(CommitSyncPhase::Before).await;
+            if !fail {
+                gate.proceed();
+                gate.at(CommitSyncPhase::After).await;
+            }
+            let late_lsn = stage_put(&col, "late", 2);
+            let mut late = col.enqueue_commit();
+            gate.resume.send(if fail { Err(io::Error::other("injected sync failure")) }
+                else { Ok(()) }).unwrap();
+            flush.await.unwrap();
+            let result = first.await.unwrap();
+            if fail {
+                assert!(result.unwrap_err().contains("injected sync failure"));
+            } else {
+                result.unwrap();
+            }
+            assert!(matches!(late.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+            assert_eq!(col.durable_lsn(), if fail { 0 } else { covered });
+            assert_eq!(db.durable_lsn.load(Ordering::SeqCst), col.durable_lsn());
+
+            let flushing_db = db.clone();
+            let flush = tokio::task::spawn_blocking(move || flushing_db.force_commit_all());
+            gate.at(CommitSyncPhase::Before).await;
+            gate.proceed();
+            gate.at(CommitSyncPhase::After).await;
+            assert_eq!(col.durable_lsn(), late_lsn);
+            gate.proceed();
+            flush.await.unwrap();
+            late.await.unwrap().unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn durable_lsn_only_moves_for_frames_a_commit_actually_synced() {
         let root = temp_root();

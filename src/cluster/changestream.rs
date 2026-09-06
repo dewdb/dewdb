@@ -4,7 +4,8 @@
 //! groups. The subscriber therefore gets a position per group, stamped with the partitioning those
 //! positions were taken against, and an ordering guarantee that is per group rather than global.
 
-use crate::api::changes::{data_event, ChangeParams, KEEPALIVE_INTERVAL, RETRY_HINT};
+use crate::api::changes::{sse_event, ChangeParams, KEEPALIVE_INTERVAL, RETRY_HINT};
+use crate::cdc::CdcFrame;
 use crate::cluster::router::{
     collection_absent_response, no_primary_response, read_targets, refusal_response,
     ReadPreference, ShardReply,
@@ -373,7 +374,9 @@ async fn supervise(
     }
 }
 
-struct ClusterStream {
+/// The merged feed as a transport consumes it. Frames rather than SSE events, so the WebSocket
+/// endpoint delivers the same fan-out without a second merge.
+pub(crate) struct ClusterStream {
     rx: mpsc::Receiver<Merged>,
     collection: String,
     cursor: ClusterChangeCursor,
@@ -382,87 +385,101 @@ struct ClusterStream {
     ended: bool,
 }
 
-async fn next_cluster_event(mut s: ClusterStream) -> Option<(Result<Event, Infallible>, ClusterStream)> {
-    if !s.opened {
-        s.opened = true;
-        let open = data_event("open", serde_json::json!({
-            "collection": s.collection,
-            "shards": s.shards,
-            "position": encode_cursor(&s.cursor),
-        })).retry(RETRY_HINT);
-        return Some((Ok(open), s));
-    }
-    if s.ended {
-        return None;
-    }
-    match s.rx.recv().await {
-        Some(Merged::Change { shard, lsn, mut payload }) => {
-            s.cursor.positions.insert(shard.clone(), lsn);
-            if let Some(fields) = payload.as_object_mut() {
-                // Which group published it: the ordering guarantee is per group, and `lsn` only
-                // means anything alongside the log it was drawn from.
-                fields.insert("shard".to_string(), serde_json::json!(shard));
-            }
-            let out = Event::default().event("change").id(encode_cursor(&s.cursor))
-                .data(payload.to_string());
-            Some((Ok(out), s))
-        },
-        Some(Merged::Topology { ring, shards, added, removed }) => {
-            s.cursor.ring = ring;
-            s.cursor.positions.retain(|group, _| shards.contains(group));
-            s.shards = shards.clone();
-            let out = data_event("topology", serde_json::json!({
-                "ring": ring,
-                "shards": shards,
-                "added": added,
-                "removed": removed,
-                "position": encode_cursor(&s.cursor),
-            }));
-            Some((Ok(out), s))
-        },
-        Some(Merged::Broken { shard, error, resume_floor }) => {
-            s.ended = true;
-            let mut body = serde_json::json!({"error": error, "shard": shard});
-            if let Some(floor) = resume_floor {
-                body["resume_floor"] = floor.into();
-            }
-            Some((Ok(data_event("error", body)), s))
-        },
-        // Only the supervisor closes the channel, and it does that when it is being dropped.
-        None => {
-            s.ended = true;
-            Some((Ok(data_event("error", serde_json::json!({
-                "error": "this router stopped coordinating the stream; resubscribe",
-            }))), s))
-        },
+impl ClusterStream {
+    pub(crate) async fn next_frame(&mut self) -> Option<CdcFrame> {
+        if !self.opened {
+            self.opened = true;
+            return Some(CdcFrame {
+                name: "open",
+                id: None,
+                body: serde_json::json!({
+                    "collection": self.collection,
+                    "shards": self.shards,
+                    "position": encode_cursor(&self.cursor),
+                }),
+            });
+        }
+        if self.ended {
+            return None;
+        }
+        match self.rx.recv().await {
+            Some(Merged::Change { shard, lsn, mut payload }) => {
+                self.cursor.positions.insert(shard.clone(), lsn);
+                if let Some(fields) = payload.as_object_mut() {
+                    // Which group published it: the ordering guarantee is per group, and `lsn` only
+                    // means anything alongside the log it was drawn from.
+                    fields.insert("shard".to_string(), serde_json::json!(shard));
+                }
+                Some(CdcFrame {
+                    name: "change",
+                    id: Some(encode_cursor(&self.cursor)),
+                    body: payload,
+                })
+            },
+            Some(Merged::Topology { ring, shards, added, removed }) => {
+                self.cursor.ring = ring;
+                self.cursor.positions.retain(|group, _| shards.contains(group));
+                self.shards = shards.clone();
+                Some(CdcFrame {
+                    name: "topology",
+                    id: None,
+                    body: serde_json::json!({
+                        "ring": ring,
+                        "shards": shards,
+                        "added": added,
+                        "removed": removed,
+                        "position": encode_cursor(&self.cursor),
+                    }),
+                })
+            },
+            Some(Merged::Broken { shard, error, resume_floor }) => {
+                self.ended = true;
+                let mut body = serde_json::json!({"error": error, "shard": shard});
+                if let Some(floor) = resume_floor {
+                    body["resume_floor"] = floor.into();
+                }
+                Some(CdcFrame { name: "error", id: None, body })
+            },
+            // Only the supervisor closes the channel, and it does that when it is being dropped.
+            None => {
+                self.ended = true;
+                Some(CdcFrame {
+                    name: "error",
+                    id: None,
+                    body: serde_json::json!({
+                        "error": "this router stopped coordinating the stream; resubscribe",
+                    }),
+                })
+            },
+        }
     }
 }
 
 /// One subscription per shard group, merged. `after` is a `ClusterChangeCursor`, not an LSN: an
 /// LSN belongs to one group's log and says nothing about where the others are.
-pub async fn router_stream_changes(
+pub(crate) async fn open_cluster_stream(
     state: &AppState,
     col_name: String,
     params: &ChangeParams,
     after: Option<&str>,
-) -> axum::response::Response {
+) -> Result<ClusterStream, axum::response::Response> {
     let resume: Option<ClusterChangeCursor> = match after {
         Some(token) => match decode_cursor(token) {
             Some(c) => Some(c),
-            None => return err_json(StatusCode::BAD_REQUEST,
-                "position does not belong to a cluster change stream".to_string()),
+            None => return Err(err_json(StatusCode::BAD_REQUEST,
+                "position does not belong to a cluster change stream".to_string())),
         },
         None => None,
     };
 
     let (ring, owners) = state.partitioning();
     if owners.is_empty() {
-        return no_primary_response();
+        return Err(no_primary_response());
     }
     // Before anything is opened: a position from another partitioning names groups that may not
     // exist and omits ones that do, and neither is recoverable by asking the shards.
     if resume.as_ref().is_some_and(|c| c.ring != ring) {
-        return stale_partitioning_response();
+        return Err(stale_partitioning_response());
     }
 
     let forwarded = forwarded_params(params);
@@ -493,17 +510,17 @@ pub async fn router_stream_changes(
                 if let Some(fields) = body.as_object_mut() {
                     fields.insert("shard".to_string(), serde_json::json!(group));
                 }
-                return (reply.status, Json(body)).into_response();
+                return Err((reply.status, Json(body)).into_response());
             },
             // A cluster feed short one group would deliver a subset of the collection's changes
             // and call it the collection, so it refuses instead of opening.
-            Upstream::NoPrimary(from_primary) => return refusal_response(from_primary),
-            Upstream::Failed => return (StatusCode::BAD_GATEWAY,
-                format!("shard group {} could not be reached for a change stream", group)).into_response(),
+            Upstream::NoPrimary(from_primary) => return Err(refusal_response(from_primary)),
+            Upstream::Failed => return Err((StatusCode::BAD_GATEWAY,
+                format!("shard group {} could not be reached for a change stream", group)).into_response()),
         }
     }
     if live.is_empty() && !absent.is_empty() {
-        return collection_absent_response(&col_name);
+        return Err(collection_absent_response(&col_name));
     }
 
     let (tx, rx) = mpsc::channel(MERGE_BUFFER);
@@ -530,17 +547,35 @@ pub async fn router_stream_changes(
     tokio::spawn(supervise(
         state.clone(), col_name.clone(), forwarded, ring, readers, tx));
 
-    let stream = futures::stream::unfold(
-        ClusterStream {
-            rx,
-            collection: col_name,
-            cursor: ClusterChangeCursor { ring, positions },
-            shards,
-            opened: false,
-            ended: false,
-        },
-        next_cluster_event,
-    );
+    Ok(ClusterStream {
+        rx,
+        collection: col_name,
+        cursor: ClusterChangeCursor { ring, positions },
+        shards,
+        opened: false,
+        ended: false,
+    })
+}
+
+pub async fn router_stream_changes(
+    state: &AppState,
+    col_name: String,
+    params: &ChangeParams,
+    after: Option<&str>,
+) -> axum::response::Response {
+    let cluster = match open_cluster_stream(state, col_name, params, after).await {
+        Ok(stream) => stream,
+        Err(refusal) => return refusal,
+    };
+
+    let stream = futures::stream::unfold(cluster, |mut cluster| async move {
+        let frame = cluster.next_frame().await?;
+        let event = match frame.name {
+            "open" => sse_event(&frame).retry(RETRY_HINT),
+            _ => sse_event(&frame),
+        };
+        Some((Ok::<Event, Infallible>(event), cluster))
+    });
     Sse::new(stream).keep_alive(KeepAlive::new().interval(KEEPALIVE_INTERVAL)).into_response()
 }
 

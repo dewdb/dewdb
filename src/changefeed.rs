@@ -111,6 +111,10 @@ pub struct Changefeed {
     /// Mirrors `Ring::subscribers` for `active()`, which the apply path calls per commit and must
     /// not have to take the ring lock for in the common case of nobody listening.
     live: AtomicUsize,
+    /// Consumers that keep the feed recording without holding a subscription: a webhook sender
+    /// between one subscription and the next, and the window after a restart before it attaches.
+    /// Without one, a change written in that window is never built, and no position recovers it.
+    pins: AtomicUsize,
     published: AtomicU64,
     overruns: AtomicU64,
 }
@@ -158,6 +162,7 @@ impl Changefeed {
             config,
             wake: watch::channel(position).0,
             live: AtomicUsize::new(0),
+            pins: AtomicUsize::new(0),
             published: AtomicU64::new(0),
             overruns: AtomicU64::new(0),
         }
@@ -166,7 +171,7 @@ impl Changefeed {
     /// Whether the apply path should build events for this commit. Resolving a document that was
     /// not inlined is a WAL read, so a feed nobody watches costs one load and one uncontended lock.
     pub fn active(&self) -> bool {
-        if self.live.load(Ordering::Relaxed) > 0 {
+        if self.live.load(Ordering::Relaxed) > 0 || self.pins.load(Ordering::Relaxed) > 0 {
             return true;
         }
         let ring = self.ring.lock().unwrap();
@@ -249,6 +254,7 @@ impl Changefeed {
         // Only while genuinely quiet: a feed with a subscriber, or inside its retention window, is
         // publishing, and its position trails `applied` for as long as one batch is in flight.
         let quiet = ring.subscribers == 0
+            && self.pins.load(Ordering::Relaxed) == 0
             && !ring.idle_since.is_some_and(|t| t.elapsed() < self.retention());
         if quiet && applied > ring.position {
             ring.resume_floor = ring.resume_floor.max(applied);
@@ -275,6 +281,13 @@ impl Changefeed {
             strict,
             delivered: false,
         })
+    }
+
+    /// Held for as long as the consumer that is not a subscription exists. Nothing is buffered on
+    /// its behalf beyond what the ring already holds, so a pin costs one recorded feed, not a queue.
+    pub fn pin(self: &Arc<Self>) -> FeedPin {
+        self.pins.fetch_add(1, Ordering::Relaxed);
+        FeedPin { feed: self.clone() }
     }
 
     fn detach(&self) {
@@ -310,6 +323,17 @@ impl Changefeed {
             published: self.published.load(Ordering::Relaxed),
             overruns: self.overruns.load(Ordering::Relaxed),
         }
+    }
+}
+
+pub struct FeedPin {
+    feed: Arc<Changefeed>,
+}
+
+impl Drop for FeedPin {
+    fn drop(&mut self) {
+        let _ = self.feed.pins.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+            |n| Some(n.saturating_sub(1)));
     }
 }
 
@@ -491,6 +515,28 @@ mod tests {
         let feed = Arc::new(Changefeed::new(ChangefeedConfig::default(), 42));
         assert_eq!(feed.subscribe(Some(0), 0).err(), Some(SubscribeError::Overrun(42)));
         assert!(feed.subscribe(None, 0).is_ok());
+    }
+
+    /// A webhook sender is not a connection, so nothing about it keeps the feed recording on its
+    /// own. Without the pin, a change written between a restart and the sender attaching is never
+    /// built, and there is no position that recovers it.
+    #[tokio::test]
+    async fn a_pin_keeps_the_feed_recording_for_a_consumer_that_has_not_attached() {
+        let feed = Arc::new(Changefeed::new(
+            ChangefeedConfig { buffer_events: 8, idle_retention_ms: 0, max_subscribers: 4 }, 0));
+        assert!(!feed.active());
+
+        let pin = feed.pin();
+        assert!(feed.active(), "a pinned feed records for a consumer that is not there yet");
+        feed.publish(vec![put(1, "a")], 1);
+
+        let mut sub = feed.subscribe(Some(0), 1).unwrap();
+        assert_eq!(lsns(&sub.next_batch().await.unwrap()), vec![1],
+            "the pin is what makes the change still there when the consumer arrives");
+
+        drop(sub);
+        drop(pin);
+        assert!(!feed.active(), "an unpinned feed with no subscriber costs the write path nothing");
     }
 
     /// The connect race: a feed that was skipping commits moves its floor under a subscriber that

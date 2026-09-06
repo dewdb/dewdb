@@ -2,11 +2,11 @@
 
 use crate::api::docs::not_the_primary;
 use crate::api::middleware::{client_collection, CollectionPath};
-use crate::changefeed::{ChangeEvent, ChangeOp, FeedEnd, SubscribeError, Subscription};
+use crate::cdc::{CdcFilter, CdcFrame, CdcSession, CdcStream};
+use crate::changefeed::SubscribeError;
 use crate::cluster::changestream::router_stream_changes;
 use crate::cluster::router::{parse_read_pref, ReadPreference};
 use crate::model::err_json;
-use crate::query::{parse_filter, Filter};
 use crate::state::AppState;
 use crate::storage::Collection;
 use axum::extract::{Query, State};
@@ -15,7 +15,6 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
-use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,9 +23,6 @@ use std::time::Duration;
 /// this stream last delivered, so the default browser retry resumes rather than restarts.
 pub(crate) const RETRY_HINT: Duration = Duration::from_secs(2);
 pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
-/// How often a `read=primary` stream re-checks that it still leads. A stream is one request that
-/// keeps answering, so leadership is not a thing it can check once the way every other read does.
-const LEADERSHIP_POLL: Duration = Duration::from_secs(1);
 
 #[derive(Deserialize)]
 pub struct ChangeParams {
@@ -39,114 +35,38 @@ pub struct ChangeParams {
     pub read: Option<String>,
 }
 
-/// Which ops a subscriber asked for. A list rather than a set: there are four.
-struct OpFilter(Option<Vec<ChangeOp>>);
-
-impl OpFilter {
-    fn parse(spec: Option<&str>) -> Result<Self, String> {
-        let Some(spec) = spec else { return Ok(Self(None)) };
-        let ops = spec.split(',').map(str::trim).filter(|s| !s.is_empty())
-            .map(ChangeOp::parse).collect::<Result<Vec<_>, _>>()?;
-        if ops.is_empty() {
-            return Err("ops must name at least one of insert, update, delete, drop".to_string());
-        }
-        Ok(Self(Some(ops)))
-    }
-
-    fn admits(&self, op: ChangeOp) -> bool {
-        self.0.as_ref().is_none_or(|ops| ops.contains(&op))
-    }
-}
-
-/// The filter governs the events that carry a document. Suppressing a delete it cannot test would
-/// leave a subscriber believing the match it was watching is still there.
-fn passes(event: &ChangeEvent, filter: &Option<Filter>, ops: &OpFilter) -> bool {
-    if !ops.admits(event.op) {
-        return false;
-    }
-    match (&event.value, filter) {
-        (Some(value), Some(filter)) => filter.matches(value),
-        _ => true,
-    }
-}
-
 pub(crate) fn data_event(name: &str, body: serde_json::Value) -> Event {
     Event::default().event(name).data(body.to_string())
 }
 
-/// The stream's own state. Held by the `unfold` rather than a spawned task, so a client that
-/// disconnects drops the `Subscription` and the feed sees it leave.
-struct Stream {
-    sub: Subscription,
-    queue: VecDeque<Arc<ChangeEvent>>,
-    filter: Option<Filter>,
-    ops: OpFilter,
-    collection: String,
-    /// The subscriber asked for the leader, so this stream owes it one for as long as it runs.
-    leader_only: Option<AppState>,
-    opened: bool,
-    ended: bool,
+pub(crate) fn sse_event(frame: &CdcFrame) -> Event {
+    let event = data_event(frame.name, frame.body.clone());
+    match &frame.id {
+        Some(id) => event.id(id),
+        None => event,
+    }
 }
 
-async fn next_event(mut s: Stream) -> Option<(Result<Event, Infallible>, Stream)> {
-    if !s.opened {
-        s.opened = true;
-        let open = data_event("open", serde_json::json!({
-            "collection": s.collection,
-            "position": s.sub.position(),
-        })).retry(RETRY_HINT);
-        return Some((Ok(open), s));
-    }
-    if s.ended {
-        return None;
-    }
-    loop {
-        while let Some(event) = s.queue.pop_front() {
-            if !passes(&event, &s.filter, &s.ops) {
-                continue;
-            }
-            // The id is the resume position, so a reconnect carrying it in `Last-Event-ID` picks
-            // up exactly where this one stopped.
-            let out = Event::default().event("change").id(event.lsn.to_string())
-                .data(serde_json::to_string(&*event).unwrap_or_default());
-            return Some((Ok(out), s));
-        }
-        // Ended rather than left quiet: a stepped-down leader publishes nothing more, and a
-        // subscriber that asked for the leader would sit on a stream that had stopped saying so.
-        if s.leader_only.as_ref().is_some_and(|state| !state.is_leader()) {
-            s.ended = true;
-            return Some((Ok(data_event("error", serde_json::json!({
-                "error": "this node no longer leads the shard group; resubscribe from `position`",
-                "position": s.sub.position(),
-            }))), s));
-        }
-        // `next_batch` waits on a `watch`, which is cancel-safe, so a lapsed poll drops nothing.
-        let batch = match &s.leader_only {
-            Some(_) => match tokio::time::timeout(LEADERSHIP_POLL, s.sub.next_batch()).await {
-                Ok(batch) => batch,
-                Err(_) => continue,
-            },
-            None => s.sub.next_batch().await,
-        };
-        match batch {
-            Ok(batch) => s.queue.extend(batch),
-            Err(end) => {
-                s.ended = true;
-                let (error, floor) = match end {
-                    FeedEnd::Overrun(floor) => (
-                        "this subscriber fell behind the change buffer; resubscribe from `resume_floor`",
-                        Some(floor)),
-                    FeedEnd::Closed => (
-                        "the collection was replaced or closed under this stream; resubscribe", None),
-                };
-                let mut body = serde_json::json!({"error": error});
-                if let Some(floor) = floor {
-                    body["resume_floor"] = floor.into();
-                }
-                return Some((Ok(data_event("error", body)), s));
-            },
-        }
-    }
+/// The parts of a change request every transport reads the same way. `read=quorum` is refused here
+/// rather than downgraded: a read index makes one answer linearizable, and a stream is not one.
+pub(crate) fn parse_request(
+    params: &ChangeParams,
+    headers: &HeaderMap,
+) -> Result<(CdcFilter, ReadPreference, Option<String>), axum::response::Response> {
+    let filter = CdcFilter::parse(params.filter.as_deref(), params.ops.as_deref())
+        .map_err(|e| err_json(StatusCode::BAD_REQUEST, e))?;
+    let pref = match parse_read_pref(params.read.as_deref()) {
+        Ok(ReadPreference::Quorum) => return Err(err_json(StatusCode::BAD_REQUEST,
+            "a change stream is not a point-in-time read; use `read=primary`".to_string())),
+        Ok(p) => p,
+        Err(e) => return Err(err_json(StatusCode::BAD_REQUEST, e)),
+    };
+    // An explicit `after` wins: `Last-Event-ID` is what the browser resends on its own reconnect,
+    // and a client that named a position meant that one.
+    let after = params.after.as_deref()
+        .or_else(|| headers.get("last-event-id").and_then(|v| v.to_str().ok()))
+        .map(|raw| raw.trim().to_string());
+    Ok((filter, pref, after))
 }
 
 fn refuse(err: SubscribeError, col: &Arc<Collection>) -> axum::response::Response {
@@ -175,84 +95,78 @@ fn refuse(err: SubscribeError, col: &Arc<Collection>) -> axum::response::Respons
     }
 }
 
+/// Subscribes to one collection's feed on this node. The refusals are the endpoint's, so SSE and
+/// WebSocket answer an unusable position identically.
+pub(crate) fn open_shard_session(
+    state: &AppState,
+    col_name: String,
+    after: Option<&str>,
+    filter: CdcFilter,
+    pref: &ReadPreference,
+) -> Result<CdcSession, axum::response::Response> {
+    if let Some(refusal) = not_the_primary(state, pref) {
+        return Err(refusal);
+    }
+    let after = match after {
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(lsn) => Some(lsn),
+            Err(_) => return Err(err_json(StatusCode::BAD_REQUEST,
+                "a shard change position is the LSN of the event it follows".to_string())),
+        },
+        None => None,
+    };
+
+    let col = client_collection(state, &col_name)?;
+    // Sampled before subscribing, so a feed that was quiet learns how far the log moved while it
+    // was not recording, and refuses a resume from under that rather than skipping it silently.
+    let applied = col.applied_lsn();
+    let sub = col.changefeed.subscribe(after, applied).map_err(|e| refuse(e, &col))?;
+    let leader_only = matches!(pref, ReadPreference::Primary).then(|| state.clone());
+    Ok(CdcSession::new(col_name, CdcStream::new(sub, filter, leader_only)))
+}
+
+/// A cluster-wide stream is served by each group's leader, so it has no replica preference to
+/// offer: a group's feed lags on a replica, and its positions are only honourable by a node whose
+/// log the group agrees on.
+pub(crate) fn router_rejects_replica_reads(pref: &ReadPreference) -> Option<axum::response::Response> {
+    matches!(pref, ReadPreference::Replica).then(|| err_json(StatusCode::BAD_REQUEST,
+        "a cluster-wide change stream is served by each group's leader; drop `read=replica`"
+            .to_string()))
+}
+
 pub async fn stream_changes(
     State(state): State<AppState>,
     CollectionPath(col_name): CollectionPath<String>,
     Query(params): Query<ChangeParams>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    let filter = match params.filter.as_deref().map(parse_filter).transpose() {
-        Ok(f) => f,
-        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
+    let (filter, pref, after) = match parse_request(&params, &headers) {
+        Ok(parsed) => parsed,
+        Err(refusal) => return refusal,
     };
-    let ops = match OpFilter::parse(params.ops.as_deref()) {
-        Ok(o) => o,
-        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
-    };
-    let pref = match parse_read_pref(params.read.as_deref()) {
-        // A read index makes one answer linearizable, and a stream is not one answer. Honouring it
-        // as `primary` would be claiming a guarantee this endpoint has no way to hold.
-        Ok(ReadPreference::Quorum) => return err_json(StatusCode::BAD_REQUEST,
-            "a change stream is not a point-in-time read; use `read=primary`".to_string()),
-        Ok(p) => p,
-        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
-    };
-
-    // An explicit `after` wins: `Last-Event-ID` is what the browser resends on its own reconnect,
-    // and a client that named a position meant that one.
-    let after = params.after.as_deref()
-        .or_else(|| headers.get("last-event-id").and_then(|v| v.to_str().ok()))
-        .map(|raw| raw.trim().to_string());
 
     if state.config.role == "router" {
-        // A group's feed lags on a replica, and its positions are only honourable by a node whose
-        // log the group agrees on, so a cluster-wide stream has no replica preference to offer.
-        if matches!(pref, ReadPreference::Replica) {
-            return err_json(StatusCode::BAD_REQUEST,
-                "a cluster-wide change stream is served by each group's leader; drop `read=replica`"
-                    .to_string());
+        if let Some(refusal) = router_rejects_replica_reads(&pref) {
+            return refusal;
         }
         return router_stream_changes(&state, col_name, &params, after.as_deref()).await;
     }
 
-    if let Some(refusal) = not_the_primary(&state, &pref) {
-        return refusal;
-    }
-    let after = match after {
-        Some(raw) => match raw.parse::<u64>() {
-            Ok(lsn) => Some(lsn),
-            Err(_) => return err_json(StatusCode::BAD_REQUEST,
-                "a shard change position is the LSN of the event it follows".to_string()),
-        },
-        None => None,
+    let session = match open_shard_session(&state, col_name, after.as_deref(), filter, &pref) {
+        Ok(session) => session,
+        Err(refusal) => return refusal,
     };
 
-    let col = match client_collection(&state, &col_name) {
-        Ok(c) => c,
-        Err(resp) => return resp,
-    };
-
-    // Sampled before subscribing, so a feed that was quiet learns how far the log moved while it
-    // was not recording, and refuses a resume from under that rather than skipping it silently.
-    let applied = col.applied_lsn();
-    let sub = match col.changefeed.subscribe(after, applied) {
-        Ok(sub) => sub,
-        Err(e) => return refuse(e, &col),
-    };
-
-    let stream = futures::stream::unfold(
-        Stream {
-            sub,
-            queue: VecDeque::new(),
-            filter,
-            ops,
-            collection: col_name,
-            leader_only: matches!(pref, ReadPreference::Primary).then(|| state.clone()),
-            opened: false,
-            ended: false,
-        },
-        next_event,
-    );
+    // Held by the `unfold` rather than a spawned task, so a client that disconnects drops the
+    // subscription and the feed sees it leave.
+    let stream = futures::stream::unfold(session, |mut session| async move {
+        let frame = session.next_frame().await?;
+        let event = match frame.name {
+            "open" => sse_event(&frame).retry(RETRY_HINT),
+            _ => sse_event(&frame),
+        };
+        Some((Ok::<Event, Infallible>(event), session))
+    });
 
     Sse::new(stream).keep_alive(KeepAlive::new().interval(KEEPALIVE_INTERVAL)).into_response()
 }
@@ -260,7 +174,6 @@ pub async fn stream_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::changefeed::ChangeOp;
     use crate::test_support::{next_test_port, single_node, temp_root, SseTap, TestNode};
 
     const SETTLE: Duration = Duration::from_secs(5);
@@ -464,35 +377,5 @@ mod tests {
         assert_eq!(ended.len(), 1, "the stream carried on without the leadership it asked for");
         assert!(ended[0].data["position"].as_u64().is_some_and(|p| p >= opened),
             "the refusal has to name a position the group can be resumed from: {:?}", ended[0]);
-    }
-
-    fn event(op: ChangeOp, value: Option<serde_json::Value>) -> ChangeEvent {
-        ChangeEvent { lsn: 1, op, key: "k1".to_string(), value }
-    }
-
-    #[test]
-    fn an_op_list_is_parsed_or_refused() {
-        assert!(OpFilter::parse(Some("insert,delete")).unwrap().admits(ChangeOp::Insert));
-        assert!(!OpFilter::parse(Some("insert,delete")).unwrap().admits(ChangeOp::Update));
-        assert!(OpFilter::parse(None).unwrap().admits(ChangeOp::Drop), "absent is every op");
-        assert!(OpFilter::parse(Some("upsert")).is_err());
-        assert!(OpFilter::parse(Some(",")).is_err(), "an empty list would silence the stream");
-    }
-
-    /// A delete carries no document, so a document filter cannot judge it. Dropping it would leave
-    /// a subscriber believing a match it was watching is still there.
-    #[test]
-    fn a_document_filter_governs_the_events_that_carry_a_document() {
-        let filter = Some(parse_filter(r#"{"status":"active"}"#).unwrap());
-        let all = OpFilter::parse(None).unwrap();
-
-        assert!(passes(&event(ChangeOp::Insert, Some(serde_json::json!({"status": "active"}))), &filter, &all));
-        assert!(!passes(&event(ChangeOp::Update, Some(serde_json::json!({"status": "done"}))), &filter, &all));
-        assert!(passes(&event(ChangeOp::Delete, None), &filter, &all));
-        assert!(passes(&event(ChangeOp::Drop, None), &filter, &all));
-
-        let writes = OpFilter::parse(Some("insert,update")).unwrap();
-        assert!(!passes(&event(ChangeOp::Delete, None), &None, &writes),
-            "an op list still excludes a delete, because that one was asked for explicitly");
     }
 }

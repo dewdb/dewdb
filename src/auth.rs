@@ -100,7 +100,23 @@ fn is_admin_route(path: &str, method: &str) -> bool {
     }
     // Defining an index is a schema change and a replicated write, so it sits with the drop rather
     // than with the data path. Listing them does not, the way listing collections does not.
-    matches!(method, "POST" | "DELETE") && is_index_route(path)
+    if matches!(method, "POST" | "DELETE") && is_index_route(path) {
+        return true;
+    }
+    // Every method, unlike indexes: a listing names the destinations this node pushes documents to.
+    is_webhook_route(path)
+}
+
+/// `/collections/<name>/webhooks` and `/collections/<name>/webhooks/<id>`.
+fn is_webhook_route(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/collections/") else { return false };
+    let mut parts = rest.split('/');
+    parts.next().is_some_and(|name| !name.is_empty())
+        && parts.next() == Some("webhooks")
+        && match parts.next() {
+            None => true,
+            Some(id) => !id.is_empty() && parts.next().is_none(),
+        }
 }
 
 /// `/collections/<name>/indexes` and `/collections/<name>/indexes/<index>`, and nothing else under
