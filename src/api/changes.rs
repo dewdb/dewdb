@@ -3,6 +3,7 @@
 use crate::api::docs::not_the_primary;
 use crate::api::middleware::{client_collection, CollectionPath};
 use crate::changefeed::{ChangeEvent, ChangeOp, FeedEnd, SubscribeError, Subscription};
+use crate::cluster::changestream::router_stream_changes;
 use crate::cluster::router::{parse_read_pref, ReadPreference};
 use crate::model::err_json;
 use crate::query::{parse_filter, Filter};
@@ -21,13 +22,16 @@ use std::time::Duration;
 
 /// SSE's own reconnection hint. A client that reconnects sends `Last-Event-ID`, which is the LSN
 /// this stream last delivered, so the default browser retry resumes rather than restarts.
-const RETRY_HINT: Duration = Duration::from_secs(2);
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+pub(crate) const RETRY_HINT: Duration = Duration::from_secs(2);
+pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+/// How often a `read=primary` stream re-checks that it still leads. A stream is one request that
+/// keeps answering, so leadership is not a thing it can check once the way every other read does.
+const LEADERSHIP_POLL: Duration = Duration::from_secs(1);
 
 #[derive(Deserialize)]
 pub struct ChangeParams {
-    /// Resume position: deliver committed changes above this LSN.
-    pub after: Option<u64>,
+    /// Resume position. A shard reads it as an LSN; a router as the cluster position it issued.
+    pub after: Option<String>,
     /// A document filter, in the `/query` syntax.
     pub filter: Option<String>,
     /// Comma-separated `insert`, `update`, `delete`, `drop`. Absent is all four.
@@ -66,7 +70,7 @@ fn passes(event: &ChangeEvent, filter: &Option<Filter>, ops: &OpFilter) -> bool 
     }
 }
 
-fn data_event(name: &str, body: serde_json::Value) -> Event {
+pub(crate) fn data_event(name: &str, body: serde_json::Value) -> Event {
     Event::default().event(name).data(body.to_string())
 }
 
@@ -78,6 +82,8 @@ struct Stream {
     filter: Option<Filter>,
     ops: OpFilter,
     collection: String,
+    /// The subscriber asked for the leader, so this stream owes it one for as long as it runs.
+    leader_only: Option<AppState>,
     opened: bool,
     ended: bool,
 }
@@ -105,7 +111,24 @@ async fn next_event(mut s: Stream) -> Option<(Result<Event, Infallible>, Stream)
                 .data(serde_json::to_string(&*event).unwrap_or_default());
             return Some((Ok(out), s));
         }
-        match s.sub.next_batch().await {
+        // Ended rather than left quiet: a stepped-down leader publishes nothing more, and a
+        // subscriber that asked for the leader would sit on a stream that had stopped saying so.
+        if s.leader_only.as_ref().is_some_and(|state| !state.is_leader()) {
+            s.ended = true;
+            return Some((Ok(data_event("error", serde_json::json!({
+                "error": "this node no longer leads the shard group; resubscribe from `position`",
+                "position": s.sub.position(),
+            }))), s));
+        }
+        // `next_batch` waits on a `watch`, which is cancel-safe, so a lapsed poll drops nothing.
+        let batch = match &s.leader_only {
+            Some(_) => match tokio::time::timeout(LEADERSHIP_POLL, s.sub.next_batch()).await {
+                Ok(batch) => batch,
+                Err(_) => continue,
+            },
+            None => s.sub.next_batch().await,
+        };
+        match batch {
             Ok(batch) => s.queue.extend(batch),
             Err(end) => {
                 s.ended = true;
@@ -158,12 +181,6 @@ pub async fn stream_changes(
     Query(params): Query<ChangeParams>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    if state.config.role == "router" {
-        return err_json(StatusCode::NOT_IMPLEMENTED,
-            "a change stream is served by a shard group; subscribe to the shards directly"
-                .to_string());
-    }
-
     let filter = match params.filter.as_deref().map(parse_filter).transpose() {
         Ok(f) => f,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
@@ -180,22 +197,34 @@ pub async fn stream_changes(
         Ok(p) => p,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
     };
-    if let Some(refusal) = not_the_primary(&state, &pref) {
-        return refusal;
-    }
 
     // An explicit `after` wins: `Last-Event-ID` is what the browser resends on its own reconnect,
     // and a client that named a position meant that one.
-    let after = match params.after {
-        Some(after) => Some(after),
-        None => match headers.get("last-event-id").and_then(|v| v.to_str().ok()) {
-            Some(raw) => match raw.trim().parse::<u64>() {
-                Ok(lsn) => Some(lsn),
-                Err(_) => return err_json(StatusCode::BAD_REQUEST,
-                    "Last-Event-ID must be a change position".to_string()),
-            },
-            None => None,
+    let after = params.after.as_deref()
+        .or_else(|| headers.get("last-event-id").and_then(|v| v.to_str().ok()))
+        .map(|raw| raw.trim().to_string());
+
+    if state.config.role == "router" {
+        // A group's feed lags on a replica, and its positions are only honourable by a node whose
+        // log the group agrees on, so a cluster-wide stream has no replica preference to offer.
+        if matches!(pref, ReadPreference::Replica) {
+            return err_json(StatusCode::BAD_REQUEST,
+                "a cluster-wide change stream is served by each group's leader; drop `read=replica`"
+                    .to_string());
+        }
+        return router_stream_changes(&state, col_name, &params, after.as_deref()).await;
+    }
+
+    if let Some(refusal) = not_the_primary(&state, &pref) {
+        return refusal;
+    }
+    let after = match after {
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(lsn) => Some(lsn),
+            Err(_) => return err_json(StatusCode::BAD_REQUEST,
+                "a shard change position is the LSN of the event it follows".to_string()),
         },
+        None => None,
     };
 
     let col = match client_collection(&state, &col_name) {
@@ -218,6 +247,7 @@ pub async fn stream_changes(
             filter,
             ops,
             collection: col_name,
+            leader_only: matches!(pref, ReadPreference::Primary).then(|| state.clone()),
             opened: false,
             ended: false,
         },
@@ -390,10 +420,10 @@ mod tests {
         assert!(seen[0].data.get("key").is_none(), "a drop names no key");
     }
 
-    /// A cluster-wide feed is commit 57. Until then a router says where the feed lives rather than
-    /// answering from one group and calling it the collection.
+    /// A router serves the collection, not one group's share of it. The fan-out itself is covered
+    /// in `cluster::changestream`; what this pins is that the endpoint no longer refuses there.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_router_points_at_the_shard_groups() {
+    async fn a_router_serves_the_collection_rather_than_refusing() {
         let root = temp_root();
         let mut shard = TestNode::new("s1", next_test_port(), &root, "primary");
         shard.start();
@@ -404,7 +434,36 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         let c = reqwest::Client::new();
-        assert_eq!(changes(&c, &router.url(), "").await.status(), StatusCode::NOT_IMPLEMENTED);
+        put(&c, &router.url(), "seed", serde_json::json!({"v": 0})).await;
+        assert_eq!(changes(&c, &router.url(), "").await.status(), StatusCode::OK);
+    }
+
+    /// A stream is one request that keeps answering, so `read=primary` is a promise it has to keep
+    /// past the moment it was checked. Ended in-band with the position, because a stepped-down
+    /// leader publishes nothing further and silence is indistinguishable from a quiet collection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_leader_only_stream_ends_when_the_node_stops_leading() {
+        use crate::test_support::{leaders, three_node_cluster, wait_for};
+
+        let root = temp_root();
+        let (n1, n2, n3) = three_node_cluster(&root).await;
+        let c = reqwest::Client::new();
+        assert!(wait_for(SETTLE, || leaders(&[&n1, &n2, &n3]) == vec!["n1".to_string()]).await,
+            "the test needs a settled leader to take office away from");
+
+        put(&c, &n1.url(), "seed", serde_json::json!({"v": 0})).await;
+        let tap = watch(&c, &n1.url(), "?read=primary").await;
+        let opened = tap.named("open")[0].data["position"].as_u64().unwrap();
+
+        let handover = c.post(format!("{}/cluster/transfer-leadership", n1.url()))
+            .timeout(Duration::from_secs(30)).json(&serde_json::json!({"to": n2.url()}))
+            .send().await.unwrap();
+        assert!(handover.status().is_success(), "{}", handover.text().await.unwrap());
+
+        let ended = tap.wait_for_events("error", 1, SETTLE).await;
+        assert_eq!(ended.len(), 1, "the stream carried on without the leadership it asked for");
+        assert!(ended[0].data["position"].as_u64().is_some_and(|p| p >= opened),
+            "the refusal has to name a position the group can be resumed from: {:?}", ended[0]);
     }
 
     fn event(op: ChangeOp, value: Option<serde_json::Value>) -> ChangeEvent {

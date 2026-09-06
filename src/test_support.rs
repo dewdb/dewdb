@@ -342,6 +342,7 @@ impl TestNode {
                     db,
                     config: Arc::new(config.clone()),
                     client: build_client(&config.auth, &config.own_url()),
+                    stream_client: crate::auth::build_stream_client(&config.auth, &config.own_url()),
                     replication: (!is_router).then_some(replication),
                     primary_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),
                     shard_failover_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),

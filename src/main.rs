@@ -218,6 +218,7 @@ async fn main() -> io::Result<()> {
         db: db.clone(),
         config: Arc::new(config.clone()),
         client: client.clone(),
+        stream_client: crate::auth::build_stream_client(&config.auth, &config.own_url()),
         replication,
         primary_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),
         shard_failover_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),

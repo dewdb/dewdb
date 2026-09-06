@@ -48,7 +48,7 @@ pub struct ShardReply {
 }
 
 impl ShardReply {
-    async fn of(r: reqwest::Response) -> Self {
+    pub(crate) async fn of(r: reqwest::Response) -> Self {
         Self { status: r.status(), body: r.text().await.unwrap_or_default() }
     }
 
@@ -315,7 +315,7 @@ fn stale_ring_response() -> axum::response::Response {
 }
 
 /// 503, not 502: the read is not wrong, it is unavailable until the shard has a leader again.
-fn no_primary_response() -> axum::response::Response {
+pub(crate) fn no_primary_response() -> axum::response::Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         [(axum::http::header::RETRY_AFTER, "1")],
@@ -331,7 +331,7 @@ fn no_primary_response() -> axum::response::Response {
 /// with a majority, or that its term is too new to read at -- a partition on the *leader's* side,
 /// which is the opposite diagnosis (L11). Same status class and same remedy either way, so this
 /// costs diagnosability only; `Retry-After` is kept because the remedy is still to retry.
-fn refusal_response(from_primary: Option<ShardReply>) -> axum::response::Response {
+pub(crate) fn refusal_response(from_primary: Option<ShardReply>) -> axum::response::Response {
     match from_primary {
         Some(reply) => {
             let json: serde_json::Value = serde_json::from_str(&reply.body)
@@ -351,7 +351,7 @@ fn load_score(load: NodeLoad, unknown_latency_us: u64) -> u64 {
     load.inflight.saturating_add(1).saturating_mul(latency)
 }
 
-fn read_targets(
+pub(crate) fn read_targets(
     pref: &ReadPreference,
     effective_primary: &str,
     replicas: &[String],
@@ -741,7 +741,7 @@ enum ShardQueryOutcome {
 }
 
 /// No shard holds the collection, so the fan-out is answering for all of them.
-fn collection_absent_response(name: &str) -> axum::response::Response {
+pub(crate) fn collection_absent_response(name: &str) -> axum::response::Response {
     err_json(StatusCode::NOT_FOUND, format!("collection '{}' does not exist", name))
 }
 

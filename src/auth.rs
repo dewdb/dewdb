@@ -166,9 +166,13 @@ pub fn authorize(
     }
 }
 
+/// Longer than the change feed's keep-alive, so a connection that has gone quiet is a dead one
+/// rather than a feed with nothing to say.
+const STREAM_READ_TIMEOUT: Duration = Duration::from_secs(45);
+
 /// `from` names this node on every internal request it makes: attribution in a peer's logs, and
 /// the key a test fault injector cuts a link on.
-pub fn build_client(auth: &AuthConfig, from: &str) -> reqwest::Client {
+fn node_headers(auth: &AuthConfig, from: &str) -> reqwest::header::HeaderMap {
     let mut headers = reqwest::header::HeaderMap::new();
 
     if let Ok(v) = reqwest::header::HeaderValue::from_str(from) {
@@ -185,10 +189,24 @@ pub fn build_client(auth: &AuthConfig, from: &str) -> reqwest::Client {
             headers.insert(API_KEY_HEADER, v);
         }
     }
+    headers
+}
 
+pub fn build_client(auth: &AuthConfig, from: &str) -> reqwest::Client {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
-        .default_headers(headers)
+        .default_headers(node_headers(auth, from))
+        .build()
+        .unwrap()
+}
+
+/// The same credentials with no whole-request deadline, for the change streams a router holds open
+/// for as long as its own subscriber does. `STREAM_READ_TIMEOUT` is the liveness check in its place.
+pub fn build_stream_client(auth: &AuthConfig, from: &str) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .read_timeout(STREAM_READ_TIMEOUT)
+        .default_headers(node_headers(auth, from))
         .build()
         .unwrap()
 }

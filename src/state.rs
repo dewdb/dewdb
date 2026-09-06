@@ -52,6 +52,9 @@ pub struct AppState {
     pub db: Option<Arc<Database>>,
     pub config: Arc<NodeConfig>,
     pub client: reqwest::Client,
+    /// The same credentials without a request deadline. Only the router-coordinated change stream
+    /// uses it: every other call to a peer is one request that must not outlive its own timeout.
+    pub stream_client: reqwest::Client,
     pub replication: Option<Arc<RwLock<ReplicationState>>>,
     pub primary_overrides: Arc<std::sync::Mutex<HashMap<String, PrimaryOverride>>>,
     pub shard_failover_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
@@ -458,6 +461,7 @@ impl AppState {
             replication: None,
             replication_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             client: reqwest::Client::new(),
+            stream_client: reqwest::Client::new(),
             config: Arc::new(config),
             primary_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),
             shard_failover_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -506,6 +510,7 @@ impl AppState {
             replication_slots: Arc::new(tokio::sync::Semaphore::new(
                 config.flow_control.max_inflight_requests.max(1))),
             client: reqwest::Client::new(),
+            stream_client: reqwest::Client::new(),
             config: Arc::new(config),
             primary_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),
             shard_failover_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
