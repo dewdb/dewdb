@@ -133,7 +133,8 @@ async fn append_and_commit(state: &AppState, config: Configuration) -> Result<u6
         Ok(Err(e)) => return Err(ChangeError::Stalled(e)),
         Err(e) => return Err(ChangeError::Stalled(e.to_string())),
     }
-    state.advance_own_commit(CONFIG_LOG, col.durable_lsn());
+    state.advance_own_commit(CONFIG_LOG, col.durable_lsn())
+        .map_err(|e| ChangeError::Stalled(e.to_string()))?;
 
     let deadline = Instant::now() + CONFIG_COMMIT_TIMEOUT;
     while state.committed_lsn(CONFIG_LOG) < lsn {
@@ -143,6 +144,8 @@ async fn append_and_commit(state: &AppState, config: Configuration) -> Result<u6
         }
         tokio::time::sleep(Duration::from_millis(COMMIT_POLL_MS)).await;
     }
+    state.apply_committed(CONFIG_LOG, state.committed_lsn(CONFIG_LOG))
+        .map_err(|e| ChangeError::Stalled(e.to_string()))?;
     Ok(lsn)
 }
 
@@ -278,7 +281,7 @@ mod tests {
         let joint = Configuration::joint(vec![own.clone(), "http://gone".to_string()], vec![own.clone()]);
         let col = state.db.as_ref().unwrap().get_collection(CONFIG_LOG).unwrap();
         let (_f, _w, _o, lsn) = col.configure(joint.clone(), state.current_term()).unwrap();
-        col.apply_committed(lsn);
+        col.apply_committed(lsn).unwrap();
         state.refresh_configuration();
         assert!(state.quorum_config().is_joint(), "the setup itself has to leave it joint");
 

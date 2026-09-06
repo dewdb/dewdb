@@ -480,7 +480,10 @@ pub fn publish_inherited_tails(state: &AppState) {
 
             // Own durability counts toward the quorum only after the fsync, as on the write path.
             if matches!(commit.await, Ok(Ok(()))) {
-                state.advance_own_commit(&name, col.durable_lsn());
+                if let Err(e) = state.advance_own_commit(&name, col.durable_lsn()) {
+                    warn!(target: "election", collection = %name, error = %e,
+                        "Failed to persist promotion commit watermark");
+                }
             }
             info!(target: "election", collection = %name, lsn,
                 "Appended a promotion barrier to publish an inherited tail");

@@ -13,6 +13,7 @@ use crate::ring::{shard_owns, BuiltRing};
 use crate::storage::frame::Configuration;
 use crate::storage::Database;
 use std::collections::{HashMap, HashSet};
+use std::io;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, RwLock};
 
@@ -161,10 +162,10 @@ impl AppState {
 
     // Acks from an older term are recorded but never advance the watermark:
     // only current-term entries count toward a quorum.
-    pub fn note_ack(&self, replica: &str, collection: &str, lsn: u64, ack_term: u64) -> u64 {
+    pub fn note_ack(&self, replica: &str, collection: &str, lsn: u64, ack_term: u64) -> io::Result<u64> {
         let repl = match self.replication.as_ref() {
             Some(r) => r,
-            None => return 0,
+            None => return Ok(0),
         };
         let leader_durable = self
             .db
@@ -187,8 +188,8 @@ impl AppState {
                 g.progress.advance(collection, &own, leader_durable, &quorum)
             }
         };
-        self.apply_committed(collection, committed);
-        committed
+        self.apply_committed(collection, committed)?;
+        Ok(committed)
     }
 
     /// This leader's own append, which is what lets `advance` commit at that LSN or above.
@@ -397,10 +398,10 @@ impl AppState {
     }
 
     // A leader with no replicas commits on its own durability, so single-node still progresses.
-    pub fn advance_own_commit(&self, collection: &str, durable_lsn: u64) -> u64 {
+    pub fn advance_own_commit(&self, collection: &str, durable_lsn: u64) -> io::Result<u64> {
         let repl = match self.replication.as_ref() {
             Some(r) => r,
-            None => return 0,
+            None => return Ok(0),
         };
         let own = self.own_url();
         let committed = {
@@ -412,19 +413,19 @@ impl AppState {
                 g.progress.advance(collection, &own, durable_lsn, &quorum)
             }
         };
-        self.apply_committed(collection, committed);
-        committed
+        self.apply_committed(collection, committed)?;
+        Ok(committed)
     }
 
     // Call under the collection's snapshot-install lock so matching, durability and publication stay ordered.
-    pub fn note_leader_committed(&self, collection: &str, term: u64, lsn: u64, matched: Option<u64>) {
-        let Some(col) = self.db.as_ref()
-            .and_then(|db| db.lookup_collection(collection).ok().flatten()) else { return };
+    pub fn note_leader_committed(&self, collection: &str, term: u64, lsn: u64, matched: Option<u64>) -> io::Result<()> {
+        let Some(db) = self.db.as_ref() else { return Ok(()) };
+        let Some(col) = db.lookup_collection(collection)? else { return Ok(()) };
         let durable = col.durable_lsn();
         let committed = if let Some(repl) = self.replication.as_ref() {
             let mut g = repl.write().unwrap();
             if g.is_leader || g.term != term {
-                return;
+                return Ok(());
             }
             let prefix = g.leader_matched.entry(collection.to_string()).or_insert((term, 0));
             if prefix.0 != term {
@@ -434,22 +435,23 @@ impl AppState {
                 prefix.1 = prefix.1.max(matched.min(durable));
             }
             lsn.min(prefix.1).min(durable)
-        } else { return };
-        self.apply_committed(collection, committed);
+        } else { return Ok(()) };
+        self.apply_committed(collection, committed)
     }
 
     // Never call with the replication lock held: this takes pending and index,
     // while note_ack reaches the collections lock in the opposite order.
-    pub fn apply_committed(&self, collection: &str, committed: u64) {
+    pub fn apply_committed(&self, collection: &str, committed: u64) -> io::Result<()> {
         if committed == 0 {
-            return;
+            return Ok(());
         }
-        if let Some(col) = self.db.as_ref().and_then(|db| db.get_collection(collection).ok()) {
-            col.apply_committed(committed);
+        if let Some(db) = self.db.as_ref() {
+            db.get_collection(collection)?.apply_committed(committed)?;
         }
         if collection == CONFIG_LOG {
             self.refresh_configuration();
         }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1072,7 +1074,7 @@ mod tests {
         assert_eq!(state.metrics.writes_rejected(), 1);
 
         // A quorum catching up drains the buffer and reopens the door.
-        col.apply_committed(col.last_appended_lsn());
+        col.apply_committed(col.last_appended_lsn()).unwrap();
         assert!(state.admit_write("t").is_ok(), "backpressure must lift once commits catch up");
     }
 
@@ -1200,11 +1202,11 @@ mod tests {
         col.durable_lsn.store(lsn, std::sync::atomic::Ordering::SeqCst);
         state.note_leader_append("t", lsn);
 
-        state.note_ack("http://127.0.0.1:9504", "t", lsn, state.current_term());
+        state.note_ack("http://127.0.0.1:9504", "t", lsn, state.current_term()).unwrap();
         assert_eq!(state.committed_lsn("t"), 0,
             "leader plus a learner is one of three, not a majority");
 
-        state.note_ack("http://127.0.0.1:9502", "t", lsn, state.current_term());
+        state.note_ack("http://127.0.0.1:9502", "t", lsn, state.current_term()).unwrap();
         assert_eq!(state.committed_lsn("t"), lsn, "leader plus a voter is a majority");
     }
 

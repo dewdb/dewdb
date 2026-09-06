@@ -106,7 +106,9 @@ pub fn replicate_to_peers(
                 match response {
                     Ok(r) if r.status().is_success() => {
                         state.note_sent(&replica_url, &col, lsn);
-                        state.note_ack(&replica_url, &col, lsn, term);
+                        if let Err(e) = state.note_ack(&replica_url, &col, lsn, term) {
+                            warn!(target: "replication", error = %e, "Failed to persist local commit watermark");
+                        }
                     },
                     Ok(r) if r.status() == StatusCode::CONFLICT => {
                         let body = r.json::<serde_json::Value>().await.ok();
@@ -396,7 +398,9 @@ async fn confirm_tail(state: &AppState, replica_url: &str, collection: &str) -> 
             // entries, not for one of ours.
             let held = applied_through(&body).unwrap_or(lsn).min(lsn);
             state.note_sent(replica_url, collection, held);
-            state.note_ack(replica_url, collection, held, term);
+            if let Err(e) = state.note_ack(replica_url, collection, held, term) {
+                warn!(target: "replication", error = %e, "Failed to persist local commit watermark");
+            }
             true
         },
         Ok(r) if r.status() == StatusCode::CONFLICT => {
@@ -662,7 +666,9 @@ async fn stream_chain_once(
         }
     }
 
-    state.note_ack(&replica_url, &collection, prev, term);
+    if let Err(e) = state.note_ack(&replica_url, &collection, prev, term) {
+        warn!(target: "replication", error = %e, "Failed to persist local commit watermark");
+    }
     info!(target: "repair", "Streamed {} frames to {}; caught up to lsn {} for '{}'", sent, replica_url, prev, collection);
     Some(prev)
 }
@@ -717,7 +723,9 @@ async fn replicate_one_await(
     match state.client.post(&url).json(&req).send().await {
         Ok(r) if r.status().is_success() => {
             state.note_sent(replica_url, collection, lsn);
-            state.note_ack(replica_url, collection, lsn, term);
+            if let Err(e) = state.note_ack(replica_url, collection, lsn, term) {
+                warn!(target: "replication", error = %e, "Failed to persist local commit watermark");
+            }
             true
         },
         Ok(r) if r.status() == StatusCode::CONFLICT => {
@@ -1156,7 +1164,7 @@ mod tests {
             last = pcol.put(format!("k{}", i), serde_json::json!({"i": i}), 1).unwrap().3;
         }
         pcol.enqueue_commit().await.unwrap().unwrap();
-        pcol.apply_committed(last);
+        pcol.apply_committed(last).unwrap();
         assert_eq!(pdb.durable_lsn.load(Ordering::SeqCst), 5);
 
         let all = chain_prefix(0, 0, pcol.read_frames_after(0, 5).unwrap());
@@ -1185,7 +1193,7 @@ mod tests {
         }
 
         rcol.enqueue_commit().await.unwrap().unwrap();
-        rcol.apply_committed(5);
+        rcol.apply_committed(5).unwrap();
         drop(rcol);
         drop(rdb);
 

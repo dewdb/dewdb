@@ -163,7 +163,9 @@ pub async fn replicate_handler(
     }
 
     if matched.is_some() {
-        state.note_leader_committed(&req.collection, req.term, req.commit_index.unwrap_or(0), matched);
+        if let Err(e) = state.note_leader_committed(&req.collection, req.term, req.commit_index.unwrap_or(0), matched) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
     }
 
     if let Some(ref repl) = state.replication {
@@ -1108,6 +1110,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ib005_replication_retries_failed_commit_persistence_on_duplicate_frames() {
+        let root = temp_root();
+        let mut replica = TestNode::new("replica", next_test_port(), &root, "replica");
+        replica.membership_mode = "learner".to_string();
+        replica.start();
+        assert_eq!(replicate(&replica, 1, 1, 0, 1, make_frame(1, 1, 0, 0, "a", 1)).await.0, StatusCode::OK);
+        let state = replica.state.clone().unwrap();
+        let col = state.db.as_ref().unwrap().get_collection("t").unwrap();
+        let path = replica.data_dir.join("t");
+        let blocked = path.join("applied.meta.tmp");
+        std::fs::create_dir(&blocked).unwrap();
+        for _ in 0..2 {
+            let frame = crate::test_support::make_drop_frame(1, 2, 1, 1);
+            assert_eq!(replicate(&replica, 1, 2, 1, 2, frame).await.0, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(crate::storage::Collection::recorded_watermark(&path).unwrap(), Some(1));
+            assert!(col.is_dropped());
+        }
+        assert!(state.note_leader_committed("t", 1, 2, None).is_err());
+        std::fs::remove_dir(&blocked).unwrap();
+        let frame = crate::test_support::make_drop_frame(1, 2, 1, 1);
+        assert_eq!(replicate(&replica, 1, 2, 1, 2, frame).await.0, StatusCode::OK);
+        assert_eq!(crate::storage::Collection::recorded_watermark(&path).unwrap(), Some(2));
+        drop(col);
+        replica.kill();
+        state.db.as_ref().unwrap().release_collection("t").unwrap();
+        let reopened = state.db.as_ref().unwrap().get_collection("t").unwrap();
+        assert!(reopened.is_dropped());
+        assert_eq!(reopened.pending_len(), 0);
+    }
+
+    #[tokio::test]
     async fn ib001_commit_hint_replaces_conflicting_tail_before_publishing_changes() {
         let root = temp_root();
         let mut replica = TestNode::new("replica", next_test_port(), &root, "replica");
@@ -1149,7 +1182,7 @@ mod tests {
         {
             let _guard = lock.lock().await;
             state.replication.as_ref().unwrap().write().unwrap().term = 2;
-            state.note_leader_committed("t", 2, 99, None);
+            state.note_leader_committed("t", 2, 99, None).unwrap();
             assert_eq!(col.applied_lsn(), 0, "old-term matching is not heartbeat evidence");
         }
         assert_eq!(replicate(&replica, 2, 1, 0, 99, make_frame(1, 1, 0, 0, "k1", 1)).await.1["status"], "duplicate");
@@ -1157,16 +1190,16 @@ mod tests {
         assert!(col.get("k2").unwrap().is_none());
         {
             let _guard = lock.lock().await;
-            state.note_leader_committed("t", 2, 99, None);
+            state.note_leader_committed("t", 2, 99, None).unwrap();
             assert_eq!(col.applied_lsn(), 1);
         }
         assert_eq!(replicate(&replica, 2, 3, 1, 0, make_frame(2, 3, 1, 1, "k3", 3)).await.0, StatusCode::OK);
         assert_eq!(col.applied_lsn(), 1, "an earlier oversized hint must not commit a later append");
         {
             let _guard = lock.lock().await;
-            state.note_leader_committed("t", 1, 99, None);
+            state.note_leader_committed("t", 1, 99, None).unwrap();
             assert_eq!(col.applied_lsn(), 1, "a delayed heartbeat cannot spend newer matching evidence");
-            state.note_leader_committed("t", 2, 99, None);
+            state.note_leader_committed("t", 2, 99, None).unwrap();
             assert_eq!(col.applied_lsn(), 3, "an idle matched tail still commits by heartbeat");
         }
         replica.kill();

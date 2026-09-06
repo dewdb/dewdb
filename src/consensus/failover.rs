@@ -455,7 +455,10 @@ pub fn heartbeat_poll_task(state: AppState) {
                                 for (col, lsn) in committed {
                                     let install_lock = state.snapshot_install_lock(&col);
                                     let _install_guard = install_lock.lock().await;
-                                    state.note_leader_committed(&col, their_term, lsn, None);
+                                    if let Err(e) = state.note_leader_committed(&col, their_term, lsn, None) {
+                                        warn!(target: "heartbeat", collection = %col, error = %e,
+                                            "Failed to persist leader commit watermark");
+                                    }
                                 }
                             }
 

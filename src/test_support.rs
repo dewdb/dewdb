@@ -149,14 +149,14 @@ pub fn stage_delete(col: &Arc<Collection>, key: &str) -> u64 {
 pub fn disk_put(col: &Arc<Collection>, key: &str, fill: &str) -> (u64, u64, u32) {
     let value = serde_json::json!({"v": fill.repeat(600)});
     let (f, wal_id, offset, lsn) = col.put(key.into(), value, 1).unwrap();
-    col.apply_committed(lsn);
+    col.apply_committed(lsn).unwrap();
     assert!(col.index.read().unwrap()[key].inline.is_none(),
         "the value must be too large to inline");
     (wal_id, offset, (f.len() - HEADER_LEN) as u32)
 }
 
 pub fn live_put(col: &Arc<Collection>, key: &str, v: i64) {
-    col.apply_committed(stage_put(col, key, v));
+    col.apply_committed(stage_put(col, key, v)).unwrap();
 }
 
 pub struct TestNode {

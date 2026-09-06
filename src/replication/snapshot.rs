@@ -563,7 +563,7 @@ mod tests {
     ) -> u64 {
         let lsn = collection.put(key.to_string(), value, 1).unwrap().3;
         collection.enqueue_commit().await.unwrap().unwrap();
-        collection.apply_committed(lsn);
+        collection.apply_committed(lsn).unwrap();
         lsn
     }
 

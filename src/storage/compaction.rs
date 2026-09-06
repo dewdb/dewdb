@@ -733,7 +733,7 @@ mod tests {
         let below = db.durable_lsn.load(Ordering::SeqCst);
 
         let del = stage_delete(&col, "a");
-        col.apply_committed(del);
+        col.apply_committed(del).unwrap();
         col.enqueue_commit().await.unwrap().unwrap();
 
         col.compact(keep_all(below)).unwrap();
@@ -981,7 +981,7 @@ mod tests {
 
             live_put(&col, "a", 3);
             let del = stage_delete(&col, "gone");
-            col.apply_committed(del);
+            col.apply_committed(del).unwrap();
             live_put(&col, "b", 9);
             col.enqueue_commit().await.unwrap().unwrap();
 
@@ -1021,7 +1021,7 @@ mod tests {
 
             let lsn = col.delete("gone".into(), 1).unwrap().3;
             col.enqueue_commit().await.unwrap().unwrap();
-            col.apply_committed(lsn);
+            col.apply_committed(lsn).unwrap();
 
             col.compact(Retention::none()).unwrap();
 
@@ -1048,7 +1048,7 @@ mod tests {
 
             let lsn = col.drop_marker(1).unwrap().3;
             col.enqueue_commit().await.unwrap().unwrap();
-            col.apply_committed(lsn);
+            col.apply_committed(lsn).unwrap();
 
             col.compact(Retention::none()).unwrap();
             assert!(col.is_dropped());
@@ -1082,7 +1082,7 @@ mod tests {
 
             let lsn = col.delete("gone".into(), 1).unwrap().3;
             col.enqueue_commit().await.unwrap().unwrap();
-            col.apply_committed(lsn);
+            col.apply_committed(lsn).unwrap();
             col.compact(Retention::none()).unwrap();
 
             assert!(!orphan.0.exists(), "the second compaction must have retired the first output");
@@ -1187,7 +1187,7 @@ mod tests {
 
         live_put(&col, "a", 1);
         let dropped_at = col.drop_marker(1).unwrap().3;
-        col.apply_committed(dropped_at);
+        col.apply_committed(dropped_at).unwrap();
         assert!(col.is_dropped());
 
         col.compact(Retention::none()).unwrap();

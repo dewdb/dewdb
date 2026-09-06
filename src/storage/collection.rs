@@ -1111,11 +1111,13 @@ impl Collection {
     /// already exist. The three fields beside it change rarely, and only that takes the full
     /// `applied.meta` rewrite -- a create, an `fsync` on a new file and a rename (bugs.md H17).
     fn persist_watermark(&self, through: u64) -> io::Result<()> {
-        if self.watermark_saved.load(Ordering::SeqCst) >= through {
+        if self.watermark_saved.load(Ordering::SeqCst) >= through
+            && self.rich_gen.load(Ordering::SeqCst) == self.rich_saved.load(Ordering::SeqCst) {
             return Ok(());
         }
         let _one_writer = self.watermark_write.lock().unwrap();
-        if self.watermark_saved.load(Ordering::SeqCst) >= through {
+        if self.watermark_saved.load(Ordering::SeqCst) >= through
+            && self.rich_gen.load(Ordering::SeqCst) == self.rich_saved.load(Ordering::SeqCst) {
             return Ok(());
         }
 
@@ -1199,14 +1201,14 @@ impl Collection {
     }
 
     /// Drains in log order; staged frames can arrive out of order.
-    pub fn apply_committed(&self, committed_lsn: u64) -> usize {
+    pub fn apply_committed(&self, committed_lsn: u64) -> io::Result<usize> {
         let mut build_wanted = false;
         // Decided once for the batch and outside the locks: whether a document has to be resolved
         // is not a per-entry question, and the answer is almost always no.
         let watched = self.changefeed.active();
         let mut changes: Vec<PendingChange> = Vec::new();
         // The pending -> index order keeps index visibility atomic with the snapshot watermark.
-        let (ready_len, needs_persist) = {
+        let ready_len = {
             let mut pending = self.pending.lock().unwrap();
             let mut ready = std::mem::take(&mut *pending);
             *pending = ready.split_off(&(committed_lsn + 1));
@@ -1287,23 +1289,12 @@ impl Collection {
                 }
             }
 
-            let previous = self.applied_lsn.fetch_max(committed_lsn, Ordering::SeqCst);
-            // The rich test is separate from the position test: a frame staged out of order and
-            // drained at an unchanged commit index still changes what `applied.meta` has to say.
-            let rich_pending = self.rich_gen.load(Ordering::SeqCst)
-                != self.rich_saved.load(Ordering::SeqCst);
-            (ready.len(), committed_lsn > previous || rich_pending)
+            self.applied_lsn.fetch_max(committed_lsn, Ordering::SeqCst);
+            ready.len()
         };
 
-        // Ahead of the reply, not behind it: `rewind_to` reads this file's position as the floor
-        // below which a truncation is refused, so a watermark that lags a crash hands a leader
-        // published entries to delete (bugs.md H17).
-        if needs_persist {
-            if let Err(e) = self.persist_watermark(committed_lsn) {
-                error!(target: "storage", collection = %self.name, error = %e,
-                    "Failed to persist applied watermark; a restart will re-stage these entries");
-            }
-        }
+        // Retry against durable state even when an earlier failed save already drained the batch.
+        let persisted = self.persist_watermark(committed_lsn);
         if build_wanted {
             self.index_signal.notify_one();
         }
@@ -1314,7 +1305,7 @@ impl Collection {
             // what stops the feed resuming across them as though nothing had happened.
             self.changefeed.note_gap(committed_lsn);
         }
-        ready_len
+        persisted.map(|()| ready_len)
     }
 
     /// Off the index lock, because a document that was not inlined is a WAL read. Resolved from the
@@ -1477,6 +1468,79 @@ mod tests {
             ChangefeedConfig::default()).unwrap())
     }
 
+    #[tokio::test]
+    async fn ib005_failed_position_save_retries_without_new_entries() {
+        for recover_before_retry in [false, true] {
+            let root = temp_root();
+            let col = ib004_open(&root);
+            let first = stage_put(&col, "a", 1);
+            col.sync_wal().unwrap();
+            col.apply_committed(first).unwrap();
+            let next = stage_put(&col, "a", 2);
+            col.sync_wal().unwrap();
+            // Exercise the full-record fallback when no position handle is available.
+            col.applied_pos.lock().unwrap().take();
+            let blocked = root.join("applied.meta.tmp");
+            fs::create_dir(&blocked).unwrap();
+
+            for _ in 0..2 {
+                assert!(col.apply_committed(next).is_err());
+                assert_eq!(col.pending_len(), 0);
+                assert_eq!(col.applied_lsn(), next);
+                assert_eq!(Collection::recorded_watermark(&root).unwrap(), Some(first));
+            }
+            let col = if recover_before_retry {
+                drop(col);
+                let reopened = ib004_open(&root);
+                assert_eq!(reopened.get("a").unwrap(), Some(serde_json::json!({"v": 1})));
+                assert_eq!(reopened.pending_len(), 1);
+                reopened
+            } else { col };
+            fs::remove_dir(&blocked).unwrap();
+            col.apply_committed(next).unwrap();
+            assert_eq!(Collection::recorded_watermark(&root).unwrap(), Some(next));
+            drop(col);
+            let reopened = ib004_open(&root);
+            assert_eq!(reopened.get("a").unwrap(), Some(serde_json::json!({"v": 2})));
+            assert_eq!(reopened.pending_len(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn ib005_failed_drop_save_retries_and_survives_recovery() {
+        for recover_before_retry in [false, true] {
+            let root = temp_root();
+            let col = ib004_open(&root);
+            let first = stage_put(&col, "a", 1);
+            col.sync_wal().unwrap();
+            col.apply_committed(first).unwrap();
+            let dropped = col.drop_marker(1).unwrap().3;
+            col.sync_wal().unwrap();
+            let blocked = root.join("applied.meta.tmp");
+            fs::create_dir(&blocked).unwrap();
+            for _ in 0..2 {
+                assert!(col.apply_committed(dropped).is_err());
+                assert!(col.is_dropped());
+                assert_eq!(Collection::recorded_watermark(&root).unwrap(), Some(first));
+            }
+            let col = if recover_before_retry {
+                drop(col);
+                let reopened = ib004_open(&root);
+                assert!(!reopened.is_dropped());
+                assert_eq!(reopened.get("a").unwrap(), Some(serde_json::json!({"v": 1})));
+                reopened
+            } else { col };
+            fs::remove_dir(&blocked).unwrap();
+            col.apply_committed(dropped).unwrap();
+            assert_eq!(Collection::recorded_watermark(&root).unwrap(), Some(dropped));
+            drop(col);
+            let reopened = ib004_open(&root);
+            assert!(reopened.is_dropped());
+            assert!(reopened.get("a").unwrap().is_none());
+            assert_eq!(reopened.pending_len(), 0);
+        }
+    }
+
     fn ib004_append(col: &Collection, replica: bool, key: &str, lsn: u64) -> io::Result<()> {
         if replica {
             let frame = crate::test_support::make_frame(1, lsn, lsn - 1,
@@ -1533,7 +1597,7 @@ mod tests {
                     assert_eq!(reopened.get("legacy").unwrap(),
                         legacy.then(|| serde_json::json!({"v": 1})));
                     if retry {
-                        reopened.apply_committed(baseline + 1);
+                        reopened.apply_committed(baseline + 1).unwrap();
                         drop(reopened);
                         let committed = ib004_open(&path);
                         assert_eq!(committed.get("pending").unwrap(), Some(serde_json::json!({"v": 2})));
@@ -1608,7 +1672,7 @@ mod tests {
     /// without the wait they would all pass on the fallback scan.
     async fn ready_index(col: &Arc<Collection>, name: &str, field: &str) {
         let lsn = col.define_index(create_spec(name, field), 1).unwrap().3;
-        col.apply_committed(lsn);
+        col.apply_committed(lsn).unwrap();
         let name = name.to_string();
         assert!(wait_for(Duration::from_secs(20), || {
             col.index_status().iter().any(|s| s.name == name && s.state == "ready")
@@ -1617,7 +1681,7 @@ mod tests {
 
     fn put_json(col: &Arc<Collection>, key: &str, value: serde_json::Value) {
         let lsn = col.put(key.to_string(), value, 1).unwrap().3;
-        col.apply_committed(lsn);
+        col.apply_committed(lsn).unwrap();
     }
 
     fn filter_of(s: &str) -> Option<crate::query::Filter> {
@@ -1953,7 +2017,7 @@ mod tests {
         // Keys ascend while the sort field descends, so key order cannot stand in for sort order.
         for i in 1..=9i64 {
             let lsn = col.put(format!("k{}", i), serde_json::json!({"n": 10 - i}), 1).unwrap().3;
-            col.apply_committed(lsn);
+            col.apply_committed(lsn).unwrap();
         }
 
         let sort = crate::query::parse_sort(Some("n:asc")).unwrap().unwrap();
@@ -2099,13 +2163,13 @@ mod tests {
             serde_json::json!({"name": "alpha", "tags": ["x", "y"], "meta": {"v": 1, "owner": "latha"}}),
             1,
         ).unwrap().3;
-        col.apply_committed(lsn);
+        col.apply_committed(lsn).unwrap();
 
         let mut doc = col.get("d1").unwrap().unwrap();
         merge_patch(&mut doc, &serde_json::json!({"meta": {"v": 2}, "tags": null, "status": "live"}));
         let lsn2 = col.put("d1".into(), doc, 1).unwrap().3;
         col.enqueue_commit().await.unwrap().unwrap();
-        col.apply_committed(lsn2);
+        col.apply_committed(lsn2).unwrap();
 
         drop(col);
         drop(db);
@@ -2133,7 +2197,7 @@ mod tests {
 
         for v in 1..=3 {
             let lsn = stage_put(&col, "a", v);
-            col.apply_committed(lsn);
+            col.apply_committed(lsn).unwrap();
             assert_eq!(Collection::recorded_watermark(&col.root_path).unwrap().unwrap(), col.applied_lsn(),
                 "an entry reported as applied must already be on disk as applied");
         }
@@ -2149,11 +2213,11 @@ mod tests {
         let col = db.get_collection("c").unwrap();
 
         let first = stage_put(&col, "a", 1);
-        col.apply_committed(first);
+        col.apply_committed(first).unwrap();
         let mut last = first;
         for v in 2..=6 {
             last = stage_put(&col, "a", v);
-            col.apply_committed(last);
+            col.apply_committed(last).unwrap();
         }
         assert!(last > first);
 
@@ -2182,7 +2246,7 @@ mod tests {
 
         live_put(&col, "a", 1);
         let dropped_at = col.drop_marker(1).unwrap().3;
-        col.apply_committed(dropped_at);
+        col.apply_committed(dropped_at).unwrap();
 
         let meta = AppliedMeta::load(&col.root_path).unwrap().unwrap();
         assert!(meta.dropped, "the drop has to be in the record that survives compaction");
@@ -2192,7 +2256,7 @@ mod tests {
         // And the reverse transition, which is what makes a keyed write after a drop expensive
         // exactly once rather than never.
         let revived = stage_put(&col, "b", 2);
-        col.apply_committed(revived);
+        col.apply_committed(revived).unwrap();
         let after = AppliedMeta::load(&col.root_path).unwrap().unwrap();
         assert!(!after.dropped, "a put clears the tombstone, and that is a full-record change");
         assert_eq!(after.applied_lsn, revived);
@@ -2207,9 +2271,9 @@ mod tests {
         let col = db.get_collection("c").unwrap();
 
         let older = stage_put(&col, "a", 1);
-        col.apply_committed(older);
+        col.apply_committed(older).unwrap();
         let newer = stage_put(&col, "a", 2);
-        col.apply_committed(newer);
+        col.apply_committed(newer).unwrap();
         assert_eq!(AppliedPos::read(&col.root_path).unwrap(), Some(newer));
 
         drop(col);
@@ -2423,7 +2487,7 @@ mod tests {
         assert!(staged <= BUDGET,
             "replay inlined {} bytes of staged frames against a {} byte budget", staged, BUDGET);
 
-        col2.apply_committed(col2.last_appended_lsn());
+        col2.apply_committed(col2.last_appended_lsn()).unwrap();
         assert!(col2.inline_bytes.load(Ordering::Relaxed) <= BUDGET,
             "committing the tail pushed tracked inline memory to {} over a {} byte budget",
             col2.inline_bytes.load(Ordering::Relaxed), BUDGET);
@@ -2491,12 +2555,12 @@ mod tests {
         assert!(col.get("a").unwrap().is_none(), "a durable but uncommitted write must not be readable");
         assert!(col.get("b").unwrap().is_none());
 
-        assert_eq!(col.apply_committed(first), 1, "only the committed prefix is published");
+        assert_eq!(col.apply_committed(first).unwrap(), 1, "only the committed prefix is published");
         assert_eq!(col.get("a").unwrap(), Some(serde_json::json!({"v": 1})));
         assert!(col.get("b").unwrap().is_none(), "the entry above the watermark stays hidden");
         assert_eq!(col.pending_len(), 1);
 
-        assert_eq!(col.apply_committed(second), 1);
+        assert_eq!(col.apply_committed(second).unwrap(), 1);
         assert_eq!(col.get("b").unwrap(), Some(serde_json::json!({"v": 2})));
         assert_eq!(col.pending_len(), 0);
         assert_eq!(col.applied_lsn(), second);
@@ -2510,7 +2574,7 @@ mod tests {
 
         stage_put(&col, "k", 1);
         let newer = stage_put(&col, "k", 2);
-        col.apply_committed(newer);
+        col.apply_committed(newer).unwrap();
 
         assert_eq!(col.get("k").unwrap(), Some(serde_json::json!({"v": 2})),
             "the later LSN must win regardless of how the staging map was walked");
@@ -2523,13 +2587,13 @@ mod tests {
         let col = db.get_collection("c").unwrap();
 
         let put = stage_put(&col, "k", 1);
-        col.apply_committed(put);
+        col.apply_committed(put).unwrap();
 
         let del = stage_delete(&col, "k");
         assert_eq!(col.get("k").unwrap(), Some(serde_json::json!({"v": 1})),
             "the delete is durable but not committed, so the old value is still the truth");
 
-        col.apply_committed(del);
+        col.apply_committed(del).unwrap();
         assert!(col.get("k").unwrap().is_none());
     }
 
@@ -2558,7 +2622,7 @@ mod tests {
         assert!(!reopened.is_dropped());
         assert_eq!(reopened.get("k").unwrap(), Some(serde_json::json!({"v": 1})));
 
-        reopened.apply_committed(dropped);
+        reopened.apply_committed(dropped).unwrap();
         assert!(reopened.is_dropped());
         assert!(reopened.get("k").unwrap().is_none());
         assert_eq!(reopened.pending_len(), 0);
@@ -2579,7 +2643,7 @@ mod tests {
         assert!(barrier > stranded, "a barrier is appended above the tail it publishes");
         assert_eq!(col.pending_len(), 2, "and is itself staged until it commits");
 
-        col.apply_committed(barrier);
+        col.apply_committed(barrier).unwrap();
         assert!(col.exists("k"), "committing the barrier commits everything below it");
         assert_eq!(col.pending_len(), 0, "including the barrier, which drains and applies nothing");
         assert_eq!(col.index.read().unwrap().len(), 1, "the barrier is not a key");
@@ -2615,7 +2679,7 @@ mod tests {
         assert_eq!(col.committed_config(), None);
         assert_eq!(col.index.read().unwrap().len(), 0, "a configuration is not a key");
 
-        col.apply_committed(lsn);
+        col.apply_committed(lsn).unwrap();
         assert_eq!(col.committed_config(), Some(first.clone()));
         assert_eq!(col.pending_len(), 0);
 
@@ -2628,7 +2692,7 @@ mod tests {
         // Compaction relocates index keys and a configuration is never in one, so the frame goes.
         let tail = col.last_appended_lsn();
         col.enqueue_commit().await.unwrap().unwrap();
-        col.apply_committed(tail);
+        col.apply_committed(tail).unwrap();
         col.compact(Retention::none()).unwrap();
         col.save_index().unwrap();
         drop(col);
@@ -2648,7 +2712,7 @@ mod tests {
 
         let committed = config_of(&["a", "b", "c"]);
         let (_f, _w, _o, lsn) = col.configure(committed.clone(), 3).unwrap();
-        col.apply_committed(lsn);
+        col.apply_committed(lsn).unwrap();
 
         let staged = config_of(&["a", "b", "c", "d"]);
         col.configure(staged.clone(), 3).unwrap();
@@ -2681,7 +2745,7 @@ mod tests {
         assert!(!reopened.exists("k"));
 
         let tail = reopened.last_appended_lsn();
-        reopened.apply_committed(tail);
+        reopened.apply_committed(tail).unwrap();
         assert!(reopened.exists("k"), "and the barrier still publishes the tail after a replay");
         assert_eq!(reopened.pending_len(), 0);
     }
@@ -2698,14 +2762,14 @@ mod tests {
         assert!(!col.exists("k"), "committed reads must not see an uncommitted write");
         assert!(col.exists_including_staged("k"), "unfixed this called a replace a create");
 
-        col.apply_committed(put);
+        col.apply_committed(put).unwrap();
         assert!(col.exists_including_staged("k"));
 
         let del = stage_delete(&col, "k");
         assert!(col.exists("k"), "the delete has not committed");
         assert!(!col.exists_including_staged("k"), "a staged delete is the newest durable state");
 
-        col.apply_committed(del);
+        col.apply_committed(del).unwrap();
         assert!(!col.exists_including_staged("k"));
     }
 
@@ -2716,7 +2780,7 @@ mod tests {
         let col = db.get_collection("c").unwrap();
 
         let put = stage_put(&col, "k", 1);
-        col.apply_committed(put);
+        col.apply_committed(put).unwrap();
         stage_put(&col, "k", 2);
 
         assert_eq!(col.get("k").unwrap(), Some(serde_json::json!({"v": 1})),
@@ -2742,7 +2806,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock,
             "relocation skips entries missing from the index, so retiring their WAL would lose them");
 
-        col.apply_committed(staged);
+        col.apply_committed(staged).unwrap();
         col.compact(Retention::none()).unwrap();
         assert_eq!(col.get("b").unwrap(), Some(serde_json::json!({"v": 2})));
     }
@@ -2779,7 +2843,7 @@ mod tests {
             let col = db.get_collection("c").unwrap();
             committed = stage_put(&col, "safe", 1);
             stage_put(&col, "risky", 2);
-            col.apply_committed(committed);
+            col.apply_committed(committed).unwrap();
             col.enqueue_commit().await.unwrap().unwrap();
 
             assert_eq!(col.get("safe").unwrap(), Some(serde_json::json!({"v": 1})));
@@ -2797,7 +2861,7 @@ mod tests {
         assert_eq!(col2.pending_len(), 1, "it is still durable, just not visible");
 
         // The restored node publishes it once the cluster commits it.
-        col2.apply_committed(committed + 1);
+        col2.apply_committed(committed + 1).unwrap();
         assert_eq!(col2.get("risky").unwrap(), Some(serde_json::json!({"v": 2})));
     }
 
@@ -2987,7 +3051,7 @@ mod tests {
         ready_index(&col, "by_age", "age").await;
 
         put_json(&col, "a", serde_json::json!({"age": 40}));
-        col.apply_committed(stage_delete(&col, "b"));
+        col.apply_committed(stage_delete(&col, "b")).unwrap();
         put_json(&col, "c", serde_json::json!({"other": 1}));
 
         assert_eq!(page_keys(&col, &filter_of(r#"{"age": 30}"#), 100), Vec::<String>::new(),
@@ -3066,7 +3130,7 @@ mod tests {
         assert!(col.committed_indexes().is_empty(), "and not committed yet");
         let above = col.put("above".to_string(), serde_json::json!({"age": 7}), 1).unwrap().3;
 
-        col.apply_committed(above.max(define));
+        col.apply_committed(above.max(define)).unwrap();
         assert!(wait_for(Duration::from_secs(20), || {
             col.index_status().iter().all(|s| s.state == "ready")
         }).await);
@@ -3085,7 +3149,7 @@ mod tests {
         let col = db.get_collection("c").unwrap();
 
         let seed = stage_put(&col, "k", 1);
-        col.apply_committed(seed);
+        col.apply_committed(seed).unwrap();
         let (frame, ..) = col.define_index(create_spec("by_v", "v"), 1).unwrap();
         assert_eq!(col.active_index_specs().len(), 1);
 
@@ -3109,7 +3173,7 @@ mod tests {
         ready_index(&col, "by_age", "age").await;
 
         let lsn = col.drop_marker(1).unwrap().3;
-        col.apply_committed(lsn);
+        col.apply_committed(lsn).unwrap();
         assert!(col.committed_indexes().is_empty(),
             "a schema outliving its collection is invisible state");
         assert!(col.index_status().is_empty());
@@ -3133,7 +3197,7 @@ mod tests {
         for frame in &frames {
             replica.append_raw_frame(frame).unwrap();
         }
-        replica.apply_committed(replica.last_appended_lsn());
+        replica.apply_committed(replica.last_appended_lsn()).unwrap();
 
         assert_eq!(replica.committed_indexes().len(), 1);
         assert!(wait_for(Duration::from_secs(20), || {
@@ -3154,7 +3218,7 @@ mod tests {
             put_json(&col, &format!("k{:04}", i), serde_json::json!({"age": 1}));
         }
         let lsn = col.define_index(create_spec("by_age", "age"), 1).unwrap().3;
-        col.apply_committed(lsn);
+        col.apply_committed(lsn).unwrap();
 
         // Interleaved with the walk rather than before or after it: more than one `BUILD_CHUNK`
         // of keys, so the build is still running when these land.

@@ -603,7 +603,7 @@ mod tests {
                 last = col.put(format!("key:{}", i), serde_json::json!({"n": i}), 1).unwrap().3;
             }
             col.enqueue_commit().await.unwrap().unwrap();
-            col.apply_committed(last);
+            col.apply_committed(last).unwrap();
         }
 
         let db2 = Database::new(&root).unwrap();
@@ -627,7 +627,7 @@ mod tests {
 
         if let Ok((_, _, _, lsn)) = col2.put("key_pre_corrupt".to_string(), serde_json::json!({"valid": true}), 1) {
             col2.enqueue_commit().await.unwrap().unwrap();
-            col2.apply_committed(lsn);
+            col2.apply_committed(lsn).unwrap();
         }
         let active_wal_path = {
             let wal_writer = col2.wal_writer.lock().unwrap();
@@ -655,7 +655,7 @@ mod tests {
 
         if let Ok((_, _, _, lsn)) = col3.put("key_post_corrupt".to_string(), serde_json::json!({"valid": true}), 1) {
             col3.enqueue_commit().await.unwrap().unwrap();
-            col3.apply_committed(lsn);
+            col3.apply_committed(lsn).unwrap();
         }
         assert!(col3.get("key_post_corrupt").unwrap().is_some(), "Writes should continue after recovery");
     }
@@ -676,7 +676,7 @@ mod tests {
                 last = col.put(format!("key:{}", i), serde_json::json!({"n": i}), 1).unwrap().3;
             }
             col.enqueue_commit().await.unwrap().unwrap();
-            col.apply_committed(last);
+            col.apply_committed(last).unwrap();
             let writer = col.wal_writer.lock().unwrap();
             wal_path = col.root_path.join(format!("wal-{:05}.log", writer.current_wal_id));
         }
@@ -704,7 +704,7 @@ mod tests {
 
         let lsn = col2.put("after".to_string(), serde_json::json!({"n": -1}), 1).unwrap().3;
         col2.enqueue_commit().await.unwrap().unwrap();
-        col2.apply_committed(lsn);
+        col2.apply_committed(lsn).unwrap();
         assert!(col2.get("after").unwrap().is_some(), "writes did not resume past a cut tail");
     }
 
@@ -903,7 +903,7 @@ mod tests {
         }
 
         rcol.enqueue_commit().await.unwrap().unwrap();
-        rcol.apply_committed(3);
+        rcol.apply_committed(3).unwrap();
         drop(rcol);
         drop(rdb);
 
@@ -954,8 +954,8 @@ mod tests {
 
         ra.enqueue_commit().await.unwrap().unwrap();
         rb.enqueue_commit().await.unwrap().unwrap();
-        ra.apply_committed(3);
-        rb.apply_committed(4);
+        ra.apply_committed(3).unwrap();
+        rb.apply_committed(4).unwrap();
         drop(ra);
         drop(rb);
         drop(rdb);
@@ -1001,7 +1001,7 @@ mod tests {
             "the frame it replaced must leave the WAL, not sit under the one that replaced it");
 
         col.enqueue_commit().await.unwrap().unwrap();
-        col.apply_committed(3);
+        col.apply_committed(3).unwrap();
         assert_eq!(col.get("k3").unwrap(), Some(serde_json::json!({"v": 99})));
 
         drop(col);
@@ -1040,7 +1040,7 @@ mod tests {
 
         replicate_term_one(&col, 5);
         col.enqueue_commit().await.unwrap().unwrap();
-        col.apply_committed(3);
+        col.apply_committed(3).unwrap();
         assert_eq!(col.applied_lsn(), 3);
 
         // A leader whose log runs 1, 2, 4 -- it never held the lsn 3 we have committed.

@@ -231,7 +231,7 @@ mod tests {
 
         col.enqueue_commit().await.unwrap().unwrap();
         state.note_leader_append("t", staged);
-        state.advance_own_commit("t", col.durable_lsn());
+        state.advance_own_commit("t", col.durable_lsn()).unwrap();
         assert!(state.has_current_term_commit("t"));
 
         assert!(read_index(&state, "t").await.is_ok(),

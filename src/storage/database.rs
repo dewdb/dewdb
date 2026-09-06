@@ -521,7 +521,7 @@ mod tests {
         assert!(!db.is_dropped("users"), "appending the drop must not apply it");
         assert_eq!(col.get("k").unwrap(), Some(serde_json::json!({"v": 1})));
 
-        col.apply_committed(lsn);
+        col.apply_committed(lsn).unwrap();
 
         assert!(col.is_dropped());
         assert!(col.get("k").unwrap().is_none());
@@ -539,7 +539,7 @@ mod tests {
         live_put(&col, "k", 1);
         let lsn = col.drop_marker(1).unwrap().3;
         col.enqueue_commit().await.unwrap().unwrap();
-        col.apply_committed(lsn);
+        col.apply_committed(lsn).unwrap();
         drop(col);
         db.release_collection("users").unwrap();
 
@@ -557,7 +557,7 @@ mod tests {
         let col = db.get_collection("users").unwrap();
         live_put(&col, "old", 1);
         let dropped = col.drop_marker(1).unwrap().3;
-        col.apply_committed(dropped);
+        col.apply_committed(dropped).unwrap();
 
         live_put(&col, "new", 2);
 

@@ -88,6 +88,8 @@ async fn finish_write(
         if let Some(c) = commit {
             settle_commit(c).await?;
         }
+        state.apply_committed(col_name, lsn)
+            .map_err(|e| err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         return Ok(WriteOutcome { met: true, acks: 1, required: 1, existed });
     }
 
@@ -132,7 +134,8 @@ async fn finish_write(
         .as_ref()
         .and_then(|db| db.get_collection(col_name).ok())
         .map_or(0, |col| col.durable_lsn());
-    state.advance_own_commit(col_name, own_durable);
+    state.advance_own_commit(col_name, own_durable)
+        .map_err(|e| err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(WriteOutcome { met: quorum.met(&holders), acks: holders.len(), required, existed })
 }
@@ -335,6 +338,8 @@ async fn finish_write_batch(
     };
 
     if state.replication.is_none() {
+        state.apply_committed(col_name, last.lsn)
+            .map_err(|e| err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         return Ok(spread(true, 1, 1));
     }
 
@@ -362,7 +367,8 @@ async fn finish_write_batch(
         .as_ref()
         .and_then(|db| db.get_collection(col_name).ok())
         .map_or(0, |col| col.durable_lsn());
-    state.advance_own_commit(col_name, own_durable);
+    state.advance_own_commit(col_name, own_durable)
+        .map_err(|e| err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(spread(quorum.met(&holders), holders.len(), required))
 }
@@ -460,6 +466,65 @@ mod tests {
     use std::sync::Arc;
     use axum::http::StatusCode;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn ib005_writes_and_batches_refuse_success_until_commit_state_is_saved() {
+        for standalone in [false, true] {
+            for wc in [WriteConcern::Local, WriteConcern::Majority, WriteConcern::All] {
+                let root = temp_root();
+                let db = Arc::new(Database::new(&root).unwrap());
+                let config: NodeConfig = serde_json::from_value(serde_json::json!({
+                    "node_id": "n1", "role": "shard", "shard_role": "primary",
+                    "listen_addr": "127.0.0.1:1", "data_dir": root.to_string_lossy(),
+                })).unwrap();
+                let mut state = AppState::for_admission_test(config, db.clone(), true);
+                if standalone {
+                    state.replication = None;
+                }
+                let timeout = Duration::from_secs(1);
+                let col = db.get_collection("t").unwrap();
+                assert!(local_write(&state, "t", "a".into(), Some(serde_json::json!({"v": 1})),
+                    wc, timeout).await.unwrap().met);
+                let first = col.applied_lsn();
+                let blocked = root.join("t/applied.meta.tmp");
+                std::fs::create_dir(&blocked).unwrap();
+                let error = super::local_drop(&state, "t", wc, timeout).await.err().unwrap();
+                assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                let dropped = col.applied_lsn();
+                assert!(dropped > first);
+                assert_eq!(crate::storage::Collection::recorded_watermark(&root.join("t")).unwrap(), Some(first));
+                assert!(state.apply_committed("t", dropped).is_err());
+                std::fs::remove_dir(&blocked).unwrap();
+                state.apply_committed("t", dropped).unwrap();
+
+                for batch in [false, true] {
+                    std::fs::create_dir(&blocked).unwrap();
+                    let error = if batch {
+                        super::local_write_batch(&state, "t", vec![
+                            ("a".into(), serde_json::json!({"v": 2})),
+                            ("b".into(), serde_json::json!({"v": 3})),
+                        ], wc, timeout).await.err().unwrap()
+                    } else {
+                        local_write(&state, "t", "a".into(), Some(serde_json::json!({"v": 2})),
+                            wc, timeout).await.err().unwrap()
+                    };
+                    assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                    let through = col.applied_lsn();
+                    assert!(state.apply_committed("t", through).is_err());
+                    std::fs::remove_dir(&blocked).unwrap();
+                    state.apply_committed("t", through).unwrap();
+                    assert_eq!(crate::storage::Collection::recorded_watermark(&root.join("t")).unwrap(), Some(through));
+                    assert!(super::local_drop(&state, "t", wc, timeout).await.unwrap().met);
+                }
+                drop(col);
+                db.release_collection("t").unwrap();
+                let reopened = db.get_collection("t").unwrap();
+                assert!(reopened.is_dropped());
+                assert!(reopened.get("a").unwrap().is_none());
+                assert_eq!(reopened.pending_len(), 0);
+            }
+        }
+    }
 
     /// M5: `existed` was sampled from the committed index, so with the quorum down — every write
     /// durable and none of them committed — a replace and a delete both reported nothing was there.
