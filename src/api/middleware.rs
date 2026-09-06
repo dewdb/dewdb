@@ -10,6 +10,9 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use tracing::warn;
 
+/// The matched-path template, which is what `metrics_middleware` compares against.
+const CHANGES_ROUTE: &str = "/collections/:name/changes";
+
 struct ActiveRequest<'a>(&'a crate::metrics::Metrics);
 
 impl Drop for ActiveRequest<'_> {
@@ -28,7 +31,9 @@ pub async fn metrics_middleware(
         .map(|m| m.as_str().to_string())
         .unwrap_or_else(|| "<unmatched>".to_string());
 
-    if path == "/metrics" {
+    // A change stream lives as long as its subscriber, so timing it would fold minutes into the
+    // latency EWMA that load-aware routing reads and take this node out of replica reads for good.
+    if path == "/metrics" || path == CHANGES_ROUTE {
         return next.run(req).await;
     }
 

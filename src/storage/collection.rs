@@ -6,6 +6,7 @@ use super::secondary::{index_values, IndexChange, IndexKey, IndexSpec, IndexStat
 use super::wal::WalsState;
 use crate::model::MAX_QUERY_LIMIT;
 use crate::aggregate::{AggregateResult, AggregateSpec, Aggregator};
+use crate::changefeed::{ChangeEvent, ChangeOp, Changefeed, ChangefeedConfig};
 use crate::query::{compare_rows, is_after, matches_filter, Filter, SortCursor, SortOrder, SortedRow};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
@@ -57,6 +58,9 @@ pub struct Collection {
     committed_indexes: std::sync::Mutex<Vec<IndexSpec>>,
     pub indexes: RwLock<Indexes>,
     index_signal: Arc<tokio::sync::Notify>,
+    /// Fed from `apply_committed` and nowhere else: a staged entry can still be truncated, and a
+    /// subscriber cannot un-see an event the way a reader can re-read.
+    pub changefeed: Arc<Changefeed>,
     pub compacting: AtomicBool,
     /// Prevents compaction from retiring WAL files during snapshot streaming.
     pub snapshot_boundary: std::sync::Mutex<()>,
@@ -116,6 +120,14 @@ pub enum StagedEffect {
     DefineIndex(IndexChange),
 }
 
+/// A committed effect the changefeed still owes an event for. Collected under the index lock,
+/// where insert and update are distinguishable, and resolved into events outside it.
+enum PendingChange {
+    Wrote { lsn: u64, op: ChangeOp, key: String, entry: IndexEntry },
+    Gone { lsn: u64, key: String },
+    Dropped { lsn: u64 },
+}
+
 impl StagedEffect {
     /// What this frame leaves for `key`: `None` if it does not touch it, otherwise the entry it
     /// leaves behind, or `Some(None)` if the key is gone.
@@ -138,6 +150,7 @@ impl Collection {
         db_next_lsn: Arc<AtomicU64>,
         db_last_log_term: Arc<AtomicU64>,
         cache: ReadCacheConfig,
+        feed: ChangefeedConfig,
     ) -> io::Result<Self> {
         fs::create_dir_all(&root_path)?;
         let data_root = root_path.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -255,6 +268,10 @@ impl Collection {
         let current_wal_size = file.metadata()?.len();
         let inline_total = inline_used;
 
+        // Also where the changefeed opens: a subscriber resuming from below the committed log is
+        // refused, rather than joined to a stream that starts in the middle.
+        let applied_at = if applied_through == u64::MAX { boot_lsn } else { applied_through };
+
         // Failing to open it is not fatal: the hot path falls back to rewriting `applied.meta`,
         // which is what it did before this file existed.
         let applied_pos = AppliedPos::open(&root_path)
@@ -287,6 +304,7 @@ impl Collection {
             indexes: RwLock::new(Indexes::seed(&committed_indexes)),
             committed_indexes: std::sync::Mutex::new(committed_indexes),
             index_signal: Arc::new(tokio::sync::Notify::new()),
+            changefeed: Arc::new(Changefeed::new(feed, applied_at)),
             committed_config: std::sync::Mutex::new(committed_config),
             committed_handover: std::sync::Mutex::new(committed_handover),
             compacting: AtomicBool::new(false),
@@ -296,7 +314,7 @@ impl Collection {
             inline_bytes: AtomicU64::new(inline_total),
             durable_lsn: AtomicU64::new(boot_lsn),
             pending: std::sync::Mutex::new(pending),
-            applied_lsn: AtomicU64::new(if applied_through == u64::MAX { boot_lsn } else { applied_through }),
+            applied_lsn: AtomicU64::new(applied_at),
             watermark_recorded: AtomicBool::new(applied_through != u64::MAX),
             watermark_saved: AtomicU64::new(if applied_through == u64::MAX { 0 } else { applied_through }),
             watermark_write: std::sync::Mutex::new(()),
@@ -1170,6 +1188,10 @@ impl Collection {
     /// Drains in log order; staged frames can arrive out of order.
     pub fn apply_committed(&self, committed_lsn: u64) -> usize {
         let mut build_wanted = false;
+        // Decided once for the batch and outside the locks: whether a document has to be resolved
+        // is not a per-entry question, and the answer is almost always no.
+        let watched = self.changefeed.active();
+        let mut changes: Vec<PendingChange> = Vec::new();
         // The pending -> index order keeps index visibility atomic with the snapshot watermark.
         let (ready_len, needs_persist) = {
             let mut pending = self.pending.lock().unwrap();
@@ -1180,11 +1202,18 @@ impl Collection {
                 // Under the index write lock with the key it indexes, so no reader ever sees a
                 // key published without its postings or a posting without its key.
                 let mut secondary = self.indexes.write().unwrap();
-                for (_lsn, staged) in ready.iter() {
+                for (lsn, staged) in ready.iter() {
                     match &staged.effect {
                         // `swap` rather than `store`: only a real flip is a change `applied.meta`
                         // has to be rewritten for, and a keyed write is the common case.
                         StagedEffect::Put { key, entry, indexed } => {
+                            // Judged before the insert: afterwards nothing separates a new key
+                            // from one this frame replaced.
+                            if watched {
+                                let op = if index.contains_key(key) { ChangeOp::Update } else { ChangeOp::Insert };
+                                changes.push(PendingChange::Wrote {
+                                    lsn: *lsn, op, key: key.clone(), entry: entry.clone() });
+                            }
                             self.apply_index_put(&mut index, key.clone(), entry.clone());
                             secondary.put(key, indexed);
                             if self.dropped.swap(false, Ordering::SeqCst) {
@@ -1192,6 +1221,11 @@ impl Collection {
                             }
                         },
                         StagedEffect::Remove { key } => {
+                            // Deleting a key that was not there changes nothing, so there is
+                            // nothing to publish; the frame still applies and still commits.
+                            if watched && index.contains_key(key) {
+                                changes.push(PendingChange::Gone { lsn: *lsn, key: key.clone() });
+                            }
                             self.apply_index_remove(&mut index, key);
                             secondary.remove(key);
                             if self.dropped.swap(false, Ordering::SeqCst) {
@@ -1201,6 +1235,9 @@ impl Collection {
                         // A barrier is committed, never applied: being committed is its whole job.
                         StagedEffect::Nothing => {},
                         StagedEffect::Clear => {
+                            if watched {
+                                changes.push(PendingChange::Dropped { lsn: *lsn });
+                            }
                             self.clear_index(&mut index);
                             // The definitions go with the documents: the collection is gone as far
                             // as a client is concerned, and a schema outliving it is invisible state.
@@ -1257,7 +1294,46 @@ impl Collection {
         if build_wanted {
             self.index_signal.notify_one();
         }
+        if watched {
+            self.publish_changes(changes, committed_lsn);
+        } else if self.changefeed.has_subscribers() {
+            // Somebody attached mid-batch, so these changes were never built. Marking the gap is
+            // what stops the feed resuming across them as though nothing had happened.
+            self.changefeed.note_gap(committed_lsn);
+        }
         ready_len
+    }
+
+    /// Off the index lock, because a document that was not inlined is a WAL read. Resolved from the
+    /// frame the entry names, so two writes to one key in one batch do not both report the later one.
+    fn publish_changes(&self, changes: Vec<PendingChange>, through: u64) {
+        let mut events = Vec::with_capacity(changes.len());
+        let mut gap = 0;
+        for change in changes {
+            match change {
+                PendingChange::Wrote { lsn, op, key, entry } => match self.read_entry(&entry) {
+                    Ok(Some(value)) => events.push(ChangeEvent { lsn, op, key, value: Some(value) }),
+                    // A gap costs the subscriber a resubscribe; an event without the document it
+                    // says it carries would be a wrong answer.
+                    unresolved => {
+                        warn!(target: "changefeed", collection = %self.name, key = %key, lsn,
+                            cause = ?unresolved.err(), "Could not resolve a changed document; \
+                            breaking the feed here");
+                        gap = gap.max(lsn);
+                    },
+                },
+                PendingChange::Gone { lsn, key } =>
+                    events.push(ChangeEvent { lsn, op: ChangeOp::Delete, key, value: None }),
+                PendingChange::Dropped { lsn } =>
+                    events.push(ChangeEvent { lsn, op: ChangeOp::Drop, key: String::new(), value: None }),
+            }
+        }
+        self.changefeed.publish(events, through);
+        // After the publish, so the floor lands on the unresolved frame and the events above it
+        // that did resolve stay servable from there.
+        if gap > 0 {
+            self.changefeed.note_gap(gap);
+        }
     }
 
     /// Read-modify-write must read the newest durable value; the committed one drops a racing write.
@@ -1348,6 +1424,9 @@ impl Collection {
 
         self.commit_signal.notify_one();
         self.index_signal.notify_one();
+        // No local position continues into the directory that replaces this one, so subscribers
+        // are ended rather than left waiting on a feed nothing will ever publish to again.
+        self.changefeed.close();
         self.drain_read_pool(u64::MAX);
         self.pending.lock().unwrap().clear();
         self.index.write().unwrap().clear();
@@ -1916,7 +1995,7 @@ mod tests {
     #[tokio::test]
     async fn cached_reads_do_not_touch_the_wal_at_all() {
         let root = temp_root();
-        let db = Database::with_cache(&root, cache_cfg(512, 1 << 20)).unwrap();
+        let db = Database::with_config(&root, cache_cfg(512, 1 << 20), Default::default()).unwrap();
         let col = db.get_collection("c").unwrap();
 
         for i in 0..20 {
@@ -1942,7 +2021,7 @@ mod tests {
     #[tokio::test]
     async fn values_over_the_threshold_stay_on_disk() {
         let root = temp_root();
-        let db = Database::with_cache(&root, cache_cfg(64, 1 << 20)).unwrap();
+        let db = Database::with_config(&root, cache_cfg(64, 1 << 20), Default::default()).unwrap();
         let col = db.get_collection("c").unwrap();
 
         let (f, w, o, _) = col.put("small".into(), serde_json::json!({"v": 1}), 1).unwrap();
@@ -1964,7 +2043,7 @@ mod tests {
     #[tokio::test]
     async fn inline_budget_caps_memory_and_is_released_on_delete() {
         let root = temp_root();
-        let db = Database::with_cache(&root, cache_cfg(512, 400)).unwrap();
+        let db = Database::with_config(&root, cache_cfg(512, 400), Default::default()).unwrap();
         let col = db.get_collection("c").unwrap();
 
         for i in 0..20 {
@@ -1996,7 +2075,7 @@ mod tests {
     #[tokio::test]
     async fn overwriting_a_key_refreshes_its_cached_value() {
         let root = temp_root();
-        let db = Database::with_cache(&root, cache_cfg(512, 1 << 20)).unwrap();
+        let db = Database::with_config(&root, cache_cfg(512, 1 << 20), Default::default()).unwrap();
         let col = db.get_collection("c").unwrap();
 
         live_put(&col, "k", 1);
@@ -2026,7 +2105,7 @@ mod tests {
         const BUDGET: u64 = 400;
 
         {
-            let db = Database::with_cache(&root, cache_cfg(512, BUDGET)).unwrap();
+            let db = Database::with_config(&root, cache_cfg(512, BUDGET), Default::default()).unwrap();
             let col = db.get_collection("c").unwrap();
             // Durable and never committed, which is what a leader that lost its quorum leaves.
             for i in 0..40 {
@@ -2035,7 +2114,7 @@ mod tests {
             col.enqueue_commit().await.unwrap().unwrap();
         }
 
-        let db2 = Database::with_cache(&root, cache_cfg(512, BUDGET)).unwrap();
+        let db2 = Database::with_config(&root, cache_cfg(512, BUDGET), Default::default()).unwrap();
         let col2 = db2.get_collection("c").unwrap();
         assert_eq!(col2.pending_len(), 40, "the tail must come back staged, not applied");
 
@@ -2060,7 +2139,7 @@ mod tests {
         let root = temp_root();
 
         {
-            let db = Database::with_cache(&root, cache_cfg(512, 1 << 20)).unwrap();
+            let db = Database::with_config(&root, cache_cfg(512, 1 << 20), Default::default()).unwrap();
             let col = db.get_collection("c").unwrap();
             for i in 0..10 {
                 live_put(&col, &format!("k{}", i), i);
@@ -2070,7 +2149,7 @@ mod tests {
             col.save_index().unwrap();
         }
 
-        let db2 = Database::with_cache(&root, cache_cfg(512, 1 << 20)).unwrap();
+        let db2 = Database::with_config(&root, cache_cfg(512, 1 << 20), Default::default()).unwrap();
         let col2 = db2.get_collection("c").unwrap();
         assert_eq!(inline_count(&col2), 10, "a snapshot restore must come back warm, not cold");
         assert_eq!(col2.inline_bytes.load(Ordering::Relaxed),

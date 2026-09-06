@@ -177,6 +177,8 @@ pub struct TestNode {
     pub allow_unsafe_ring_changes: bool,
     pub data_movement_batch_size: usize,
     pub data_movement_batch_delay_ms: u64,
+    /// A `ChangefeedConfig` body; `{}` is the default.
+    pub changefeed: serde_json::Value,
     /// An `AuthConfig` body; `{}` is the default open configuration.
     pub auth: serde_json::Value,
     pub state: Option<AppState>,
@@ -238,6 +240,7 @@ fn node_config(n: &TestNode) -> NodeConfig {
         "heartbeat_timeout_secs": n.heartbeat_timeout_secs,
         "election_delay_ms": 200,
         "auth": n.auth,
+        "changefeed": n.changefeed,
         "maintenance": { "enabled": false },
         "data_movement": {
             "batch_size": n.data_movement_batch_size,
@@ -267,6 +270,7 @@ impl TestNode {
             data_movement_batch_size: 64,
             data_movement_batch_delay_ms: 5,
             auth: serde_json::json!({}),
+            changefeed: serde_json::json!({}),
             state: None,
             stop: None,
             thread: None,
@@ -296,7 +300,8 @@ impl TestNode {
             rt.block_on(async move {
                 let is_router = config.role == "router";
                 let db = (!is_router).then(|| Arc::new(
-                    Database::with_cache(&config.data_dir, ReadCacheConfig::default()).unwrap()));
+                    Database::with_config(&config.data_dir, ReadCacheConfig::default(),
+                        config.changefeed.clone()).unwrap()));
 
                 let meta = ReplicationMeta::load(&config.data_dir).expect("unreadable replication.meta");
                 let solo = !config.is_learner()
@@ -436,6 +441,84 @@ async fn bind_with_retry(addr: &str) -> tokio::net::TcpListener {
         }
     }
     panic!("could not bind {}", addr);
+}
+
+#[derive(Clone, Debug)]
+pub struct SseEvent {
+    pub name: String,
+    pub id: Option<String>,
+    pub data: serde_json::Value,
+}
+
+/// Reads an SSE response in the background and collects what arrives. Dropping it aborts the read
+/// and closes the connection, which is how a test plays a subscriber going away.
+pub struct SseTap {
+    seen: Arc<std::sync::Mutex<Vec<SseEvent>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for SseTap {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl SseTap {
+    pub fn open(response: reqwest::Response) -> Self {
+        use futures::StreamExt;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let task = tokio::spawn(async move {
+            let mut body = response.bytes_stream();
+            let mut buffered = String::new();
+            while let Some(Ok(chunk)) = body.next().await {
+                buffered.push_str(&String::from_utf8_lossy(&chunk));
+                while let Some(end) = buffered.find("\n\n") {
+                    let block: String = buffered.drain(..end + 2).collect();
+                    if let Some(event) = parse_sse_block(&block) {
+                        sink.lock().unwrap().push(event);
+                    }
+                }
+            }
+        });
+        Self { seen, task }
+    }
+
+    pub fn events(&self) -> Vec<SseEvent> {
+        self.seen.lock().unwrap().clone()
+    }
+
+    pub fn named(&self, name: &str) -> Vec<SseEvent> {
+        self.events().into_iter().filter(|e| e.name == name).collect()
+    }
+
+    pub async fn wait_for_events(&self, name: &str, want: usize, deadline: Duration) -> Vec<SseEvent> {
+        let start = std::time::Instant::now();
+        while start.elapsed() < deadline && self.named(name).len() < want {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        self.named(name)
+    }
+}
+
+/// A keep-alive is a comment line and carries no `event:`, so it parses to nothing.
+fn parse_sse_block(block: &str) -> Option<SseEvent> {
+    let mut name = None;
+    let mut id = None;
+    let mut data = String::new();
+    for line in block.lines() {
+        match line.split_once(':') {
+            Some(("event", v)) => name = Some(v.trim().to_string()),
+            Some(("id", v)) => id = Some(v.trim().to_string()),
+            Some(("data", v)) => data.push_str(v.trim()),
+            _ => {},
+        }
+    }
+    Some(SseEvent {
+        name: name?,
+        id,
+        data: serde_json::from_str(&data).unwrap_or(serde_json::Value::Null),
+    })
 }
 
 pub async fn put_doc_at(client: &reqwest::Client, base: &str, col: &str, key: &str, v: i64, query: &str) -> StatusCode {

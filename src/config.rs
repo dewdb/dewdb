@@ -1,6 +1,7 @@
 //! Node configuration, boot validation, and non-fatal misconfiguration warnings.
 
 use crate::auth::AuthConfig;
+use crate::changefeed::ChangefeedConfig;
 use crate::cluster::rebalance::RebalanceConfig;
 use crate::cluster::migration::DataMovementConfig;
 use crate::logging::LoggingConfig;
@@ -53,6 +54,8 @@ pub struct NodeConfig {
     pub data_movement: DataMovementConfig,
     #[serde(default)]
     pub read_cache: ReadCacheConfig,
+    #[serde(default)]
+    pub changefeed: ChangefeedConfig,
     #[serde(default)]
     pub logging: LoggingConfig,
     #[serde(default)]
@@ -162,6 +165,7 @@ impl NodeConfig {
         }
         self.logging.validate()?;
         self.auth.validate()?;
+        self.changefeed.validate()?;
         Ok(())
     }
 

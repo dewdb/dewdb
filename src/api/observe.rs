@@ -18,6 +18,7 @@ fn collection_metrics(db: &Database) -> Vec<serde_json::Value> {
     };
 
     collections.into_iter().map(|(name, col)| {
+        let feed = col.changefeed.stats();
         let usage = col.space_usage().ok();
         let index = col.index.read().unwrap();
         let cached = index.values().filter(|e| e.inline.is_some()).count();
@@ -38,6 +39,14 @@ fn collection_metrics(db: &Database) -> Vec<serde_json::Value> {
             "cache_bytes": col.inline_bytes.load(Ordering::Relaxed),
             "compacting": col.compacting.load(Ordering::Relaxed),
             "dropped": col.is_dropped(),
+            "changefeed": {
+                "subscribers": feed.subscribers,
+                "buffered": feed.buffered,
+                "position": feed.position,
+                "resume_floor": feed.resume_floor,
+                "published": feed.published,
+                "overruns": feed.overruns,
+            },
         })
     }).collect()
 }
@@ -192,6 +201,18 @@ fn render_prometheus(state: &AppState, collections: &[serde_json::Value], replic
         let labels = format!("node_id=\"{}\",collection=\"{}\"", node, name);
         prometheus_line(&mut out, "dewdb_wal_bytes", &labels, c["wal_bytes"].as_u64().unwrap_or(0) as f64);
         prometheus_line(&mut out, "dewdb_wal_dead_bytes", &labels, c["dead_bytes"].as_u64().unwrap_or(0) as f64);
+    }
+
+    out.push_str("# HELP dewdb_changefeed_subscribers Change-stream subscribers per collection.\n# TYPE dewdb_changefeed_subscribers gauge\n");
+    out.push_str("# HELP dewdb_changefeed_events_total Change events published per collection.\n# TYPE dewdb_changefeed_events_total counter\n");
+    out.push_str("# HELP dewdb_changefeed_overruns_total Subscribers refused or ended for falling behind the buffer.\n# TYPE dewdb_changefeed_overruns_total counter\n");
+    for c in collections {
+        let name = escape_label(c["name"].as_str().unwrap_or(""));
+        let labels = format!("node_id=\"{}\",collection=\"{}\"", node, name);
+        let feed = &c["changefeed"];
+        prometheus_line(&mut out, "dewdb_changefeed_subscribers", &labels, feed["subscribers"].as_u64().unwrap_or(0) as f64);
+        prometheus_line(&mut out, "dewdb_changefeed_events_total", &labels, feed["published"].as_u64().unwrap_or(0) as f64);
+        prometheus_line(&mut out, "dewdb_changefeed_overruns_total", &labels, feed["overruns"].as_u64().unwrap_or(0) as f64);
     }
 
     if let Some(reps) = replication.get("replicas").and_then(|r| r.as_array()) {

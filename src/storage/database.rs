@@ -3,6 +3,7 @@
 use super::collection::Collection;
 use crate::consensus::config::{is_system_collection, valid_collection_name};
 use super::index::{AppliedMeta, LsnMeta, ReadCacheConfig};
+use crate::changefeed::ChangefeedConfig;
 use crate::util::remove_dir_with_retry;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -17,6 +18,7 @@ use tracing::{error, info, warn};
 pub struct Database {
     pub root_path: PathBuf,
     pub cache: ReadCacheConfig,
+    pub changefeed: ChangefeedConfig,
     pub collections: RwLock<HashMap<String, Arc<Collection>>>,
     pub durable_lsn: Arc<AtomicU64>,
     pub next_lsn: Arc<AtomicU64>,
@@ -42,6 +44,7 @@ impl Database {
             self.next_lsn.clone(),
             self.last_log_term.clone(),
             self.cache.clone(),
+            self.changefeed.clone(),
         )?);
         Collection::start_commit_task(col.clone());
         Collection::start_index_task(col.clone());
@@ -49,10 +52,14 @@ impl Database {
     }
 
     pub fn new(path: impl AsRef<std::path::Path>) -> io::Result<Self> {
-        Self::with_cache(path, ReadCacheConfig::default())
+        Self::with_config(path, ReadCacheConfig::default(), ChangefeedConfig::default())
     }
 
-    pub fn with_cache(path: impl AsRef<std::path::Path>, cache: ReadCacheConfig) -> io::Result<Self> {
+    pub fn with_config(
+        path: impl AsRef<std::path::Path>,
+        cache: ReadCacheConfig,
+        changefeed: ChangefeedConfig,
+    ) -> io::Result<Self> {
         let root_path = path.as_ref().to_path_buf();
         fs::create_dir_all(&root_path)?;
         let boot_lsn = LsnMeta::load(&root_path).map(|m| m.commit_lsn).unwrap_or(0);
@@ -62,6 +69,7 @@ impl Database {
         let db = Self {
             root_path,
             cache,
+            changefeed,
             collections: RwLock::new(HashMap::new()),
             durable_lsn: Arc::new(AtomicU64::new(boot_lsn)),
             next_lsn: Arc::new(AtomicU64::new(boot_lsn)),

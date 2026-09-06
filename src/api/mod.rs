@@ -1,5 +1,6 @@
 //! HTTP surface: the route table.
 
+pub mod changes;
 pub mod collections;
 pub mod docs;
 pub mod indexes;
@@ -11,6 +12,7 @@ pub mod observe;
 pub mod ring;
 pub mod write;
 
+use changes::stream_changes;
 use collections::{compact_collection, drop_collection, list_collections, snapshot_collection};
 use crate::cluster::rebalance::rebalance_status_handler;
 use docs::{aggregate_docs, bulk_create_docs, create_doc, delete_doc, get_doc, list_docs, put_doc,
@@ -60,6 +62,7 @@ pub fn build_app(state: &AppState) -> Router {
         .route("/collections/:name/docs/bulk", post(bulk_create_docs))
         .route("/collections/:name/query", get(query_docs))
         .route("/collections/:name/aggregate", get(aggregate_docs))
+        .route("/collections/:name/changes", get(stream_changes))
         .route("/collections/:name/docs/:id", get(get_doc).put(put_doc).patch(update_doc).delete(delete_doc));
 
     // Every role carries a cluster view, so these are not gated on being a shard the way the

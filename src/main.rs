@@ -3,6 +3,7 @@
 mod aggregate;
 mod api;
 mod auth;
+mod changefeed;
 mod cluster;
 mod config;
 mod consensus;
@@ -129,7 +130,8 @@ async fn main() -> io::Result<()> {
     let cluster = Arc::new(RwLock::new(load_cluster_view(&config)));
 
     let db = if config.role == "shard" {
-        Some(Arc::new(Database::with_cache(&config.data_dir, config.read_cache.clone())?))
+        Some(Arc::new(Database::with_config(
+            &config.data_dir, config.read_cache.clone(), config.changefeed.clone())?))
     } else {
         None
     };

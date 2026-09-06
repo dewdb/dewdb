@@ -66,7 +66,7 @@ fn own_id(state: &AppState, collection: &str, first: String) -> Option<String> {
 
 /// `read=primary` is a guarantee, not a hint: a node that does not lead refuses rather than
 /// answering from a log it may be behind on. The router forwards the preference for this check.
-fn not_the_primary(state: &AppState, pref: &ReadPreference) -> Option<axum::response::Response> {
+pub(super) fn not_the_primary(state: &AppState, pref: &ReadPreference) -> Option<axum::response::Response> {
     if !matches!(pref, ReadPreference::Primary | ReadPreference::Quorum)
         || !state.is_shard() || state.is_leader() {
         return None;
