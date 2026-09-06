@@ -5,7 +5,8 @@ use super::index::{AppliedMeta, AppliedPos, IndexEntry, IndexSnapshot, LsnMeta, 
 use super::secondary::{index_values, IndexChange, IndexKey, IndexSpec, IndexStatus, Indexes, Selection, BUILD_CHUNK};
 use super::wal::WalsState;
 use crate::model::MAX_QUERY_LIMIT;
-use crate::query::{compare_rows, is_after, matches_filter, Filter, SortCursor, SortSpec, SortedRow};
+use crate::aggregate::{AggregateResult, AggregateSpec, Aggregator};
+use crate::query::{compare_rows, is_after, matches_filter, Filter, SortCursor, SortOrder, SortedRow};
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Write};
@@ -838,7 +839,7 @@ impl Collection {
         start: Option<&str>,
         end: Option<&str>,
         filter: &Option<Filter>,
-        sort: &SortSpec,
+        sort: &SortOrder,
         after: Option<&SortCursor>,
         limit: usize,
     ) -> io::Result<(Vec<SortedRow>, bool)> {
@@ -879,6 +880,32 @@ impl Collection {
         rows.sort_by(|a, b| compare_rows(a, b, sort));
         rows.truncate(keep);
         Ok((rows, matched > keep))
+    }
+
+    /// Every matching document folded into `spec`, over the whole range rather than a page: an
+    /// aggregate is not resumable, so a partial one merged across shards would be wrong.
+    pub fn aggregate(
+        &self,
+        start: Option<&str>,
+        end: Option<&str>,
+        filter: &Option<Filter>,
+        spec: AggregateSpec,
+    ) -> io::Result<AggregateResult> {
+        self.check_live()?;
+        let mut agg = Aggregator::new(spec);
+        let plan = self.index_plan(filter);
+
+        self.scan_for::<io::Error, _>(plan.as_ref(), None, start, end, |key| {
+            let Some(value) = self.get(key)? else { return Ok(true) };
+            if filter.as_ref().is_some_and(|f| !matches_filter(&value, f)) {
+                return Ok(true);
+            }
+            // `InvalidInput` is what the handler answers `400`: the remedy is a narrower request.
+            agg.add(&value).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+            Ok(true)
+        })?;
+
+        Ok(agg.finish())
     }
 
     fn value_from_payload(payload: &[u8]) -> Option<serde_json::Value> {
@@ -1555,7 +1582,7 @@ mod tests {
             col.apply_committed(lsn);
         }
 
-        let sort = SortSpec { field: "n".to_string(), desc: false };
+        let sort = crate::query::parse_sort(Some("n:asc")).unwrap().unwrap();
         let mut seen: Vec<i64> = Vec::new();
         let mut cursor: Option<SortCursor> = None;
 
@@ -1564,10 +1591,8 @@ mod tests {
             assert!(rows.len() <= 2);
             seen.extend(rows.iter().map(|r| r.value["n"].as_i64().unwrap()));
             match (more, rows.last()) {
-                (true, Some(last)) => cursor = Some(SortCursor {
-                    value: last.value["n"].clone(),
-                    key: last.key.clone(),
-                }),
+                (true, Some(last)) => cursor = Some(SortCursor::at(
+                    crate::query::sort_position(&last.value, &sort), last.key.clone())),
                 _ => break,
             }
         }
@@ -1575,7 +1600,7 @@ mod tests {
         assert_eq!(seen, (1..=9).collect::<Vec<i64>>(), "every row once, in sort order");
 
         let (desc_rows, _) = col.sorted_page(
-            None, None, &None, &SortSpec { field: "n".to_string(), desc: true }, None, 3).unwrap();
+            None, None, &None, &crate::query::parse_sort(Some("n:desc")).unwrap().unwrap(), None, 3).unwrap();
         assert_eq!(desc_rows.iter().map(|r| r.value["n"].as_i64().unwrap()).collect::<Vec<_>>(),
             vec![9, 8, 7]);
 
@@ -2463,17 +2488,28 @@ mod tests {
         let indexed = db.get_collection("indexed").unwrap();
         let plain = db.get_collection("plain").unwrap();
 
-        let docs: Vec<(String, serde_json::Value)> = (0..40).map(|i| (
-            format!("k{:03}", i),
-            serde_json::json!({"age": i % 7, "tier": if i % 3 == 0 { "gold" } else { "silver" },
-                               "meta": {"rank": i}}),
-        )).collect();
+        let docs: Vec<(String, serde_json::Value)> = (0..40).map(|i| {
+            let mut doc = serde_json::json!({
+                "age": i % 7,
+                "tier": if i % 3 == 0 { "gold" } else { "silver" },
+                "name": format!("n{:02}", i % 11),
+                "tags": ["a", if i % 2 == 0 { "even" } else { "odd" }],
+                "meta": {"rank": i},
+            });
+            // Present on some documents only, so `$exists` has both answers to give.
+            if i % 5 == 0 {
+                doc["bonus"] = serde_json::json!(i);
+            }
+            (format!("k{:03}", i), doc)
+        }).collect();
         for (key, value) in &docs {
             put_json(&indexed, key, value.clone());
             put_json(&plain, key, value.clone());
         }
         ready_index(&indexed, "by_age", "age").await;
         ready_index(&indexed, "by_rank", "meta.rank").await;
+        ready_index(&indexed, "by_name", "name").await;
+        ready_index(&indexed, "by_bonus", "bonus").await;
 
         for expr in [
             r#"{"age": 3}"#,
@@ -2485,6 +2521,20 @@ mod tests {
             r#"{"age": 3, "tier": "gold"}"#,
             r#"{"age": {"$ne": 3}}"#,
             r#"{"tier": "gold"}"#,
+            r#"{"name": {"$prefix": "n0"}}"#,
+            r#"{"name": {"$gte": "n03", "$lt": "n07"}}"#,
+            r#"{"name": {"$suffix": "5"}}"#,
+            r#"{"name": {"$contains": "0"}}"#,
+            r#"{"bonus": {"$exists": true}}"#,
+            r#"{"bonus": {"$exists": false}}"#,
+            r#"{"bonus": {"$type": "number"}}"#,
+            r#"{"age": {"$not": {"$gte": 5}}}"#,
+            r#"{"tags": {"$all": ["a", "even"]}}"#,
+            r#"{"tags": {"$size": 2}}"#,
+            r#"{"tags": {"$elemMatch": {"$prefix": "ev"}}}"#,
+            r#"{"$or": [{"age": 1}, {"name": {"$prefix": "n1"}}]}"#,
+            r#"{"age": {"$gte": 5}, "$or": [{"tier": "gold"}, {"bonus": {"$exists": true}}]}"#,
+            r#"{"$nor": [{"age": 1}, {"age": 2}]}"#,
         ] {
             let filter = filter_of(expr);
             assert_eq!(page_keys(&indexed, &filter, 100), page_keys(&plain, &filter, 100),
@@ -2494,6 +2544,12 @@ mod tests {
         assert!(indexed.index_plan(&filter_of(r#"{"age": 3}"#)).is_some(), "and it was used");
         assert!(indexed.index_plan(&filter_of(r#"{"tier": "gold"}"#)).is_none(),
             "with no index on the field there is nothing to use");
+        assert!(indexed.index_plan(&filter_of(r#"{"name": {"$prefix": "n0"}}"#)).is_some(),
+            "a prefix is a band of the string order");
+        assert!(indexed.index_plan(&filter_of(r#"{"bonus": {"$exists": true}}"#)).is_some(),
+            "few enough documents hold the field for its postings to be the answer");
+        assert!(indexed.index_plan(&filter_of(r#"{"$or": [{"age": 1}, {"age": 2}]}"#)).is_none(),
+            "nothing inside an $or constrains every matching row");
     }
 
     /// A page resuming by key has to see the candidates in key order, or its cursor either repeats

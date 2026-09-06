@@ -13,7 +13,8 @@ pub mod write;
 
 use collections::{compact_collection, drop_collection, list_collections, snapshot_collection};
 use crate::cluster::rebalance::rebalance_status_handler;
-use docs::{bulk_create_docs, create_doc, delete_doc, get_doc, list_docs, put_doc, query_docs, update_doc};
+use docs::{aggregate_docs, bulk_create_docs, create_doc, delete_doc, get_doc, list_docs, put_doc,
+    query_docs, update_doc};
 use indexes::{create_index, drop_index, list_indexes};
 use internal::{
     cluster_update_handler, cluster_view_handler, data_summary_handler, heartbeat_handler,
@@ -58,6 +59,7 @@ pub fn build_app(state: &AppState) -> Router {
         .route("/collections/:name/docs", post(create_doc).get(list_docs))
         .route("/collections/:name/docs/bulk", post(bulk_create_docs))
         .route("/collections/:name/query", get(query_docs))
+        .route("/collections/:name/aggregate", get(aggregate_docs))
         .route("/collections/:name/docs/:id", get(get_doc).put(put_doc).patch(update_doc).delete(delete_doc));
 
     // Every role carries a cluster view, so these are not gated on being a shard the way the

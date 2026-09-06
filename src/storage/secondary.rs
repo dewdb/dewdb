@@ -12,7 +12,7 @@
 //! a missing row. Every path that changes a key changes the postings with it.
 
 use crate::json::{get_path_value, json_cmp};
-use crate::query::Filter;
+use crate::query::{Condition, Filter, JsonKind, Op};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Bound;
@@ -190,45 +190,101 @@ enum Probe {
     Range { lower: Bound<IndexKey>, upper: Bound<IndexKey> },
 }
 
-/// All bools sort below all numbers, and all strings above them, so a numeric comparison's
-/// candidates are exactly the band between these two. Without it a `$gt` scans every string,
-/// array and object in the index and discards them one document read at a time.
-fn numeric_band() -> (Bound<IndexKey>, Bound<IndexKey>) {
-    (
-        Bound::Excluded(IndexKey(serde_json::Value::Bool(true))),
-        Bound::Excluded(IndexKey(serde_json::Value::String(String::new()))),
-    )
+/// The span of one JSON type in `json_cmp` order. Values sort by type before they sort by value,
+/// so a comparison against one type can never be answered by the postings of another.
+fn band(kind: JsonKind) -> (Bound<IndexKey>, Bound<IndexKey>) {
+    use serde_json::Value;
+    let at = |v: Value| Bound::Included(IndexKey(v));
+    let below = |v: Value| Bound::Excluded(IndexKey(v));
+    match kind {
+        JsonKind::Null => (at(Value::Null), at(Value::Null)),
+        JsonKind::Bool => (at(Value::Bool(false)), at(Value::Bool(true))),
+        JsonKind::Number => (below(Value::Bool(true)), below(Value::String(String::new()))),
+        JsonKind::String => (at(Value::String(String::new())), below(Value::Array(Vec::new()))),
+        JsonKind::Array => (at(Value::Array(Vec::new())), below(Value::Object(serde_json::Map::new()))),
+        JsonKind::Object => (at(Value::Object(serde_json::Map::new())), Bound::Unbounded),
+    }
 }
 
-fn probe_for(cond: &serde_json::Value) -> Option<Probe> {
-    let map = match cond.as_object() {
-        Some(m) if m.keys().any(|k| k.starts_with('$')) => m,
-        // A literal condition, object or scalar, is an equality test.
-        _ => return Some(Probe::Exact(vec![IndexKey(cond.clone())])),
-    };
+/// The least string above every string starting with `prefix`, or `None` when the prefix runs to
+/// the top of the order. Per char, because `str` compares in the same order its chars do.
+fn prefix_successor(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        let mut next = last as u32 + 1;
+        if next == 0xD800 {
+            next = 0xE000;
+        }
+        if let Some(c) = char::from_u32(next) {
+            chars.push(c);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
+}
 
-    // Membership before range: a validated `$in` is a short list of exact lookups, which is at
-    // least as selective as any band the same condition also names.
-    if let Some(values) = map.get("$in").and_then(|v| v.as_array()) {
-        return Some(Probe::Exact(values.iter().map(|v| IndexKey(v.clone())).collect()));
+/// The narrowest probe the operators in `cond` name, or `None` to leave this condition to the scan.
+/// Ignoring the rest is safe: the caller re-applies the whole filter, so a superset is all it needs.
+fn probe_for(cond: &Condition) -> Option<Probe> {
+    let ops = cond.ops();
+    let first = |f: fn(&Op) -> bool| ops.iter().find(|o| f(o));
+
+    // Equality before membership before a band: each is at least as selective as the next.
+    if let Some(Op::Eq(v)) = first(|o| matches!(o, Op::Eq(_))) {
+        return Some(Probe::Exact(vec![IndexKey(v.clone())]));
+    }
+    if let Some(Op::In(vs)) = first(|o| matches!(o, Op::In(_))) {
+        return Some(Probe::Exact(vs.iter().map(|v| IndexKey(v.clone())).collect()));
     }
 
-    let (band_low, band_high) = numeric_band();
-    let lower = match (map.get("$gt"), map.get("$gte")) {
-        (Some(v), _) => Bound::Excluded(IndexKey(v.clone())),
-        (None, Some(v)) => Bound::Included(IndexKey(v.clone())),
-        (None, None) => band_low,
-    };
-    let upper = match (map.get("$lt"), map.get("$lte")) {
-        (Some(v), _) => Bound::Excluded(IndexKey(v.clone())),
-        (None, Some(v)) => Bound::Included(IndexKey(v.clone())),
-        (None, None) => band_high,
-    };
-    // Only `$ne`, or an operator set that names no band: nothing here narrows anything.
-    if !map.keys().any(|k| matches!(k.as_str(), "$gt" | "$gte" | "$lt" | "$lte")) {
-        return None;
+    let bound_of = |want: fn(&Op) -> Option<(&serde_json::Value, bool)>| ops.iter().find_map(want);
+    let lower = bound_of(|o| match o {
+        Op::Gt(v) => Some((v, false)),
+        Op::Gte(v) => Some((v, true)),
+        _ => None,
+    });
+    let upper = bound_of(|o| match o {
+        Op::Lt(v) => Some((v, false)),
+        Op::Lte(v) => Some((v, true)),
+        _ => None,
+    });
+    // Validation holds both bounds to one type, so either one names the band the other defaults to.
+    if let Some(kind) = lower.or(upper).map(|(v, _)| JsonKind::of(v)) {
+        let (band_low, band_high) = band(kind);
+        let edge = |b: Option<(&serde_json::Value, bool)>, fallback| match b {
+            Some((v, true)) => Bound::Included(IndexKey(v.clone())),
+            Some((v, false)) => Bound::Excluded(IndexKey(v.clone())),
+            None => fallback,
+        };
+        return Some(Probe::Range {
+            lower: edge(lower, band_low),
+            upper: edge(upper, band_high),
+        });
     }
-    Some(Probe::Range { lower, upper })
+
+    if let Some(Op::Prefix(p)) = first(|o| matches!(o, Op::Prefix(_))) {
+        let (_, band_high) = band(JsonKind::String);
+        return Some(Probe::Range {
+            lower: Bound::Included(IndexKey(serde_json::Value::String(p.clone()))),
+            upper: match prefix_successor(p) {
+                Some(next) => Bound::Excluded(IndexKey(serde_json::Value::String(next))),
+                None => band_high,
+            },
+        });
+    }
+    // One type is a contiguous span; several are not, and the union is left to the scan.
+    if let Some(Op::Type(kinds)) = first(|o| matches!(o, Op::Type(_))) {
+        if let [kind] = kinds[..] {
+            let (lower, upper) = band(kind);
+            return Some(Probe::Range { lower, upper });
+        }
+    }
+    // Every posting, which the selectivity gate then judges: an index files only the documents
+    // that have the field, so holding one at all is the answer to `$exists: true`.
+    if ops.iter().any(|o| matches!(o, Op::Exists(true))) {
+        return Some(Probe::Range { lower: Bound::Unbounded, upper: Bound::Unbounded });
+    }
+    None
 }
 
 /// `BTreeMap::range` panics on a reversed pair, and a filter is free to name one.
@@ -379,15 +435,14 @@ impl Indexes {
     /// every candidate, so a second index would remove reads a first one already narrowed to a
     /// page's worth.
     pub fn select(&self, filter: &Filter, total_docs: usize) -> Option<Selection> {
-        // `Filter::fields` is a `HashMap`, so the order it yields is not the same twice. Sorted,
-        // because two plans of equal size must not be picked differently on two shards.
-        let mut fields: Vec<(&String, &serde_json::Value)> = filter.fields.iter().collect();
-        fields.sort_by(|a, b| a.0.cmp(b.0));
+        // Sorted, because two plans of equal size must not be picked differently on two shards.
+        let mut fields = filter.conjuncts();
+        fields.sort_by_key(|(path, _)| *path);
 
         let mut best: Option<(usize, &String, &SecondaryIndex, Probe)> = None;
         for (field, cond) in fields {
             for (name, index) in self.map.iter() {
-                if !index.is_ready() || index.field != *field {
+                if !index.is_ready() || index.field != field {
                     continue;
                 }
                 let probe = match probe_for(cond) {
@@ -652,6 +707,120 @@ mod tests {
 
         assert!(selected(&idx, r#"{"w": 1}"#, 200).is_none(),
             "materialising every key to save no reads is worse than the walk it replaces");
+    }
+
+    #[test]
+    fn a_string_range_stays_inside_the_string_band() {
+        let idx = built("s", &[
+            ("a", json!({"s": "alpha"})),
+            ("b", json!({"s": "beta"})),
+            ("g", json!({"s": "gamma"})),
+            ("n", json!({"s": 5})),
+            ("t", json!({"s": true})),
+        ]);
+        assert_eq!(selected(&idx, r#"{"s": {"$gte": "b", "$lt": "h"}}"#, 5),
+            Some(vec!["b".to_string(), "g".to_string()]),
+            "a number is below every string and can never satisfy a string comparison");
+        assert_eq!(selected(&idx, r#"{"s": {"$gt": "alpha"}}"#, 5),
+            Some(vec!["b".to_string(), "g".to_string()]));
+    }
+
+    #[test]
+    fn a_prefix_selects_exactly_the_strings_under_it() {
+        let idx = built("s", &[
+            ("a", json!({"s": "ab"})),
+            ("b", json!({"s": "abz"})),
+            ("c", json!({"s": "ac"})),
+            ("d", json!({"s": "b"})),
+        ]);
+        assert_eq!(selected(&idx, r#"{"s": {"$prefix": "ab"}}"#, 4),
+            Some(vec!["a".to_string(), "b".to_string()]),
+            "the successor of the prefix is where the band ends");
+
+        // A prefix at the top of the order has no successor, so the band runs to the end of strings.
+        let top = String::from(char::MAX);
+        let edge = built("s", &[("a", json!({"s": format!("{}z", top)})), ("b", json!({"s": "a"}))]);
+        let filter = format!(r#"{{"s": {{"$prefix": "{}"}}}}"#, top);
+        assert_eq!(selected(&edge, &filter, 2), Some(vec!["a".to_string()]));
+        assert!(prefix_successor(&top).is_none());
+        assert_eq!(prefix_successor("ab").as_deref(), Some("ac"));
+    }
+
+    #[test]
+    fn a_type_test_selects_that_type_and_nothing_else() {
+        let idx = built("v", &[
+            ("n", json!({"v": 7})), ("s", json!({"v": "7"})),
+            ("b", json!({"v": true})), ("z", json!({"v": null})),
+            ("a", json!({"v": [1]})), ("o", json!({"v": {"x": 1}})),
+        ]);
+        for (kind, key) in [("number", "n"), ("string", "s"), ("bool", "b"),
+                            ("null", "z"), ("array", "a"), ("object", "o")] {
+            assert_eq!(selected(&idx, &format!(r#"{{"v": {{"$type": "{}"}}}}"#, kind), 6),
+                Some(vec![key.to_string()]), "{} is a contiguous band of its own", kind);
+        }
+        // Two types are not one span, so the union is left to the scan.
+        assert!(selected(&idx, r#"{"v": {"$type": ["number", "string"]}}"#, 6).is_none());
+    }
+
+    /// An index files only the documents that have the field, so holding one is the answer -- and
+    /// the selectivity gate is what stops it being used when most of the collection has it.
+    #[test]
+    fn existence_is_answered_by_the_postings_when_few_documents_have_the_field() {
+        let mut rows: Vec<(String, serde_json::Value)> = (0..200)
+            .map(|i| (format!("k{:03}", i), json!({"other": i}))).collect();
+        rows.push(("has".to_string(), json!({"v": 1})));
+
+        let mut idx = Indexes::seed(&[spec("i", "v")]);
+        assert!(idx.absorb_build("i", "v", &rows));
+        idx.finish_build("i", "v");
+
+        assert_eq!(selected(&idx, r#"{"v": {"$exists": true}}"#, 201), Some(vec!["has".to_string()]));
+        assert!(selected(&idx, r#"{"v": {"$exists": false}}"#, 201).is_none(),
+            "an index holds no record of the documents it never filed");
+    }
+
+    /// Nothing indexes array elements, and a negation's complement is the whole index.
+    #[test]
+    fn predicates_with_no_band_are_left_to_the_scan() {
+        let idx = built("v", &[("a", json!({"v": ["x", "y"]})), ("b", json!({"v": "xy"}))]);
+        for unindexable in [
+            r#"{"v": {"$all": ["x"]}}"#,
+            r#"{"v": {"$size": 2}}"#,
+            r#"{"v": {"$elemMatch": {"$eq": "x"}}}"#,
+            r#"{"v": {"$contains": "x"}}"#,
+            r#"{"v": {"$suffix": "y"}}"#,
+            r#"{"v": {"$nin": ["x"]}}"#,
+            r#"{"v": {"$not": {"$eq": "xy"}}}"#,
+        ] {
+            assert!(selected(&idx, unindexable, 2).is_none(), "{} narrows nothing", unindexable);
+        }
+    }
+
+    /// A branch of an `$or` constrains nothing on its own: planning on one would drop the rows the
+    /// other branch matches, which an index may never do.
+    #[test]
+    fn a_condition_under_an_or_is_never_planned_on() {
+        let idx = built("v", &[
+            ("a", json!({"v": 1, "w": 9})), ("b", json!({"v": 2, "w": 1})),
+        ]);
+        assert!(selected(&idx, r#"{"$or": [{"v": 1}, {"w": 1}]}"#, 2).is_none());
+        assert_eq!(selected(&idx, r#"{"v": 1, "$or": [{"w": 9}, {"w": 1}]}"#, 2),
+            Some(vec!["a".to_string()]),
+            "the conjunct beside the $or still narrows, because every match satisfies it");
+    }
+
+    #[test]
+    fn the_narrowest_operator_in_one_condition_is_the_one_probed() {
+        let idx = built("n", &[
+            ("a", json!({"n": 1})), ("b", json!({"n": 2})), ("c", json!({"n": 3})),
+        ]);
+        assert_eq!(selected(&idx, r#"{"n": {"$eq": 2, "$gte": 1}}"#, 3), Some(vec!["b".to_string()]),
+            "equality is at least as selective as any band beside it");
+        assert_eq!(selected(&idx, r#"{"n": {"$in": [1, 3], "$gte": 1}}"#, 3),
+            Some(vec!["a".to_string(), "c".to_string()]));
+        assert_eq!(selected(&idx, r#"{"n": {"$gte": 2, "$ne": 3}}"#, 3),
+            Some(vec!["b".to_string(), "c".to_string()]),
+            "the operator that narrows nothing is simply not probed on");
     }
 
     #[test]

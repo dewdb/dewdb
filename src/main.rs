@@ -1,5 +1,6 @@
 //! Entry point: load config, open storage, wire shared state, start role tasks.
 
+mod aggregate;
 mod api;
 mod auth;
 mod cluster;

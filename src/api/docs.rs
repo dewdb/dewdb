@@ -1,17 +1,21 @@
 //! Document endpoints.
 
 use super::write::{local_patch, local_write, local_write_batch};
+use crate::aggregate::{parse_group, parse_metrics, AggregateSpec};
 use crate::cluster::router::{
-    parse_read_pref, router_forward_write, router_read_doc, router_query, bulk_router_forward,
-    passthrough, ForwardMethod, ReadPreference,
+    parse_read_pref, router_aggregate, router_forward_write, router_read_doc, router_query,
+    bulk_router_forward, passthrough, ForwardMethod, ReadPreference,
 };
 use crate::consensus::read_index::read_index;
 use crate::json::{parse_fields, project};
 use crate::model::{
-    err_json, BulkDoc, CreateDoc, QueryPage, QueryParams, ReadParams, DEFAULT_QUERY_LIMIT,
-    MAX_QUERY_LIMIT,
+    err_json, AggregateParams, BulkDoc, CreateDoc, QueryPage, QueryParams, ReadParams,
+    DEFAULT_QUERY_LIMIT, MAX_QUERY_LIMIT,
 };
-use crate::query::{decode_cursor, encode_cursor, parse_filter, parse_sort, sort_value, KeyCursor, SortCursor, SortedRow};
+use crate::query::{
+    decode_cursor, encode_cursor, parse_filter, parse_sort, sort_position, KeyCursor, SortCursor,
+    SortedRow,
+};
 use crate::replication::{parse_write_concern, wc_query_string, WriteConcernParams, DEFAULT_WTIMEOUT_MS};
 use crate::cluster::ownership::Ownership;
 use crate::api::middleware::{client_collection, CollectionPath};
@@ -432,7 +436,10 @@ pub async fn query_docs(
         Some(n) => n.max(1),
         None => DEFAULT_QUERY_LIMIT,
     };
-    let sort = parse_sort(params.sort.as_deref());
+    let sort = match parse_sort(params.sort.as_deref()) {
+        Ok(s) => s,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
+    };
     let fields = parse_fields(params.fields.as_deref());
     let filter_obj = match params.filter.as_deref().map(parse_filter).transpose() {
         Ok(f) => f,
@@ -447,7 +454,10 @@ pub async fn query_docs(
     // and must not be ignored. Both are checked: the unsorted one used to be a bare key, which any
     // string is a valid one of, so the mix-up in that direction was answered rather than refused.
     let sort_cursor = match (&sort, params.cursor.as_deref()) {
-        (Some(_), Some(c)) => match decode_cursor::<SortCursor>(c) {
+        // The arity is part of belonging: a position taken under one set of sort keys says nothing
+        // about where a different set resumes.
+        (Some(order), Some(c)) => match decode_cursor::<SortCursor>(c)
+            .filter(|c| c.positions().len() == order.keys.len()) {
             Some(c) => Some(c),
             None => return err_json(StatusCode::BAD_REQUEST,
                 "cursor does not belong to this sorted query".to_string()),
@@ -497,10 +507,8 @@ pub async fn query_docs(
                     start.as_deref(), end.as_deref(), &filter_obj, sort, sort_cursor.as_ref(), limit)?;
                 // The last row of the page is where the next one resumes, in sort order.
                 let next = match (more, rows.last()) {
-                    (true, Some(last)) => Some(encode_cursor(&SortCursor {
-                        value: sort_value(&last.value, sort).clone(),
-                        key: last.key.clone(),
-                    })),
+                    (true, Some(last)) => Some(encode_cursor(&SortCursor::at(
+                        sort_position(&last.value, sort), last.key.clone()))),
                     _ => None,
                 };
                 Ok((rows, next))
@@ -519,6 +527,61 @@ pub async fn query_docs(
             let items = rows.iter().map(|r| project(&r.value, &fields)).collect();
             (StatusCode::OK, Json(QueryPage { items, next_cursor, keys })).into_response()
         },
+        Ok(Err(e)) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+pub async fn aggregate_docs(
+    State(state): State<AppState>,
+    CollectionPath(col_name): CollectionPath<String>,
+    Query(params): Query<AggregateParams>,
+) -> impl axum::response::IntoResponse {
+    let filter_obj = match params.filter.as_deref().map(parse_filter).transpose() {
+        Ok(f) => f,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
+    };
+    let group = match parse_group(params.group.as_deref()) {
+        Ok(g) => g,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
+    };
+    let metrics = match parse_metrics(params.metrics.as_deref()) {
+        Ok(m) => m,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
+    };
+    let pref = match parse_read_pref(params.read.as_deref()) {
+        Ok(p) => p,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
+    };
+
+    if state.config.role == "router" {
+        return router_aggregate(&state, &col_name, &params, pref).await;
+    }
+
+    if let Some(refusal) = not_the_primary(&state, &pref) {
+        return refusal;
+    }
+    // The same guarantee a `read=quorum` page gets: the starting point is linearizable, and the
+    // walk that follows it is not a snapshot.
+    if let Some(refusal) = unconfirmed_leader(&state, &pref, &col_name).await {
+        return refusal;
+    }
+
+    let col = match client_collection(&state, &col_name) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+
+    let (start, end) = (params.start.clone(), params.end.clone());
+    let spec = AggregateSpec { group, metrics };
+    let result = tokio::task::spawn_blocking(move || {
+        col.aggregate(start.as_deref(), end.as_deref(), &filter_obj, spec)
+    }).await;
+
+    match result {
+        Ok(Ok(agg)) => (StatusCode::OK, Json(agg)).into_response(),
+        Ok(Err(e)) if e.kind() == io::ErrorKind::InvalidInput =>
+            err_json(StatusCode::BAD_REQUEST, e.to_string()),
         Ok(Err(e)) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -881,10 +944,12 @@ mod tests {
             "with the lease lapsed and no majority reachable, nothing rules out a leader \
              elected on the other side of the partition, and answering here is stale");
 
-        // /query reaches the barrier by its own path, so it has its own assertion.
-        let status = client.get(&format!("{}/collections/t/query?read=quorum", base))
-            .send().await.unwrap().status();
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        // /query and /aggregate reach the barrier by their own paths, so each has its own assertion.
+        for path in ["query", "aggregate"] {
+            let status = client.get(&format!("{}/collections/t/{}?read=quorum", base, path))
+                .send().await.unwrap().status();
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "/{}", path);
+        }
     }
 
     /// The router half: it still lists replicas so a promoted one is found, so the guarantee holds
@@ -938,6 +1003,140 @@ mod tests {
         assert!(recovered, "the router never found the new primary");
     }
 
+    /// A second sort key only matters where the first ties, and the page has to keep meaning the
+    /// same thing across shards and across the cursor that resumes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_multi_key_sort_pages_across_shards_in_one_global_order() {
+        let root = temp_root();
+        let (_s1, _s2, router) = two_shard_cluster(&root).await;
+        let client = reqwest::Client::new();
+
+        // Four bands of three, so the second key decides inside every band.
+        let rows = 12i64;
+        for i in 0..rows {
+            let value = serde_json::json!({"band": i % 4, "score": i});
+            assert_eq!(put_value(&client, &router.url(), "t", &format!("k{:02}", i), value, "").await,
+                StatusCode::CREATED);
+        }
+
+        let mut seen: Vec<(i64, i64)> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..20 {
+            let mut q = vec![("sort".to_string(), "band:asc,score:desc".to_string()),
+                             ("limit".to_string(), "5".to_string())];
+            if let Some(c) = &cursor { q.push(("cursor".to_string(), c.clone())); }
+            let r = client.get(&format!("{}/collections/t/query", router.url()))
+                .query(&q).send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+            let body: serde_json::Value = r.json().await.unwrap();
+            seen.extend(body["items"].as_array().unwrap().iter()
+                .map(|v| (v["band"].as_i64().unwrap(), v["score"].as_i64().unwrap())));
+            match body["next_cursor"].as_str() {
+                Some(c) => cursor = Some(c.to_string()),
+                None => break,
+            }
+        }
+
+        let mut expected: Vec<(i64, i64)> = (0..rows).map(|i| (i % 4, i)).collect();
+        expected.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+        assert_eq!(seen, expected, "every row once, ascending by band and descending by score");
+
+        // A cursor is a position under one set of sort keys and says nothing under another.
+        let first = client.get(&format!("{}/collections/t/query", router.url()))
+            .query(&[("sort", "band:asc,score:desc"), ("limit", "2")]).send().await.unwrap()
+            .json::<serde_json::Value>().await.unwrap();
+        let two_key = first["next_cursor"].as_str().unwrap().to_string();
+        let refused = client.get(&format!("{}/collections/t/query", router.url()))
+            .query(&[("sort", "band:asc"), ("cursor", &two_key)]).send().await.unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST,
+            "a two-key position is not a one-key position");
+    }
+
+    /// IB-019: `sort=v:descc` sorted ascending and `sort=:desc` dropped the sort, both answered
+    /// `200`, so a client had no way to find out its query had been reinterpreted.
+    #[tokio::test]
+    async fn invalid_sort_syntax_is_refused_rather_than_reinterpreted() {
+        let root = temp_root();
+        let node = single_node(&root).await;
+        let client = reqwest::Client::new();
+        put_value(&client, &node.url(), "t", "k1", serde_json::json!({"v": 1}), "").await;
+
+        for bad in ["v:descc", ":desc", "", "v:", "v,v"] {
+            let r = client.get(&format!("{}/collections/t/query", node.url()))
+                .query(&[("sort", bad)]).send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST, "sort `{}` must be refused", bad);
+        }
+        let ok = client.get(&format!("{}/collections/t/query", node.url()))
+            .query(&[("sort", "v:DESC")]).send().await.unwrap();
+        assert_eq!(ok.status(), StatusCode::OK, "the direction is case-insensitive, not free-form");
+    }
+
+    /// Grouping splits across shards by key, so the merge has to be over groups. An average is the
+    /// case that shows it: averaging the shard averages is a different number.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_aggregation_merges_across_shards_by_group() {
+        let root = temp_root();
+        let (_s1, _s2, router) = two_shard_cluster(&root).await;
+        let client = reqwest::Client::new();
+
+        let rows = 20i64;
+        for i in 0..rows {
+            let value = serde_json::json!({
+                "tier": if i % 2 == 0 { "gold" } else { "silver" },
+                "amount": i,
+            });
+            assert_eq!(put_value(&client, &router.url(), "t", &format!("k{:02}", i), value, "").await,
+                StatusCode::CREATED);
+        }
+
+        let aggregate = |q: Vec<(&'static str, String)>| {
+            let (c, base) = (client.clone(), router.url());
+            async move {
+                let r = c.get(&format!("{}/collections/t/aggregate", base)).query(&q).send().await.unwrap();
+                assert_eq!(r.status(), StatusCode::OK);
+                r.json::<serde_json::Value>().await.unwrap()
+            }
+        };
+
+        let whole = aggregate(vec![("metrics", "count,sum:amount,avg:amount,min:amount,max:amount".into())]).await;
+        assert_eq!(whole["matched"].as_u64(), Some(20));
+        assert_eq!(whole["groups"].as_array().map(Vec::len), Some(1));
+        let m = &whole["groups"][0]["metrics"];
+        assert_eq!(m["count"]["count"].as_u64(), Some(20));
+        assert_eq!(m["sum:amount"]["sum"].as_f64(), Some(190.0));
+        assert_eq!(m["avg:amount"]["avg"].as_f64(), Some(9.5));
+        assert_eq!(m["min:amount"]["min"].as_i64(), Some(0));
+        assert_eq!(m["max:amount"]["max"].as_i64(), Some(19));
+
+        let grouped = aggregate(vec![("group", "tier".into()), ("metrics", "avg:amount".into())]).await;
+        let groups = grouped["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2, "two tiers, however the keys hashed across the shards");
+        let by_tier = |name: &str| groups.iter()
+            .find(|g| g["key"]["tier"] == serde_json::json!(name)).expect("tier present").clone();
+        assert_eq!(by_tier("gold")["count"].as_u64(), Some(10));
+        assert_eq!(by_tier("gold")["metrics"]["avg:amount"]["avg"].as_f64(), Some(9.0));
+        assert_eq!(by_tier("silver")["metrics"]["avg:amount"]["avg"].as_f64(), Some(10.0));
+
+        let filtered = aggregate(vec![
+            ("filter", r#"{"amount": {"$gte": 10}}"#.into()),
+            ("metrics", "count".into()),
+        ]).await;
+        assert_eq!(filtered["matched"].as_u64(), Some(10), "the filter travels to every shard");
+
+        for bad in [vec![("metrics", "total".to_string())],
+                    vec![("metrics", "sum".to_string())],
+                    vec![("group", "".to_string())],
+                    vec![("filter", "{".to_string())]] {
+            let r = client.get(&format!("{}/collections/t/aggregate", router.url()))
+                .query(&bad).send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{:?} must be refused", bad);
+        }
+
+        let missing = client.get(&format!("{}/collections/nosuch/aggregate", router.url()))
+            .send().await.unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND, "no shard holds it");
+    }
+
     /// M1: a filter the engine cannot evaluate is a client error. Before the fix it was dropped and
     /// the query answered as if no filter had been sent.
     #[tokio::test]
@@ -955,7 +1154,7 @@ mod tests {
             async move { c.get(&url).query(&[("filter", filter)]).send().await.unwrap() }
         };
 
-        for bad in [r#"{"n": {"$exists": true}}"#, r#"{"n": {"$in": 1}}"#, r#"{"$or": []}"#, "not json"] {
+        for bad in [r#"{"n": {"$regex": "x"}}"#, r#"{"n": {"$in": 1}}"#, r#"{"$or": []}"#, "not json"] {
             assert_eq!(query(bad).await.status(), StatusCode::BAD_REQUEST, "filter {} must be refused", bad);
         }
 

@@ -1,7 +1,11 @@
 //! Request forwarding, shard failover, and cross-shard fan-out.
 
-use crate::model::{err_json, BulkDoc, CreateDoc, QueryPage, QueryParams};
-use crate::query::{decode_cursor, encode_cursor, kway_merge, sort_value, ShardCursor, SortCursor, SortSpec, SortedRow};
+use crate::aggregate::{merge as merge_aggregates, AggregateResult};
+use crate::model::{err_json, AggregateParams, BulkDoc, CreateDoc, QueryPage, QueryParams};
+use crate::query::{
+    decode_cursor, encode_cursor, kway_merge, sort_position, ShardCursor, SortCursor, SortOrder,
+    SortedRow,
+};
 use crate::json::project;
 use crate::cluster::probe::unique_shards;
 use crate::metrics::NodeLoad;
@@ -746,7 +750,7 @@ pub async fn router_query(
     col_name: &str,
     params: &QueryParams,
     limit: usize,
-    sort: &Option<SortSpec>,
+    sort: &Option<SortOrder>,
     fields: &[String],
     pref: ReadPreference,
 ) -> axum::response::Response {
@@ -899,10 +903,8 @@ pub async fn router_query(
             let merged = kway_merge(lists, sort, limit);
             // Rows this page did not reach are either past a shard's own page or past the merge cut.
             let next_cursor = match merged.last() {
-                Some(last) if shard_has_more || received > merged.len() => Some(encode_cursor(&SortCursor {
-                    value: sort_value(&last.value, sort).clone(),
-                    key: last.key.clone(),
-                })),
+                Some(last) if shard_has_more || received > merged.len() => Some(encode_cursor(
+                    &SortCursor::at(sort_position(&last.value, sort), last.key.clone()))),
                 _ => None,
             };
             let keys = if want_keys { merged.iter().map(|r| r.key.clone()).collect() } else { Vec::new() };
@@ -947,6 +949,117 @@ pub async fn router_query(
         };
 
         return (StatusCode::OK, Json(QueryPage { items: merged, next_cursor, keys })).into_response();
+}
+
+/// What one shard answered an aggregation with. `Page` is absent here because an aggregate is not
+/// paginated: a shard folds its whole range or it contributes nothing.
+enum ShardAggregateOutcome {
+    Result(AggregateResult),
+    NoPrimary(Option<ShardReply>),
+    Absent,
+    Refused(ShardReply),
+    Failed,
+}
+
+/// Fans the aggregation out whole and merges the partials. Every shard sees the same filter and the
+/// same metrics, so the merge is over groups rather than over rows.
+pub async fn router_aggregate(
+    state: &AppState,
+    col_name: &str,
+    params: &AggregateParams,
+    pref: ReadPreference,
+) -> axum::response::Response {
+    let primary_only = forwarded_read_pref(&pref).is_some();
+    let (_ring, owners) = state.partitioning();
+
+    let mut q: Vec<(String, String)> = Vec::new();
+    if let Some(v) = &params.start { q.push(("start".to_string(), v.clone())); }
+    if let Some(v) = &params.end { q.push(("end".to_string(), v.clone())); }
+    if let Some(v) = &params.filter { q.push(("filter".to_string(), v.clone())); }
+    if let Some(v) = &params.group { q.push(("group".to_string(), v.clone())); }
+    if let Some(v) = &params.metrics { q.push(("metrics".to_string(), v.clone())); }
+    if let Some(v) = forwarded_read_pref(&pref) { q.push(("read".to_string(), v.to_string())); }
+
+    let mut futures = Vec::new();
+    for (original, replicas) in owners {
+        let effective = state.effective_primary(&original);
+        let rr = state.read_rr.fetch_add(1, Ordering::Relaxed);
+        let loads = state.fresh_node_loads();
+        let targets = read_targets(&pref, &effective, &replicas, rr, &loads);
+        let client = state.client.clone();
+        let route_state = state.clone();
+        let col = col_name.to_string();
+        let q = q.clone();
+        let primary = effective.clone();
+
+        futures.push(tokio::spawn(async move {
+            let mut refused = false;
+            let mut primary_refusal: Option<ShardReply> = None;
+            let mut absent = false;
+            let mut rejected: Option<ShardReply> = None;
+            for target in targets {
+                let _routed = route_state.track_routed_read(&target);
+                let url = format!("{}/collections/{}/aggregate", target, encode_path_segment(&col));
+                if let Ok(res) = client.get(&url).query(&q).send().await {
+                    if res.status().is_success() {
+                        if let Ok(part) = res.json::<AggregateResult>().await {
+                            return ShardAggregateOutcome::Result(part);
+                        }
+                    } else if res.status() == StatusCode::BAD_REQUEST {
+                        // The request is wrong for every shard, so retrying the next one only
+                        // spends round trips to reach the same answer.
+                        rejected = Some(ShardReply::of(res).await);
+                        break;
+                    } else if res.status() == StatusCode::SERVICE_UNAVAILABLE && primary_only {
+                        refused = true;
+                        if crate::util::same_endpoint(&target, &primary) {
+                            primary_refusal = Some(ShardReply::of(res).await);
+                        }
+                    } else if res.status() == StatusCode::NOT_FOUND {
+                        absent = true;
+                        break;
+                    }
+                }
+                route_state.clear_node_load(&target);
+            }
+            match (rejected, refused, absent) {
+                (Some(reply), _, _) => ShardAggregateOutcome::Refused(reply),
+                (_, true, _) => ShardAggregateOutcome::NoPrimary(primary_refusal),
+                (_, _, true) => ShardAggregateOutcome::Absent,
+                _ => ShardAggregateOutcome::Failed,
+            }
+        }));
+    }
+
+    let mut parts = Vec::new();
+    let (mut present, mut absent) = (0usize, 0usize);
+    for res in futures::future::join_all(futures).await {
+        match res {
+            Ok(ShardAggregateOutcome::Result(part)) => {
+                present += 1;
+                parts.push(part);
+            },
+            Ok(ShardAggregateOutcome::Refused(reply)) => {
+                let body: serde_json::Value = serde_json::from_str(&reply.body)
+                    .unwrap_or(serde_json::Value::String(reply.body));
+                return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+            },
+            Ok(ShardAggregateOutcome::NoPrimary(from_primary)) => return refusal_response(from_primary),
+            Ok(ShardAggregateOutcome::Absent) => absent += 1,
+            Ok(ShardAggregateOutcome::Failed) =>
+                return (StatusCode::BAD_GATEWAY, "Shard aggregation failed").into_response(),
+            // Partial aggregates cannot be merged into an honest total, so a lost task is an error.
+            Err(_) => return (StatusCode::BAD_GATEWAY, "Shard aggregation task failed").into_response(),
+        }
+    }
+    if present == 0 && absent > 0 {
+        return collection_absent_response(col_name);
+    }
+
+    match merge_aggregates(parts) {
+        Ok(merged) => (StatusCode::OK, Json(merged)).into_response(),
+        Err(e) => err_json(StatusCode::BAD_REQUEST, e),
+    }
 }
 
 #[cfg(test)]

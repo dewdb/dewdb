@@ -48,6 +48,18 @@ pub struct QueryPage {
 }
 
 #[derive(Deserialize)]
+pub struct AggregateParams {
+    pub start: Option<String>,
+    pub end: Option<String>,
+    pub filter: Option<String>,
+    pub read: Option<String>,
+    /// Dotted paths to group by. Absent is one group over everything the filter matched.
+    pub group: Option<String>,
+    /// `count`, `sum:field`, `avg:field`, `min:field`, `max:field`. Absent is `count`.
+    pub metrics: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct ReadParams {
     pub read: Option<String>,
 }
