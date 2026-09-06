@@ -1082,25 +1082,18 @@ impl Collection {
         pending.insert(lsn, StagedApply { wal_id, offset, term, effect });
     }
 
-    /// First stage marks this collection consensus-managed. Without the watermark, a restart before
-    /// the first commit would apply-all and publish unacknowledged entries. Kept off the append lock:
-    /// it writes a file, and holding the writer for that would stall every other writer.
-    pub(super) fn record_watermark_once(&self) {
-        if !self.watermark_recorded.swap(true, Ordering::SeqCst) {
-            let applied_lsn = self.applied_lsn();
-            if let Err(e) = (AppliedMeta {
-                applied_lsn,
-                dropped: self.is_dropped(),
-                config: self.committed_config(),
-                handover: self.committed_handover(),
-                indexes: self.committed_indexes(),
-            }).save(&self.root_path)
-            {
-                error!(target: "storage", collection = %self.name, error = %e,
-                    "Failed to record applied watermark");
-                self.watermark_recorded.store(false, Ordering::SeqCst);
-            }
+    /// No managed frame may reach the WAL before recovery can distinguish it from committed history.
+    pub(super) fn record_watermark_once(&self) -> io::Result<()> {
+        if self.watermark_recorded.load(Ordering::SeqCst) {
+            return Ok(());
         }
+        let _one_writer = self.watermark_write.lock().unwrap();
+        if self.watermark_recorded.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.persist_watermark_full(self.rich_gen.load(Ordering::SeqCst))?;
+        self.watermark_recorded.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     /// A durable commit position covering at least `through`, before this returns. `dropped`,
@@ -1475,6 +1468,135 @@ mod tests {
 
     fn cache_cfg(max_value: u32, budget: u64) -> ReadCacheConfig {
         ReadCacheConfig { inline_max_value_bytes: max_value, inline_budget_bytes: budget }
+    }
+
+    fn ib004_open(path: &Path) -> Arc<Collection> {
+        Arc::new(Collection::open("c".into(), path.to_path_buf(),
+            Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)), ReadCacheConfig::default(),
+            ChangefeedConfig::default()).unwrap())
+    }
+
+    fn ib004_append(col: &Collection, replica: bool, key: &str, lsn: u64) -> io::Result<()> {
+        if replica {
+            let frame = crate::test_support::make_frame(1, lsn, lsn - 1,
+                if lsn == 1 { 0 } else { 1 }, key, 2);
+            assert!(matches!(col.append_raw_frame(&frame)?,
+                crate::storage::frame::ReplicaApply::Applied { lsn: applied } if applied == lsn));
+        } else {
+            assert_eq!(col.put(key.into(), serde_json::json!({"v": 2}), 1)?.3, lsn);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ib004_failed_initial_watermark_rejects_appends_and_retries_safely() {
+        for replica in [false, true] {
+            for legacy in [false, true] {
+                for retry in [false, true] {
+                    let root = temp_root();
+                    let path = root.join("c");
+                    fs::create_dir_all(&path).unwrap();
+                    let baseline = u64::from(legacy);
+                    if legacy {
+                        fs::write(path.join("wal-00001.log"),
+                            crate::test_support::make_frame(1, 1, 0, 0, "legacy", 1)).unwrap();
+                    }
+                    let col = ib004_open(&path);
+                    let blocked = path.join("applied.meta.tmp");
+                    fs::create_dir(&blocked).unwrap();
+
+                    for _ in 0..2 {
+                        assert!(ib004_append(&col, replica, "pending", baseline + 1).is_err());
+                        assert!(!col.watermark_recorded.load(Ordering::SeqCst));
+                        assert_eq!(col.last_appended_lsn(), baseline);
+                        assert_eq!(col.db_next_lsn.load(Ordering::SeqCst), baseline);
+                        assert_eq!(col.pending_len(), 0);
+                        let wal = col.wal_writer.lock().unwrap();
+                        assert_eq!(wal.current_wal_size, 0);
+                        assert_eq!(wal.current_wal.metadata().unwrap().len(), 0);
+                    }
+                    assert_eq!(Collection::recorded_watermark(&path).unwrap(), None);
+                    fs::remove_dir(&blocked).unwrap();
+                    if retry {
+                        ib004_append(&col, replica, "pending", baseline + 1).unwrap();
+                        assert_eq!(Collection::recorded_watermark(&path).unwrap(), Some(baseline));
+                    }
+                    col.sync_wal().unwrap();
+                    drop(col);
+
+                    let reopened = ib004_open(&path);
+                    assert_eq!(reopened.applied_lsn(), baseline);
+                    assert_eq!(reopened.last_appended_lsn(), baseline + u64::from(retry));
+                    assert_eq!(reopened.pending_len(), usize::from(retry));
+                    assert!(reopened.get("pending").unwrap().is_none());
+                    assert_eq!(reopened.get("legacy").unwrap(),
+                        legacy.then(|| serde_json::json!({"v": 1})));
+                    if retry {
+                        reopened.apply_committed(baseline + 1);
+                        drop(reopened);
+                        let committed = ib004_open(&path);
+                        assert_eq!(committed.get("pending").unwrap(), Some(serde_json::json!({"v": 2})));
+                        assert_eq!(committed.pending_len(), 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ib004_concurrent_appends_wait_for_initial_watermark_persistence() {
+        for fail in [false, true] {
+            let root = temp_root();
+            let path = root.join("c");
+            let col = ib004_open(&path);
+            if fail {
+                fs::create_dir(path.join("applied.meta.tmp")).unwrap();
+            }
+            let saving = col.watermark_write.lock().unwrap();
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let writers: Vec<_> = [false, true].into_iter().map(|replica| {
+                let col = col.clone();
+                let started = started_tx.clone();
+                let done = done_tx.clone();
+                std::thread::spawn(move || {
+                    started.send(()).unwrap();
+                    let result = if replica {
+                        let frame = crate::test_support::make_frame(1, 100, 0, 0, "replica", 2);
+                        col.append_raw_frame(&frame).map(|_| ())
+                    } else {
+                        col.put("local".into(), serde_json::json!({"v": 2}), 1).map(|_| ())
+                    };
+                    done.send(result).unwrap();
+                })
+            }).collect();
+            for _ in 0..2 {
+                started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            let premature = done_rx.recv_timeout(Duration::from_millis(100));
+            let recorded_early = col.watermark_recorded.load(Ordering::SeqCst);
+            let appended_early = col.last_appended_lsn();
+            drop(saving);
+            for writer in writers {
+                writer.join().unwrap();
+            }
+            assert!(matches!(premature, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+                "an append bypassed the watermark writer");
+            assert!(!recorded_early, "an unfinished watermark was advertised as persisted");
+            assert_eq!(appended_early, 0);
+            for _ in 0..2 {
+                assert_eq!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap().is_err(), fail);
+            }
+            assert_eq!(Collection::recorded_watermark(&path).unwrap(), if fail { None } else { Some(0) });
+            col.sync_wal().unwrap();
+            drop(col);
+            let reopened = ib004_open(&path);
+            assert!(reopened.get("local").unwrap().is_none());
+            assert!(reopened.get("replica").unwrap().is_none());
+            assert_eq!(reopened.applied_lsn(), 0);
+            assert_eq!(reopened.last_appended_lsn() > 0, !fail);
+        }
     }
 
     fn create_spec(name: &str, field: &str) -> IndexChange {

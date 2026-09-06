@@ -197,7 +197,7 @@ impl Collection {
 
         let frame_len = HEADER_LEN as u64 + len;
 
-        self.record_watermark_once();
+        self.record_watermark_once()?;
         let mut wal = self.wal_writer.lock().unwrap();
 
         if self.released.load(Ordering::SeqCst) {
@@ -363,7 +363,7 @@ impl Collection {
 
         let frame_len = (HEADER_LEN + len) as u64;
 
-        self.record_watermark_once();
+        self.record_watermark_once()?;
         let mut wal = self.wal_writer.lock().unwrap();
 
         if self.released.load(Ordering::SeqCst) {
