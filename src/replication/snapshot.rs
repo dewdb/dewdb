@@ -1067,4 +1067,52 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(!root.join("x.log").exists());
     }
+
+    /// IB-008 follow-up: `<name>.tmp` is both the install staging directory and the directory a
+    /// download streams into. Treating a complete-looking download as an install to finish let
+    /// `existing_collection` -- called here, between the transfer and validation -- promote the
+    /// staged directory out from under this function, so every first sync of a collection the
+    /// replica does not already hold failed with the snapshot already live and unvalidated.
+    #[tokio::test]
+    async fn a_first_sync_does_not_install_the_download_before_it_is_validated() {
+        let root = temp_root();
+        let source_db = Database::new(root.join("source")).unwrap();
+        let source = source_db.get_collection("events").unwrap();
+        committed_put(&source, "k", serde_json::json!({"v": 1})).await;
+        let wire = collect_snapshot(source).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/internal/snapshot",
+            axum::routing::get({
+                let wire = wire.clone();
+                move || {
+                    let wire = wire.clone();
+                    async move { (axum::http::StatusCode::OK, wire) }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let replica_db = Database::new(root.join("replica")).unwrap();
+        assert!(!replica_db.root_path.join("events").exists(), "the replica starts without it");
+
+        replica_sync_from_primary(
+            &reqwest::Client::new(),
+            &format!("http://{}", address),
+            &replica_db,
+            "events",
+        )
+        .await
+        .expect("a first sync of a collection the replica lacks must install the snapshot");
+
+        assert_eq!(
+            replica_db.get_collection("events").unwrap().get("k").unwrap(),
+            Some(serde_json::json!({"v": 1})),
+        );
+        assert!(!replica_db.root_path.join("events.tmp").exists());
+
+        server.abort();
+    }
 }

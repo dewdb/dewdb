@@ -4,14 +4,49 @@ use super::collection::Collection;
 use crate::consensus::config::{is_system_collection, valid_collection_name};
 use super::index::{AppliedMeta, LsnMeta, ReadCacheConfig};
 use crate::changefeed::ChangefeedConfig;
-use crate::util::remove_dir_with_retry;
+use crate::util::{remove_dir_with_retry, rename_with_retry, write_atomic};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use tracing::{error, info, warn};
+
+const INSTALL_MARKER: &str = ".install";
+
+fn sync_dir(dir: &Path) {
+    if let Ok(d) = fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+}
+
+fn install_paths(root: &Path, name: &str) -> (PathBuf, PathBuf, PathBuf) {
+    (
+        root.join(name),
+        root.join(format!("{}.old", name)),
+        root.join(format!("{}.tmp", name)),
+    )
+}
+
+fn install_base_name(dir_name: &str) -> Option<&str> {
+    for suffix in [".tmp", ".old"] {
+        if let Some(base) = dir_name.strip_suffix(suffix) {
+            if valid_collection_name(base) {
+                return Some(base);
+            }
+        }
+    }
+    None
+}
+
+/// Only the marker, never the file set: `<name>.tmp` is also the directory a snapshot download
+/// streams into, and a complete-looking download is not yet an install anyone decided to make.
+/// A pre-marker crash state is recovered from `<name>.old` instead, which loses the snapshot but
+/// never the collection.
+fn staged_install_ready(dir: &Path) -> bool {
+    dir.is_dir() && dir.join(INSTALL_MARKER).is_file()
+}
 
 // durable_lsn is the highest LSN fsynced in any collection, not a prefix: a lower LSN in another
 // collection can still be unsynced. Replication watermarks live in consensus::Progress.
@@ -75,8 +110,77 @@ impl Database {
             next_lsn: Arc::new(AtomicU64::new(boot_lsn)),
             last_log_term: Arc::new(AtomicU64::new(0)),
         };
+        db.reconcile_collection_installs()?;
         db.adopt_collection_tails()?;
         Ok(db)
+    }
+
+    /// Crash between `live→.old` and `.tmp→live` hides both suffixes from listing.
+    fn reconcile_collection_installs(&self) -> io::Result<()> {
+        let mut names = HashSet::new();
+        for entry in fs::read_dir(&self.root_path)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let fname = entry.file_name();
+            let Some(name) = fname.to_str() else { continue };
+            if valid_collection_name(name) {
+                names.insert(name.to_string());
+            } else if let Some(base) = install_base_name(name) {
+                names.insert(base.to_string());
+            }
+        }
+        for name in names {
+            self.recover_collection_install(&name, true)?;
+        }
+        Ok(())
+    }
+
+    fn recover_collection_install(&self, name: &str, boot: bool) -> io::Result<()> {
+        if !valid_collection_name(name) {
+            return Ok(());
+        }
+        let (live, old, tmp) = install_paths(&self.root_path, name);
+        if live.is_dir() {
+            let _ = fs::remove_file(live.join(INSTALL_MARKER));
+            if boot && tmp.is_dir() {
+                if let Err(e) = remove_dir_with_retry(&tmp) {
+                    warn!(target: "storage", collection = %name, error = %e,
+                        "Could not remove leftover snapshot staging directory");
+                }
+            }
+            return Ok(());
+        }
+
+        if staged_install_ready(&tmp) {
+            rename_with_retry(&tmp, &live)?;
+            sync_dir(&self.root_path);
+            let _ = fs::remove_file(live.join(INSTALL_MARKER));
+            return Ok(());
+        }
+
+        if tmp.is_dir() {
+            if let Err(e) = remove_dir_with_retry(&tmp) {
+                warn!(target: "storage", collection = %name, error = %e,
+                    "Could not remove incomplete snapshot staging directory");
+            }
+        }
+        if old.is_dir() {
+            rename_with_retry(&old, &live)?;
+            sync_dir(&self.root_path);
+        }
+        Ok(())
+    }
+
+    fn drop_install_backup(&self, name: &str) {
+        let old = self.root_path.join(format!("{}.old", name));
+        if old.is_dir() {
+            if let Err(e) = remove_dir_with_retry(&old) {
+                warn!(target: "storage", collection = %name, error = %e,
+                    "Could not remove leftover collection backup after snapshot install");
+            }
+        }
     }
 
     /// `lsn.meta` records only the committed prefix, so every collection is opened before the first
@@ -108,8 +212,10 @@ impl Database {
             return Ok(col.clone());
         }
 
+        self.recover_collection_install(name, false)?;
         let col = self.open_collection(name)?;
         collections.insert(name.to_string(), col.clone());
+        self.drop_install_backup(name);
         Ok(col)
     }
 
@@ -122,7 +228,9 @@ impl Database {
         if let Some(col) = self.collections.read().unwrap().get(name) {
             return Ok(Some(col.clone()));
         }
-        if !self.collection_dir(name)?.is_dir() {
+        let live = self.collection_dir(name)?;
+        let (_, old, tmp) = install_paths(&self.root_path, name);
+        if !live.is_dir() && !old.is_dir() && !staged_install_ready(&tmp) {
             return Ok(None);
         }
         self.get_collection(name).map(Some)
@@ -174,8 +282,20 @@ impl Database {
         }
 
         let had_old = col_path.is_dir();
+        if let Err(e) = write_atomic(staged_path, INSTALL_MARKER, b"1") {
+            if col_path.is_dir() {
+                if let Ok(reopened) = self.open_collection(name) {
+                    collections.insert(name.to_string(), reopened);
+                }
+            }
+            if let Some(path) = tombstone {
+                let _ = fs::remove_file(path);
+            }
+            return Err(e);
+        }
+
         if had_old {
-            if let Err(e) = fs::rename(&col_path, &old_path) {
+            if let Err(e) = rename_with_retry(&col_path, &old_path) {
                 if let Ok(reopened) = self.open_collection(name) {
                     collections.insert(name.to_string(), reopened);
                 }
@@ -184,12 +304,16 @@ impl Database {
                 }
                 return Err(e);
             }
+            sync_dir(&self.root_path);
         }
 
-        if let Err(e) = fs::rename(staged_path, &col_path) {
+        if let Err(e) = rename_with_retry(staged_path, &col_path) {
             let restore = if had_old {
-                fs::rename(&old_path, &col_path)
-                    .and_then(|_| self.open_collection(name))
+                rename_with_retry(&old_path, &col_path)
+                    .and_then(|_| {
+                        sync_dir(&self.root_path);
+                        self.open_collection(name)
+                    })
                     .map(|col| collections.insert(name.to_string(), col))
             } else { Ok(None) };
             if let Some(path) = tombstone {
@@ -202,10 +326,12 @@ impl Database {
                     e, restore_error))),
             };
         }
+        sync_dir(&self.root_path);
 
         match self.open_collection(name) {
             Ok(col) => {
                 collections.insert(name.to_string(), col);
+                let _ = fs::remove_file(col_path.join(INSTALL_MARKER));
                 if old_path.exists() {
                     if let Err(e) = remove_dir_with_retry(&old_path) {
                         warn!(target: "replica_sync", collection = %name, error = %e,
@@ -219,13 +345,16 @@ impl Database {
             },
             Err(install_error) => {
                 // Restore and reopen the last known-good directory if installation fails.
-                let moved_bad = fs::rename(&col_path, staged_path).is_ok();
+                let moved_bad = rename_with_retry(&col_path, staged_path).is_ok();
                 if !moved_bad && col_path.exists() {
                     let _ = remove_dir_with_retry(&col_path);
                 }
                 let restore = if had_old {
-                    fs::rename(&old_path, &col_path)
-                        .and_then(|_| self.open_collection(name))
+                    rename_with_retry(&old_path, &col_path)
+                        .and_then(|_| {
+                            sync_dir(&self.root_path);
+                            self.open_collection(name)
+                        })
                         .map(|col| collections.insert(name.to_string(), col))
                 } else {
                     Ok(None)
@@ -586,5 +715,84 @@ mod tests {
         assert!(root.join("users").is_dir());
         assert!(staged.is_dir(), "the rejected snapshot goes back to staging for cleanup");
         assert!(!root.join("users.old").exists());
+    }
+
+    async fn committed_collection(root: &std::path::Path, name: &str, key: &str, v: i64) {
+        let db = Database::new(root).unwrap();
+        let col = db.get_collection(name).unwrap();
+        live_put(&col, key, v);
+        col.enqueue_commit().await.unwrap().unwrap();
+        drop(col);
+        for existing in db.list_collections().unwrap() {
+            let _ = db.release_collection(&existing);
+        }
+        drop(db);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn ib008_swap_crash_after_backup_rename_restores_the_collection() {
+        let root = temp_root();
+        committed_collection(&root, "t", "k", 1).await;
+        crate::util::rename_with_retry(&root.join("t"), &root.join("t.old")).unwrap();
+
+        let db = Database::new(&root).unwrap();
+        assert_eq!(db.list_collections().unwrap(), vec!["t".to_string()]);
+        assert_eq!(db.get_collection("t").unwrap().get("k").unwrap(),
+            Some(serde_json::json!({"v": 1})));
+        assert!(root.join("t").is_dir());
+        assert!(!root.join("t.old").exists());
+
+        live_put(&db.get_collection("t").unwrap(), "k2", 2);
+        assert_eq!(db.get_collection("t").unwrap().get("k").unwrap(),
+            Some(serde_json::json!({"v": 1})),
+            "a later write must use the restored directory, not a freshly created one");
+    }
+
+    #[tokio::test]
+    async fn ib008_swap_crash_promotes_a_complete_staged_snapshot() {
+        let root = temp_root();
+        committed_collection(&root, "snap", "k", 1).await;
+        committed_collection(&root, "t", "k", 2).await;
+
+        crate::util::rename_with_retry(&root.join("t"), &root.join("t.old")).unwrap();
+        crate::util::write_atomic(&root.join("snap"), INSTALL_MARKER, b"1").unwrap();
+        crate::util::rename_with_retry(&root.join("snap"), &root.join("t.tmp")).unwrap();
+
+        let db = Database::new(&root).unwrap();
+        assert_eq!(db.get_collection("t").unwrap().get("k").unwrap(),
+            Some(serde_json::json!({"v": 1})),
+            "a crash after live→old must finish the install from the staged snapshot");
+        assert!(root.join("t").is_dir());
+        assert!(!root.join("t.tmp").exists());
+        assert!(!root.join("t.old").exists());
+        assert!(!root.join("snap").exists());
+    }
+
+    #[tokio::test]
+    async fn ib008_incomplete_staging_restores_the_backed_up_collection() {
+        let root = temp_root();
+        committed_collection(&root, "app.events", "k", 7).await;
+        crate::util::rename_with_retry(&root.join("app.events"), &root.join("app.events.old")).unwrap();
+        fs::create_dir_all(root.join("app.events.tmp")).unwrap();
+
+        let db = Database::new(&root).unwrap();
+        assert_eq!(db.list_collections().unwrap(), vec!["app.events".to_string()]);
+        assert_eq!(db.get_collection("app.events").unwrap().get("k").unwrap(),
+            Some(serde_json::json!({"v": 7})));
+        assert!(!root.join("app.events.tmp").exists());
+        assert!(!root.join("app.events.old").exists());
+    }
+
+    #[tokio::test]
+    async fn ib008_boot_drops_leftover_backup_once_the_live_directory_opens() {
+        let root = temp_root();
+        committed_collection(&root, "t", "k", 1).await;
+        fs::create_dir_all(root.join("t.old")).unwrap();
+
+        let db = Database::new(&root).unwrap();
+        assert_eq!(db.get_collection("t").unwrap().get("k").unwrap(),
+            Some(serde_json::json!({"v": 1})));
+        assert!(!root.join("t.old").exists());
     }
 }
