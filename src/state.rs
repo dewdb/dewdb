@@ -163,6 +163,20 @@ impl AppState {
         0
     }
 
+    /// The term this node may append under, read as one sample so leadership and term cannot be
+    /// taken from either side of a demotion. `None` is a node with no authority to append.
+    pub fn leader_term(&self) -> Option<u64> {
+        let g = self.replication.as_ref()?.read().unwrap();
+        g.is_leader.then_some(g.term)
+    }
+
+    /// Whether an append made under `term` still has leadership behind it. Both halves of a
+    /// step-down are caught: `relinquish_leadership` keeps the term and drops the claim, while
+    /// `apply_demotion` moves the term.
+    pub fn still_leading(&self, term: u64) -> bool {
+        self.leader_term() == Some(term)
+    }
+
     // Acks from an older term are recorded but never advance the watermark:
     // only current-term entries count toward a quorum.
     pub fn note_ack(&self, replica: &str, collection: &str, lsn: u64, ack_term: u64) -> io::Result<u64> {

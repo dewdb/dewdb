@@ -78,6 +78,9 @@ pub struct Collection {
     pub rewriting: std::sync::Mutex<()>,
     pub cache: ReadCacheConfig,
     pub inline_bytes: AtomicU64,
+    /// Inline bytes held by staged frames, which the committed-only index cannot count. The same
+    /// budget, since it is the same memory; released when the frame commits or is truncated away.
+    pub staged_inline: AtomicU64,
     // This collection's fsynced tail, distinct from the database-wide durable_lsn.
     pub durable_lsn: AtomicU64,
     // Durable but uncommitted. The index holds committed state only: a leader change can still revoke these.
@@ -329,6 +332,7 @@ impl Collection {
             rewriting: std::sync::Mutex::new(()),
             cache,
             inline_bytes: AtomicU64::new(inline_total),
+            staged_inline: AtomicU64::new(staged_inline),
             durable_lsn: AtomicU64::new(boot_lsn),
             pending: std::sync::Mutex::new(pending),
             applied_lsn: AtomicU64::new(applied_at),
@@ -347,13 +351,34 @@ impl Collection {
     pub fn build_entry(&self, wal_id: u64, offset: u64, payload: &[u8]) -> IndexEntry {
         let len = payload.len() as u32;
         let inline = if len <= self.cache.inline_max_value_bytes
-            && self.inline_bytes.load(Ordering::Relaxed) + len as u64 <= self.cache.inline_budget_bytes
+            && self.inline_resident() + len as u64 <= self.cache.inline_budget_bytes
         {
             Some(payload.to_vec().into_boxed_slice())
         } else {
             None
         };
         IndexEntry { wal_id, offset, len, inline }
+    }
+
+    /// Committed plus staged inline bytes -- the budget bounds resident memory, and a staged frame's
+    /// copy is as resident as a committed one.
+    pub fn inline_resident(&self) -> u64 {
+        self.inline_bytes.load(Ordering::Relaxed) + self.staged_inline.load(Ordering::Relaxed)
+    }
+
+    /// `build_entry` plus the reservation the frame holds until it commits or is truncated. Without
+    /// it a burst of uncommitted writes each sizes itself against the same unused budget (M11).
+    fn reserve_staged_entry(&self, wal_id: u64, offset: u64, payload: &[u8]) -> IndexEntry {
+        let entry = self.build_entry(wal_id, offset, payload);
+        self.staged_inline.fetch_add(entry.inline_bytes(), Ordering::Relaxed);
+        entry
+    }
+
+    /// Called for every staged frame that leaves `pending`, by commit or by truncation.
+    pub(super) fn release_staged(&self, effect: &StagedEffect) {
+        if let StagedEffect::Put { entry, .. } = effect {
+            self.staged_inline.fetch_sub(entry.inline_bytes(), Ordering::Relaxed);
+        }
     }
 
     pub fn apply_index_put(&self, index: &mut BTreeMap<String, IndexEntry>, key: String, entry: IndexEntry) {
@@ -1075,7 +1100,7 @@ impl Collection {
             // `wal_writer`: a definition just below this frame is already in force for it.
             LogEntry::Put { key, value, .. } => StagedEffect::Put {
                 key: key.clone(),
-                entry: self.build_entry(wal_id, offset, payload),
+                entry: self.reserve_staged_entry(wal_id, offset, payload),
                 indexed: index_values(&Self::overlay_index_specs(&committed_specs, &pending), value),
             },
             LogEntry::Del { key, .. } => StagedEffect::Remove { key: key.clone() },
@@ -1085,7 +1110,10 @@ impl Collection {
             LogEntry::Handover { handover, .. } => StagedEffect::RecordHandover(handover.clone()),
             LogEntry::Index { change, .. } => StagedEffect::DefineIndex(change.clone()),
         };
-        pending.insert(lsn, StagedApply { wal_id, offset, term, effect });
+        // A frame landing on an LSN we already hold displaces it; its reservation goes with it.
+        if let Some(old) = pending.insert(lsn, StagedApply { wal_id, offset, term, effect }) {
+            self.release_staged(&old.effect);
+        }
     }
 
     /// No managed frame may reach the WAL before recovery can distinguish it from committed history.
@@ -1292,6 +1320,9 @@ impl Collection {
                             self.rich_gen.fetch_add(1, Ordering::SeqCst);
                         },
                     }
+                    // After the index has been charged, never before: the overlap over-reports for
+                    // an instant, where the gap would let a concurrent append inline past the budget.
+                    self.release_staged(&staged.effect);
                 }
             }
 
@@ -1460,7 +1491,11 @@ impl Collection {
         // are ended rather than left waiting on a feed nothing will ever publish to again.
         self.changefeed.close();
         self.drain_read_pool(u64::MAX);
-        self.pending.lock().unwrap().clear();
+        {
+            let mut pending = self.pending.lock().unwrap();
+            pending.clear();
+            self.staged_inline.store(0, Ordering::Relaxed);
+        }
         self.index.write().unwrap().clear();
         // The definitions stay: the log still says they exist, and the collection reopened over
         // the installed directory rebuilds their postings from whatever it now holds.
@@ -2515,6 +2550,72 @@ mod tests {
         }
         assert!(col.get("k").unwrap().is_none(), "a deleted key must not be served from cache");
         assert_eq!(col.inline_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    fn staged_inline_sum(col: &Arc<Collection>) -> u64 {
+        col.pending.lock().unwrap().values()
+            .filter_map(|s| match &s.effect {
+                StagedEffect::Put { entry, .. } => Some(entry.inline_bytes()),
+                _ => None,
+            })
+            .sum()
+    }
+
+    /// IB-013: every staged value was measured against committed `inline_bytes` alone, so a burst
+    /// of uncommitted writes each inlined against the same unused budget. M11 covered replay only.
+    #[tokio::test]
+    async fn ib013_staged_values_are_charged_to_the_inline_budget() {
+        let root = temp_root();
+        const BUDGET: u64 = 100;
+        let db = Database::with_config(&root, cache_cfg(512, BUDGET), Default::default()).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        let mut tail = 0;
+        for i in 0..10 {
+            tail = stage_put(&col, &format!("k{}", i), i);
+        }
+
+        let staged = staged_inline_sum(&col);
+        assert!(staged > 0, "some staged frame must be inlined, or this tests nothing");
+        assert!(staged <= BUDGET,
+            "staging inlined {} bytes against a {} byte budget", staged, BUDGET);
+        assert_eq!(col.staged_inline.load(Ordering::Relaxed), staged,
+            "the reservation must match what the staged frames actually hold");
+
+        col.apply_committed(tail).unwrap();
+        assert_eq!(col.staged_inline.load(Ordering::Relaxed), 0,
+            "committing must hand every reservation back");
+        assert!(col.inline_bytes.load(Ordering::Relaxed) <= BUDGET,
+            "committing the batch left {} inline bytes against a {} byte budget",
+            col.inline_bytes.load(Ordering::Relaxed), BUDGET);
+
+        for i in 0..10 {
+            assert_eq!(col.get(&format!("k{}", i)).unwrap(), Some(serde_json::json!({"v": i})),
+                "a value the budget refused to inline still resolves from the WAL");
+        }
+    }
+
+    /// The staged reservation is only correct if it is released by every path a staged frame leaves
+    /// `pending` on. Here that is an overwrite of the same key, then a delete on top of it.
+    #[tokio::test]
+    async fn ib013_a_staged_reservation_survives_replacement_and_release() {
+        let root = temp_root();
+        let db = Database::with_config(&root, cache_cfg(512, 1 << 20), Default::default()).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        stage_put(&col, "k", 1);
+        let one = col.staged_inline.load(Ordering::Relaxed);
+        assert!(one > 0, "a small value under an ample budget must inline");
+
+        stage_put(&col, "k", 2);
+        assert_eq!(col.staged_inline.load(Ordering::Relaxed), one * 2,
+            "two staged versions of a key hold two copies, and both are resident");
+
+        let tail = stage_delete(&col, "k");
+        col.apply_committed(tail).unwrap();
+        assert_eq!(col.staged_inline.load(Ordering::Relaxed), 0);
+        assert_eq!(col.inline_bytes.load(Ordering::Relaxed), 0,
+            "the key is gone, so neither counter may still hold its bytes");
     }
 
     /// bugs.md M11: replay inlined a staged frame on value size alone, so a node restarting on a

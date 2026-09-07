@@ -305,7 +305,9 @@ impl Collection {
             let cut = pending.get(&doomed[0]).map(|s| (s.wal_id, s.offset));
             self.rewind_index_tail(prev_lsn, prev_term)?;
             for lsn in doomed {
-                pending.remove(&lsn);
+                if let Some(dropped) = pending.remove(&lsn) {
+                    self.release_staged(&dropped.effect);
+                }
             }
             cut
         };
@@ -1180,6 +1182,41 @@ mod tests {
         let col2 = reopened.get_collection("c").unwrap();
         assert_eq!(col2.last_appended(), (2, 3), "and the truncation must survive a restart");
         assert_eq!(col2.get("k3").unwrap(), Some(serde_json::json!({"v": 99})));
+    }
+
+    /// IB-013: a truncated frame's inline copy is freed with it, so the reservation must go too --
+    /// otherwise a replica that repeatedly loses its tail leaks the budget until nothing inlines.
+    #[tokio::test]
+    async fn ib013_truncation_returns_the_staged_inline_reservation() {
+        let root = temp_root();
+        let cache = ReadCacheConfig { inline_max_value_bytes: 512, inline_budget_bytes: 1 << 20 };
+        let db = Database::with_config(&root, cache, Default::default()).unwrap();
+        let col = db.get_collection("c").unwrap();
+
+        replicate_term_one(&col, 3);
+        let three_staged = col.staged_inline.load(Ordering::Relaxed);
+        assert!(three_staged > 0, "the replicated frames must be inlined, or this tests nothing");
+
+        // A new leader replaces lsn 2 and everything above it.
+        match col.append_raw_frame(&make_frame(2, 2, 1, 1, "k2", 99)).unwrap() {
+            ReplicaApply::Applied { lsn } => assert_eq!(lsn, 2),
+            other => panic!("an uncommitted tail is the leader's to replace: {:?}", other),
+        }
+        assert_eq!(col.pending_len(), 2);
+        let held: u64 = col.pending.lock().unwrap().values()
+            .filter_map(|s| match &s.effect {
+                StagedEffect::Put { entry, .. } => Some(entry.inline_bytes()),
+                _ => None,
+            })
+            .sum();
+        assert!(held < three_staged, "the truncation must have dropped inlined frames");
+        assert_eq!(col.staged_inline.load(Ordering::Relaxed), held,
+            "the frames the truncation dropped must give their bytes back");
+
+        col.apply_committed(2).unwrap();
+        assert_eq!(col.staged_inline.load(Ordering::Relaxed), 0);
+        assert_eq!(col.inline_bytes.load(Ordering::Relaxed),
+            col.index.read().unwrap().values().map(|e| e.inline_bytes()).sum::<u64>());
     }
 
     #[tokio::test]

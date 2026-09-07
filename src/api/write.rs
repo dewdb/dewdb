@@ -41,6 +41,31 @@ async fn settle_commit(commit: CommitWait) -> Result<(), axum::response::Respons
     }
 }
 
+/// 503 and not 403: the router retries a write on the rest of the group, and the node that took
+/// the term is in it, where an authoritative status would hand the client a refusal instead.
+fn not_leading_response(col_name: &str) -> axum::response::Response {
+    err_json(StatusCode::SERVICE_UNAVAILABLE, format!(
+        "no longer leading {}; retry against the current primary", col_name))
+}
+
+/// The term an append is stamped with, sampled here and not in the handler, whose leadership check
+/// precedes the write gate and the key locks a deposed node can sit parked on (IB-012).
+fn append_term(state: &AppState, col_name: &str) -> Result<u64, axum::response::Response> {
+    match state.leader_term() {
+        Some(term) => Ok(term),
+        // No replication configured, so there is no leadership to lose; `finish_write` commits it
+        // on this node's own durability.
+        None if state.replication.is_none() => Ok(0),
+        None => Err(not_leading_response(col_name)),
+    }
+}
+
+/// The same fence after the fsync and the replica calls. `w=1` is what it exists for: this node
+/// supplies the one ack that concern needs, so the acks cannot show a doomed append as short.
+fn kept_authority(state: &AppState, term: u64) -> bool {
+    state.replication.is_none() || state.still_leading(term)
+}
+
 async fn local_write_inner(
     state: &AppState,
     col: &Arc<Collection>,
@@ -49,7 +74,7 @@ async fn local_write_inner(
 ) -> Result<PendingWrite, axum::response::Response> {
     let col_clone = col.clone();
     let key_clone = key.clone();
-    let term = state.current_term();
+    let term = append_term(state, &col.name)?;
     // Sampled under the key lock: created/replaced must reflect this write, not a racing one.
     // Staged included, so a replace of a key whose previous write has not committed is not a create.
     let existed = col.exists_including_staged(&key);
@@ -126,6 +151,10 @@ async fn finish_write(
             None => replicating.await,
         }
     };
+
+    if !kept_authority(state, term) {
+        return Err(not_leading_response(col_name));
+    }
 
     // Only after the fsync above: counting our own durability early would put an entry in the
     // commit index that this node could still lose.
@@ -253,7 +282,7 @@ pub async fn local_drop(
             _guards.push(lock.lock().await);
         }
 
-        let term = state.current_term();
+        let term = append_term(state, col_name)?;
         let col_clone = col.clone();
         let appended = tokio::task::spawn_blocking(move || col_clone.drop_marker(term)).await;
         let (frame, _wal_id, _offset, lsn) = match appended {
@@ -292,7 +321,7 @@ pub async fn local_index_change(
         Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     };
 
-    let term = state.current_term();
+    let term = append_term(state, col_name)?;
     let col_clone = col.clone();
     let appended = tokio::task::spawn_blocking(move || col_clone.define_index(change, term)).await;
     let (frame, _wal_id, _offset, lsn) = match appended {
@@ -362,6 +391,10 @@ async fn finish_write_batch(
         ).await
     };
 
+    if !kept_authority(state, term) {
+        return Err(not_leading_response(col_name));
+    }
+
     let own_durable = state
         .db
         .as_ref()
@@ -378,7 +411,7 @@ async fn local_write_batch_inner(
     col: &Arc<Collection>,
     items: Vec<(String, serde_json::Value)>,
 ) -> Result<Vec<PendingWrite>, axum::response::Response> {
-    let term = state.current_term();
+    let term = append_term(state, &col.name)?;
     // A key repeated inside one batch is replaced by its second write, and the pre-batch state
     // cannot show that: every sample here is taken before the first `put`.
     let mut batched: HashSet<&str> = HashSet::new();
@@ -563,33 +596,106 @@ mod tests {
         assert_eq!(body["existed"], true, "unfixed this deleted a key it said was not there: {}", body);
     }
 
-    /// C26: `finish_write` opened with `!state.is_leader()`, meant as "there is nothing to
-    /// replicate to". It is equally true of a leader deposed between the handler's leadership check
-    /// and the fsync after it, and that node answered `201` with `required: 1` whatever was asked,
-    /// for an entry that is unreplicated at a stale term and that the next leader truncates.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_write_that_lost_leadership_mid_flight_does_not_report_its_concern_met() {
-        let root = temp_root();
-        let db = Arc::new(Database::new(&root).unwrap());
-        let peers = vec![
-            format!("http://127.0.0.1:{}", next_test_port()),
-            format!("http://127.0.0.1:{}", next_test_port()),
-        ];
+    /// A primary whose `replication` is present but whose leadership is not. C26 and IB-012 are
+    /// both about this state; the difference is what reaches it.
+    fn deposed_node(root: &std::path::Path, replicas: usize) -> (AppState, Arc<Database>) {
+        let db = Arc::new(Database::new(root).unwrap());
+        let peers: Vec<String> = (0..replicas)
+            .map(|_| format!("http://127.0.0.1:{}", next_test_port()))
+            .collect();
         let config: NodeConfig = serde_json::from_value(serde_json::json!({
             "node_id": "n1", "role": "shard", "shard_role": "primary",
             "listen_addr": "127.0.0.1:1",
             "data_dir": root.to_string_lossy(),
             "replicas": peers, "peers": peers,
         })).unwrap();
-        // Deposed, not standalone: `replication` is present and `is_leader` is not.
-        let state = AppState::for_admission_test(config, db, false);
+        (AppState::for_admission_test(config, db.clone(), true), db)
+    }
 
-        let outcome = local_write(&state, "t", "k".into(), Some(serde_json::json!({"v": 1})),
-            WriteConcern::Majority, Duration::from_millis(250)).await.unwrap();
+    fn depose(state: &AppState) {
+        crate::consensus::state::relinquish_leadership(
+            &mut state.replication.as_ref().unwrap().write().unwrap());
+    }
 
-        assert_eq!(outcome.required, 2, "a majority of three voters, whoever is leading");
-        assert_eq!(outcome.acks, 1, "nothing but this node holds it");
-        assert!(!outcome.met, "an acknowledged write the next leader is going to truncate");
+    /// C26: `finish_write` opened with `!state.is_leader()`, meant as "there is nothing to
+    /// replicate to". It is equally true of a leader deposed between the handler's leadership check
+    /// and the fsync after it, and that node answered `201` with `required: 1` whatever was asked,
+    /// for an entry that is unreplicated at a stale term and that the next leader truncates.
+    ///
+    /// C26 routed that node onto the quorum path, where majority answered `202 acks: 1
+    /// required: 2`. IB-012 is why the append does not happen at all now: `w=1` needs one ack and
+    /// this node supplies it, so no arithmetic on the quorum path can catch it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_write_that_lost_leadership_mid_flight_does_not_report_its_concern_met() {
+        let root = temp_root();
+        let (state, db) = deposed_node(&root, 2);
+        depose(&state);
+
+        for wc in [WriteConcern::Local, WriteConcern::Majority, WriteConcern::All] {
+            let refusal = local_write(&state, "t", "k".into(), Some(serde_json::json!({"v": 1})),
+                wc, Duration::from_millis(250)).await.err().unwrap();
+            assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE,
+                "a deposed node has no term to append under, at any concern");
+        }
+
+        let col = db.get_collection("t").unwrap();
+        assert_eq!(col.last_appended_lsn(), 0,
+            "the refusal has to precede the append: a frame at a dead term still consumes the              uncommitted bound and still has to be truncated");
+        assert_eq!(col.pending_len(), 0);
+    }
+
+    /// IB-012, the reproduction: leadership is checked in the handler, and the write gate and key
+    /// locks are taken after it. A handler parked on one of those and deposed while it waited used
+    /// to append at the stale term it had captured, and at `w=1` `finish_write` counted the local
+    /// node and answered `201` for a value that is uncommitted, unreadable, and truncated by the
+    /// next leader.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_write_deposed_while_parked_on_the_key_lock_is_refused() {
+        let root = temp_root();
+        let (state, db) = deposed_node(&root, 2);
+        let col = db.get_collection("t").unwrap();
+
+        let held = col.key_lock("k").lock().await;
+        let parked = {
+            let state = state.clone();
+            tokio::spawn(async move {
+                local_write(&state, "t", "k".into(), Some(serde_json::json!({"v": 1})),
+                    WriteConcern::Local, Duration::from_millis(250)).await.err()
+            })
+        };
+        // The handler is past its leadership check and waiting on the lock this holds.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        depose(&state);
+        drop(held);
+
+        let refusal = parked.await.unwrap().expect("w=1 reported success on a deposed node");
+        assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(col.last_appended_lsn(), 0, "nothing was appended under the lost term");
+    }
+
+    /// The other side of the same fence: the term was held at the append and gone by the
+    /// acknowledgement. Nothing keeps leadership still across an fsync and a round of replica
+    /// calls, so the captured term is rechecked there too -- `w=1` is met by this node alone and
+    /// the quorum arithmetic cannot notice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_write_deposed_after_its_append_is_not_acknowledged() {
+        let root = temp_root();
+        let (state, db) = deposed_node(&root, 2);
+        let col = db.get_collection("t").unwrap();
+
+        let pending = {
+            let _guard = col.key_lock("k").lock().await;
+            super::local_write_inner(&state, &col, "k".into(), Some(serde_json::json!({"v": 1})))
+                .await.unwrap()
+        };
+        depose(&state);
+
+        let refusal = super::finish_write(&state, "t", pending, WriteConcern::Local,
+            Duration::from_millis(250)).await.err().unwrap();
+        assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(state.committed_lsn("t"), 0,
+            "a deposed node must not publish a commit watermark over its own append");
+        assert!(col.get("k").unwrap().is_none(), "and the value stays unreadable");
     }
 
     /// H7: the batch called `finish_write` per document, so a bulk of N paid N fan-outs for a run

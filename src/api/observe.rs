@@ -37,6 +37,7 @@ fn collection_metrics(db: &Database) -> Vec<serde_json::Value> {
             "pending_apply": col.pending_len(),
             "cached_documents": cached,
             "cache_bytes": col.inline_bytes.load(Ordering::Relaxed),
+            "staged_cache_bytes": col.staged_inline.load(Ordering::Relaxed),
             "compacting": col.compacting.load(Ordering::Relaxed),
             "dropped": col.is_dropped(),
             "changefeed": {
