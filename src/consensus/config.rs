@@ -17,17 +17,26 @@ pub fn is_system_collection(name: &str) -> bool {
 
 pub const MAX_COLLECTION_NAME_LEN: usize = 128;
 
-/// A collection name is both a directory under the data root and a replicated identity, so it is
-/// bounded to one ordinary path component here rather than wherever it is next joined or spliced.
-/// `.`-prefixed and `.tmp` / `.old` names are excluded because the directory walk reads those as
-/// staging leftovers rather than as collections.
+/// Win32 resolves a device name in any directory and ignores the extension, so the stem decides.
+fn is_windows_reserved(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name);
+    ["con", "prn", "aux", "nul",
+     "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+     "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9"]
+        .iter().any(|device| stem.eq_ignore_ascii_case(device))
+}
+
+/// Replicated identity and a directory name: lowercase-only, so no two valid names alias on a
+/// case-insensitive filesystem; `.`-prefixed and `.tmp` / `.old` read as staging, not collections.
 pub fn valid_collection_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_COLLECTION_NAME_LEN
         && !name.starts_with('.')
+        && !name.ends_with('.')
         && !name.ends_with(".tmp")
         && !name.ends_with(".old")
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        && !is_windows_reserved(name)
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'.'))
 }
 
 /// Majority of one half, by endpoint. `held` answers for a member this node has evidence about.
@@ -211,5 +220,18 @@ mod tests {
         }
         assert!(valid_collection_name(&"a".repeat(MAX_COLLECTION_NAME_LEN)));
         assert!(!valid_collection_name(&"a".repeat(MAX_COLLECTION_NAME_LEN + 1)));
+    }
+
+    #[test]
+    fn ib009_canonical_names_reject_case_and_filesystem_aliases() {
+        for name in [
+            "Orders", "orders.", "orders..", "users_A", "CON", "con", "nul", "aux", "prn",
+            "com1", "lpt1", "nul.events", "con.log",
+        ] {
+            assert!(!valid_collection_name(name), "alias {:?} must be rejected", name);
+        }
+        for name in ["orders", "users_a", "app.events-1", "a-b", CONFIG_LOG] {
+            assert!(valid_collection_name(name), "canonical {:?} should be accepted", name);
+        }
     }
 }

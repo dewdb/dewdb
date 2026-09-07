@@ -547,6 +547,97 @@ pub async fn replica_sync_from_primary(
     Ok(())
 }
 
+fn prepare_election_snapshot(
+    target: &Path,
+    name: &str,
+    local_tail: crate::consensus::election::LogTail,
+    local_applied: u64,
+    offered: crate::consensus::election::LogTail,
+    term: u64,
+) -> io::Result<()> {
+    use crate::consensus::election::LogTail;
+    use std::sync::atomic::AtomicU64;
+
+    validate_staged_snapshot(target, 0)?;
+    let staged = Collection::open(name.to_string(), target.to_path_buf(),
+        Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)),
+        Default::default(), Default::default())?;
+    let (last_term, last_lsn) = staged.last_appended();
+    let tail = LogTail { last_term, last_lsn };
+    // Only histories newer in Raft order may replace local entries, including uncommitted ones.
+    if tail < offered || tail <= local_tail || last_term > term || last_lsn < local_applied {
+        return Err(io::Error::new(io::ErrorKind::InvalidData,
+            "election snapshot does not preserve the required history"));
+    }
+    // A peer may hold the complete log without having learned our committed watermark.
+    if staged.applied_lsn() < local_applied {
+        staged.apply_committed(local_applied)?;
+        if staged.applied_lsn() != local_applied {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                "election snapshot is missing the locally committed position"));
+        }
+        staged.save_index()?;
+    }
+    Ok(())
+}
+
+pub async fn recover_from_peer(
+    state: &crate::state::AppState,
+    peer: &str,
+    name: &str,
+    offered: crate::consensus::election::LogTail,
+    term: u64,
+) -> Result<(), String> {
+    use crate::consensus::election::LogTail;
+
+    if !crate::consensus::config::valid_collection_name(name) {
+        return Err("invalid election collection name".into());
+    }
+    let quorum = state.quorum_config();
+    if !quorum.contains(peer) {
+        return Err("election snapshot source is not a voter".into());
+    }
+    let db = state.db.as_ref().ok_or("No database")?;
+    let _writes = state.write_gate.write().await;
+    let install = state.snapshot_install_lock(name);
+    let _install = install.lock().await;
+    if state.is_leader() || state.current_term() != term || state.resyncing.lock().unwrap().contains(name) {
+        return Err("node state changed during election recovery".into());
+    }
+    let local = db.lookup_collection(name).map_err(|e| e.to_string())?;
+    let (last_term, last_lsn) = local.as_ref().map_or((0, 0), |c| c.last_appended());
+    let local_tail = LogTail { last_term, last_lsn };
+    if offered <= local_tail {
+        return Ok(());
+    }
+    let response = state.client.get(format!("{peer}/internal/election-snapshot"))
+        .query(&[("collection", name)]).timeout(SNAPSHOT_TIMEOUT).send().await
+        .map_err(|e| e.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("Election snapshot returned {}", response.status()));
+    }
+    let target = db.root_path.join(format!("{name}.tmp"));
+    if target.exists() {
+        remove_dir_with_retry(&target).map_err(|e| e.to_string())?;
+    }
+    fs::create_dir(&target).map_err(|e| e.to_string())?;
+    let cleanup = SnapshotSpool(target.clone());
+    let mut reader = StreamReader::new(response.bytes_stream().map_err(io::Error::other));
+    receive_snapshot(&mut reader, &target).await.map_err(|e| e.to_string())?;
+
+    let _history = state.election_history.write().await;
+    if state.is_leader() || state.current_term() != term || state.quorum_config() != quorum {
+        return Err("node state changed during election recovery".into());
+    }
+    let local_applied = local.as_ref().map_or(0, |c| c.applied_lsn());
+    prepare_election_snapshot(&target, name, local_tail, local_applied, offered, term)
+        .map_err(|e| e.to_string())?;
+    db.install_staged_collection(name, &target).map_err(|e| e.to_string())?;
+    state.refresh_configuration();
+    drop(cleanup);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,6 +680,71 @@ mod tests {
         let stream = futures::stream::iter(vec![Ok::<_, io::Error>(Cursor::new(bytes))]);
         let mut reader = StreamReader::new(stream);
         receive_snapshot(&mut reader, target).await
+    }
+
+    #[tokio::test]
+    async fn ib010_recovery_preserves_a_commit_watermark_the_donor_has_not_learned() {
+        use crate::consensus::election::LogTail;
+
+        let root = temp_root();
+        let source_db = Database::new(root.join("source")).unwrap();
+        let source = source_db.get_collection("c").unwrap();
+        for lsn in 1..=3 {
+            source.append_raw_frame(&make_frame(1, lsn, lsn - 1,
+                if lsn == 1 { 0 } else { 1 }, &format!("k{lsn}"), lsn as i64)).unwrap();
+        }
+        source.enqueue_commit().await.unwrap().unwrap();
+        source.apply_committed(1).unwrap();
+        let receiver = Database::new(root.join("receiver")).unwrap();
+        let staged = receiver.root_path.join("c.tmp");
+        fs::create_dir(&staged).unwrap();
+        decode_bytes(collect_snapshot(source).await, &staged).await.unwrap();
+        prepare_election_snapshot(&staged, "c", LogTail { last_term: 1, last_lsn: 2 },
+            2, LogTail { last_term: 1, last_lsn: 3 }, 1).unwrap();
+        receiver.install_staged_collection("c", &staged).unwrap();
+        let col = receiver.get_collection("c").unwrap();
+        assert_eq!(col.applied_lsn(), 2);
+        assert_eq!(col.last_appended(), (1, 3));
+        assert_eq!(col.get("k2").unwrap().unwrap()["v"], 2);
+        assert!(col.get("k3").unwrap().is_none());
+        assert_eq!(col.pending_len(), 1);
+        col.apply_committed(3).unwrap();
+        assert_eq!(col.get("k3").unwrap().unwrap()["v"], 3);
+    }
+
+    #[tokio::test]
+    async fn ib010_recovery_refuses_stale_missing_and_future_histories() {
+        use crate::consensus::election::LogTail;
+
+        let root = temp_root();
+        let db = Database::new(root.join("source")).unwrap();
+        let source = db.get_collection("c").unwrap();
+        source.append_raw_frame(&make_frame(1, 1, 0, 0, "k", 1)).unwrap();
+        source.append_raw_frame(&make_frame(2, 2, 1, 1, "pending", 2)).unwrap();
+        source.enqueue_commit().await.unwrap().unwrap();
+        source.apply_committed(1).unwrap();
+        let wire = collect_snapshot(source).await;
+        let cases = [
+            ((2, 2), 1, (2, 2), 2),
+            ((3, 1), 1, (2, 2), 3),
+            ((1, 1), 1, (2, 3), 2),
+            ((1, 1), 1, (2, 2), 1),
+            ((1, 3), 3, (2, 2), 2),
+        ];
+        for (i, (local, applied, offered, term)) in cases.into_iter().enumerate() {
+            let staged = root.join(format!("refused-{i}.tmp"));
+            fs::create_dir(&staged).unwrap();
+            decode_bytes(wire.clone(), &staged).await.unwrap();
+            let err = prepare_election_snapshot(&staged, "c",
+                LogTail { last_term: local.0, last_lsn: local.1 }, applied,
+                LogTail { last_term: offered.0, last_lsn: offered.1 }, term).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+        let staged = root.join("newer-term.tmp");
+        fs::create_dir(&staged).unwrap();
+        decode_bytes(wire, &staged).await.unwrap();
+        prepare_election_snapshot(&staged, "c", LogTail { last_term: 1, last_lsn: 3 },
+            1, LogTail { last_term: 2, last_lsn: 2 }, 2).unwrap();
     }
 
     /// Entry names in the order the stream carries them, which `receive_snapshot` discards.
@@ -1068,11 +1224,8 @@ mod tests {
         assert!(!root.join("x.log").exists());
     }
 
-    /// IB-008 follow-up: `<name>.tmp` is both the install staging directory and the directory a
-    /// download streams into. Treating a complete-looking download as an install to finish let
-    /// `existing_collection` -- called here, between the transfer and validation -- promote the
-    /// staged directory out from under this function, so every first sync of a collection the
-    /// replica does not already hold failed with the snapshot already live and unvalidated.
+    /// `<name>.tmp` is both install staging and the download target, so treating a complete-looking
+    /// download as an install let the `existing_collection` probe below promote it before validation.
     #[tokio::test]
     async fn a_first_sync_does_not_install_the_download_before_it_is_validated() {
         let root = temp_root();

@@ -7,7 +7,7 @@ use crate::consensus::config::CONFIG_LOG;
 use crate::consensus::lease;
 use crate::consensus::election::run_election;
 use crate::consensus::{
-    decide_pre_vote, decide_vote, demote, heartbeat_poll_task, local_log_tails, log_summary,
+    decide_pre_vote, decide_vote, demote, heartbeat_poll_task, log_summary,
     ReplicationMeta, VoteRequest, VoteResponse,
 };
 use crate::model::err_json;
@@ -603,6 +603,7 @@ pub async fn pre_vote_handler(
     State(state): State<AppState>,
     Json(req): Json<VoteRequest>,
 ) -> impl axum::response::IntoResponse {
+    let _history = state.election_history.read().await;
     if !state.is_shard() || !state.in_quorum() {
         return (StatusCode::FORBIDDEN, "Not a voting node").into_response();
     }
@@ -613,7 +614,10 @@ pub async fn pre_vote_handler(
     };
 
     // Collected before the replication lock: local_log_tails reaches the collections lock.
-    let my_logs = local_log_tails(&state);
+    let my_logs = match crate::consensus::election::try_local_log_tails(&state) {
+        Ok(logs) => logs,
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
     let my_summary = log_summary(&state, &my_logs);
 
     let (term, granted) = {
@@ -636,6 +640,7 @@ pub async fn vote_handler(
     State(state): State<AppState>,
     Json(req): Json<VoteRequest>,
 ) -> impl axum::response::IntoResponse {
+    let _history = state.election_history.read().await;
     // Granting is quorum participation, not just standing, so it takes the same predicate the
     // candidate side does: a node absent from every threshold can only push a candidate past one.
     if !state.is_shard() || !state.in_quorum() {
@@ -648,7 +653,10 @@ pub async fn vote_handler(
     };
 
     // Collected before the replication lock: local_log_tails reaches the collections lock.
-    let my_logs = local_log_tails(&state);
+    let my_logs = match crate::consensus::election::try_local_log_tails(&state) {
+        Ok(logs) => logs,
+        Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    };
     let my_summary = log_summary(&state, &my_logs);
     let (my_config, contact, granted_until, since_boot) = {
         let g = repl.read().unwrap();
@@ -715,6 +723,23 @@ pub struct SnapshotQuery {
     pub collection: String,
 }
 
+pub async fn election_histories_handler(State(state): State<AppState>) -> axum::response::Response {
+    let _history = state.election_history.read().await;
+    match crate::consensus::election::try_local_log_tails(&state) {
+        Ok(logs) => Json(crate::consensus::recovery::ElectionHistories {
+            term: state.current_term(), logs,
+        }).into_response(),
+        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
+pub async fn election_snapshot_handler(
+    State(state): State<AppState>,
+    Query(params): Query<SnapshotQuery>,
+) -> axum::response::Response {
+    serve_snapshot(&state, &params.collection)
+}
+
 pub async fn snapshot_handler(
     State(state): State<AppState>,
     Query(params): Query<SnapshotQuery>,
@@ -722,6 +747,11 @@ pub async fn snapshot_handler(
     if !state.is_leader() {
         return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "Only primary nodes serve snapshots"}))).into_response();
     }
+
+    serve_snapshot(&state, &params.collection)
+}
+
+fn serve_snapshot(state: &AppState, collection: &str) -> axum::response::Response {
 
     let db = match state.db.as_ref() {
         Some(db) => db.clone(),
@@ -731,10 +761,10 @@ pub async fn snapshot_handler(
     // Serving with `get_collection` created what it was asked for, so any name a caller sent cost
     // a directory, a wal and a commit task here (bugs.md H18). Empty is also the wrong answer: the
     // asker cannot tell it from a collection this node genuinely holds nothing of.
-    let col = match db.lookup_collection(&params.collection) {
+    let col = match db.lookup_collection(collection) {
         Ok(Some(c)) => c,
         Ok(None) => return err_json(StatusCode::NOT_FOUND,
-            format!("no collection '{}' on this node", params.collection)),
+            format!("no collection '{}' on this node", collection)),
         Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
 

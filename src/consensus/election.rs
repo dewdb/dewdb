@@ -60,18 +60,21 @@ pub struct VoteDecision {
 // Opens every collection on disk: one we have not opened yet still holds entries we could lose.
 // Takes the collections lock, so never call this while holding the replication lock.
 pub fn local_log_tails(state: &AppState) -> HashMap<String, LogTail> {
+    try_local_log_tails(state).unwrap_or_default()
+}
+
+pub fn try_local_log_tails(state: &AppState) -> std::io::Result<HashMap<String, LogTail>> {
     let db = match state.db.as_ref() {
         Some(d) => d,
-        None => return HashMap::new(),
+        None => return Ok(HashMap::new()),
     };
     let mut tails = HashMap::new();
-    for name in db.list_collections().unwrap_or_default() {
-        if let Ok(col) = db.get_collection(&name) {
-            let (last_term, last_lsn) = col.last_appended();
-            tails.insert(name, LogTail { last_term, last_lsn });
-        }
+    for name in db.list_collections()? {
+        let col = db.get_collection(&name)?;
+        let (last_term, last_lsn) = col.last_appended();
+        tails.insert(name, LogTail { last_term, last_lsn });
     }
-    tails
+    Ok(tails)
 }
 
 /// The database-wide `(term, lsn)` pair for peers that predate per-collection `logs`.
@@ -293,6 +296,7 @@ async fn ask_peers(
 /// to avoid disturbing a live leader is exactly what a transfer must skip -- the jitter, adopting
 /// the leader that is standing aside, and the pre-vote round it would lose by asking.
 pub async fn run_election(state: &AppState, max_delay_ms: u64, forced_by: Option<String>) {
+    let Ok(_campaign) = state.campaign.try_lock() else { return };
     let forced = forced_by.is_some();
     if !forced {
         let delay_ms = election_jitter(&state.config.node_id, max_delay_ms);
@@ -321,7 +325,13 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64, forced_by: Option
     }
 
     // Order matters: the summary is only as fresh as the collections local_log_tails has opened.
-    let my_logs = local_log_tails(state);
+    let my_logs = match try_local_log_tails(state) {
+        Ok(logs) => logs,
+        Err(e) => {
+            warn!(target: "election", error = %e, "Cannot read election histories");
+            return;
+        },
+    };
     let my_tail = log_summary(state, &my_logs);
     let candidate_id = state.config.node_id.clone();
 
@@ -350,6 +360,9 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64, forced_by: Option
         if !quorum.has_quorum(&willing) {
             info!(target: "election", "Pre-vote {:?} is short of a quorum for term {}; not standing",
                 willing, asking);
+            if let Err(e) = super::recovery::recover_histories(state, &quorum).await {
+                warn!(target: "election", error = %e, "Election history recovery failed; will retry");
+            }
             return;
         }
     }

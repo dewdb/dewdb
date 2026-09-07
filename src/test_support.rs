@@ -370,6 +370,8 @@ impl TestNode {
                     migrations: Arc::new(std::sync::Mutex::new(MigrationRuns::restored(&config.data_dir))),
                     webhooks: Arc::new(crate::webhook::WebhookStore::restored(&config.data_dir)),
                     write_gate: Arc::new(tokio::sync::RwLock::new(())),
+                    campaign: Arc::new(tokio::sync::Mutex::new(())),
+                    election_history: Arc::new(tokio::sync::RwLock::new(())),
                 };
 
                 let app = build_app(&state);

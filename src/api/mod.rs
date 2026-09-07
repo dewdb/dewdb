@@ -25,7 +25,7 @@ use internal::{
     migrate_cleanup_handler, migrate_handler, migrate_reset_handler,
     migration_status_handler,
     pre_vote_handler, replicate_handler, resync_handler, snapshot_handler,
-    timeout_now_handler, vote_handler,
+    timeout_now_handler, vote_handler, election_histories_handler, election_snapshot_handler,
 };
 use members::{
     configuration_handler, join_handler, leave_handler, set_configuration_handler,
@@ -84,6 +84,8 @@ pub fn build_app(state: &AppState) -> Router {
             .route("/internal/replicate", post(replicate_handler)
                 .layer(DefaultBodyLimit::max(MAX_INTERNAL_BODY)))
             .route("/internal/snapshot", get(snapshot_handler))
+            .route("/internal/election-histories", get(election_histories_handler))
+            .route("/internal/election-snapshot", get(election_snapshot_handler))
             .route("/internal/resync", post(resync_handler))
             .route("/internal/vote", post(vote_handler))
             .route("/internal/pre-vote", post(pre_vote_handler))

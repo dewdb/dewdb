@@ -2,7 +2,7 @@
 
 use super::collection::Collection;
 use crate::consensus::config::{is_system_collection, valid_collection_name};
-use super::index::{AppliedMeta, LsnMeta, ReadCacheConfig};
+use super::index::{AppliedMeta, INDEX_FILENAME, LsnMeta, ReadCacheConfig};
 use crate::changefeed::ChangefeedConfig;
 use crate::util::{remove_dir_with_retry, rename_with_retry, write_atomic};
 use std::collections::{HashMap, HashSet};
@@ -40,12 +40,22 @@ fn install_base_name(dir_name: &str) -> Option<&str> {
     None
 }
 
-/// Only the marker, never the file set: `<name>.tmp` is also the directory a snapshot download
-/// streams into, and a complete-looking download is not yet an install anyone decided to make.
-/// A pre-marker crash state is recovered from `<name>.old` instead, which loses the snapshot but
-/// never the collection.
+/// The marker, never the file set: `<name>.tmp` is also a snapshot download target, and a
+/// complete-looking download is not an install. Without it, `<name>.old` is restored instead.
 fn staged_install_ready(dir: &Path) -> bool {
     dir.is_dir() && dir.join(INSTALL_MARKER).is_file()
+}
+
+fn holds_collection_data(dir: &Path) -> bool {
+    dir.join("applied.meta").is_file()
+        || dir.join(INDEX_FILENAME).is_file()
+        || fs::read_dir(dir).ok().is_some_and(|entries| {
+            entries.flatten().any(|entry| {
+                entry.file_name().to_str().is_some_and(|n| {
+                    n.starts_with("wal-") && n.ends_with(".log")
+                })
+            })
+        })
 }
 
 // durable_lsn is the highest LSN fsynced in any collection, not a prefix: a lower LSN in another
@@ -110,9 +120,33 @@ impl Database {
             next_lsn: Arc::new(AtomicU64::new(boot_lsn)),
             last_log_term: Arc::new(AtomicU64::new(0)),
         };
+        db.refuse_uncanonical_collections()?;
         db.reconcile_collection_installs()?;
         db.adopt_collection_tails()?;
         Ok(db)
+    }
+
+    /// A name the old rule allowed and this one cannot address: `list_collections` hides it, so its
+    /// tail is never adopted and the LSN it holds is handed out a second time. Refused, not skipped.
+    fn refuse_uncanonical_collections(&self) -> io::Result<()> {
+        for entry in fs::read_dir(&self.root_path)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let fname = entry.file_name();
+            let Some(name) = fname.to_str() else { continue };
+            if valid_collection_name(name) || install_base_name(name).is_some() {
+                continue;
+            }
+            if holds_collection_data(&entry.path()) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, format!(
+                    "collection directory '{}' holds data under a name this version cannot \
+                     address; rename it to [a-z0-9._-], no trailing '.', no Windows device name",
+                    name)));
+            }
+        }
+        Ok(())
     }
 
     /// Crash between `live→.old` and `.tmp→live` hides both suffixes from listing.
@@ -200,6 +234,10 @@ impl Database {
     }
 
     pub fn get_collection(&self, name: &str) -> io::Result<Arc<Collection>> {
+        if !valid_collection_name(name) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                format!("invalid collection name '{}'", name)));
+        }
         {
             let collections = self.collections.read().unwrap();
             if let Some(col) = collections.get(name) {
@@ -225,6 +263,10 @@ impl Database {
     /// `Ok(None)` is absent; a directory that is there and will not open stays an error, so a
     /// caller answering a client does not report a broken collection as a missing one.
     pub fn lookup_collection(&self, name: &str) -> io::Result<Option<Arc<Collection>>> {
+        if !valid_collection_name(name) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                format!("invalid collection name '{}'", name)));
+        }
         if let Some(col) = self.collections.read().unwrap().get(name) {
             return Ok(Some(col.clone()));
         }
@@ -403,6 +445,9 @@ impl Database {
     }
 
     pub fn is_dropped(&self, name: &str) -> bool {
+        if !valid_collection_name(name) {
+            return false;
+        }
         if let Some(col) = self.collections.read().unwrap().get(name) {
             return col.is_dropped();
         }
@@ -420,6 +465,9 @@ impl Database {
     }
 
     pub fn release_collection(&self, name: &str) -> io::Result<Option<PathBuf>> {
+        if !valid_collection_name(name) {
+            return Ok(None);
+        }
         let existing = self.collections.write().unwrap().remove(name);
         match existing {
             Some(col) => Ok(Some(col.release_handles()?)),
@@ -794,5 +842,70 @@ mod tests {
         assert_eq!(db.get_collection("t").unwrap().get("k").unwrap(),
             Some(serde_json::json!({"v": 1})));
         assert!(!root.join("t.old").exists());
+    }
+
+    #[tokio::test]
+    async fn ib009_case_and_trailing_dot_aliases_are_refused_by_database() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+
+        for alias in ["Orders", "orders.", "orders..", "users_A", "nul", "con"] {
+            match db.get_collection(alias) {
+                Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
+                Ok(_) => panic!("expected get_collection to fail for alias {}", alias),
+            }
+            match db.lookup_collection(alias) {
+                Err(err) => assert_eq!(err.kind(), io::ErrorKind::InvalidInput),
+                Ok(_) => panic!("expected lookup_collection to fail for alias {}", alias),
+            }
+        }
+
+        let orders = db.get_collection("orders").unwrap();
+        assert_eq!(db.collections.read().unwrap().len(), 1);
+
+        for alias in ["Orders", "orders.", "orders.."] {
+            assert!(db.get_collection(alias).is_err());
+            assert!(db.lookup_collection(alias).is_err());
+        }
+        assert_eq!(db.collections.read().unwrap().len(), 1);
+        assert_eq!(orders.name, "orders");
+        assert_eq!(db.list_collections().unwrap(), vec!["orders".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn ib009_a_legacy_alias_directory_refuses_boot_rather_than_hiding_its_tail() {
+        let root = temp_root();
+        {
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("orders").unwrap();
+            live_put(&col, "k", 1);
+            col.enqueue_commit().await.unwrap().unwrap();
+            live_put(&col, "tail", 2);
+            assert_eq!(col.last_appended(), (1, 2), "an appended tail above the commit watermark");
+            drop(col);
+            db.release_collection("orders").unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        crate::util::rename_with_retry(&root.join("orders"), &root.join("Orders")).unwrap();
+
+        let err = match Database::new(&root) {
+            Err(e) => e,
+            Ok(_) => panic!("a collection this version cannot address must not boot as if absent"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("Orders"),
+            "the operator needs the directory named: {}", err);
+    }
+
+    #[tokio::test]
+    async fn ib009_an_alias_directory_holding_no_collection_data_does_not_block_boot() {
+        let root = temp_root();
+        fs::create_dir_all(root.join("Orders")).unwrap();
+        fs::create_dir_all(root.join("users_A")).unwrap();
+
+        let db = Database::new(&root).unwrap();
+        assert!(db.list_collections().unwrap().is_empty());
+        assert!(db.get_collection("Orders").is_err());
+        assert!(db.get_collection("users_A").is_err());
     }
 }

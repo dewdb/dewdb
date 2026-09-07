@@ -238,6 +238,8 @@ async fn main() -> io::Result<()> {
         migrations: Arc::new(std::sync::Mutex::new(MigrationRuns::restored(&config.data_dir))),
         webhooks: Arc::new(WebhookStore::restored(&config.data_dir)),
         write_gate: Arc::new(tokio::sync::RwLock::new(())),
+        campaign: Arc::new(tokio::sync::Mutex::new(())),
+        election_history: Arc::new(tokio::sync::RwLock::new(())),
     };
 
     if config.shard_role.as_deref() == Some("replica") {

@@ -90,7 +90,7 @@ where
         }
         if !valid_collection_name(name) {
             return Err(err_json(StatusCode::BAD_REQUEST, format!(
-                "invalid collection name: expected 1-{} of [A-Za-z0-9._-]", MAX_COLLECTION_NAME_LEN)));
+                "invalid collection name: expected 1-{} of [a-z0-9._-]", MAX_COLLECTION_NAME_LEN)));
         }
         Ok(Self(captured))
     }
@@ -280,5 +280,22 @@ mod tests {
         assert_eq!(body["shards"][0]["status"].as_u64(), Some(200),
             "the shard refused the router's forwarded credential: {}", body);
 
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ib009_api_refuses_collection_aliases() {
+        let root = temp_root();
+        let n = single_node(&root).await;
+        let c = reqwest::Client::new();
+
+        for alias in ["Orders", "orders.", "orders..", "users_A", "nul", "con"] {
+            let r = c.put(format!("{}/collections/{}/docs/k1", n.url(), alias))
+                .json(&serde_json::json!({"value": {"v": 1}})).send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST, "alias {} must return 400", alias);
+        }
+
+        let r = c.put(format!("{}/collections/orders/docs/k1", n.url()))
+            .json(&serde_json::json!({"value": {"v": 1}})).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
     }
 }
