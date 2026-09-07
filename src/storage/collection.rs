@@ -2320,6 +2320,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ib006_corrupt_position_cannot_retract_the_recovery_watermark() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+        for value in 1..=2 {
+            let lsn = stage_put(&col, "a", value);
+            col.sync_wal().unwrap();
+            col.apply_committed(lsn).unwrap();
+        }
+        let dir = root.join("c");
+        assert_eq!(AppliedMeta::load(&dir).unwrap().unwrap().applied_lsn, 0);
+        assert_eq!(Collection::recorded_watermark(&dir).unwrap(), Some(2));
+        drop(col);
+        db.release_collection("c").unwrap();
+        let path = dir.join("applied.pos");
+        let intact = fs::read(&path).unwrap();
+        let mut bad_magic = intact.clone();
+        bad_magic[..4].copy_from_slice(b"BAD!");
+        bad_magic[512..516].copy_from_slice(b"BAD!");
+        for damaged in [bad_magic, intact[..23].to_vec(), Vec::new()] {
+            fs::write(&path, &damaged).unwrap();
+            assert_eq!(Collection::recorded_watermark(&dir).unwrap_err().kind(),
+                io::ErrorKind::InvalidData);
+            assert!(db.get_collection("c").is_err());
+            assert_eq!(fs::read(&path).unwrap(), damaged);
+        }
+        fs::write(&path, intact).unwrap();
+        let recovered = db.get_collection("c").unwrap();
+        assert_eq!(recovered.applied_lsn(), 2);
+        assert_eq!(recovered.pending_len(), 0);
+        assert_eq!(recovered.get("a").unwrap(), Some(serde_json::json!({"v": 2})));
+    }
+
+    #[tokio::test]
     async fn key_locks_are_stable_and_striped() {
         let root = temp_root();
         let db = Database::new(&root).unwrap();

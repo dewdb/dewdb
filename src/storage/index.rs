@@ -143,9 +143,7 @@ fn pos_encode(seq: u64, applied_lsn: u64) -> [u8; POS_RECORD] {
     out
 }
 
-/// Never written and damaged are different answers, the way they are for `AppliedMeta`: absence
-/// means replay from the full record, and reading damage as absence lowers the watermark, which is
-/// the truncation `H17` is about.
+// Reading damage as absence can lower the recovered watermark.
 enum Slot {
     Empty,
     Damaged,
@@ -153,8 +151,14 @@ enum Slot {
 }
 
 fn pos_decode(bytes: &[u8]) -> Slot {
-    if bytes.len() < POS_RECORD || u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != POS_MAGIC {
+    if bytes.len() != POS_SLOT as usize {
+        return Slot::Damaged;
+    }
+    if bytes.iter().all(|byte| *byte == 0) {
         return Slot::Empty;
+    }
+    if u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != POS_MAGIC {
+        return Slot::Damaged;
     }
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(&bytes[0..20]);
@@ -172,38 +176,44 @@ impl AppliedPos {
     /// is a data flush into blocks that already exist.
     pub fn open(col_dir: &Path) -> io::Result<Self> {
         let path = col_dir.join(POS_FILENAME);
-        let file = fs::OpenOptions::new().create(true).read(true).write(true).open(&path)?;
+        let file = match fs::OpenOptions::new().create_new(true).read(true).write(true).open(&path) {
+            Ok(file) => {
+                file.set_len(POS_SLOT * 2)?;
+                file.sync_all()?;
+                file
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists =>
+                fs::OpenOptions::new().read(true).write(true).open(&path)?,
+            Err(e) => return Err(e),
+        };
         let seq = Self::newest(&file)?.map_or(0, |(seq, _)| seq);
-        if file.metadata()?.len() != POS_SLOT * 2 {
-            file.set_len(POS_SLOT * 2)?;
-            file.sync_all()?;
-        }
         Ok(Self { file, seq })
     }
 
-    /// The higher-sequence slot that verifies. A short read is a file that was created and never
-    /// written, which is `Empty` rather than an error. Both slots damaged is an error: one of them
-    /// held a position, and answering "nothing recorded" would retract it.
+    // A torn record can leave a valid peer slot; an unexpected file size cannot prove that.
     fn newest(file: &fs::File) -> io::Result<Option<(u64, u64)>> {
         use std::io::{Read, Seek};
+        let len = file.metadata()?.len();
+        if len != POS_SLOT * 2 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                format!("{} has unexpected length {}; expected {} bytes", POS_FILENAME, len, POS_SLOT * 2)));
+        }
         let mut handle = file.try_clone()?;
         handle.seek(io::SeekFrom::Start(0))?;
         let mut buf = vec![0u8; (POS_SLOT * 2) as usize];
         let mut filled = 0;
         while filled < buf.len() {
             match handle.read(&mut buf[filled..]) {
-                Ok(0) => break,
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::InvalidData,
+                    format!("{} was truncated while reading its slots", POS_FILENAME))),
                 Ok(n) => filled += n,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {},
                 Err(e) => return Err(e),
             }
         }
 
-        let slots: Vec<Slot> = [0usize, POS_SLOT as usize].iter()
-            .map(|at| match buf.get(*at..at + POS_RECORD) {
-                Some(bytes) if at + POS_RECORD <= filled => pos_decode(bytes),
-                _ => Slot::Empty,
-            })
+        let slots: Vec<Slot> = buf.chunks_exact(POS_SLOT as usize)
+            .map(pos_decode)
             .collect();
 
         let newest = slots.iter()
@@ -256,5 +266,82 @@ impl LsnMeta {
         let content = serde_json::to_string(self)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         fs::write(dir.join("lsn.meta"), content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::temp_root;
+
+    #[test]
+    fn ib006_only_complete_zeroed_slots_are_unwritten() {
+        let dir = temp_root();
+        fs::create_dir_all(&dir).unwrap();
+        assert_eq!(AppliedPos::read(&dir).unwrap(), None);
+        drop(AppliedPos::open(&dir).unwrap());
+        let path = dir.join(POS_FILENAME);
+        let empty = fs::read(&path).unwrap();
+        assert_eq!(empty, vec![0; (POS_SLOT * 2) as usize]);
+        assert_eq!(AppliedPos::read(&dir).unwrap(), None);
+        drop(AppliedPos::open(&dir).unwrap());
+
+        for offset in [0, 4, 20, 24, 511, 512, 1023] {
+            let mut bytes = empty.clone();
+            bytes[offset] = 1;
+            fs::write(&path, &bytes).unwrap();
+            assert_eq!(AppliedPos::read(&dir).unwrap_err().kind(), io::ErrorKind::InvalidData,
+                "nonzero byte at {offset} is not an unwritten slot");
+            assert!(AppliedPos::open(&dir).is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn ib006_unexpected_position_lengths_are_refused_without_resizing() {
+        let dir = temp_root();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(POS_FILENAME);
+        for len in [0, 1, 23, 24, 511, 512, 513, 535, 536, 1023, 1025] {
+            for with_record in [false, true] {
+                let mut bytes = vec![0; len];
+                if with_record {
+                    let record = pos_encode(2, 42);
+                    let copied = len.min(POS_RECORD);
+                    bytes[..copied].copy_from_slice(&record[..copied]);
+                }
+                fs::write(&path, &bytes).unwrap();
+                assert_eq!(AppliedPos::read(&dir).unwrap_err().kind(), io::ErrorKind::InvalidData,
+                    "length {len}, with_record={with_record}");
+                assert!(AppliedPos::open(&dir).is_err());
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn ib006_bad_magic_preserves_the_valid_slot_and_next_save_sequence() {
+        let dir = temp_root();
+        fs::create_dir_all(&dir).unwrap();
+        let mut pos = AppliedPos::open(&dir).unwrap();
+        pos.save(10).unwrap();
+        pos.save(20).unwrap();
+        drop(pos);
+        let path = dir.join(POS_FILENAME);
+        let intact = fs::read(&path).unwrap();
+        for (offset, survivor) in [(0, 10), (POS_SLOT as usize, 20)] {
+            let mut bytes = intact.clone();
+            bytes[offset..offset + 4].copy_from_slice(b"BAD!");
+            fs::write(&path, bytes).unwrap();
+            assert_eq!(AppliedPos::read(&dir).unwrap(), Some(survivor));
+            let mut pos = AppliedPos::open(&dir).unwrap();
+            pos.save(30).unwrap();
+            drop(pos);
+            assert_eq!(AppliedPos::read(&dir).unwrap(), Some(30));
+            let mut pos = AppliedPos::open(&dir).unwrap();
+            pos.save(40).unwrap();
+            drop(pos);
+            assert_eq!(AppliedPos::read(&dir).unwrap(), Some(40));
+        }
     }
 }
