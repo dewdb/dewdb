@@ -170,6 +170,10 @@ pub async fn set_configuration_handler(
 
     // Only after the log committed it. The view records the outcome; it never decides it, so a
     // failure to publish costs routing accuracy and nothing in the quorum.
+    let _change = state.membership_changes.gate.lock().await;
+    if !state.is_leader() || state.quorum_config() != installed || pending_change(&state).is_some() {
+        return (StatusCode::OK, Json(configuration_body(&state))).into_response();
+    }
     let own = state.own_url();
     match plan_configuration(&state.cluster_view(), &state.config.node_id, &own, &installed.voters) {
         Ok(next) => {

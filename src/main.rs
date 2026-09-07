@@ -240,6 +240,7 @@ async fn main() -> io::Result<()> {
         write_gate: Arc::new(tokio::sync::RwLock::new(())),
         campaign: Arc::new(tokio::sync::Mutex::new(())),
         election_history: Arc::new(tokio::sync::RwLock::new(())),
+        membership_changes: Arc::new(Default::default()),
     };
 
     if config.shard_role.as_deref() == Some("replica") {

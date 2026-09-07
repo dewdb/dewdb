@@ -87,6 +87,7 @@ pub struct AppState {
     pub write_gate: Arc<tokio::sync::RwLock<()>>,
     pub campaign: Arc<tokio::sync::Mutex<()>>,
     pub election_history: Arc<tokio::sync::RwLock<()>>,
+    pub membership_changes: Arc<crate::consensus::reconfigure::MembershipChanges>,
 }
 
 /// Whether `incoming` carries a catalogue entry `current` does not already hold. Cheaper than the
@@ -482,6 +483,7 @@ impl AppState {
             write_gate: Arc::new(tokio::sync::RwLock::new(())),
             campaign: Arc::new(tokio::sync::Mutex::new(())),
             election_history: Arc::new(tokio::sync::RwLock::new(())),
+            membership_changes: Arc::new(Default::default()),
         }
     }
 
@@ -535,6 +537,7 @@ impl AppState {
             write_gate: Arc::new(tokio::sync::RwLock::new(())),
             campaign: Arc::new(tokio::sync::Mutex::new(())),
             election_history: Arc::new(tokio::sync::RwLock::new(())),
+            membership_changes: Arc::new(Default::default()),
         }
     }
 

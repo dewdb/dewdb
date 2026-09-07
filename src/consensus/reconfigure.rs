@@ -20,6 +20,27 @@ use tracing::{info, warn};
 const CONFIG_COMMIT_TIMEOUT: Duration = Duration::from_secs(10);
 const COMMIT_POLL_MS: u64 = 20;
 
+#[derive(Default)]
+pub struct MembershipChanges {
+    pub gate: tokio::sync::Mutex<()>,
+    #[cfg(test)]
+    before_append: std::sync::Mutex<Option<std::sync::Arc<AppendPause>>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct AppendPause {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+fn require_leader(state: &AppState, term: u64) -> Result<(), ChangeError> {
+    if !state.is_leader() || state.current_term() != term || !state.in_quorum() {
+        return Err(ChangeError::Refused("leadership changed; send the change to the current leader".into()));
+    }
+    Ok(())
+}
+
 impl ChangeError {
     pub fn why(&self) -> &str {
         match self {
@@ -28,6 +49,7 @@ impl ChangeError {
     }
 }
 
+#[derive(Debug)]
 pub enum ChangeError {
     /// The caller can retry elsewhere or later; nothing was appended.
     Refused(String),
@@ -86,7 +108,8 @@ fn validate(state: &AppState, current: &Configuration, next: &[String]) -> Resul
 
 /// Appends one configuration entry and waits for it to commit. The entry is in force before this
 /// returns either way: `refresh_configuration` runs on the append, not on the commit.
-async fn append_and_commit(state: &AppState, config: Configuration) -> Result<u64, ChangeError> {
+async fn append_and_commit(state: &AppState, config: Configuration, term: u64) -> Result<u64, ChangeError> {
+    require_leader(state, term)?;
     let db = state.db.as_ref()
         .ok_or_else(|| ChangeError::Refused("this node has no storage".to_string()))?;
     let col = db.get_collection(CONFIG_LOG)
@@ -99,7 +122,15 @@ async fn append_and_commit(state: &AppState, config: Configuration) -> Result<u6
         .filter(|m| !previous.contains(m))
         .collect();
 
-    let term = state.current_term();
+    #[cfg(test)]
+    {
+        let pause = state.membership_changes.before_append.lock().unwrap().take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
+    require_leader(state, term)?;
     let appended = {
         let col = col.clone();
         let config = config.clone();
@@ -146,6 +177,7 @@ async fn append_and_commit(state: &AppState, config: Configuration) -> Result<u6
     }
     state.apply_committed(CONFIG_LOG, state.committed_lsn(CONFIG_LOG))
         .map_err(|e| ChangeError::Stalled(e.to_string()))?;
+    require_leader(state, term).map_err(|e| ChangeError::Stalled(e.why().to_string()))?;
     Ok(lsn)
 }
 
@@ -178,6 +210,21 @@ pub async fn change_membership(
     state: &AppState,
     next: Vec<String>,
 ) -> Result<Configuration, ChangeError> {
+    let state = state.clone();
+    // Client cancellation must not release the gate while a blocking append can still finish.
+    tokio::spawn(async move {
+        let _change = state.membership_changes.gate.lock().await;
+        let term = state.current_term();
+        change_membership_locked(&state, next, term).await
+    }).await.map_err(|e| ChangeError::Stalled(e.to_string()))?
+}
+
+async fn change_membership_locked(
+    state: &AppState,
+    next: Vec<String>,
+    term: u64,
+) -> Result<Configuration, ChangeError> {
+    require_leader(state, term)?;
     let current = state.quorum_config();
     validate(state, &current, &next)?;
     if !next.iter().any(|v| same_endpoint(v, &state.own_url())) {
@@ -196,11 +243,11 @@ pub async fn change_membership(
         let joint = Configuration::joint(current.voters.clone(), target.voters.clone());
         info!(target: "membership", from = ?current.voters, to = ?target.voters,
             "Entering joint consensus");
-        append_and_commit(state, joint).await?;
+        append_and_commit(state, joint, term).await?;
     }
 
     info!(target: "membership", voters = ?target.voters, "Joint configuration committed; leaving it");
-    match append_and_commit(state, target.clone()).await {
+    match append_and_commit(state, target.clone(), term).await {
         Ok(_) => Ok(target),
         // The joint entry is committed, so both halves are still deciding together. Availability is
         // unchanged and correctness is not at risk; only the second entry is owed.
@@ -222,28 +269,31 @@ pub async fn change_membership(
 /// would let a majority of the incoming half alone commit both, which is the hole joint consensus
 /// exists to close.
 pub fn resume_change(state: &AppState) {
+    let state = state.clone();
+    let term = state.current_term();
+    tokio::spawn(async move { resume_change_serialized(&state, term).await });
+}
+
+async fn resume_change_serialized(state: &AppState, term: u64) {
+    let _change = state.membership_changes.gate.lock().await;
+    if !state.is_leader() || state.current_term() != term {
+        return;
+    }
     let committed = state.db.as_ref()
         .and_then(|db| db.existing_collection(CONFIG_LOG))
         .and_then(|col| col.committed_config());
     let Some(joint) = committed.filter(|c| c.is_joint()) else { return };
-
-    let state = state.clone();
-    let term = state.current_term();
-    tokio::spawn(async move {
-        if !state.is_leader() || state.current_term() != term {
-            return;
-        }
-        let target = joint.target();
-        info!(target: "membership", voters = ?target.voters,
-            "Inherited a joint configuration; appending the target it was heading for");
-        match append_and_commit(&state, target.clone()).await {
-            Ok(_) => info!(target: "membership", voters = ?target.voters, "Configuration change completed"),
-            // A redirect cannot reach here: the target of an inherited joint entry is the half
-            // this node is finishing from, and it is a member of it or it would not be leading.
-            Err(e) => warn!(target: "membership", error = %e.why(),
-                "Could not leave joint consensus; the next promotion will try again"),
-        }
-    });
+    if state.quorum_config() != joint || pending_change(state).is_some() {
+        return;
+    }
+    let target = joint.target();
+    info!(target: "membership", voters = ?target.voters,
+        "Inherited a joint configuration; appending the target it was heading for");
+    match change_membership_locked(state, target.voters.clone(), term).await {
+        Ok(_) => info!(target: "membership", voters = ?target.voters, "Configuration change completed"),
+        Err(e) => warn!(target: "membership", error = %e.why(),
+            "Could not leave joint consensus; the next promotion will try again"),
+    }
 }
 
 #[cfg(test)]
@@ -253,6 +303,174 @@ mod tests {
 
     fn urls(names: &[&str]) -> Vec<String> {
         names.iter().map(|n| format!("http://{}", n)).collect()
+    }
+
+    fn pause_append(state: &AppState) -> std::sync::Arc<AppendPause> {
+        let pause = std::sync::Arc::new(AppendPause::default());
+        *state.membership_changes.before_append.lock().unwrap() = Some(pause.clone());
+        pause
+    }
+
+    fn configurations(state: &AppState) -> Vec<Configuration> {
+        use crate::storage::frame::{LogEntry, HEADER_LEN};
+        state.db.as_ref().unwrap().get_collection(CONFIG_LOG).unwrap()
+            .read_frames_after(0, u64::MAX).unwrap().into_iter()
+            .filter_map(|(_, frame)| match serde_json::from_slice::<LogEntry>(&frame[HEADER_LEN..]).unwrap() {
+                LogEntry::Config { config, .. } => Some(config),
+                _ => None,
+            }).collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ib011_concurrent_requests_validate_against_the_completed_predecessor() {
+        let root = temp_root();
+        let (mut leader, mut a, mut b) = crate::test_support::three_node_cluster_with_timeout(&root, 30).await;
+        let state = leader.state.clone().unwrap();
+        let original = state.quorum_config();
+        let first_target = vec![leader.url(), a.url()];
+        let second_target = vec![leader.url()];
+        let pause = pause_append(&state);
+        let endpoint = format!("{}/cluster/configuration", leader.url());
+        let request = |target: Vec<String>| {
+            let endpoint = endpoint.clone();
+            tokio::spawn(async move {
+                reqwest::Client::new().post(endpoint).json(&serde_json::json!({"voters": target}))
+                    .send().await.unwrap().status()
+            })
+        };
+        let first = request(first_target.clone());
+        tokio::time::timeout(Duration::from_secs(5), pause.entered.notified()).await.unwrap();
+        let protected = state.membership_changes.gate.try_lock().is_err();
+        let mut second = request(second_target.clone());
+        let early = tokio::time::timeout(Duration::from_millis(150), &mut second).await;
+        let waited = early.is_err();
+        pause.release.notify_one();
+        assert_eq!(first.await.unwrap(), axum::http::StatusCode::OK);
+        let second_status = match early { Ok(result) => result.unwrap(), Err(_) => second.await.unwrap() };
+        assert_eq!(second_status, axum::http::StatusCode::OK);
+        assert!(protected && waited, "another request entered before the first validated append finished");
+        assert_eq!(configurations(&state), vec![
+            Configuration::joint(original.voters, first_target.clone()),
+            Configuration::simple(first_target.clone()),
+            Configuration::joint(first_target, second_target.clone()),
+            Configuration::simple(second_target.clone()),
+        ]);
+        assert_eq!(state.quorum_config(), Configuration::simple(second_target));
+        assert!(pending_change(&state).is_none());
+        drop(state);
+        leader.kill();
+        a.kill();
+        b.kill();
+        let db = crate::storage::Database::new(&leader.data_dir).unwrap();
+        assert_eq!(db.get_collection(CONFIG_LOG).unwrap().committed_config().unwrap().voters, vec![leader.url()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ib011_cancelling_a_request_keeps_its_transition_serialized() {
+        let root = temp_root();
+        let (mut leader, mut a, mut b) = crate::test_support::three_node_cluster_with_timeout(&root, 30).await;
+        let state = leader.state.clone().unwrap();
+        let target = vec![leader.url(), a.url()];
+        let pause = pause_append(&state);
+        let changing = state.clone();
+        let next = target.clone();
+        let request = tokio::spawn(async move { change_membership(&changing, next).await });
+        tokio::time::timeout(Duration::from_secs(5), pause.entered.notified()).await.unwrap();
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        let protected = state.membership_changes.gate.try_lock().is_err();
+        let retrying = state.clone();
+        let next = target.clone();
+        let retry = tokio::spawn(async move { change_membership(&retrying, next).await });
+        pause.release.notify_one();
+        assert_eq!(retry.await.unwrap().unwrap(), Configuration::simple(target));
+        assert!(protected, "client cancellation released an append still in flight");
+        assert_eq!(configurations(&state).len(), 2, "retry must not append a second transition");
+        drop(state);
+        leader.kill();
+        a.kill();
+        b.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ib011_resume_and_retries_share_one_transition_and_recheck_pending_entries() {
+        let root = temp_root();
+        let mut node = single_node(&root).await;
+        let state = node.state.clone().unwrap();
+        let target = vec![node.url()];
+        let joint = Configuration::joint(vec![node.url(), "http://gone".into()], target.clone());
+        let col = state.db.as_ref().unwrap().get_collection(CONFIG_LOG).unwrap();
+        let lsn = col.configure(joint.clone(), state.current_term()).unwrap().3;
+        col.enqueue_commit().await.unwrap().unwrap();
+        col.apply_committed(lsn).unwrap();
+        state.refresh_configuration();
+        let pause = pause_append(&state);
+        let resuming = state.clone();
+        let term = state.current_term();
+        let resume = tokio::spawn(async move { resume_change_serialized(&resuming, term).await });
+        tokio::time::timeout(Duration::from_secs(5), pause.entered.notified()).await.unwrap();
+        let protected = state.membership_changes.gate.try_lock().is_err();
+        let retrying = state.clone();
+        let next = target.clone();
+        let retry = tokio::spawn(async move { change_membership(&retrying, next).await });
+        pause.release.notify_one();
+        resume.await.unwrap();
+        retry.await.unwrap().unwrap();
+        resume_change_serialized(&state, term).await;
+        assert!(protected);
+        assert_eq!(configurations(&state), vec![joint.clone(), Configuration::simple(target.clone())]);
+
+        let joint_lsn = col.configure(joint, term).unwrap().3;
+        col.apply_committed(joint_lsn).unwrap();
+        col.configure(Configuration::simple(target), term).unwrap();
+        state.refresh_configuration();
+        let tail = col.last_appended();
+        resume_change_serialized(&state, term).await;
+        assert_eq!(col.last_appended(), tail, "resume must not append over a pending target");
+        assert!(pending_change(&state).is_some());
+        assert!(matches!(change_membership(&state, vec![node.url()]).await, Err(ChangeError::Refused(_))));
+        assert_eq!(col.last_appended(), tail);
+        col.apply_committed(tail.1).unwrap();
+        col.configure(Configuration::joint(vec![node.url()], vec![node.url(), "http://gone".into()]), term).unwrap();
+        state.refresh_configuration();
+        let tail = col.last_appended();
+        resume_change_serialized(&state, term).await;
+        assert_eq!(col.last_appended(), tail, "an uncommitted joint entry cannot be finalized");
+        drop(col);
+        drop(state);
+        node.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ib011_waiting_changes_recheck_leadership_and_failed_appends_release_the_gate() {
+        let root = temp_root();
+        let mut node = single_node(&root).await;
+        let state = node.state.clone().unwrap();
+        let gate = state.membership_changes.gate.lock().await;
+        let changing = state.clone();
+        let target = vec![node.url()];
+        let queued = tokio::spawn(async move { change_membership(&changing, target).await });
+        state.replication.as_ref().unwrap().write().unwrap().is_leader = false;
+        drop(gate);
+        assert!(matches!(queued.await.unwrap(), Err(ChangeError::Refused(_))));
+        assert!(configurations(&state).is_empty());
+        state.replication.as_ref().unwrap().write().unwrap().is_leader = true;
+        let col = state.db.as_ref().unwrap().get_collection(CONFIG_LOG).unwrap();
+        let target = vec![node.url()];
+        let joint = Configuration::joint(vec![node.url(), "http://gone".into()], target.clone());
+        let lsn = col.configure(joint.clone(), state.current_term()).unwrap().3;
+        col.enqueue_commit().await.unwrap().unwrap();
+        col.apply_committed(lsn).unwrap();
+        state.refresh_configuration();
+        let tombstone = col.release_handles().unwrap();
+        assert!(matches!(change_membership(&state, target.clone()).await, Err(ChangeError::Refused(_))));
+        assert!(state.membership_changes.gate.try_lock().is_ok());
+        state.db.as_ref().unwrap().collections.write().unwrap().remove(CONFIG_LOG);
+        drop(col);
+        let _ = std::fs::remove_file(tombstone);
+        assert_eq!(change_membership(&state, target.clone()).await.unwrap(), Configuration::simple(target));
+        drop(state);
+        node.kill();
     }
 
     #[test]
