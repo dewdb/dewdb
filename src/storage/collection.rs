@@ -151,7 +151,7 @@ impl StagedEffect {
 }
 
 impl Collection {
-    // Recovery ordering: the snapshot sets the replay resume point; the tail LSN is the max of both.
+    // The snapshot supplies the prefix; surviving replayed frames determine the tail.
     pub fn open(
         name: String,
         root_path: PathBuf,
@@ -232,7 +232,7 @@ impl Collection {
 
         let fold = |res: (u64, u64), max_lsn: &mut u64, max_term: &mut u64| {
             let (lsn, term) = res;
-            if lsn > *max_lsn {
+            if lsn != 0 {
                 *max_lsn = lsn;
                 *max_term = term;
             }
@@ -257,6 +257,12 @@ impl Collection {
                      fold(r, &mut max_lsn, &mut max_term);
                  }
              }
+        }
+
+        // An uncommitted snapshot tail must still exist in the replayed staging buffer.
+        if max_lsn > applied_through && pending.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData,
+                "Index snapshot tail has no surviving uncommitted WAL frame"));
         }
 
         let boot_lsn = max_lsn;
@@ -1403,6 +1409,28 @@ impl Collection {
         let saved_lsn = snapshot.last_lsn;
         info!(target: "storage", collection = %self.name, wal_id = snapshot.last_wal_id, offset = snapshot.last_offset, lsn = saved_lsn, "Index snapshot saved");
         Ok(saved_lsn)
+    }
+
+    // Called under the append lock before truncation; a crash may replay either surviving tail.
+    pub(super) fn rewind_index_tail(&self, lsn: u64, term: u64) -> io::Result<()> {
+        let path = self.root_path.join(INDEX_FILENAME);
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let mut snapshot = match bincode::deserialize_from::<_, IndexSnapshot>(BufReader::new(file)) {
+            Ok(snapshot) => snapshot,
+            // An unreadable snapshot is already ignored by recovery.
+            Err(_) => return Ok(()),
+        };
+        if snapshot.last_lsn <= lsn {
+            return Ok(());
+        }
+        snapshot.last_lsn = lsn;
+        snapshot.last_term = term;
+        let bytes = bincode::serialize(&snapshot).map_err(io::Error::other)?;
+        crate::util::write_atomic(&self.root_path, INDEX_FILENAME, &bytes)
     }
 
     // Windows will not delete an open file; the writer is parked on a throwaway tombstone first.

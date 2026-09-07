@@ -303,6 +303,7 @@ impl Collection {
                 return Ok(None);
             }
             let cut = pending.get(&doomed[0]).map(|s| (s.wal_id, s.offset));
+            self.rewind_index_tail(prev_lsn, prev_term)?;
             for lsn in doomed {
                 pending.remove(&lsn);
             }
@@ -589,6 +590,175 @@ mod tests {
     use crate::test_support::{disk_put, live_put, make_frame, temp_root};
     use std::io::Write;
     use std::sync::atomic::Ordering;
+
+    fn ib007_open(path: &std::path::Path) -> Collection {
+        use std::sync::atomic::AtomicU64;
+        Collection::open("c".into(), path.to_path_buf(),
+            Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)), ReadCacheConfig::default(),
+            crate::changefeed::ChangefeedConfig::default()).unwrap()
+    }
+
+    #[test]
+    fn ib007_replaced_snapshot_tail_recovers_and_chains_the_next_append() {
+        for replacement_lsn in [2, 100] {
+            for rotate in [false, true] {
+                for legacy_snapshot in [false, true] {
+                    let root = temp_root();
+                    let col = ib007_open(&root);
+                    col.append_raw_frame(&make_frame(1, 1, 0, 0, "safe", 1)).unwrap();
+                    col.sync_wal().unwrap();
+                    col.apply_committed(1).unwrap();
+                    col.append_raw_frame(&make_frame(1, 100, 1, 1, "old", 100)).unwrap();
+                    col.sync_wal().unwrap();
+                    col.save_index().unwrap();
+                    let snapshot_path = root.join(super::super::index::INDEX_FILENAME);
+                    let old_snapshot = fs::read(&snapshot_path).unwrap();
+                    if rotate {
+                        col.open_next_wal(&mut col.wal_writer.lock().unwrap()).unwrap();
+                        col.append_raw_frame(&make_frame(1, 200, 100, 1, "later", 200)).unwrap();
+                        col.sync_wal().unwrap();
+                    }
+                    assert!(matches!(col.append_raw_frame(
+                        &make_frame(2, replacement_lsn, 1, 1, "new", 2)).unwrap(),
+                        ReplicaApply::Applied { .. }));
+                    col.sync_wal().unwrap();
+                    assert_eq!(col.last_appended(), (2, replacement_lsn));
+                    if legacy_snapshot {
+                        // Reconstruct the stale snapshot left by a pre-fix replacement.
+                        fs::write(&snapshot_path, &old_snapshot).unwrap();
+                    }
+                    drop(col);
+
+                    let col = ib007_open(&root);
+                    assert_eq!(col.last_appended(), (2, replacement_lsn));
+                    assert_eq!(col.durable_lsn.load(Ordering::SeqCst), replacement_lsn);
+                    assert_eq!(col.db_next_lsn.load(Ordering::SeqCst), replacement_lsn);
+                    assert_eq!(col.db_last_log_term.load(Ordering::SeqCst), 2);
+                    assert_eq!(col.applied_lsn(), 1);
+                    assert_eq!(col.pending_len(), 1);
+                    assert_eq!(col.get("safe").unwrap(), Some(serde_json::json!({"v": 1})));
+                    assert!(col.get("new").unwrap().is_none());
+                    assert!(!col.exists_including_staged("old"));
+                    assert!(!col.exists_including_staged("later"));
+                    let (frame, _, _, next) = col.put("next".into(), serde_json::json!({"v": 3}), 3).unwrap();
+                    let header = FrameHeader::parse(&frame).unwrap();
+                    assert_eq!((header.prev_term, header.prev_lsn), (2, replacement_lsn));
+                    assert_eq!(next, replacement_lsn + 1);
+                    col.sync_wal().unwrap();
+                    col.apply_committed(next).unwrap();
+                    drop(col);
+                    let col = ib007_open(&root);
+                    assert_eq!(col.last_appended(), (3, next));
+                    assert_eq!(col.get("new").unwrap(), Some(serde_json::json!({"v": 2})));
+                    assert_eq!(col.pending_len(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ib007_rewind_crash_boundaries_preserve_compacted_and_staged_prefixes() {
+        for retain_staged in [false, true] {
+            for after_truncation in [false, true] {
+                let root = temp_root();
+                let col = ib007_open(&root);
+                col.put("safe".into(), serde_json::json!({"v": 1}), 1).unwrap();
+                let barrier = col.barrier(3).unwrap().3;
+                col.sync_wal().unwrap();
+                col.apply_committed(barrier).unwrap();
+                col.compact(Retention::none()).unwrap();
+                col.append_raw_frame(&make_frame(4, 10, barrier, 3, "retained", 10)).unwrap();
+                col.sync_wal().unwrap();
+                col.open_next_wal(&mut col.wal_writer.lock().unwrap()).unwrap();
+                col.append_raw_frame(&make_frame(4, 100, 10, 4, "old", 100)).unwrap();
+                col.sync_wal().unwrap();
+                col.save_index().unwrap();
+                let (term, lsn) = if retain_staged { (4, 10) } else { (3, barrier) };
+                if after_truncation {
+                    assert!(col.rewind_to(&mut col.wal_writer.lock().unwrap(), lsn, term).unwrap().is_some());
+                } else {
+                    col.rewind_index_tail(lsn, term).unwrap();
+                }
+                drop(col);
+
+                let col = ib007_open(&root);
+                let expected = if after_truncation { (term, lsn) } else { (4, 100) };
+                assert_eq!(col.last_appended(), expected);
+                assert_eq!(col.applied_lsn(), barrier);
+                assert_eq!(col.get("safe").unwrap(), Some(serde_json::json!({"v": 1})));
+                assert_eq!(col.pending_len(), if after_truncation { usize::from(retain_staged) } else { 2 });
+                assert_eq!(col.exists_including_staged("old"), !after_truncation);
+                assert!(!col.exists("retained"));
+            }
+        }
+    }
+
+    #[test]
+    fn ib007_snapshot_reconcile_failure_leaves_the_tail_retryable() {
+        let root = temp_root();
+        let col = ib007_open(&root);
+        col.append_raw_frame(&make_frame(1, 1, 0, 0, "safe", 1)).unwrap();
+        col.sync_wal().unwrap();
+        col.apply_committed(1).unwrap();
+        col.append_raw_frame(&make_frame(1, 100, 1, 1, "old", 100)).unwrap();
+        col.sync_wal().unwrap();
+        col.save_index().unwrap();
+        let snapshot_path = root.join(super::super::index::INDEX_FILENAME);
+        let snapshot = fs::read(&snapshot_path).unwrap();
+        let wal_path = root.join(format!("wal-{:05}.log", col.wal_writer.lock().unwrap().current_wal_id));
+        let wal_bytes = fs::read(&wal_path).unwrap();
+        let blocked = root.join(format!("{}.tmp", super::super::index::INDEX_FILENAME));
+        fs::create_dir(&blocked).unwrap();
+        let replacement = make_frame(2, 2, 1, 1, "new", 2);
+        for _ in 0..2 {
+            assert!(col.append_raw_frame(&replacement).is_err());
+            assert_eq!(col.last_appended(), (1, 100));
+            assert_eq!(col.staged_term(100), Some(1));
+            assert_eq!(col.pending_len(), 1);
+            assert_eq!(col.durable_lsn.load(Ordering::SeqCst), 100);
+            assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot);
+            assert_eq!(fs::read(&wal_path).unwrap(), wal_bytes);
+        }
+        fs::remove_dir(&blocked).unwrap();
+        assert!(matches!(col.append_raw_frame(&replacement).unwrap(), ReplicaApply::Applied { lsn: 2 }));
+        col.sync_wal().unwrap();
+        drop(col);
+        let col = ib007_open(&root);
+        assert_eq!(col.last_appended(), (2, 2));
+        assert_eq!(col.pending_len(), 1);
+        assert!(!col.exists_including_staged("old"));
+    }
+
+    #[test]
+    fn ib007_legacy_snapshot_without_a_surviving_tail_is_refused() {
+        use std::sync::atomic::AtomicU64;
+        let root = temp_root();
+        let col = ib007_open(&root);
+        col.append_raw_frame(&make_frame(1, 1, 0, 0, "safe", 1)).unwrap();
+        col.sync_wal().unwrap();
+        col.apply_committed(1).unwrap();
+        col.append_raw_frame(&make_frame(1, 100, 1, 1, "old", 100)).unwrap();
+        col.sync_wal().unwrap();
+        col.save_index().unwrap();
+        let snapshot_path = root.join(super::super::index::INDEX_FILENAME);
+        let stale = fs::read(&snapshot_path).unwrap();
+        col.rewind_to(&mut col.wal_writer.lock().unwrap(), 1, 1).unwrap().unwrap();
+        let reconciled = fs::read(&snapshot_path).unwrap();
+        drop(col);
+        // A pre-fix crash after truncation left only the stale snapshot's claim to LSN 100.
+        fs::write(&snapshot_path, &stale).unwrap();
+        let error = Collection::open("c".into(), root.to_path_buf(),
+            Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)), ReadCacheConfig::default(),
+            crate::changefeed::ChangefeedConfig::default()).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read(&snapshot_path).unwrap(), stale);
+        fs::write(&snapshot_path, &reconciled).unwrap();
+        let col = ib007_open(&root);
+        assert_eq!(col.last_appended(), (1, 1));
+        assert_eq!(col.get("safe").unwrap(), Some(serde_json::json!({"v": 1})));
+    }
 
     #[tokio::test]
     async fn durability_recovery_size_limit_and_corruption() {
