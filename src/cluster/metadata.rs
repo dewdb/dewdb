@@ -105,11 +105,56 @@ impl CollectionIndexes {
 /// only bound on its growth is this one.
 pub const MAX_CATALOG_COLLECTIONS: usize = 4096;
 
+/// Why no node could act on this entry, or `None`. Separate from `validate` because the rules it
+/// applies tighten between releases: an entry a newer rule made unaddressable must cost the entry
+/// and not the whole view carrying it, or a rolling upgrade takes routing down (IB-035).
+fn unaddressable_entry(collection: &str, entry: &CollectionIndexes) -> Option<String> {
+    // The same gate the API puts in front of a name that becomes a directory.
+    if !crate::consensus::config::valid_collection_name(collection) {
+        return Some(format!("'{}' is not a usable collection name", collection));
+    }
+    if entry.indexes.len() > MAX_INDEXES_PER_COLLECTION {
+        return Some(format!("'{}' is given more than {} indexes", collection,
+            MAX_INDEXES_PER_COLLECTION));
+    }
+    let mut seen = HashSet::new();
+    for spec in &entry.indexes {
+        if !valid_index_name(&spec.name) {
+            return Some(format!("'{}' has an invalid index name", collection));
+        }
+        if !valid_field_path(&spec.field) {
+            return Some(format!("'{}.{}' has an invalid field path", collection, spec.name));
+        }
+        if !seen.insert(spec.name.as_str()) {
+            return Some(format!("'{}' names '{}' more than once", collection, spec.name));
+        }
+    }
+    None
+}
+
+/// Drops the entries no node could act on, returning one reason per drop. Runs on every catalogue
+/// arriving from disk or off the wire before the view is compared or stored, so the fingerprint is
+/// computed over what the node actually holds rather than over what it was handed.
+pub fn sanitize_catalog(catalog: &mut IndexCatalog) -> Vec<String> {
+    let mut dropped = Vec::new();
+    catalog.retain(|collection, entry| match unaddressable_entry(collection, entry) {
+        Some(why) => {
+            dropped.push(why);
+            false
+        },
+        None => true,
+    });
+    dropped
+}
+
 /// Takes the newer entry per collection. Returns whether `into` moved, which is what says a
 /// merge is worth persisting or handing on.
 pub fn merge_catalog(into: &mut IndexCatalog, from: &IndexCatalog) -> bool {
     let mut moved = false;
     for (collection, incoming) in from {
+        if unaddressable_entry(collection, incoming).is_some() {
+            continue;
+        }
         match into.get(collection) {
             Some(current) if !incoming.supersedes(current) => {},
             _ => {
@@ -290,9 +335,15 @@ impl ClusterMetadata {
         for name in [CLUSTER_FILE, CLUSTER_TMP] {
             match fs::read_to_string(dir.join(name)) {
                 Ok(content) => match serde_json::from_str::<Self>(&content) {
-                    Ok(meta) => match meta.validate() {
-                        Ok(()) => return Ok(Some(meta)),
-                        Err(why) => corrupt = Some((name.to_string(), why)),
+                    Ok(mut meta) => {
+                        for why in sanitize_catalog(&mut meta.index_catalog) {
+                            tracing::warn!(target: "cluster", file = %name,
+                                "Dropped an unusable index catalogue entry: {}", why);
+                        }
+                        match meta.validate() {
+                            Ok(()) => return Ok(Some(meta)),
+                            Err(why) => corrupt = Some((name.to_string(), why)),
+                        }
                     },
                     Err(e) => corrupt = Some((name.to_string(), e.to_string())),
                 },
@@ -535,38 +586,13 @@ impl ClusterMetadata {
         xxhash_rust::xxh64::xxh64(parts.join("|").as_bytes(), 0)
     }
 
-    /// The catalogue arrives off the wire and is stored by every node that sees it, so it is
-    /// bounded and shape-checked here rather than where it is read.
+    /// The size bound only. Per-entry shape belongs to `unaddressable_entry`, which drops the entry
+    /// rather than failing the document; how many entries ride every view is a fact about the
+    /// document and has no per-entry answer.
     fn validate_catalog(&self) -> Result<(), String> {
         if self.index_catalog.len() > MAX_CATALOG_COLLECTIONS {
             return Err(format!("index catalogue names more than {} collections",
                 MAX_CATALOG_COLLECTIONS));
-        }
-        for (collection, entry) in &self.index_catalog {
-            // The same gate the API puts in front of a name that becomes a directory, applied
-            // where a name arrives off the wire instead.
-            if !crate::consensus::config::valid_collection_name(collection) {
-                return Err(format!("index catalogue names an invalid collection '{}'", collection));
-            }
-            if entry.indexes.len() > MAX_INDEXES_PER_COLLECTION {
-                return Err(format!("index catalogue gives '{}' more than {} indexes",
-                    collection, MAX_INDEXES_PER_COLLECTION));
-            }
-            let mut seen = HashSet::new();
-            for spec in &entry.indexes {
-                if !valid_index_name(&spec.name) {
-                    return Err(format!("index catalogue entry '{}' has an invalid index name",
-                        collection));
-                }
-                if !valid_field_path(&spec.field) {
-                    return Err(format!("index catalogue entry '{}.{}' has an invalid field path",
-                        collection, spec.name));
-                }
-                if !seen.insert(spec.name.as_str()) {
-                    return Err(format!("index catalogue names '{}.{}' more than once",
-                        collection, spec.name));
-                }
-            }
         }
         Ok(())
     }
@@ -596,7 +622,13 @@ pub enum Adoption {
 
 /// Validates before comparing: a malformed view must not win on version alone, or one bad push
 /// would take routing down cluster-wide and outrank every correction that follows.
-pub fn adopt(current: &mut ClusterMetadata, incoming: ClusterMetadata) -> Adoption {
+pub fn adopt(current: &mut ClusterMetadata, mut incoming: ClusterMetadata) -> Adoption {
+    // Before the validate and before the version comparison the catalogue feeds: an entry no node
+    // can act on is dropped, never a reason to refuse the topology it rode in on (IB-035).
+    for why in sanitize_catalog(&mut incoming.index_catalog) {
+        tracing::warn!(target: "cluster", version = incoming.version,
+            "Dropped an index catalogue entry from an offered view: {}", why);
+    }
     if let Err(why) = incoming.validate() {
         return Adoption::Rejected(why);
     }
@@ -1062,34 +1094,91 @@ mod tests {
             "a ring change is not a schema change and must not read as one");
     }
 
+    fn entry(indexes: Vec<IndexSpec>) -> CollectionIndexes {
+        CollectionIndexes { version: 1, updated_by: "n1".into(), indexes }
+    }
+
     #[test]
-    fn a_malformed_catalogue_is_refused_the_way_a_malformed_ring_is() {
-        let mut v = view(4, "n1", vec![]);
-        v.index_catalog.insert("t".into(), CollectionIndexes {
-            version: 1, updated_by: "n1".into(), indexes: vec![spec("ok", "a..b")],
-        });
-        assert!(v.validate().is_err(), "a field path off the wire is stored by every node");
+    fn a_malformed_catalogue_entry_is_dropped_rather_than_kept() {
+        let cases = [
+            ("t", entry(vec![spec("ok", "a..b")]), "a field path off the wire is stored by every node"),
+            ("../escape", entry(vec![spec("i", "a")]), "and the name is what becomes a directory"),
+            ("t", entry(vec![spec("i", "a"), spec("i", "b")]), "one name cannot index two fields"),
+            ("t", entry((0..MAX_INDEXES_PER_COLLECTION + 1)
+                .map(|i| spec(&format!("i{}", i), "a")).collect()), "an unbounded entry"),
+        ];
+        for (collection, entry, why) in cases {
+            let mut catalog = IndexCatalog::new();
+            catalog.insert(collection.into(), entry);
+            assert_eq!(sanitize_catalog(&mut catalog).len(), 1, "{}", why);
+            assert!(catalog.is_empty(), "{}", why);
+        }
+    }
 
+    #[test]
+    fn a_catalogue_naming_more_collections_than_the_bound_is_refused() {
         let mut v = view(4, "n1", vec![]);
-        v.index_catalog.insert("../escape".into(), CollectionIndexes {
-            version: 1, updated_by: "n1".into(), indexes: vec![spec("i", "a")],
-        });
-        assert!(v.validate().is_err(), "and the name is what becomes a directory");
+        for i in 0..MAX_CATALOG_COLLECTIONS + 1 {
+            v.index_catalog.insert(format!("c{}", i), entry(vec![spec("i", "a")]));
+        }
+        assert!(v.validate().is_err(), "the size bound is a fact about the document");
+    }
 
-        let mut v = view(4, "n1", vec![]);
-        v.index_catalog.insert("t".into(), CollectionIndexes {
-            version: 1, updated_by: "n1".into(), indexes: vec![spec("i", "a"), spec("i", "b")],
-        });
-        assert!(v.validate().is_err(), "one name cannot index two fields");
+    /// IB-035: the collection-name rule narrowed after these documents were written, and a view
+    /// that fails to validate is refused whole -- routing included.
+    #[test]
+    fn a_name_a_newer_rule_rejects_costs_its_entry_and_not_the_view() {
+        let mut incoming = view(9, "n2", vec![]);
+        incoming.index_catalog.insert("Legacy.Name".into(), entry(vec![spec("i", "a")]));
+        incoming.index_catalog.insert("users".into(), entry(vec![spec("j", "email")]));
 
-        let mut v = view(4, "n1", vec![]);
-        v.index_catalog.insert("t".into(), CollectionIndexes {
-            version: 1,
-            updated_by: "n1".into(),
-            indexes: (0..MAX_INDEXES_PER_COLLECTION + 1)
-                .map(|i| spec(&format!("i{}", i), "a")).collect(),
-        });
-        assert!(v.validate().is_err());
+        let mut current = view(4, "n1", vec![]);
+        assert_eq!(adopt(&mut current, incoming), Adoption::Adopted { from: 4, to: 9 });
+        assert_eq!(current.version, 9, "an old peer's push must not take routing down");
+        assert!(!current.index_catalog.contains_key("Legacy.Name"));
+        assert_eq!(current.index_catalog["users"].indexes, vec![spec("j", "email")],
+            "the rest of the catalogue still travels");
+    }
+
+    #[test]
+    fn a_dropped_entry_leaves_the_fingerprint_where_a_node_that_never_saw_it_stands() {
+        let mut theirs = view(9, "n2", vec![]);
+        theirs.index_catalog.insert("Legacy.Name".into(), entry(vec![spec("i", "a")]));
+        theirs.record_index_change("n2", "users", &created("j", "email"));
+
+        let mut ours = view(4, "n1", vec![]);
+        adopt(&mut ours, theirs.clone());
+
+        sanitize_catalog(&mut theirs.index_catalog);
+        assert_eq!(ours.catalog_fingerprint(), theirs.catalog_fingerprint(),
+            "or every gossip round reads the dropped entry as something still to exchange");
+    }
+
+    #[test]
+    fn a_catalogue_that_cannot_be_addressed_is_read_back_rather_than_called_corrupt() {
+        let root = temp_root();
+        let dir = root.to_string_lossy().to_string();
+
+        let mut written = view(5, "n1", vec![]);
+        written.index_catalog.insert("Legacy.Name".into(), entry(vec![spec("i", "a")]));
+        written.record_index_change("n1", "users", &created("j", "email"));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(Path::new(&dir).join(CLUSTER_FILE),
+            serde_json::to_vec(&written).unwrap()).unwrap();
+
+        let back = ClusterMetadata::load(&dir).unwrap().expect("the topology is still readable");
+        assert_eq!(back.version, 5);
+        assert!(!back.index_catalog.contains_key("Legacy.Name"));
+        assert!(back.index_catalog.contains_key("users"));
+    }
+
+    #[test]
+    fn a_merge_never_takes_an_entry_no_node_could_act_on() {
+        let mut from = IndexCatalog::new();
+        from.insert("Legacy.Name".into(), entry(vec![spec("i", "a")]));
+        let mut into = IndexCatalog::new();
+        assert!(!merge_catalog(&mut into, &from), "nothing moved, so nothing is worth persisting");
+        assert!(into.is_empty());
     }
 
     #[test]

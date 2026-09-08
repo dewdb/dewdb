@@ -1,7 +1,8 @@
 //! AppState: shared handle to storage, config, replication state, router caches.
 
 use crate::cluster::metadata::{
-    adopt, merge_catalog, Adoption, ClusterMetadata, IndexCatalog, Migration, ViewId,
+    adopt, merge_catalog, sanitize_catalog, Adoption, ClusterMetadata, IndexCatalog, Migration,
+    ViewId,
 };
 use crate::cluster::migration::MigrationRuns;
 use crate::cluster::ownership::{classify, group_owner, group_owns, Ownership};
@@ -826,7 +827,13 @@ impl AppState {
     /// boot would come up on a topology this node already rejected.
     /// Durable before visible. Publishing first left a window in which a node served a topology it
     /// would forget on restart, so a crash there silently rewound it to the config seed.
-    pub fn adopt_cluster(&self, incoming: ClusterMetadata) -> Adoption {
+    pub fn adopt_cluster(&self, mut incoming: ClusterMetadata) -> Adoption {
+        // Ahead of the validate and the save, not only of `adopt`: what this persists when the view
+        // wins is `incoming` itself, and an unaddressable catalogue entry must not reach disk.
+        for why in sanitize_catalog(&mut incoming.index_catalog) {
+            tracing::warn!(target: "cluster", version = incoming.version,
+                "Dropped an index catalogue entry from an offered view: {}", why);
+        }
         // Decided against the current view first, so the fsync below happens outside every lock.
         let superseding = {
             if let Err(why) = incoming.validate() {

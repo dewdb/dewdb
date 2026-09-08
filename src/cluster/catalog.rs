@@ -14,7 +14,7 @@
 //! reach them.
 
 use crate::api::write::local_index_change;
-use crate::cluster::metadata::ClusterMetadata;
+use crate::cluster::metadata::{sanitize_catalog, ClusterMetadata};
 use crate::consensus::config::is_system_collection;
 use crate::replication::write_concern::DEFAULT_WTIMEOUT_MS;
 use crate::replication::WriteConcern;
@@ -95,7 +95,12 @@ async fn gossip_catalog(state: &AppState) {
                 _ => None,
             };
             // Validated before it is taken: this is a view off the wire, and every node that takes
-            // one stores it and hands it on.
+            // one stores it and hands it on. Sanitized ahead of the fingerprint below, or an entry
+            // this node drops and an older peer keeps reads as a difference every round (IB-035).
+            let view = view.map(|mut v| {
+                sanitize_catalog(&mut v.index_catalog);
+                v
+            });
             (target, view.filter(|v| v.validate().is_ok()))
         }
     })).await;
