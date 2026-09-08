@@ -5,7 +5,7 @@ use crate::replication::stream::{replicate_and_await, replicate_to_peers};
 use crate::replication::WriteConcern;
 use crate::replication::write_concern::write_quorum;
 use crate::json::merge_patch;
-use crate::state::AppState;
+use crate::state::{AppState, FrameReservation, Refusal};
 use crate::storage::{Collection, FrameHeader};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -184,6 +184,20 @@ pub fn backpressure_response(collection: &str, pending: usize, bound: usize) -> 
     ).into_response()
 }
 
+/// Reserves `frames` against the uncommitted bound. The reservation stands in for frames the
+/// append has not staged yet, so it has to be dropped after the append and not before.
+fn admit(state: &AppState, col_name: &str, frames: usize)
+    -> Result<Option<FrameReservation>, axum::response::Response>
+{
+    let bound = state.config.flow_control.max_uncommitted_frames;
+    state.admit_write(col_name, frames).map_err(|refusal| match refusal {
+        Refusal::Backlog { in_flight } => backpressure_response(col_name, in_flight, bound),
+        // 413 and not 503: no retry of this request is admissible, so `Retry-After` would be a lie.
+        Refusal::TooWide { frames } => err_json(StatusCode::PAYLOAD_TOO_LARGE, format!(
+            "batch of {} documents exceeds max_uncommitted_frames ({})", frames, bound)),
+    })
+}
+
 pub async fn local_write(
     state: &AppState,
     col_name: &str,
@@ -192,10 +206,7 @@ pub async fn local_write(
     wc: WriteConcern,
     wtimeout: Duration,
 ) -> Result<WriteOutcome, axum::response::Response> {
-    if let Err(pending) = state.admit_write(col_name) {
-        return Err(backpressure_response(
-            col_name, pending, state.config.flow_control.max_uncommitted_frames));
-    }
+    let admitted = admit(state, col_name, 1)?;
 
     let db = state.db.as_ref().unwrap();
     let col = match db.get_collection(col_name) {
@@ -207,6 +218,7 @@ pub async fn local_write(
         let _guard = col.key_lock(&key).lock().await;
         local_write_inner(state, &col, key, value).await?
     };
+    drop(admitted);
 
     finish_write(state, col_name, pending, wc, wtimeout).await
 }
@@ -219,10 +231,7 @@ pub async fn local_patch(
     wc: WriteConcern,
     wtimeout: Duration,
 ) -> Result<Option<WriteOutcome>, axum::response::Response> {
-    if let Err(pending) = state.admit_write(col_name) {
-        return Err(backpressure_response(
-            col_name, pending, state.config.flow_control.max_uncommitted_frames));
-    }
+    let admitted = admit(state, col_name, 1)?;
 
     let db = state.db.as_ref().unwrap();
     let col = match db.get_collection(col_name) {
@@ -250,6 +259,7 @@ pub async fn local_patch(
 
         local_write_inner(state, &col, key, Some(doc)).await?
     };
+    drop(admitted);
 
     Ok(Some(finish_write(state, col_name, pending, wc, wtimeout).await?))
 }
@@ -263,10 +273,7 @@ pub async fn local_drop(
     wc: WriteConcern,
     wtimeout: Duration,
 ) -> Result<WriteOutcome, axum::response::Response> {
-    if let Err(pending) = state.admit_write(col_name) {
-        return Err(backpressure_response(
-            col_name, pending, state.config.flow_control.max_uncommitted_frames));
-    }
+    let admitted = admit(state, col_name, 1)?;
 
     let db = state.db.as_ref().unwrap();
     let col = match db.get_collection(col_name) {
@@ -295,6 +302,7 @@ pub async fn local_drop(
         state.note_leader_append(col_name, lsn);
         PendingWrite { frame, term, lsn, existed: true, commit: Some(commit) }
     };
+    drop(admitted);
 
     finish_write(state, col_name, pending, wc, wtimeout).await
 }
@@ -310,10 +318,7 @@ pub async fn local_index_change(
     wc: WriteConcern,
     wtimeout: Duration,
 ) -> Result<WriteOutcome, axum::response::Response> {
-    if let Err(pending) = state.admit_write(col_name) {
-        return Err(backpressure_response(
-            col_name, pending, state.config.flow_control.max_uncommitted_frames));
-    }
+    let admitted = admit(state, col_name, 1)?;
 
     let db = state.db.as_ref().unwrap();
     let col = match db.get_collection(col_name) {
@@ -333,6 +338,7 @@ pub async fn local_index_change(
     let commit = col.enqueue_commit();
     state.note_leader_append(col_name, lsn);
     let pending = PendingWrite { frame, term, lsn, existed: true, commit: Some(commit) };
+    drop(admitted);
 
     finish_write(state, col_name, pending, wc, wtimeout).await
 }
@@ -406,10 +412,13 @@ async fn finish_write_batch(
     Ok(spread(quorum.met(&holders), holders.len(), required))
 }
 
+/// `admitted` is released as soon as the frames are staged, not when the batch finishes: past that
+/// point `pending_len` counts them, and holding it over the group commit would report the run twice.
 async fn local_write_batch_inner(
     state: &AppState,
     col: &Arc<Collection>,
     items: Vec<(String, serde_json::Value)>,
+    admitted: Option<FrameReservation>,
 ) -> Result<Vec<PendingWrite>, axum::response::Response> {
     let term = append_term(state, &col.name)?;
     // A key repeated inside one batch is replaced by its second write, and the pre-batch state
@@ -434,6 +443,7 @@ async fn local_write_batch_inner(
         Ok(Err(e)) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
         Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     };
+    drop(admitted);
 
     match col.enqueue_commit().await {
         Ok(Ok(())) => {},
@@ -459,10 +469,7 @@ pub async fn local_write_batch(
     wc: WriteConcern,
     wtimeout: Duration,
 ) -> Result<Vec<WriteOutcome>, axum::response::Response> {
-    if let Err(pending) = state.admit_write(col_name) {
-        return Err(backpressure_response(
-            col_name, pending, state.config.flow_control.max_uncommitted_frames));
-    }
+    let admitted = admit(state, col_name, items.len())?;
 
     let db = state.db.as_ref().unwrap();
     let col = match db.get_collection(col_name) {
@@ -480,7 +487,7 @@ pub async fn local_write_batch(
         _guards.push(col.key_locks[stripe].lock().await);
     }
 
-    let pending = local_write_batch_inner(state, &col, items).await?;
+    let pending = local_write_batch_inner(state, &col, items, admitted).await?;
 
     finish_write_batch(state, col_name, pending, wc, wtimeout).await
 }

@@ -499,12 +499,14 @@ pub async fn query_docs(
     let start = params.start.clone();
     let end = params.end.clone();
     let want_keys = params.keys.unwrap_or(false);
+    let ownership = state.scan_ownership(&col_name);
 
     let result = tokio::task::spawn_blocking(move || -> io::Result<(Vec<SortedRow>, Option<String>)> {
         match &sort {
             Some(sort) => {
-                let (rows, more) = col_clone.sorted_page(
-                    start.as_deref(), end.as_deref(), &filter_obj, sort, sort_cursor.as_ref(), limit)?;
+                let (rows, more) = col_clone.sorted_page_owned(
+                    start.as_deref(), end.as_deref(), &filter_obj, sort, sort_cursor.as_ref(), limit,
+                    &|key| ownership.includes(key))?;
                 // The last row of the page is where the next one resumes, in sort order.
                 let next = match (more, rows.last()) {
                     (true, Some(last)) => Some(encode_cursor(&SortCursor::at(
@@ -514,8 +516,9 @@ pub async fn query_docs(
                 Ok((rows, next))
             },
             None => {
-                let (rows, next) = col_clone.query_page(
-                    after.as_deref(), start.as_deref(), end.as_deref(), &filter_obj, limit)?;
+                let (rows, next) = col_clone.query_page_owned(
+                    after.as_deref(), start.as_deref(), end.as_deref(), &filter_obj, limit,
+                    &|key| ownership.includes(key))?;
                 Ok((rows, next.map(|key| encode_cursor(&KeyCursor { key }))))
             },
         }
@@ -574,8 +577,10 @@ pub async fn aggregate_docs(
 
     let (start, end) = (params.start.clone(), params.end.clone());
     let spec = AggregateSpec { group, metrics };
+    let ownership = state.scan_ownership(&col_name);
     let result = tokio::task::spawn_blocking(move || {
-        col.aggregate(start.as_deref(), end.as_deref(), &filter_obj, spec)
+        col.aggregate(start.as_deref(), end.as_deref(), &filter_obj, spec,
+            &|key| ownership.includes(key))
     }).await;
 
     match result {
@@ -589,6 +594,8 @@ pub async fn aggregate_docs(
 
 #[cfg(test)]
 mod tests {
+    use crate::cluster::metadata::{Adoption, Migration, MigrationPhase};
+    use crate::ring::{hash_key, HashRing, RingShard};
     use crate::test_support::{
         next_test_port, node_by_id, put_doc_http, put_value, router_for, single_node, temp_root,
         three_node_cluster, two_shard_cluster, wait_for, TestNode,
@@ -1137,6 +1144,102 @@ mod tests {
         assert_eq!(missing.status(), StatusCode::NOT_FOUND, "no shard holds it");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ib016_queries_and_aggregates_ignore_non_owner_migration_copies() {
+        let root = temp_root();
+        let (s1, s2, router) = two_shard_cluster(&root).await;
+        let current = HashRing {
+            vnodes: 32,
+            shards: vec![
+                RingShard { node_url: s1.url(), replica_urls: Vec::new() },
+                RingShard { node_url: s2.url(), replica_urls: Vec::new() },
+            ],
+        };
+        let target = HashRing { vnodes: 64, shards: current.shards.clone() };
+        let before = current.build();
+        let after = target.build();
+        let key = (0..100_000).map(|i| format!("copied-{}", i)).find(|key| {
+            before.owner(hash_key("t", key)).is_some_and(|owner| owner.node_url == s1.url())
+                && after.owner(hash_key("t", key)).is_some_and(|owner| owner.node_url == s2.url())
+        }).expect("changing the vnode layout must move a key between these groups");
+
+        let mut view = router.state.as_ref().unwrap().cluster_view();
+        view.version += 1;
+        view.updated_by = "ib016".to_string();
+        view.seeded = false;
+        view.ring = Some(current);
+        view.migration = Some(Migration {
+            id: "ib016-copy".to_string(),
+            target,
+            started_by: "ib016".to_string(),
+            phase: MigrationPhase::Copy,
+        });
+        for state in [s1.state.as_ref().unwrap(), s2.state.as_ref().unwrap(),
+            router.state.as_ref().unwrap()]
+        {
+            assert!(matches!(state.adopt_cluster(view.clone()), Adoption::Adopted { .. }));
+        }
+
+        for (node, value) in [
+            (&s1, serde_json::json!({"amount": 1, "copy": false})),
+            (&s2, serde_json::json!({"amount": 100, "copy": true})),
+        ] {
+            let col = node.state.as_ref().unwrap().db.as_ref().unwrap()
+                .get_collection("t").unwrap();
+            let (_, _, _, lsn) = col.put(key.clone(), value, 1).unwrap();
+            col.apply_committed(lsn).unwrap();
+        }
+
+        let client = reqwest::Client::new();
+        let query = format!("{}/collections/t/query", router.url());
+        let mut cursor = None;
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let mut q = vec![("limit", "1"), ("keys", "true")];
+            if let Some(value) = cursor.as_deref() { q.push(("cursor", value)); }
+            let response = client.get(&query).query(&q).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let page = response.json::<serde_json::Value>().await.unwrap();
+            seen.extend(page["items"].as_array().unwrap().iter().cloned());
+            cursor = page["next_cursor"].as_str().map(str::to_string);
+            if cursor.is_none() { break; }
+        }
+        assert_eq!(seen, vec![serde_json::json!({"amount": 1, "copy": false})]);
+
+        let sorted = client.get(&query)
+            .query(&[("sort", "amount:asc"), ("keys", "true")])
+            .send().await.unwrap().json::<serde_json::Value>().await.unwrap();
+        assert_eq!(sorted["keys"], serde_json::json!([key]));
+        assert_eq!(sorted["items"], serde_json::json!([{"amount": 1, "copy": false}]));
+
+        let aggregate = client.get(format!("{}/collections/t/aggregate", router.url()))
+            .query(&[("metrics", "count,sum:amount")]).send().await.unwrap();
+        assert_eq!(aggregate.status(), StatusCode::OK);
+        let aggregate = aggregate.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(aggregate["matched"].as_u64(), Some(1));
+        assert_eq!(aggregate["groups"][0]["count"].as_u64(), Some(1));
+        assert_eq!(aggregate["groups"][0]["metrics"]["sum:amount"]["sum"].as_f64(), Some(1.0));
+
+        let flipped = view.with_ring("ib016", view.migration.as_ref().unwrap().target.clone());
+        for state in [s1.state.as_ref().unwrap(), s2.state.as_ref().unwrap(),
+            router.state.as_ref().unwrap()]
+        {
+            assert!(matches!(state.adopt_cluster(flipped.clone()), Adoption::Adopted { .. }));
+        }
+
+        let sorted = client.get(&query)
+            .query(&[("sort", "amount:asc"), ("keys", "true")])
+            .send().await.unwrap().json::<serde_json::Value>().await.unwrap();
+        assert_eq!(sorted["keys"], serde_json::json!([key]));
+        assert_eq!(sorted["items"], serde_json::json!([{"amount": 100, "copy": true}]));
+
+        let aggregate = client.get(format!("{}/collections/t/aggregate", router.url()))
+            .query(&[("metrics", "count,sum:amount")]).send().await.unwrap()
+            .json::<serde_json::Value>().await.unwrap();
+        assert_eq!(aggregate["matched"].as_u64(), Some(1));
+        assert_eq!(aggregate["groups"][0]["metrics"]["sum:amount"]["sum"].as_f64(), Some(100.0));
+    }
+
     /// M1: a filter the engine cannot evaluate is a client error. Before the fix it was dropped and
     /// the query answered as if no filter had been sent.
     #[tokio::test]
@@ -1257,6 +1360,41 @@ mod tests {
         let met = c.post(format!("{}/collections/t/docs/bulk?w=1", node.url()))
             .json(&serde_json::json!([{"value": {"v": 3}}])).send().await.unwrap();
         assert_eq!(met.status(), StatusCode::CREATED, "a batch that met its concern is still 201");
+
+        node.kill();
+    }
+
+    /// IB-014: a bulk write checked the uncommitted bound once, against the count before its own
+    /// frames, so a batch of any width was admitted whole and left the buffer over the bound.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_bulk_write_cannot_stage_past_the_uncommitted_bound() {
+        let root = temp_root();
+        let mut node = TestNode::new("bnd", next_test_port(), &root, "primary");
+        node.replicas = vec![
+            format!("http://127.0.0.1:{}", next_test_port()),
+            format!("http://127.0.0.1:{}", next_test_port()),
+        ];
+        node.flow_control = serde_json::json!({ "max_uncommitted_frames": 2 });
+        node.start();
+        let c = reqwest::Client::new();
+
+        let ten: Vec<serde_json::Value> =
+            (0..10).map(|i| serde_json::json!({"value": {"v": i}})).collect();
+        let wide = c.post(format!("{}/collections/t/docs/bulk?w=majority&wtimeout=200", node.url()))
+            .json(&ten).send().await.unwrap();
+        assert_eq!(wide.status(), StatusCode::PAYLOAD_TOO_LARGE,
+            "ten frames under a bound of two used to be staged in full");
+
+        // Fills the bound with frames no quorum will ever commit.
+        let filled = c.post(format!("{}/collections/t/docs/bulk?w=majority&wtimeout=200", node.url()))
+            .json(&serde_json::json!([{"value": {"v": 1}}, {"value": {"v": 2}}]))
+            .send().await.unwrap();
+        assert_eq!(filled.status(), StatusCode::MULTI_STATUS);
+
+        let refused = c.post(format!("{}/collections/t/docs?w=majority&wtimeout=200", node.url()))
+            .json(&serde_json::json!({"value": {"v": 3}})).send().await.unwrap();
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE,
+            "a full buffer refuses the next write, and this one is retriable unlike the wide batch");
 
         node.kill();
     }

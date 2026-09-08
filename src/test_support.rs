@@ -183,6 +183,8 @@ pub struct TestNode {
     pub webhooks: serde_json::Value,
     /// An `AuthConfig` body; `{}` is the default open configuration.
     pub auth: serde_json::Value,
+    /// A `FlowControlConfig` body; `{}` is the default 4096-frame bound.
+    pub flow_control: serde_json::Value,
     pub state: Option<AppState>,
     pub stop: Option<Arc<tokio::sync::Notify>>,
     pub thread: Option<std::thread::JoinHandle<()>>,
@@ -244,6 +246,7 @@ fn node_config(n: &TestNode) -> NodeConfig {
         "auth": n.auth,
         "changefeed": n.changefeed,
         "webhooks": n.webhooks,
+        "flow_control": n.flow_control,
         "maintenance": { "enabled": false },
         "data_movement": {
             "batch_size": n.data_movement_batch_size,
@@ -273,6 +276,7 @@ impl TestNode {
             data_movement_batch_size: 64,
             data_movement_batch_delay_ms: 5,
             auth: serde_json::json!({}),
+            flow_control: serde_json::json!({}),
             changefeed: serde_json::json!({}),
             webhooks: serde_json::json!({}),
             state: None,
@@ -355,6 +359,7 @@ impl TestNode {
                     read_rr: Arc::new(AtomicUsize::new(0)),
                     node_loads: Arc::new(std::sync::Mutex::new(HashMap::new())),
                     routed_reads: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                    frame_reservations: Arc::new(std::sync::Mutex::new(HashMap::new())),
                     metrics: Arc::new(Metrics::new()),
                     replication_slots: Arc::new(tokio::sync::Semaphore::new(
                         config.flow_control.max_inflight_requests.max(1))),

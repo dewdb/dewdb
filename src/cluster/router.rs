@@ -938,7 +938,7 @@ pub async fn router_query(
                 ShardQueryOutcome::Failed => return (StatusCode::BAD_GATEWAY, "Shard query failed").into_response(),
             }
         }
-        if present == 0 && absent > 0 {
+        if present == 0 && absent > 0 && positions.is_empty() {
             return collection_absent_response(col_name);
         }
 
@@ -1305,6 +1305,48 @@ mod tests {
             assert_eq!(r.status(), StatusCode::NOT_FOUND, "{} of a collection no shard holds", action);
         }
 
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ib015_absent_shard_preserves_unqueried_positions() {
+        use crate::test_support::{put_value, temp_root, two_shard_cluster};
+
+        let root = temp_root();
+        let (_s1, _s2, router) = two_shard_cluster(&root).await;
+        let c = reqwest::Client::new();
+        let (_, owners) = router.state.as_ref().unwrap().partitioning();
+        assert_eq!(owners.len(), 2);
+        assert_eq!(put_value(&c, &owners[1].0, "narrow", "only",
+            serde_json::json!({"v": 1}), "").await, StatusCode::CREATED);
+
+        for (collection, filter, expected) in [
+            ("narrow", "{}", Some(serde_json::json!({"v": 1}))),
+            ("narrow", r#"{"v":2}"#, None),
+            ("ghost", "{}", None),
+        ] {
+            let url = format!("{}/collections/{}/query", router.url(), collection);
+            let first = c.get(&url).query(&[("limit", "1"), ("keys", "true"),
+                ("filter", filter)]).send().await.unwrap();
+            assert_eq!(first.status(), StatusCode::OK, "{collection}: unqueried owner remains");
+            let first = first.json::<QueryPage>().await.unwrap();
+            assert!(first.items.is_empty());
+            assert!(first.keys.is_empty());
+            let cursor = first.next_cursor.expect("unqueried owner must remain reachable");
+            let decoded: ShardCursor = decode_cursor(&cursor).unwrap();
+            assert_eq!(decoded.positions, BTreeMap::from([(owners[1].0.clone(), None)]));
+
+            let last = c.get(&url).query(&[("limit", "1"), ("keys", "true"),
+                ("filter", filter), ("cursor", cursor.as_str())]).send().await.unwrap();
+            if collection == "ghost" {
+                assert_eq!(last.status(), StatusCode::NOT_FOUND);
+                continue;
+            }
+            assert_eq!(last.status(), StatusCode::OK);
+            let last = last.json::<QueryPage>().await.unwrap();
+            assert_eq!(last.items, expected.into_iter().collect::<Vec<_>>());
+            assert_eq!(last.keys, if filter == "{}" { vec!["only"] } else { vec![] });
+            assert!(last.next_cursor.is_none());
+        }
     }
 
     fn listing(rows: serde_json::Value) -> (StatusCode, serde_json::Value) {

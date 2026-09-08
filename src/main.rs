@@ -230,6 +230,7 @@ async fn main() -> io::Result<()> {
         read_rr: Arc::new(AtomicUsize::new(0)),
         node_loads: Arc::new(std::sync::Mutex::new(HashMap::new())),
         routed_reads: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        frame_reservations: Arc::new(std::sync::Mutex::new(HashMap::new())),
         metrics: Arc::new(Metrics::new()),
         replication_slots: Arc::new(tokio::sync::Semaphore::new(
             config.flow_control.max_inflight_requests.max(1))),

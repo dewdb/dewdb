@@ -852,6 +852,7 @@ impl Collection {
         });
     }
 
+    #[cfg(test)]
     pub fn query_page(
         &self,
         after: Option<&str>,
@@ -859,6 +860,18 @@ impl Collection {
         end: Option<&str>,
         filter: &Option<Filter>,
         limit: usize,
+    ) -> io::Result<(Vec<SortedRow>, Option<String>)> {
+        self.query_page_owned(after, start, end, filter, limit, &|_| true)
+    }
+
+    pub(crate) fn query_page_owned(
+        &self,
+        after: Option<&str>,
+        start: Option<&str>,
+        end: Option<&str>,
+        filter: &Option<Filter>,
+        limit: usize,
+        owned: &dyn Fn(&str) -> bool,
     ) -> io::Result<(Vec<SortedRow>, Option<String>)> {
         // Ahead of the walk, not inside it: a cleared index yields no keys, so a scan of a released
         // handle never reaches the check inside `get` and answers an empty page.
@@ -870,6 +883,9 @@ impl Collection {
         let plan = self.index_plan(filter);
 
         self.scan_for::<io::Error, _>(plan.as_ref(), after, start, end, |key| {
+            if !owned(key) {
+                return Ok(true);
+            }
             if items.len() >= limit {
                 match filter {
                     None => {
@@ -903,6 +919,7 @@ impl Collection {
     /// The scan is still the whole range unless the filter has an index to narrow it: nothing
     /// indexes the sort field's order, so every page re-reads what it covers and pagination bounds
     /// the memory rather than the work.
+    #[cfg(test)]
     pub fn sorted_page(
         &self,
         start: Option<&str>,
@@ -911,6 +928,19 @@ impl Collection {
         sort: &SortOrder,
         after: Option<&SortCursor>,
         limit: usize,
+    ) -> io::Result<(Vec<SortedRow>, bool)> {
+        self.sorted_page_owned(start, end, filter, sort, after, limit, &|_| true)
+    }
+
+    pub(crate) fn sorted_page_owned(
+        &self,
+        start: Option<&str>,
+        end: Option<&str>,
+        filter: &Option<Filter>,
+        sort: &SortOrder,
+        after: Option<&SortCursor>,
+        limit: usize,
+        owned: &dyn Fn(&str) -> bool,
     ) -> io::Result<(Vec<SortedRow>, bool)> {
         self.check_live()?;
         let keep = limit.min(MAX_QUERY_LIMIT);
@@ -922,6 +952,9 @@ impl Collection {
         let plan = self.index_plan(filter);
 
         self.scan_for::<io::Error, _>(plan.as_ref(), None, start, end, |key| {
+            if !owned(key) {
+                return Ok(true);
+            }
             let value = match self.get(key)? {
                 Some(v) => v,
                 None => return Ok(true),
@@ -959,12 +992,16 @@ impl Collection {
         end: Option<&str>,
         filter: &Option<Filter>,
         spec: AggregateSpec,
+        owned: &dyn Fn(&str) -> bool,
     ) -> io::Result<AggregateResult> {
         self.check_live()?;
         let mut agg = Aggregator::new(spec);
         let plan = self.index_plan(filter);
 
         self.scan_for::<io::Error, _>(plan.as_ref(), None, start, end, |key| {
+            if !owned(key) {
+                return Ok(true);
+            }
             let Some(value) = self.get(key)? else { return Ok(true) };
             if filter.as_ref().is_some_and(|f| !matches_filter(&value, f)) {
                 return Ok(true);

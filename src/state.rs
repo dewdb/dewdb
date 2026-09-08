@@ -4,7 +4,7 @@ use crate::cluster::metadata::{
     adopt, merge_catalog, Adoption, ClusterMetadata, IndexCatalog, Migration,
 };
 use crate::cluster::migration::MigrationRuns;
-use crate::cluster::ownership::{classify, Ownership};
+use crate::cluster::ownership::{classify, group_owner, group_owns, Ownership};
 use crate::config::NodeConfig;
 use crate::consensus::config::CONFIG_LOG;
 use crate::consensus::ReplicationState;
@@ -32,6 +32,23 @@ pub struct RoutedRead {
     counts: Arc<std::sync::Mutex<HashMap<String, u64>>>,
 }
 
+#[derive(Clone)]
+pub(crate) struct ScanOwnership {
+    ring: Option<Arc<BuiltRing>>,
+    group: Option<String>,
+    collection: String,
+}
+
+impl ScanOwnership {
+    pub fn includes(&self, key: &str) -> bool {
+        match &self.ring {
+            None => true,
+            Some(ring) => self.group.as_deref()
+                .is_some_and(|group| group_owns(ring, group, &self.collection, key)),
+        }
+    }
+}
+
 impl Drop for RoutedRead {
     fn drop(&mut self) {
         let Ok(mut counts) = self.counts.lock() else { return };
@@ -39,6 +56,34 @@ impl Drop for RoutedRead {
             *count = count.saturating_sub(1);
             if *count == 0 {
                 counts.remove(&self.url);
+            }
+        }
+    }
+}
+
+/// Why a write was not admitted. `Backlog` is transient and the same request succeeds once commits
+/// drain; `TooWide` never can, because one request asks for more than the whole bound.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Refusal {
+    Backlog { in_flight: usize },
+    TooWide { frames: usize },
+}
+
+/// Capacity held between admission and the append that consumes it. Released on drop, so a write
+/// that fails anywhere before staging gives its slots back without the caller unwinding them.
+pub struct FrameReservation {
+    collection: String,
+    frames: usize,
+    held: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+}
+
+impl Drop for FrameReservation {
+    fn drop(&mut self) {
+        let Ok(mut held) = self.held.lock() else { return };
+        if let Some(count) = held.get_mut(&self.collection) {
+            *count = count.saturating_sub(self.frames);
+            if *count == 0 {
+                held.remove(&self.collection);
             }
         }
     }
@@ -64,6 +109,9 @@ pub struct AppState {
     pub read_rr: Arc<AtomicUsize>,
     pub(crate) node_loads: Arc<std::sync::Mutex<HashMap<String, NodeLoadSample>>>,
     pub(crate) routed_reads: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    /// Frames an admitted write has not staged yet, per collection. Counted with `pending_len`, or
+    /// a bulk request and a set of concurrent writes each pass one pre-append sample (IB-014).
+    pub(crate) frame_reservations: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     pub metrics: Arc<Metrics>,
     /// Node-wide cap on concurrent outbound replication requests. Shared across every write, unlike
     /// a per-call semaphore, which bounds one write's fan-out and nothing else.
@@ -133,27 +181,46 @@ impl AppState {
         self.config.role == "shard"
     }
 
-    /// `Err` means the collection has more durable-but-uncommitted frames than the bound allows.
-    /// Checked before the append: once a frame is on disk it is staged, and the staging buffer only
-    /// drains on commit, so admitting here is the last point where growth can still be refused.
-    pub fn admit_write(&self, collection: &str) -> Result<(), usize> {
+    /// Admits a write of `frames` frames. Checked before the append: the staging buffer only drains
+    /// on commit, so this is the last point where growth can still be refused. The reservation must
+    /// outlive the append -- until it stages, a frame is counted nowhere at all (IB-014).
+    pub fn admit_write(&self, collection: &str, frames: usize)
+        -> Result<Option<FrameReservation>, Refusal>
+    {
         let bound = self.config.flow_control.max_uncommitted_frames;
         // Not `!is_leader()`: a leader deposed mid-write still holds staged frames that no quorum
         // will ever commit, which is when the bound matters most rather than least (bugs.md C26).
         if bound == 0 || self.replication.is_none() {
-            return Ok(());
+            return Ok(None);
         }
+        // Refused on the request alone, before the sample: draining cannot make room for it, so
+        // answering with retriable backpressure would leave the client looping.
+        if frames > bound {
+            self.metrics.note_write_rejected();
+            return Err(Refusal::TooWide { frames });
+        }
+        // One lock over the sample and the reservation, or two requests decide against the same
+        // count and both append. Nothing holds a collection's `pending` while taking this.
+        let mut held = self.frame_reservations.lock().unwrap();
         let pending = self
             .db
             .as_ref()
             .and_then(|db| db.get_collection(collection).ok())
             .map_or(0, |col| col.pending_len());
+        let in_flight = pending.saturating_add(held.get(collection).copied().unwrap_or(0));
 
-        if pending >= bound {
+        if in_flight.saturating_add(frames) > bound {
+            drop(held);
             self.metrics.note_write_rejected();
-            return Err(pending);
+            return Err(Refusal::Backlog { in_flight });
         }
-        Ok(())
+        *held.entry(collection.to_string()).or_insert(0) += frames;
+        drop(held);
+        Ok(Some(FrameReservation {
+            collection: collection.to_string(),
+            frames,
+            held: self.frame_reservations.clone(),
+        }))
     }
 
     pub fn current_term(&self) -> u64 {
@@ -489,6 +556,7 @@ impl AppState {
             read_rr: Arc::new(AtomicUsize::new(0)),
             node_loads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             routed_reads: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            frame_reservations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             metrics: Arc::new(Metrics::new()),
             cluster: Arc::new(RwLock::new(cluster)),
             ring_cache: Arc::new(std::sync::Mutex::new(RingCache::default())),
@@ -543,6 +611,7 @@ impl AppState {
             read_rr: Arc::new(AtomicUsize::new(0)),
             node_loads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             routed_reads: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            frame_reservations: Arc::new(std::sync::Mutex::new(HashMap::new())),
             metrics: Arc::new(Metrics::new()),
             cluster: Arc::new(RwLock::new(cluster)),
             ring_cache: Arc::new(std::sync::Mutex::new(RingCache::default())),
@@ -961,6 +1030,18 @@ impl AppState {
         classify(&view, ring.as_deref()?, target.as_deref(), &self.own_url(), collection, key)
     }
 
+    /// One ownership view for a whole scan, so a topology adoption cannot split a page.
+    pub(crate) fn scan_ownership(&self, collection: &str) -> ScanOwnership {
+        let view = self.cluster.read().unwrap();
+        let (ring, _) = self.rings_for(&view);
+        let group = ring.as_ref().and_then(|ring| group_owner(ring, &self.own_url()));
+        ScanOwnership {
+            ring,
+            group,
+            collection: collection.to_string(),
+        }
+    }
+
     pub fn get_effective_shard_url(&self, hash: u64) -> Option<(String, String, Vec<String>)> {
         if let Some(ring) = self.built_ring() {
             let owner = ring.owner(hash)?;
@@ -1087,18 +1168,18 @@ mod tests {
 
         for i in 0..2 {
             stage_put(&col, &format!("k{}", i), i);
-            assert!(state.admit_write("t").is_ok(), "under the bound the write is admitted");
+            assert!(state.admit_write("t", 1).is_ok(), "under the bound the write is admitted");
         }
 
         stage_put(&col, "k2", 2);
-        assert_eq!(state.admit_write("t"), Err(3),
+        assert_eq!(state.admit_write("t", 1).err(), Some(Refusal::Backlog { in_flight: 3 }),
             "at the bound the leader must refuse, or the staging buffer grows without limit \
              for as long as commits are stalled");
         assert_eq!(state.metrics.writes_rejected(), 1);
 
         // A quorum catching up drains the buffer and reopens the door.
         col.apply_committed(col.last_appended_lsn()).unwrap();
-        assert!(state.admit_write("t").is_ok(), "backpressure must lift once commits catch up");
+        assert!(state.admit_write("t", 1).is_ok(), "backpressure must lift once commits catch up");
     }
 
     /// C26: this asserted the opposite, reasoning that a follower refusing replicated frames would
@@ -1116,12 +1197,57 @@ mod tests {
         }
 
         let deposed = AppState::for_admission_test(config_with_bound(&root, 1), db.clone(), false);
-        assert_eq!(deposed.admit_write("t"), Err(5),
+        assert_eq!(deposed.admit_write("t", 1).err(), Some(Refusal::Backlog { in_flight: 5 }),
             "losing leadership stopped the bound applying to a buffer that can no longer drain: \
              nothing this node still accepts will ever reach a quorum");
 
         let unbounded = AppState::for_admission_test(config_with_bound(&root, 0), db.clone(), true);
-        assert!(unbounded.admit_write("t").is_ok(), "0 opts out of the bound");
+        assert!(unbounded.admit_write("t", 10).is_ok(), "0 opts out of the bound");
+    }
+
+    /// IB-014: the bound was checked against a pre-append count and nothing was reserved, so one
+    /// bulk request appended as many frames as it liked and concurrent single writes each passed
+    /// the same sample.
+    #[tokio::test]
+    async fn a_batch_is_admitted_as_a_whole_and_reservations_stop_concurrent_writes_sharing_a_count() {
+        let root = temp_root();
+        let db = Arc::new(Database::new(&root).unwrap());
+        let state = AppState::for_admission_test(config_with_bound(&root, 4), db.clone(), true);
+        let col = db.get_collection("t").unwrap();
+
+        assert_eq!(state.admit_write("t", 10).err(), Some(Refusal::TooWide { frames: 10 }),
+            "ten documents in one bulk write staged ten frames under a bound of four");
+
+        stage_put(&col, "k0", 0);
+        assert_eq!(state.admit_write("t", 4).err(), Some(Refusal::Backlog { in_flight: 1 }),
+            "a batch has to fit beside what is already staged, not just against the bound");
+
+        let held = state.admit_write("t", 3).unwrap().expect("3 fits beside 1 staged frame");
+        assert_eq!(state.admit_write("t", 1).err(), Some(Refusal::Backlog { in_flight: 4 }),
+            "an admitted write that has not appended yet still occupies its slots");
+
+        drop(held);
+        assert!(state.admit_write("t", 3).is_ok(),
+            "a write that never reached its append must give the capacity back");
+    }
+
+    #[tokio::test]
+    async fn the_bound_counts_a_reservation_until_the_frame_it_covers_is_staged() {
+        let root = temp_root();
+        let db = Arc::new(Database::new(&root).unwrap());
+        let state = AppState::for_admission_test(config_with_bound(&root, 2), db.clone(), true);
+        let col = db.get_collection("t").unwrap();
+
+        let first = state.admit_write("t", 1).unwrap().unwrap();
+        // What the write path does: append under the reservation, release it once staged.
+        stage_put(&col, "k0", 0);
+        drop(first);
+        assert_eq!(col.pending_len(), 1);
+
+        let second = state.admit_write("t", 1).unwrap().unwrap();
+        assert_eq!(state.admit_write("t", 1).err(), Some(Refusal::Backlog { in_flight: 2 }),
+            "one staged frame plus one reserved fills a bound of two");
+        drop(second);
     }
 
     #[tokio::test]

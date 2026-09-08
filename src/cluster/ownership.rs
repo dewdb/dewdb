@@ -29,6 +29,15 @@ fn entry_for<'a>(shards: &'a [RingShard], node_url: &str) -> Option<&'a RingShar
     })
 }
 
+pub(crate) fn group_owner(built: &BuiltRing, own_url: &str) -> Option<String> {
+    entry_for(built.shards(), own_url).map(|entry| entry.node_url.clone())
+}
+
+pub(crate) fn group_owns(built: &BuiltRing, group: &str, collection: &str, key: &str) -> bool {
+    built.owner(hash_key(collection, key))
+        .is_some_and(|owner| same_endpoint(&owner.node_url, group))
+}
+
 /// `None` only when there is no ring at all, which is a single shard or a range-based cluster and
 /// must not be broken by a check meant for sharded ones.
 ///
