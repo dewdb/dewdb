@@ -1395,9 +1395,8 @@ impl Collection {
         }
         if watched {
             self.publish_changes(changes, committed_lsn);
-        } else if self.changefeed.has_subscribers() {
-            // Somebody attached mid-batch, so these changes were never built. Marking the gap is
-            // what stops the feed resuming across them as though nothing had happened.
+        } else if self.changefeed.active() {
+            // A subscriber or pin attached mid-batch, so these changes were never built.
             self.changefeed.note_gap(committed_lsn);
         }
         persisted.map(|()| ready_len)

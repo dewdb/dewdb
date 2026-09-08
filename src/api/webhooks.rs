@@ -26,6 +26,8 @@ pub struct CreateWebhook {
     pub secret: Option<String>,
     pub filter: Option<String>,
     pub ops: Option<String>,
+    #[serde(default)]
+    pub position: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -135,19 +137,29 @@ pub async fn create_webhook(
         filter: payload.filter.clone(),
         ops: payload.ops.clone(),
     };
+    let feed_position = col.applied_lsn();
+    // Covers commits between sampling the initial cursor and transferring ownership to the store.
+    let registration_pin = col.changefeed.pin_from(feed_position);
     // From here rather than from the start of the log: a new subscription is "from now on", the
     // way a change stream that names no position is.
-    let subscription = match state.webhooks.upsert(spec, col.applied_lsn(), state.config.webhooks.max_subscriptions) {
+    let initial_position = if params.local {
+        payload.position.unwrap_or(feed_position)
+    } else {
+        feed_position
+    };
+    let subscription = match state.webhooks.upsert(spec, initial_position, state.config.webhooks.max_subscriptions) {
         Ok(subscription) => subscription,
         Err(max) => return err_json(StatusCode::CONFLICT, format!(
             "this node already holds the maximum of {} webhook subscriptions", max)),
     };
+    state.webhooks.sync_pins(state.db.as_ref().unwrap());
+    drop(registration_pin);
 
     let mut body = subscription.public();
     if !params.local {
         let forwarded = serde_json::json!({
             "id": payload.id, "url": payload.url, "secret": payload.secret,
-            "filter": payload.filter, "ops": payload.ops,
+            "filter": payload.filter, "ops": payload.ops, "position": subscription.delivery.position,
         });
         let (took, missed) = push_to_group(&state, &col_name, Some(&forwarded), &payload.id).await;
         body["replicated_to"] = serde_json::json!(took);
@@ -204,6 +216,7 @@ pub async fn delete_webhook(
 
     let key = (col_name.clone(), id.clone());
     let removed = state.webhooks.remove(&key);
+    state.webhooks.sync_pins(state.db.as_ref().unwrap());
     if params.local {
         return match removed {
             true => StatusCode::NO_CONTENT.into_response(),
@@ -231,7 +244,7 @@ pub async fn delete_webhook(
 mod tests {
     use crate::test_support::{
         leaders, next_test_port, put_value, router_for, single_node, temp_root, three_node_cluster,
-        wait_for, TestNode, WebhookSink,
+        three_node_cluster_with_timeout, wait_for, TestNode, WebhookSink,
     };
     use crate::webhook::sign;
     use axum::http::StatusCode;
@@ -327,6 +340,12 @@ mod tests {
         assert!(attempts.iter().take(3)
             .all(|d| d.body["events"].as_array().map(|e| e.len()) == Some(1)),
             "the retry must carry the same events, not fewer");
+
+        assert!(wait_for(SETTLE, || n.state.as_ref().and_then(|state| state.webhooks.get(
+            &("c".to_string(), "orders".to_string())))
+            .is_some_and(|subscription| subscription.delivery.delivered == 1
+                && subscription.delivery.failures == 0)).await,
+            "the successful attempt did not commit its cursor and clear the retry state");
 
         let state = state_of(&c, &n.url(), "orders").await;
         assert!(state["delivery"]["attempts"].as_u64().is_some_and(|a| a >= 3), "{}", state);
@@ -497,5 +516,64 @@ mod tests {
                 .send().await.unwrap().status(), StatusCode::NOT_FOUND,
                 "a removal has to reach the group too, or a failover resurrects the destination");
         }
+    }
+
+    /// IB-030: the acknowledged cursor belongs to the group, and every registered replica keeps
+    /// the bounded feed window that cursor resumes inside before it becomes leader.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn a_promoted_replica_resumes_webhook_delivery_after_the_last_acknowledged_event() {
+        let root = temp_root();
+        let (mut n1, mut n2, mut n3) = three_node_cluster_with_timeout(&root, 3).await;
+        let sink = WebhookSink::start().await;
+        let c = reqwest::Client::new();
+        assert!(wait_for(SETTLE, || n1.is_leader()).await, "n1 did not settle as leader");
+
+        assert!(put_value(&c, &n1.url(), "c", "seed", serde_json::json!({"v": 0}),
+            "?w=majority").await.is_success());
+        assert_eq!(register(&c, &n1.url(), serde_json::json!({
+            "id": "orders", "url": sink.url,
+        })).await.status(), StatusCode::CREATED);
+        for follower in [&n2, &n3] {
+            let feed_active = follower.state.as_ref().and_then(|state| state.db.as_ref())
+                .and_then(|db| db.existing_collection("c"))
+                .is_some_and(|col| col.changefeed.active());
+            assert!(feed_active, "{} did not pin the feed when it took the registration", follower.url());
+        }
+
+        put(&c, &n1.url(), "before", 1).await;
+        let first = sink.wait_for_events(1, SETTLE).await;
+        assert_eq!(first.iter().filter_map(|event| event["key"].as_str()).collect::<Vec<_>>(),
+            vec!["before"], "the initial event was not delivered exactly once: {:?}", first);
+        assert!(wait_for(SETTLE, || {
+            n1.state.as_ref().and_then(|state| state.webhooks.get(
+                &("c".to_string(), "orders".to_string())))
+                .is_some_and(|subscription| subscription.delivery.position > 0)
+        }).await, "the acknowledged position did not become durable");
+
+        n1.kill();
+        assert!(wait_for(Duration::from_secs(30), || leaders(&[&n2, &n3]).len() == 1).await,
+            "the surviving quorum did not elect a leader");
+        let promoted = if n2.is_leader() { &n2 } else { &n3 };
+        let deadline = std::time::Instant::now() + SETTLE;
+        loop {
+            let status = put_value(&c, &promoted.url(), "c", "after",
+                serde_json::json!({"v": 2}), "").await;
+            if status.is_success() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline,
+                "the promoted leader did not become ready for writes: {}", status);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let events = sink.wait_for_events(2, SETTLE).await;
+        let keys: Vec<&str> = events.iter().filter_map(|event| event["key"].as_str()).collect();
+        assert_eq!(keys, vec!["before", "after"],
+            "promotion redelivered or skipped around the acknowledged cursor: {:?}", events);
+        let delivery = state_of(&c, &promoted.url(), "orders").await;
+        assert_eq!(delivery["delivery"]["gaps"].as_u64(), Some(0), "{}", delivery);
+
+        n2.kill();
+        n3.kill();
     }
 }

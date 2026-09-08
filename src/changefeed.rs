@@ -235,12 +235,6 @@ impl Changefeed {
         self.wake.send_replace(position);
     }
 
-    /// A subscriber attached while the feed was quiet has no wakeup coming for the batch already
-    /// in flight, so its changes are never published. One relaxed load per skipped commit.
-    pub fn has_subscribers(&self) -> bool {
-        self.live.load(Ordering::Relaxed) > 0
-    }
-
     /// `applied` is the collection's committed watermark. Catching a quiet feed up to it here
     /// rather than on the write path is what keeps a feed nobody watches free.
     pub fn subscribe(self: &Arc<Self>, after: Option<u64>, applied: u64) -> Result<Subscription, SubscribeError> {
@@ -283,10 +277,26 @@ impl Changefeed {
         })
     }
 
-    /// Held for as long as the consumer that is not a subscription exists. Nothing is buffered on
-    /// its behalf beyond what the ring already holds, so a pin costs one recorded feed, not a queue.
-    pub fn pin(self: &Arc<Self>) -> FeedPin {
-        self.pins.fetch_add(1, Ordering::Relaxed);
+    /// Activates a quiet feed at the observed collection position and holds it for a consumer.
+    pub fn pin_from(self: &Arc<Self>, applied: u64) -> FeedPin {
+        let advanced = {
+            let mut ring = self.ring.lock().unwrap();
+            let quiet = ring.subscribers == 0
+                && self.pins.load(Ordering::Relaxed) == 0
+                && !ring.idle_since.is_some_and(|t| t.elapsed() < self.retention());
+            self.pins.fetch_add(1, Ordering::Relaxed);
+            if quiet && applied > ring.position {
+                ring.resume_floor = ring.resume_floor.max(applied);
+                ring.position = applied;
+                ring.events.clear();
+                Some(ring.position)
+            } else {
+                None
+            }
+        };
+        if let Some(position) = advanced {
+            self.wake.send_replace(position);
+        }
         FeedPin { feed: self.clone() }
     }
 
@@ -526,7 +536,7 @@ mod tests {
             ChangefeedConfig { buffer_events: 8, idle_retention_ms: 0, max_subscribers: 4 }, 0));
         assert!(!feed.active());
 
-        let pin = feed.pin();
+        let pin = feed.pin_from(0);
         assert!(feed.active(), "a pinned feed records for a consumer that is not there yet");
         feed.publish(vec![put(1, "a")], 1);
 

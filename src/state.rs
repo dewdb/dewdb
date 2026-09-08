@@ -127,8 +127,7 @@ pub struct AppState {
     /// Progress of a handover this node is driving. Runtime only: a half-copied shard is this
     /// node's business, not a fact the cluster needs to agree on.
     pub migrations: Arc<std::sync::Mutex<MigrationRuns>>,
-    /// Webhook registrations and how far delivery got. Node-local and durable: a destination is
-    /// something this node pushes to, not a fact the cluster agrees on.
+    /// Node-local webhook registrations and counters; acknowledged cursors live in `_webhooks`.
     pub webhooks: Arc<crate::webhook::WebhookStore>,
     /// The barrier that holds writes still on this node. Data movement drains it -- taken and
     /// dropped, to settle writes that decided ownership under the old view -- and a leadership

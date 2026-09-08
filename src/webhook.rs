@@ -1,16 +1,17 @@
 //! Webhook delivery: a CDC consumer that pushes to an endpoint instead of holding a connection.
 //!
-//! A subscription is durable node-local state -- the registration and the position last
-//! acknowledged -- so a restart resumes where the endpoint got to rather than where the feed is.
-//! Delivery is at-least-once: the position advances only after a `2xx`, so a crash between the
-//! acknowledgement and the write redelivers the batch that was in flight and nothing older.
+//! Registrations and counters are durable node-local state. An acknowledged position advances
+//! through the group's `_webhooks` log before the local cursor, so failover remains at-least-once.
 //!
 //! Only the group's leader delivers. The stream is opened `read=primary` for that reason, and a
 //! step-down ends it in place rather than leaving two nodes pushing the same events.
 
 use crate::cdc::{CdcEnd, CdcFilter, CdcStream};
-use crate::changefeed::{ChangeEvent, FeedPin, SubscribeError};
+use crate::changefeed::{ChangeEvent, Changefeed, FeedPin, SubscribeError};
+use crate::replication::write_concern::DEFAULT_WTIMEOUT_MS;
+use crate::replication::WriteConcern;
 use crate::state::AppState;
+use crate::storage::Database;
 use crate::util::write_atomic;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 const WEBHOOK_FILE: &str = "webhooks.meta";
+const WEBHOOK_PROGRESS_LOG: &str = "_webhooks";
 /// How often the sender set is reconciled against the registrations and this node's leadership.
 /// A registration change wakes it early, so this is a bound on noticing a failover rather than
 /// something a request waits on.
@@ -168,11 +170,11 @@ struct WebhookMeta {
 /// A collection and an id. Two collections may use the same id, so neither alone is the identity.
 pub type WebhookKey = (String, String);
 
-/// The registrations and their positions, in memory and on disk. Node-local: a registration is a
-/// destination this node pushes to, not a fact the cluster agrees on.
+/// Node-local registrations and delivery state, plus the feed pins a promotion needs beforehand.
 pub struct WebhookStore {
     data_dir: String,
     subscriptions: std::sync::Mutex<BTreeMap<WebhookKey, Subscription>>,
+    pinned: std::sync::Mutex<HashMap<String, (Arc<Changefeed>, FeedPin)>>,
     /// Wakes the supervisor, so a registration starts delivering at once rather than at the next
     /// poll -- the window between registering and subscribing is one the feed can move under.
     changed: Notify,
@@ -190,6 +192,7 @@ impl WebhookStore {
         Self {
             data_dir: data_dir.to_string(),
             subscriptions: std::sync::Mutex::new(subscriptions),
+            pinned: std::sync::Mutex::new(HashMap::new()),
             changed: Notify::new(),
         }
     }
@@ -266,6 +269,21 @@ impl WebhookStore {
             .map(|(key, _)| key.clone()).collect()
     }
 
+    pub fn sync_pins(&self, db: &Database) {
+        let wanted = self.collections();
+        let mut pinned = self.pinned.lock().unwrap();
+        pinned.retain(|collection, _| wanted.contains(collection));
+        for collection in wanted {
+            let Some(col) = db.existing_collection(&collection) else { continue };
+            let stale = pinned.get(&collection)
+                .is_none_or(|(feed, _)| !Arc::ptr_eq(feed, &col.changefeed));
+            if stale {
+                let feed = col.changefeed.clone();
+                pinned.insert(collection, (feed.clone(), feed.pin_from(col.applied_lsn())));
+            }
+        }
+    }
+
     /// Records progress against the registration as it stands. A subscription removed mid-delivery
     /// is not resurrected by the acknowledgement of its own last batch.
     fn note(&self, key: &WebhookKey, change: impl FnOnce(&mut Delivery)) {
@@ -273,6 +291,47 @@ impl WebhookStore {
         let Some(subscription) = held.get_mut(key) else { return };
         change(&mut subscription.delivery);
         self.persist(&held);
+    }
+}
+
+fn progress_key(key: &WebhookKey) -> String {
+    serde_json::to_string(key).expect("webhook keys serialize")
+}
+
+fn replicated_position(state: &AppState, key: &WebhookKey) -> u64 {
+    state.db.as_ref()
+        .and_then(|db| db.existing_collection(WEBHOOK_PROGRESS_LOG))
+        .and_then(|col| col.get(&progress_key(key)).ok().flatten())
+        .and_then(|value| value.get("position").and_then(|p| p.as_u64()))
+        .unwrap_or(0)
+}
+
+async fn commit_position(state: &AppState, key: &WebhookKey, position: u64) -> Result<(), Stop> {
+    let timeout = Duration::from_millis(DEFAULT_WTIMEOUT_MS);
+    loop {
+        if replicated_position(state, key) >= position {
+            return Ok(());
+        }
+        if state.replication.is_some() && !state.is_leader() {
+            return Err(Stop::NotLeading);
+        }
+        match crate::api::write::local_write(
+            state,
+            WEBHOOK_PROGRESS_LOG,
+            progress_key(key),
+            Some(serde_json::json!({"position": position})),
+            WriteConcern::Majority,
+            timeout,
+        ).await {
+            Ok(outcome) if outcome.met && replicated_position(state, key) >= position =>
+                return Ok(()),
+            Ok(_) => warn!(target: "webhook", subscription = %key.1, collection = %key.0,
+                position, "Webhook acknowledgement has not reached a quorum; retrying"),
+            Err(response) => warn!(target: "webhook", subscription = %key.1,
+                collection = %key.0, position, status = %response.status(),
+                "Could not record webhook acknowledgement; retrying"),
+        }
+        tokio::time::sleep(REOPEN_DELAY).await;
     }
 }
 
@@ -401,14 +460,14 @@ async fn post_until_acknowledged(
         };
 
         let Some(error) = outcome else {
+            let Some(last) = events.last() else { return Ok(()) };
+            commit_position(state, key, last.lsn).await?;
             state.webhooks.note(key, |d| {
                 d.attempts += 1;
                 d.delivered += events.len() as u64;
                 d.failures = 0;
                 d.last_error = None;
-                if let Some(last) = events.last() {
-                    d.position = last.lsn;
-                }
+                d.position = last.lsn;
             });
             return Ok(());
         };
@@ -434,11 +493,18 @@ async fn post_until_acknowledged(
 fn open(state: &AppState, key: &WebhookKey) -> Option<CdcStream> {
     let subscription = state.webhooks.get(key)?;
     let db = state.db.as_ref()?;
+    if db.existing_collection(WEBHOOK_PROGRESS_LOG)
+        .is_some_and(|progress| progress.pending_len() > 0) {
+        return None;
+    }
     let col = db.lookup_collection(&subscription.spec.collection).ok().flatten()?;
     let filter = CdcFilter::parse(
         subscription.spec.filter.as_deref(), subscription.spec.ops.as_deref()).ok()?;
 
-    let position = subscription.delivery.position;
+    let position = subscription.delivery.position.max(replicated_position(state, key));
+    if position > subscription.delivery.position {
+        state.webhooks.note(key, |d| d.position = d.position.max(position));
+    }
     match col.changefeed.subscribe(Some(position), col.applied_lsn()) {
         Ok(sub) => Some(CdcStream::new(sub, filter, Some(state.clone()))),
         // Delivery fell further behind than the buffer holds. The events under the floor are gone,
@@ -509,28 +575,7 @@ async fn deliver(state: AppState, key: WebhookKey) {
     }
 }
 
-/// Holds the feed of every collection with a deliverable registration open while this node leads.
-/// A sender is not a connection: between one subscription and the next, and before the first one
-/// after a restart, nothing else would keep those changes recorded.
-fn pin_feeds(state: &AppState, held: &mut HashMap<String, FeedPin>) {
-    let wanted = match state.is_leader() {
-        true => state.webhooks.collections(),
-        false => HashSet::new(),
-    };
-    held.retain(|collection, _| wanted.contains(collection));
-    let Some(db) = state.db.as_ref() else { return };
-    for collection in wanted {
-        if held.contains_key(&collection) {
-            continue;
-        }
-        // A collection that is not there records nothing anyway, and the next pass pins it once a
-        // write brings it back.
-        if let Some(col) = db.existing_collection(&collection) {
-            held.insert(collection, col.changefeed.pin());
-        }
-    }
-}
-
+/// Holds every registered feed open on followers as well as the node currently delivering.
 /// Keeps one sender per deliverable registration while this node leads, and none when it does not.
 pub fn webhook_task(state: AppState) {
     if state.db.is_none() || !state.config.webhooks.enabled {
@@ -538,8 +583,7 @@ pub fn webhook_task(state: AppState) {
     }
     // Before the caller binds its listener, not on the first tick: a change written while the
     // supervisor was still starting would otherwise never be built.
-    let mut pins: HashMap<String, FeedPin> = HashMap::new();
-    pin_feeds(&state, &mut pins);
+    state.webhooks.sync_pins(state.db.as_ref().unwrap());
 
     tokio::spawn(async move {
         let mut senders: HashMap<WebhookKey, JoinHandle<()>> = HashMap::new();
@@ -557,8 +601,7 @@ pub fn webhook_task(state: AppState) {
                 }
             }
             senders.retain(|key, _| wanted.contains(key));
-            // Pinned before the sender is spawned, so the window it takes to subscribe is covered.
-            pin_feeds(&state, &mut pins);
+            state.webhooks.sync_pins(state.db.as_ref().unwrap());
             for key in wanted {
                 senders.entry(key.clone())
                     .or_insert_with(|| tokio::spawn(deliver(state.clone(), key)));

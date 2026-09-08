@@ -3,8 +3,9 @@
 use crate::api::middleware::{client_collection, CollectionPath};
 use crate::api::write::local_drop;
 use crate::cluster::metadata::MigrationPhase;
-use crate::cluster::probe::unique_shards;
-use crate::cluster::router::{router_fanout_drop, router_fanout_maintenance};
+use crate::cluster::router::{
+    router_fanout_drop, router_fanout_maintenance, router_list_collections,
+};
 use crate::model::err_json;
 use crate::replication::write_concern::{
     parse_write_concern, WriteConcernParams, DEFAULT_WTIMEOUT_MS,
@@ -14,7 +15,6 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use std::collections::HashSet;
 use std::io;
 use std::time::Duration;
 use tracing::info;
@@ -23,43 +23,7 @@ pub async fn list_collections(
     State(state): State<AppState>,
 ) -> impl axum::response::IntoResponse {
     if state.config.role == "router" {
-        let mut targets = Vec::new();
-        for (original, replicas) in unique_shards(&state) {
-            targets.push((state.effective_primary(&original), replicas));
-        }
-
-        let per_shard = futures::future::join_all(targets.into_iter().map(|(primary, replicas)| {
-            let client = state.client.clone();
-            async move {
-                let mut candidates = vec![primary];
-                candidates.extend(replicas);
-                for node in candidates {
-                    let url = format!("{}/collections", node);
-                    if let Ok(r) = client.get(&url).send().await {
-                        if r.status().is_success() {
-                            if let Ok(body) = r.json::<serde_json::Value>().await {
-                                return body.get("collections")
-                                    .and_then(|c| c.as_array().cloned())
-                                    .unwrap_or_default();
-                            }
-                        }
-                    }
-                }
-                Vec::new()
-            }
-        })).await;
-
-        let mut names: HashSet<String> = HashSet::new();
-        for list in per_shard {
-            for v in list {
-                if let Some(s) = v.as_str() {
-                    names.insert(s.to_string());
-                }
-            }
-        }
-        let mut out: Vec<String> = names.into_iter().collect();
-        out.sort();
-        return (StatusCode::OK, Json(serde_json::json!({"collections": out}))).into_response();
+        return router_list_collections(&state).await;
     }
 
     let db = state.db.as_ref().unwrap().clone();
@@ -226,8 +190,9 @@ mod tests {
     use crate::config::NodeConfig;
     use crate::storage::Database;
     use crate::test_support::{
-        live_put, next_test_port, put_doc_http, temp_root, three_node_cluster,
-        three_node_cluster_with_timeout, wait_for, wait_for_doc, TestNode,
+        keys_for_group, live_put, next_test_port, put_doc_at, put_doc_http, put_value, router_for,
+        sharded_cluster, temp_root, three_node_cluster, three_node_cluster_with_timeout,
+        voter_group, wait_for, wait_for_doc, TestNode,
     };
     use std::sync::Arc;
     use std::time::Duration;
@@ -295,6 +260,12 @@ mod tests {
             "and left the directory, the wal and a commit task behind with it");
 
         node.kill();
+    }
+
+    async fn listing(client: &reqwest::Client, base: &str) -> (StatusCode, serde_json::Value) {
+        let r = client.get(format!("{}/collections", base)).send().await.unwrap();
+        let status = r.status();
+        (status, r.json::<serde_json::Value>().await.unwrap_or(serde_json::Value::Null))
     }
 
     async fn collections_on(client: &reqwest::Client, base: &str) -> Option<Vec<String>> {
@@ -366,6 +337,94 @@ mod tests {
             client.get(format!("{}/collections/t/docs/k", n1.url())).send().await.unwrap().status(),
             StatusCode::OK,
             "an uncommitted drop must not hide committed data");
+    }
+
+    /// IB-020: the router graded every shard status below 300 as full success, so a staged drop
+    /// came back as a top-level 200 with the collection still readable underneath it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn a_router_reports_a_staged_drop_as_accepted_not_ok() {
+        let root = temp_root();
+        let mut nodes = voter_group(&root, 3, 30).await;
+        let mut router = router_for(
+            &root, &[(nodes[0].url(), vec![nodes[1].url(), nodes[2].url()])]).await;
+        let client = reqwest::Client::new();
+        let base = router.url();
+
+        assert_eq!(put_doc_at(&client, &base, "t", "k", 1, "").await, StatusCode::CREATED);
+        assert!(wait_for_doc(&client, &base, "t", "k", 1, Duration::from_secs(10)).await,
+            "the write has to commit while the quorum is up, or the drop is not what hides it");
+
+        nodes[2].kill();
+        nodes[1].kill();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let (status, body) = drop_via(&client, &base, "?w=majority&wtimeout=1000").await;
+        assert_eq!(status, StatusCode::ACCEPTED,
+            "the owner staged its drop, so the aggregate is pending too: {}", body);
+        assert_eq!(body["shards"][0]["status"], 202);
+        assert_eq!(body["shards"][0]["response"]["status"], "staged");
+
+        assert_eq!(
+            client.get(format!("{}/collections/t/docs/k", base)).send().await.unwrap().status(),
+            StatusCode::OK,
+            "unfixed a 200 said the collection was gone while a client could still read it");
+
+        router.kill();
+        for node in nodes.iter_mut() {
+            node.kill();
+        }
+    }
+
+    /// IB-021: a group that could not answer contributed an empty list to the union, so the router
+    /// answered 200 with that group's collections missing and no way for a client to notice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn a_router_refuses_a_collection_listing_it_cannot_complete() {
+        let root = temp_root();
+        let (mut shards, mut router) = sharded_cluster(&root, 2).await;
+        let client = reqwest::Client::new();
+        let base = router.url();
+
+        // One collection per group, so losing a group loses a name rather than some of the keys
+        // under a name every group holds.
+        let on_first = keys_for_group("first", true, 1).remove(0);
+        let on_second = keys_for_group("second", false, 1).remove(0);
+        assert!(put_value(&client, &base, "first", &on_first,
+            serde_json::json!({"v": 1}), "").await.is_success());
+        assert!(put_value(&client, &base, "second", &on_second,
+            serde_json::json!({"v": 1}), "").await.is_success());
+
+        let (status, body) = listing(&client, &base).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["collections"], serde_json::json!(["first", "second"]),
+            "the union has to be complete while both groups answer: {}", body);
+        assert_eq!(collections_of(&shards[1]).unwrap(), vec!["second".to_string()],
+            "and the second name has to live on the group about to go down");
+
+        shards[1].kill();
+
+        let (status, body) = listing(&client, &base).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY,
+            "unfixed this was 200 with 'second' silently gone: {}", body);
+        assert!(body["error"].as_str().is_some_and(|e| e.contains(&shards[1].url())),
+            "the answer has to name the group that could not answer: {}", body);
+
+        shards[1].start();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let recovered = loop {
+            let (status, body) = listing(&client, &base).await;
+            if status == StatusCode::OK {
+                break body;
+            }
+            assert!(std::time::Instant::now() < deadline,
+                "the listing has to clear itself when the group comes back: {}", body);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(recovered["collections"], serde_json::json!(["first", "second"]));
+
+        router.kill();
+        for shard in shards.iter_mut() {
+            shard.kill();
+        }
     }
 
     #[tokio::test]

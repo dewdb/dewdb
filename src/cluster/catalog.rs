@@ -12,9 +12,14 @@
 //! change is not a routing decision: shards handed their topology by config never adopt anyone's
 //! view (`supersedes` refuses a seed), and a catalogue carried only by the winner would never
 //! reach them.
+//!
+//! The round carries topology as well, in both directions. It is the only poll any node runs
+//! against another group's leader, so two leaders left holding conflicting views converge through
+//! no other path (IB-037). The two halves stay independent: `adopt_cluster` takes a view only if
+//! it wins the total order, and merges the catalogue whoever won.
 
 use crate::api::write::local_index_change;
-use crate::cluster::metadata::{sanitize_catalog, ClusterMetadata};
+use crate::cluster::metadata::{sanitize_catalog, Adoption, ClusterMetadata};
 use crate::consensus::config::is_system_collection;
 use crate::replication::write_concern::DEFAULT_WTIMEOUT_MS;
 use crate::replication::WriteConcern;
@@ -105,17 +110,42 @@ async fn gossip_catalog(state: &AppState) {
         }
     })).await;
 
+    // Sampled once: a catalogue merge moves nothing the total order reads.
+    let ours_id = state.cluster_view_id();
     let mut behind = Vec::new();
+    let mut winner: Option<(String, ClusterMetadata)> = None;
     for (target, theirs) in fetched {
         let Some(theirs) = theirs else { continue };
         let theirs_fingerprint = theirs.catalog_fingerprint();
         if state.merge_index_catalog(&theirs.index_catalog) {
             info!(target: "catalog", peer = %target, "Took index definitions from a peer");
         }
-        behind.push((target, theirs_fingerprint));
+        behind.push((target.clone(), theirs_fingerprint));
+        // Only the best of the round is adopted, not each in turn: an intermediate view would be
+        // persisted and reacted to on its way to one that already supersedes it.
+        if theirs.view_id().supersedes(&ours_id)
+            && winner.as_ref().map_or(true, |(_, best)| theirs.supersedes(best))
+        {
+            winner = Some((target, theirs));
+        }
     }
 
-    // Sampled after every merge, so a peer is only sent a view that is already the union.
+    // No node polls another group's leader for a topology view, so two leaders holding conflicting
+    // ones do not converge (IB-037). The push below already offers a whole view to
+    // `/internal/cluster`; taking one here is the same authority in the other direction, decided
+    // by the same total order.
+    if let Some((source, view)) = winner {
+        match state.adopt_cluster(view) {
+            Adoption::Adopted { from, to } => info!(target: "catalog", peer = %source,
+                "Adopted cluster view v{} from a catalogue round (was v{})", to, from),
+            Adoption::Rejected(why) => warn!(target: "catalog", peer = %source,
+                "Refused a cluster view offered by a catalogue round: {}", why),
+            Adoption::Stale { .. } => {},
+        }
+    }
+
+    // Sampled after the merges and the adoption, so a peer is only sent a view that is already
+    // the union.
     let ours = state.catalog_fingerprint();
     let view = state.cluster_view();
     futures::future::join_all(behind.into_iter()
@@ -212,7 +242,9 @@ fn describe(change: &IndexChange) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{cleanup, put_value, sharded_cluster, temp_root, TestNode};
+    use crate::test_support::{
+        cleanup, keys_for_group, put_value, sharded_cluster, temp_root, TestNode,
+    };
     use axum::http::StatusCode;
 
     fn spec(name: &str, field: &str) -> IndexSpec {
@@ -250,14 +282,6 @@ mod tests {
     /// Keys the router sends to one half of a two-group ring. Which group a key lands on is the
     /// whole subject here, so they are picked by the hash the router routes by rather than hoped
     /// for.
-    fn keys_for_group(col: &str, first: bool, n: usize) -> Vec<String> {
-        let half = 1u64 << 63;
-        (0..1000).map(|i| format!("k{:04}", i))
-            .filter(|k| (crate::ring::hash_key(col, k) < half) == first)
-            .take(n)
-            .collect()
-    }
-
     fn local_index(node: &TestNode, col: &str, index: &str) -> Option<&'static str> {
         node.state.as_ref()
             .and_then(|s| s.db.as_ref())
@@ -319,7 +343,7 @@ mod tests {
         }
         assert!(local_index(&shards[1], "t", "by_age").is_none());
 
-        assert_eq!(create(&client, &base, "t", "by_age", "age").await, StatusCode::OK);
+        assert_eq!(create(&client, &base, "t", "by_age", "age").await, StatusCode::CREATED);
         assert!(wait_until(Duration::from_secs(20),
             || local_index(&shards[0], "t", "by_age") == Some("ready")).await,
             "the group that held the collection indexes it directly");
@@ -368,7 +392,7 @@ mod tests {
             assert!(put_value(&client, &base, "t", &key,
                 serde_json::json!({"age": i}), "").await.is_success());
         }
-        assert_eq!(create(&client, &base, "t", "by_age", "age").await, StatusCode::OK);
+        assert_eq!(create(&client, &base, "t", "by_age", "age").await, StatusCode::CREATED);
         assert!(wait_until(Duration::from_secs(20),
             || local_index(&shards[1], "t", "by_age") == Some("ready")).await);
 
@@ -393,6 +417,59 @@ mod tests {
         cleanup(&root).await;
     }
 
+    /// `IB-037`: two shard leaders left holding conflicting equal-version views. Neither runs a
+    /// poller against the other -- `heartbeat_poll_task` only starts on a node that is not leader,
+    /// and `leader_contact_task` probes a leader's own replicas -- so the catalogue round is the
+    /// only place either of them hears the other's view.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn two_shard_leaders_converge_on_the_winning_view_through_the_catalogue_round() {
+        let root = temp_root();
+        let (mut shards, mut router) = sharded_cluster(&root, 2).await;
+        let client = reqwest::Client::new();
+
+        let view_of = |node: &TestNode| node.state.as_ref().unwrap().cluster_view();
+        // The rule the widened round must not break: every node here is still on its own config
+        // seed, and a seed loses to everything, so several rounds move nobody.
+        tokio::time::sleep(Duration::from_secs(CATALOG_SYNC_INTERVAL_SECS * 2 + 1)).await;
+        for node in shards.iter() {
+            let view = view_of(node);
+            assert!(view.seeded && view.version == 1 && view.ring.is_none(),
+                "a config seed must not travel between nodes");
+        }
+
+        // One published view per leader at the same version, differing only in the tiebreak.
+        let published = |updated_by: &str| {
+            let mut v = view_of(&router);
+            v.version = 2;
+            v.updated_by = updated_by.to_string();
+            v.seeded = false;
+            v
+        };
+        let (winner, loser) = (published("zzz-node"), published("aaa-node"));
+        assert!(winner.supersedes(&loser), "the tiebreak has to be decided for this to be a test");
+
+        for (node, view) in [(&shards[0], &winner), (&shards[1], &loser)] {
+            let answer = client.post(format!("{}/internal/cluster", node.url()))
+                .json(view).send().await.unwrap()
+                .json::<serde_json::Value>().await.unwrap();
+            assert_eq!(answer["status"], "adopted", "{:?}", answer);
+        }
+        assert_eq!(view_of(&shards[1]).updated_by, "aaa-node",
+            "the split has to exist before convergence can be asserted");
+
+        assert!(wait_until(Duration::from_secs(30),
+            || view_of(&shards[1]).view_id() == winner.view_id()).await,
+            "the losing leader had no poller that would ever reach the winner");
+        assert_eq!(view_of(&shards[0]).view_id(), winner.view_id(),
+            "and the winner does not take the loser back");
+
+        router.kill();
+        for shard in shards.iter_mut() {
+            shard.kill();
+        }
+        cleanup(&root).await;
+    }
+
     /// A restart is the case the catalogue has to be durable for: the group comes back with its
     /// own log and nothing else, and `cluster.meta` is where the cluster-wide half lives.
     #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -406,7 +483,7 @@ mod tests {
             assert!(put_value(&client, &base, "t", &key,
                 serde_json::json!({"age": i}), "").await.is_success());
         }
-        assert_eq!(create(&client, &base, "t", "by_age", "age").await, StatusCode::OK);
+        assert_eq!(create(&client, &base, "t", "by_age", "age").await, StatusCode::CREATED);
         assert!(wait_until(Duration::from_secs(20),
             || local_index(&shards[0], "t", "by_age") == Some("ready")).await);
         assert!(wait_until(Duration::from_secs(20), || router.state.as_ref()

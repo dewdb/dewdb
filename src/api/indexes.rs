@@ -64,6 +64,8 @@ pub async fn create_index(
         // A group that answered `404` holds none of the collection and so has no definition, and a
         // group that failed has none either. Both are what the catalogue is for, so it is recorded
         // for anything but the collection being nowhere -- reconciliation finishes the fan-out.
+        // A group that only staged its definition (`202`) is the same case: the entry is durable
+        // but revocable, and the catalogue is what puts it back if a later leader drops it.
         if reply.status() != StatusCode::NOT_FOUND {
             state.record_index_catalog(&col_name, &IndexChange::Create {
                 spec: IndexSpec { name: payload.name.clone(), field: payload.field.clone() },
@@ -231,7 +233,8 @@ pub async fn drop_index(
 #[cfg(test)]
 mod tests {
     use crate::test_support::{
-        cleanup, put_value, sharded_cluster, single_node, temp_root, wait_for, TestNode,
+        cleanup, put_doc_at, put_value, router_for, sharded_cluster, single_node, temp_root,
+        voter_group, wait_for, wait_for_doc, TestNode,
     };
     use axum::http::StatusCode;
     use std::time::Duration;
@@ -436,7 +439,7 @@ mod tests {
 
         let (status, body) = create(&client, &base, "t",
             serde_json::json!({"name": "by_age", "field": "age"})).await;
-        assert_eq!(status, StatusCode::OK, "{}", body);
+        assert_eq!(status, StatusCode::CREATED, "every group created it, as the shard route says: {}", body);
         assert_eq!(body["shards"].as_array().unwrap().len(), 2);
         assert!(await_ready(&client, &base, "t").await, "the router unions the groups' answers");
 
@@ -456,6 +459,67 @@ mod tests {
         router.kill();
         for shard in shards.iter_mut() {
             shard.kill();
+        }
+        cleanup(&root).await;
+    }
+
+    /// IB-038: `router_fanout_index` counted every status below 300 as committed, so a definition
+    /// the owner could only stage read as a top-level `200` and a client asking for `majority` had
+    /// no way to tell the two apart. The same grading IB-020 fixed for a collection drop, on the
+    /// second copy of the rule. The `201` half is the same fan-out answering for a create that
+    /// every group did commit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn a_router_reports_a_staged_definition_as_accepted_not_ok() {
+        let root = temp_root();
+        let mut nodes = voter_group(&root, 3, 30).await;
+        let mut router = router_for(
+            &root, &[(nodes[0].url(), vec![nodes[1].url(), nodes[2].url()])]).await;
+        let client = reqwest::Client::new();
+        let base = router.url();
+
+        let create_wc = |name: &'static str, field: &'static str, wc: &'static str| {
+            let (client, base) = (client.clone(), base.clone());
+            async move {
+                let r = client.post(format!("{}/collections/t/indexes{}", base, wc))
+                    .json(&serde_json::json!({"name": name, "field": field}))
+                    .send().await.unwrap();
+                let status = r.status();
+                (status, r.json::<serde_json::Value>().await.unwrap())
+            }
+        };
+
+        assert_eq!(put_doc_at(&client, &base, "t", "k", 1, "").await, StatusCode::CREATED);
+        assert!(wait_for_doc(&client, &base, "t", "k", 1, Duration::from_secs(10)).await,
+            "the collection has to exist on the owner before a definition can reach it");
+
+        let (status, body) = create_wc("by_v", "v", "?w=majority&wtimeout=2000").await;
+        assert_eq!(status, StatusCode::CREATED, "the quorum is up, so this one committed: {}", body);
+        assert_eq!(body["shards"][0]["status"], 201);
+
+        nodes[2].kill();
+        nodes[1].kill();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let (status, body) = create_wc("by_w", "w", "?w=majority&wtimeout=1000").await;
+        assert_eq!(status, StatusCode::ACCEPTED,
+            "the owner staged its definition, so the aggregate is pending too: {}", body);
+        assert_eq!(body["shards"][0]["status"], 202);
+        assert_eq!(body["shards"][0]["response"]["status"], "staged");
+
+        // The drop half of the same fan-out, against the definition that did commit.
+        let dropped = client.delete(
+            format!("{}/collections/t/indexes/by_v?w=majority&wtimeout=1000", base))
+            .send().await.unwrap();
+        let status = dropped.status();
+        let body = dropped.json::<serde_json::Value>().await.unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED,
+            "a staged removal is not a removal a client can rely on: {}", body);
+        assert_eq!(body["shards"][0]["status"], 202);
+        assert_eq!(body["shards"][0]["response"]["status"], "staged");
+
+        router.kill();
+        for node in nodes.iter_mut() {
+            node.kill();
         }
         cleanup(&root).await;
     }

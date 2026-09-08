@@ -906,6 +906,17 @@ fn ids(nodes: &[&TestNode], f: impl Fn(&TestNode) -> bool) -> Vec<String> {
     nodes.iter().filter(|n| f(n)).map(|n| n.node_id.clone()).collect()
 }
 
+/// Keys that hash into the first or second half of the ring for `col`, which is the half a
+/// `sharded_cluster(_, 2)` group owns. A test that needs a collection present on one group only
+/// picks its keys from here; the collection is part of the hash, so the answer differs per name.
+pub fn keys_for_group(col: &str, first: bool, n: usize) -> Vec<String> {
+    let half = 1u64 << 63;
+    (0..1000).map(|i| format!("k{:04}", i))
+        .filter(|k| (crate::ring::hash_key(col, k) < half) == first)
+        .take(n)
+        .collect()
+}
+
 /// `shards` single-node shard groups behind one router, one hash range each. A write pays the
 /// routing hop and a query pays a fan-out across every range.
 pub async fn sharded_cluster(root: &Path, shards: usize) -> (Vec<TestNode>, TestNode) {

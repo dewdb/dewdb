@@ -16,7 +16,7 @@ use crate::state::AppState;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::info;
@@ -596,8 +596,19 @@ pub async fn router_fanout_drop(
     let results = fanout_to_owners(
         state, col_name, "", &query, AdminMethod::Delete, None).await;
 
-    let all_ok = results.iter().all(|r| r.get("status").and_then(|s| s.as_u64()).map_or(false, |s| s < 300));
-    let status = if all_ok { StatusCode::OK } else { StatusCode::MULTI_STATUS };
+    // A shard answers 202 for a drop that is durable but short of its write concern, and a later
+    // leader can still revoke it; reporting 200 would promise a removal nobody committed.
+    let node_status = |r: &serde_json::Value| r.get("status").and_then(|s| s.as_u64());
+    let pending = results.iter().filter(|r| node_status(r) == Some(202)).count();
+    let done = results.iter()
+        .filter(|r| node_status(r).map_or(false, |s| s < 300 && s != 202)).count();
+    let status = if done == results.len() {
+        StatusCode::OK
+    } else if done + pending == results.len() {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::MULTI_STATUS
+    };
     (status, Json(serde_json::json!({"shards": results}))).into_response()
 }
 
@@ -618,14 +629,81 @@ pub async fn router_fanout_index(
     let method = if method_is_create { AdminMethod::Post } else { AdminMethod::Delete };
     let results = fanout_to_owners(state, col_name, suffix, &query, method, body).await;
 
+    // A shard answers 202 for a definition that is durable but short of its write concern, and a
+    // later leader can still revoke it, so it is graded apart from a committed one -- the same
+    // rule as `router_fanout_drop`, on the second copy of it (IB-038). 404 stays "holds none of
+    // the collection": not a failure, and not a definition either.
     let node_status = |r: &serde_json::Value| r.get("status").and_then(|s| s.as_u64());
     let absent = results.iter().filter(|r| node_status(r) == Some(404)).count();
-    let ok = results.iter().filter(|r| node_status(r).map_or(false, |s| s < 300)).count();
-    if ok == 0 && absent > 0 {
+    let pending = results.iter().filter(|r| node_status(r) == Some(202)).count();
+    let done = results.iter()
+        .filter(|r| node_status(r).map_or(false, |s| s < 300 && s != 202)).count();
+    let created = results.iter().filter(|r| node_status(r) == Some(201)).count();
+    if done == 0 && pending == 0 && absent > 0 {
         return collection_absent_response(col_name);
     }
-    let status = if ok + absent == results.len() { StatusCode::OK } else { StatusCode::MULTI_STATUS };
+    let status = if done + absent == results.len() {
+        // `201` only when every group that holds the collection created it, which is what the
+        // shard route answers for the same request; a router answering `200` contradicted both it
+        // and the reference. A group that already held the definition answers `200
+        // {"status":"exists"}` and keeps the aggregate at `200`.
+        if method_is_create && created > 0 && created == done {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        }
+    } else if done + pending + absent == results.len() {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::MULTI_STATUS
+    };
     (status, Json(serde_json::json!({"shards": results}))).into_response()
+}
+
+/// The union of the collection lists of every shard group. A group that could not answer is not an
+/// empty group: its names would drop out of the union with nothing to tell a client they had, so
+/// the listing fails whole with the `502` a failed shard gets from `/query` (IB-021). Nothing of
+/// the group's own to pass through here, unlike the document path (L11): it answers from its own
+/// catalogue or not at all.
+pub async fn router_list_collections(state: &AppState) -> axum::response::Response {
+    let per_shard = futures::future::join_all(unique_shards(state).into_iter()
+        .map(|(original, replicas)| {
+            let state = state.clone();
+            async move {
+                let primary = state.effective_primary(&original);
+                let mut candidates = vec![primary.clone()];
+                if original != primary {
+                    candidates.push(original.clone());
+                }
+                candidates.extend(replicas.into_iter().filter(|r| *r != primary));
+
+                for node in candidates {
+                    let url = format!("{}/collections", node);
+                    let Ok(res) = state.client.get(&url).send().await else { continue };
+                    if !res.status().is_success() {
+                        continue;
+                    }
+                    if let Ok(body) = res.json::<serde_json::Value>().await {
+                        if let Some(list) = body.get("collections").and_then(|c| c.as_array()) {
+                            return (original, Some(list.clone()));
+                        }
+                    }
+                }
+                (original, None)
+            }
+        })).await;
+
+    let mut names: BTreeSet<String> = BTreeSet::new();
+    for (original, listed) in per_shard {
+        let Some(list) = listed else {
+            return err_json(StatusCode::BAD_GATEWAY,
+                format!("no node in shard group '{}' could list its collections", original));
+        };
+        names.extend(list.iter().filter_map(|v| v.as_str()).map(str::to_string));
+    }
+
+    let out: Vec<String> = names.into_iter().collect();
+    (StatusCode::OK, Json(serde_json::json!({"collections": out}))).into_response()
 }
 
 /// The union of what each shard group reports, since an index is defined per group and a client
