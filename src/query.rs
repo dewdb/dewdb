@@ -131,6 +131,16 @@ pub fn parse_sort(s: Option<&str>) -> Result<Option<SortOrder>, String> {
     Ok(Some(SortOrder { keys }))
 }
 
+/// Inclusive bounds on the key order. A reversed pair reached `BTreeMap::range` and panicked
+/// there (IB-018); it is a malformed request, not an empty page, so the client is told.
+pub fn check_key_range(start: Option<&str>, end: Option<&str>) -> Result<(), String> {
+    match start.zip(end) {
+        Some((s, e)) if s > e => Err(format!(
+            "start `{}` is above end `{}`; both bounds are inclusive and ascending", s, e)),
+        _ => Ok(()),
+    }
+}
+
 /// The sort field, or `Null` where the document does not have it.
 fn key_value<'a>(doc: &'a serde_json::Value, key: &SortKey) -> &'a serde_json::Value {
     get_path_value(doc, &key.field).unwrap_or(&serde_json::Value::Null)

@@ -13,8 +13,8 @@ use crate::model::{
     DEFAULT_QUERY_LIMIT, MAX_QUERY_LIMIT,
 };
 use crate::query::{
-    decode_cursor, encode_cursor, parse_filter, parse_sort, sort_position, KeyCursor, SortCursor,
-    SortedRow,
+    check_key_range, decode_cursor, encode_cursor, parse_filter, parse_sort, sort_position,
+    KeyCursor, SortCursor, SortedRow,
 };
 use crate::replication::{parse_write_concern, wc_query_string, WriteConcernParams, DEFAULT_WTIMEOUT_MS};
 use crate::cluster::ownership::Ownership;
@@ -449,6 +449,9 @@ pub async fn query_docs(
         Ok(p) => p,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
     };
+    if let Err(e) = check_key_range(params.start.as_deref(), params.end.as_deref()) {
+        return err_json(StatusCode::BAD_REQUEST, e);
+    }
     // A sorted cursor is a position in the sort order and an unsorted one is a position in one
     // shard's keyspace, so a cursor carried over from a differently-shaped query cannot be honoured
     // and must not be ignored. Both are checked: the unsorted one used to be a bare key, which any
@@ -556,6 +559,9 @@ pub async fn aggregate_docs(
         Ok(p) => p,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
     };
+    if let Err(e) = check_key_range(params.start.as_deref(), params.end.as_deref()) {
+        return err_json(StatusCode::BAD_REQUEST, e);
+    }
 
     if state.config.role == "router" {
         return router_aggregate(&state, &col_name, &params, pref).await;
@@ -1076,6 +1082,43 @@ mod tests {
         let ok = client.get(&format!("{}/collections/t/query", node.url()))
             .query(&[("sort", "v:DESC")]).send().await.unwrap();
         assert_eq!(ok.status(), StatusCode::OK, "the direction is case-insensitive, not free-form");
+    }
+
+    /// IB-018: `start=z&end=a` reached `BTreeMap::range`, which panics on a reversed pair, and the
+    /// blocking-task failure surfaced as a 500.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reversed_key_range_is_refused_and_a_stale_cursor_is_not() {
+        let root = temp_root();
+        let (_s1, _s2, router) = two_shard_cluster(&root).await;
+        let client = reqwest::Client::new();
+        for k in ["a", "b", "c"] {
+            put_value(&client, &router.url(), "t", k, serde_json::json!({"v": 1}), "").await;
+        }
+
+        for path in ["query", "aggregate"] {
+            let r = client.get(&format!("{}/collections/t/{}", router.url(), path))
+                .query(&[("start", "z"), ("end", "a"), ("metrics", "count")])
+                .send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{} must refuse a reversed range", path);
+        }
+
+        let equal = client.get(&format!("{}/collections/t/query", router.url()))
+            .query(&[("start", "b"), ("end", "b")]).send().await.unwrap();
+        assert_eq!(equal.status(), StatusCode::OK, "an equal pair is a one-key range");
+        assert_eq!(equal.json::<serde_json::Value>().await.unwrap()["items"].as_array().map(Vec::len),
+            Some(1));
+
+        // A cursor is opaque, so carrying one past a narrower `end` is an empty page and not a
+        // client error the way an explicit reversed pair is.
+        let first = client.get(&format!("{}/collections/t/query", router.url()))
+            .query(&[("limit", "1")]).send().await.unwrap()
+            .json::<serde_json::Value>().await.unwrap();
+        let cursor = first["next_cursor"].as_str().unwrap().to_string();
+        let narrowed = client.get(&format!("{}/collections/t/query", router.url()))
+            .query(&[("cursor", cursor.as_str()), ("end", "a")]).send().await.unwrap();
+        assert_eq!(narrowed.status(), StatusCode::OK);
+        assert_eq!(narrowed.json::<serde_json::Value>().await.unwrap()["items"].as_array().map(Vec::len),
+            Some(0));
     }
 
     /// Grouping splits across shards by key, so the merge has to be over groups. An average is the

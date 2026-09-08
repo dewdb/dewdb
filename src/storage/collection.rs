@@ -657,6 +657,13 @@ impl Collection {
         end: Option<&str>,
         limit: usize,
     ) -> Vec<String> {
+        let lower = after.or(start);
+        // `BTreeMap::range` panics on a reversed pair, and a cursor can carry `after` above a
+        // narrower `end` on the next request; an empty range is the answer (IB-018).
+        if lower.zip(end).is_some_and(|(l, e)| l > e) {
+            return Vec::new();
+        }
+
         let index = self.index.read().unwrap();
 
         let start_bound = if let Some(a) = after {
@@ -2072,6 +2079,25 @@ mod tests {
 
         let exclusive: Vec<String> = col.range_from(Some("b"), None, None);
         assert_eq!(exclusive, vec!["c", "d"], "cursor resumes strictly after the key");
+    }
+
+    /// IB-018: a reversed pair went straight into `BTreeMap::range`, which panics on one.
+    #[tokio::test]
+    async fn a_reversed_range_is_empty_rather_than_a_panic() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+        for k in ["a", "b", "c", "d"] {
+            live_put(&col, k, 1);
+        }
+
+        assert!(col.range_from(None, Some("z"), Some("a")).is_empty(), "start above end");
+        assert!(col.range_from(Some("z"), None, Some("a")).is_empty(),
+            "a cursor above a narrower end on the next request");
+        assert_eq!(col.range_from(None, Some("b"), Some("b")), vec!["b"],
+            "an equal pair is one key, not a rejected range");
+        let (rows, next) = col.query_page(None, Some("z"), Some("a"), &None, 10).unwrap();
+        assert!(rows.is_empty() && next.is_none(), "and the query path returns the empty page");
     }
 
     #[tokio::test]
