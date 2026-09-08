@@ -57,6 +57,11 @@ pub struct AggregateParams {
     pub group: Option<String>,
     /// `count`, `sum:field`, `avg:field`, `min:field`, `max:field`. Absent is `count`.
     pub metrics: Option<String>,
+    /// Documents the aggregation may read on each shard. Per shard rather than per cluster: it
+    /// bounds one node's walk, which is the thing that occupies a blocking thread.
+    pub max_docs: Option<usize>,
+    /// Accept the totals over what the budget bought instead of a refusal when it runs out.
+    pub partial: Option<bool>,
 }
 
 #[derive(Deserialize)]

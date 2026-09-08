@@ -234,6 +234,7 @@ async fn main() -> io::Result<()> {
         metrics: Arc::new(Metrics::new()),
         replication_slots: Arc::new(tokio::sync::Semaphore::new(
             config.flow_control.max_inflight_requests.max(1))),
+        scan_slots: Arc::new(tokio::sync::Semaphore::new(crate::aggregate::MAX_CONCURRENT_SCANS)),
         cluster,
         ring_cache: Arc::new(std::sync::Mutex::new(Default::default())),
         migrations: Arc::new(std::sync::Mutex::new(MigrationRuns::restored(&config.data_dir))),

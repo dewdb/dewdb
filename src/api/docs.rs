@@ -1,7 +1,10 @@
 //! Document endpoints.
 
 use super::write::{local_patch, local_write, local_write_batch};
-use crate::aggregate::{parse_group, parse_metrics, AggregateSpec};
+use crate::aggregate::{
+    budget_spent, parse_group, parse_metrics, AggregateSpec, DEFAULT_AGGREGATE_SCAN,
+    MAX_AGGREGATE_SCAN, SCAN_ADMISSION_WAIT_MS,
+};
 use crate::cluster::router::{
     parse_read_pref, router_aggregate, router_forward_write, router_read_doc, router_query,
     bulk_router_forward, passthrough, ForwardMethod, ReadPreference,
@@ -543,6 +546,16 @@ pub async fn aggregate_docs(
     CollectionPath(col_name): CollectionPath<String>,
     Query(params): Query<AggregateParams>,
 ) -> impl axum::response::IntoResponse {
+    // Refused rather than clamped, the way `/query` refuses an oversized `limit`: a client that
+    // asked for a walk this size is told it is bounded instead of being handed a short answer.
+    let budget = match params.max_docs {
+        Some(n) if n > MAX_AGGREGATE_SCAN => return err_json(StatusCode::BAD_REQUEST,
+            format!("max_docs {} exceeds the maximum of {}; narrow the aggregation instead",
+                n, MAX_AGGREGATE_SCAN)),
+        Some(n) => n.max(1),
+        None => DEFAULT_AGGREGATE_SCAN,
+    };
+    let allow_partial = params.partial.unwrap_or(false);
     let filter_obj = match params.filter.as_deref().map(parse_filter).transpose() {
         Ok(f) => f,
         Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
@@ -581,15 +594,29 @@ pub async fn aggregate_docs(
         Err(resp) => return resp,
     };
 
+    // Admission before the walk, not a queue of walks: waiting costs a task, and a scan that has
+    // started holds a blocking thread for as long as its budget lasts.
+    let wait = Duration::from_millis(SCAN_ADMISSION_WAIT_MS);
+    let _slot = match tokio::time::timeout(wait, state.scan_slots.clone().acquire_owned()).await {
+        Ok(Ok(slot)) => slot,
+        // Retryable and shard-local, so a router tries the next replica rather than giving up.
+        _ => return err_json(StatusCode::TOO_MANY_REQUESTS,
+            "too many aggregations running on this node; retry".to_string()),
+    };
+
     let (start, end) = (params.start.clone(), params.end.clone());
     let spec = AggregateSpec { group, metrics };
     let ownership = state.scan_ownership(&col_name);
     let result = tokio::task::spawn_blocking(move || {
-        col.aggregate(start.as_deref(), end.as_deref(), &filter_obj, spec,
+        col.aggregate(start.as_deref(), end.as_deref(), &filter_obj, spec, budget,
             &|key| ownership.includes(key))
     }).await;
 
     match result {
+        // A partial the client did not ask for is refused for the reason the group ceiling is: the
+        // totals are short, and short is indistinguishable from complete once a router merges them.
+        Ok(Ok(agg)) if agg.partial && !allow_partial =>
+            err_json(StatusCode::BAD_REQUEST, budget_spent(budget)),
         Ok(Ok(agg)) => (StatusCode::OK, Json(agg)).into_response(),
         Ok(Err(e)) if e.kind() == io::ErrorKind::InvalidInput =>
             err_json(StatusCode::BAD_REQUEST, e.to_string()),
@@ -600,6 +627,7 @@ pub async fn aggregate_docs(
 
 #[cfg(test)]
 mod tests {
+    use crate::aggregate::{MAX_AGGREGATE_SCAN, MAX_CONCURRENT_SCANS};
     use crate::cluster::metadata::{Adoption, Migration, MigrationPhase};
     use crate::ring::{hash_key, HashRing, RingShard};
     use crate::test_support::{
@@ -1185,6 +1213,95 @@ mod tests {
         let missing = client.get(&format!("{}/collections/nosuch/aggregate", router.url()))
             .send().await.unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND, "no shard holds it");
+    }
+
+    /// IB-025: `/query` capped `limit` and `/aggregate` capped nothing, so one request could walk a
+    /// whole collection. The budget is per shard, and one shard stopping short marks the merge.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_aggregation_is_refused_when_it_would_outrun_its_read_budget() {
+        let root = temp_root();
+        let (_s1, _s2, router) = two_shard_cluster(&root).await;
+        let client = reqwest::Client::new();
+
+        let rows = 20i64;
+        for i in 0..rows {
+            assert_eq!(put_value(&client, &router.url(), "t", &format!("k{:02}", i),
+                serde_json::json!({"amount": i}), "").await, StatusCode::CREATED);
+        }
+
+        let ask = |q: Vec<(&'static str, String)>| {
+            let (c, base) = (client.clone(), router.url());
+            async move {
+                let r = c.get(&format!("{}/collections/t/aggregate", base)).query(&q).send().await.unwrap();
+                (r.status(), r.json::<serde_json::Value>().await.unwrap())
+            }
+        };
+
+        let (status, whole) = ask(vec![("metrics", "count,sum:amount".into())]).await;
+        assert_eq!(status, StatusCode::OK, "the default budget covers twenty rows");
+        assert_eq!(whole["matched"].as_u64(), Some(20));
+        assert_eq!(whole["scanned"].as_u64(), Some(20), "the reads are published, not only the matches");
+        assert_eq!(whole["partial"].as_bool(), Some(false));
+
+        // One document per shard fits inside the budget on neither shard, and the request is
+        // refused rather than answered with whatever the budget bought.
+        let (status, body) = ask(vec![("metrics", "count".into()), ("max_docs", "1".into())]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "a spent budget refuses by default");
+        assert!(body["error"].as_str().unwrap_or_default().contains("max_docs"),
+            "and the refusal names the remedy: {}", body["error"]);
+
+        let (status, partial) = ask(vec![
+            ("metrics", "count,sum:amount".into()),
+            ("max_docs", "1".into()),
+            ("partial", "true".into()),
+        ]).await;
+        assert_eq!(status, StatusCode::OK, "`partial=true` accepts what the budget bought");
+        assert_eq!(partial["partial"].as_bool(), Some(true),
+            "and the answer says so, so a short total cannot read as a complete one");
+        assert_eq!(partial["scanned"].as_u64(), Some(2), "one document from each of the two shards");
+        assert_eq!(partial["matched"].as_u64(), Some(2));
+
+        // Above the ceiling is refused rather than clamped: a client asking for an unbounded walk
+        // is told the walk is bounded.
+        let (status, _) = ask(vec![("max_docs", (MAX_AGGREGATE_SCAN + 1).to_string())]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = ask(vec![("max_docs", MAX_AGGREGATE_SCAN.to_string())]).await;
+        assert_eq!(status, StatusCode::OK, "the ceiling itself is allowed");
+    }
+
+    /// The other half of IB-025: a budget bounds one walk, and concurrent walks are what occupy the
+    /// blocking pool the ordinary reads and group commits share.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_node_admits_a_bounded_number_of_aggregation_scans() {
+        let root = temp_root();
+        let (s1, _s2, router) = two_shard_cluster(&root).await;
+        let client = reqwest::Client::new();
+        for i in 0..4 {
+            assert_eq!(put_value(&client, &router.url(), "t", &format!("k{}", i),
+                serde_json::json!({"amount": i}), "").await, StatusCode::CREATED);
+        }
+
+        let slots = s1.state.as_ref().unwrap().scan_slots.clone();
+        let held = slots.clone().acquire_many_owned(MAX_CONCURRENT_SCANS as u32).await.unwrap();
+
+        let refused = client.get(&format!("{}/collections/t/aggregate", s1.url()))
+            .query(&[("metrics", "count")]).send().await.unwrap();
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS,
+            "every slot is taken, so the scan is refused rather than queued behind them");
+
+        // A load refusal is not a missing primary and not a bad request, and the router says which:
+        // a partial merged over the shard that could not answer would be short without saying so.
+        let through_router = client.get(&format!("{}/collections/t/aggregate", router.url()))
+            .query(&[("metrics", "count")]).send().await.unwrap();
+        assert_eq!(through_router.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        drop(held);
+        let admitted = client.get(&format!("{}/collections/t/aggregate", router.url()))
+            .query(&[("metrics", "count")]).send().await.unwrap();
+        assert_eq!(admitted.status(), StatusCode::OK, "and a returned slot is reusable");
+        assert_eq!(admitted.json::<serde_json::Value>().await.unwrap()["matched"].as_u64(), Some(4));
+        assert_eq!(slots.available_permits(), MAX_CONCURRENT_SCANS,
+            "an answered aggregation releases its slot");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

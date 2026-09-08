@@ -1036,11 +1036,16 @@ enum ShardAggregateOutcome {
     NoPrimary(Option<ShardReply>),
     Absent,
     Refused(ShardReply),
+    Overloaded(ShardReply),
     Failed,
 }
 
 /// Fans the aggregation out whole and merges the partials. Every shard sees the same filter and the
 /// same metrics, so the merge is over groups rather than over rows.
+///
+/// `max_docs` travels unchanged rather than divided the way a page's `limit` is: a limit bounds the
+/// answer, which is one cluster-wide number, and a read budget bounds a walk, which each node runs
+/// on its own thread and its own share of the keyspace.
 pub async fn router_aggregate(
     state: &AppState,
     col_name: &str,
@@ -1056,6 +1061,8 @@ pub async fn router_aggregate(
     if let Some(v) = &params.filter { q.push(("filter".to_string(), v.clone())); }
     if let Some(v) = &params.group { q.push(("group".to_string(), v.clone())); }
     if let Some(v) = &params.metrics { q.push(("metrics".to_string(), v.clone())); }
+    if let Some(v) = params.max_docs { q.push(("max_docs".to_string(), v.to_string())); }
+    if let Some(v) = params.partial { q.push(("partial".to_string(), v.to_string())); }
     if let Some(v) = forwarded_read_pref(&pref) { q.push(("read".to_string(), v.to_string())); }
 
     let mut futures = Vec::new();
@@ -1075,6 +1082,7 @@ pub async fn router_aggregate(
             let mut primary_refusal: Option<ShardReply> = None;
             let mut absent = false;
             let mut rejected: Option<ShardReply> = None;
+            let mut overloaded: Option<ShardReply> = None;
             for target in targets {
                 let _routed = route_state.track_routed_read(&target);
                 let url = format!("{}/collections/{}/aggregate", target, encode_path_segment(&col));
@@ -1088,6 +1096,10 @@ pub async fn router_aggregate(
                         // spends round trips to reach the same answer.
                         rejected = Some(ShardReply::of(res).await);
                         break;
+                    } else if res.status() == StatusCode::TOO_MANY_REQUESTS {
+                        // A load refusal is about this node, so the next target is worth trying;
+                        // it is remembered in case every target says the same thing.
+                        overloaded = Some(ShardReply::of(res).await);
                     } else if res.status() == StatusCode::SERVICE_UNAVAILABLE && primary_only {
                         refused = true;
                         if crate::util::same_endpoint(&target, &primary) {
@@ -1100,10 +1112,11 @@ pub async fn router_aggregate(
                 }
                 route_state.clear_node_load(&target);
             }
-            match (rejected, refused, absent) {
-                (Some(reply), _, _) => ShardAggregateOutcome::Refused(reply),
-                (_, true, _) => ShardAggregateOutcome::NoPrimary(primary_refusal),
-                (_, _, true) => ShardAggregateOutcome::Absent,
+            match (rejected, overloaded, refused, absent) {
+                (Some(reply), _, _, _) => ShardAggregateOutcome::Refused(reply),
+                (_, Some(reply), _, _) => ShardAggregateOutcome::Overloaded(reply),
+                (_, _, true, _) => ShardAggregateOutcome::NoPrimary(primary_refusal),
+                (_, _, _, true) => ShardAggregateOutcome::Absent,
                 _ => ShardAggregateOutcome::Failed,
             }
         }));
@@ -1121,6 +1134,11 @@ pub async fn router_aggregate(
                 let body: serde_json::Value = serde_json::from_str(&reply.body)
                     .unwrap_or(serde_json::Value::String(reply.body));
                 return (StatusCode::BAD_REQUEST, Json(body)).into_response();
+            },
+            Ok(ShardAggregateOutcome::Overloaded(reply)) => {
+                let body: serde_json::Value = serde_json::from_str(&reply.body)
+                    .unwrap_or(serde_json::Value::String(reply.body));
+                return (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
             },
             Ok(ShardAggregateOutcome::NoPrimary(from_primary)) => return refusal_response(from_primary),
             Ok(ShardAggregateOutcome::Absent) => absent += 1,

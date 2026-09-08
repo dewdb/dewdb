@@ -13,6 +13,23 @@ use std::collections::BTreeMap;
 /// merged across shards would be wrong, not merely short -- so the bound is a refusal.
 pub const MAX_AGGREGATE_GROUPS: usize = 10_000;
 
+/// Documents one aggregation may read on one shard before it stops, absent `max_docs`. It bounds
+/// the reads rather than the groups, which are the same number only when every document is its own
+/// group (IB-025).
+pub const DEFAULT_AGGREGATE_SCAN: usize = 100_000;
+
+/// Ceiling on `max_docs`. Above it the request is refused rather than clamped, so a client that
+/// asked for an unbounded walk is told the walk is bounded instead of quietly getting a short one.
+pub const MAX_AGGREGATE_SCAN: usize = 1_000_000;
+
+/// Aggregation scans one node runs at once. A budget bounds one walk; this bounds how many walks
+/// share the blocking pool with the reads and group commits that also live there.
+pub const MAX_CONCURRENT_SCANS: usize = 4;
+
+/// How long an aggregation waits for a scan slot before it is refused `429`. A waiting request
+/// holds no blocking thread, so the wait costs a task; refusing is for the queue that is not moving.
+pub const SCAN_ADMISSION_WAIT_MS: u64 = 2_000;
+
 pub const MAX_AGGREGATE_METRICS: usize = 16;
 
 pub const MAX_GROUP_FIELDS: usize = 4;
@@ -96,6 +113,14 @@ pub struct AggregateResult {
     pub groups: Vec<AggregateGroup>,
     /// Documents the filter matched, across every group.
     pub matched: u64,
+    /// Documents read to produce this, matched or not. The request's cost, which `matched` is not:
+    /// a filter that selects nothing still reads everything the plan offered.
+    #[serde(default)]
+    pub scanned: u64,
+    /// The read budget stopped the walk with keys left, so the totals cover `scanned` documents
+    /// rather than the range. Set on the shard that stopped and carried by the merged answer.
+    #[serde(default)]
+    pub partial: bool,
 }
 
 /// `group=a,b.c`, dotted paths.
@@ -169,6 +194,15 @@ pub fn too_many_groups() -> String {
         MAX_AGGREGATE_GROUPS)
 }
 
+/// The message a spent read budget produces. Both remedies are named because they are different
+/// requests: a narrower one reads less, and `partial=true` accepts what this budget bought.
+pub fn budget_spent(budget: usize) -> String {
+    format!("aggregation read its budget of {} documents on one shard without finishing; \
+narrow it with `filter`, `start`/`end` or an indexed field, raise `max_docs` up to {}, or ask \
+for `partial=true` to accept the totals over what was read",
+        budget, MAX_AGGREGATE_SCAN)
+}
+
 struct Bucket {
     key: Option<serde_json::Value>,
     count: u64,
@@ -212,7 +246,9 @@ impl Aggregator {
         Ok(())
     }
 
-    pub fn finish(self) -> AggregateResult {
+    /// `scanned` and `partial` come from the walk rather than from the fold: an aggregator is told
+    /// about the documents that matched, and the reads behind them are the caller's count.
+    pub fn finish(self, scanned: u64, partial: bool) -> AggregateResult {
         let labels: Vec<&str> = self.spec.metrics.iter().map(|m| m.label.as_str()).collect();
         let groups = self.buckets.into_values().map(|b| AggregateGroup {
             key: b.key,
@@ -226,7 +262,7 @@ impl Aggregator {
                 })
                 .collect(),
         }).collect();
-        AggregateResult { groups, matched: self.matched }
+        AggregateResult { groups, matched: self.matched, scanned, partial }
     }
 }
 
@@ -287,9 +323,15 @@ fn accumulate(spec: &MetricSpec, held: &mut MetricValue, doc: &serde_json::Value
 pub fn merge(parts: Vec<AggregateResult>) -> Result<AggregateResult, String> {
     let mut buckets: BTreeMap<String, AggregateGroup> = BTreeMap::new();
     let mut matched = 0u64;
+    let mut scanned = 0u64;
+    // One shard stopping short makes the whole answer partial: the merge cannot tell which groups
+    // the unread keys belonged to, so no group is known complete.
+    let mut partial = false;
 
     for part in parts {
         matched += part.matched;
+        scanned += part.scanned;
+        partial |= part.partial;
         for group in part.groups {
             let slot = serde_json::to_string(&group.key).unwrap_or_default();
             match buckets.get_mut(&slot) {
@@ -309,7 +351,7 @@ pub fn merge(parts: Vec<AggregateResult>) -> Result<AggregateResult, String> {
         }
     }
 
-    Ok(AggregateResult { groups: buckets.into_values().collect(), matched })
+    Ok(AggregateResult { groups: buckets.into_values().collect(), matched, scanned, partial })
 }
 
 #[cfg(test)]
@@ -329,7 +371,7 @@ mod tests {
         for doc in docs {
             agg.add(doc).expect("within the group ceiling");
         }
-        agg.finish()
+        agg.finish(docs.len() as u64, false)
     }
 
     fn only(result: &AggregateResult, label: &str) -> MetricValue {

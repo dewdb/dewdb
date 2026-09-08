@@ -1007,22 +1007,37 @@ impl Collection {
 
     /// Every matching document folded into `spec`, over the whole range rather than a page: an
     /// aggregate is not resumable, so a partial one merged across shards would be wrong.
+    ///
+    /// `budget` is documents read, not groups produced or rows matched, and it is the only thing
+    /// bounding the walk -- a filter that matches nothing still reads what the plan offered. The
+    /// result says how many were read and whether the walk stopped short; refusing a short answer
+    /// is the caller's decision, not this one's.
     pub fn aggregate(
         &self,
         start: Option<&str>,
         end: Option<&str>,
         filter: &Option<Filter>,
         spec: AggregateSpec,
+        budget: usize,
         owned: &dyn Fn(&str) -> bool,
     ) -> io::Result<AggregateResult> {
         self.check_live()?;
         let mut agg = Aggregator::new(spec);
         let plan = self.index_plan(filter);
+        let mut scanned = 0u64;
+        let mut partial = false;
 
         self.scan_for::<io::Error, _>(plan.as_ref(), None, start, end, |key| {
             if !owned(key) {
                 return Ok(true);
             }
+            // Charged before the read and after the ownership test, so the flag means "a key this
+            // node owns was left unread" rather than "the budget happened to land on the last key".
+            if scanned as usize >= budget {
+                partial = true;
+                return Ok(false);
+            }
+            scanned += 1;
             let Some(value) = self.get(key)? else { return Ok(true) };
             if filter.as_ref().is_some_and(|f| !matches_filter(&value, f)) {
                 return Ok(true);
@@ -1032,7 +1047,7 @@ impl Collection {
             Ok(true)
         })?;
 
-        Ok(agg.finish())
+        Ok(agg.finish(scanned, partial))
     }
 
     fn value_from_payload(payload: &[u8]) -> Option<serde_json::Value> {
@@ -2097,6 +2112,51 @@ mod tests {
             "an equal pair is one key, not a rejected range");
         let (rows, next) = col.query_page(None, Some("z"), Some("a"), &None, 10).unwrap();
         assert!(rows.is_empty() && next.is_none(), "and the query path returns the empty page");
+    }
+
+    /// IB-025: the walk had no request-level bound, so `MAX_AGGREGATE_GROUPS` was the only ceiling
+    /// and it bounded the answer rather than the reads that produced it.
+    #[tokio::test]
+    async fn an_aggregation_stops_at_its_read_budget_and_says_so() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+        for i in 0..40 {
+            live_put(&col, &format!("k{:03}", i), i as i64);
+        }
+
+        let spec = || AggregateSpec {
+            group: Vec::new(),
+            metrics: crate::aggregate::parse_metrics(Some("count,sum:v")).unwrap(),
+        };
+
+        let whole = col.aggregate(None, None, &None, spec(), 1000, &|_| true).unwrap();
+        assert_eq!((whole.matched, whole.scanned), (40, 40));
+        assert!(!whole.partial, "a budget the range fits inside leaves nothing unread");
+
+        let capped = col.aggregate(None, None, &None, spec(), 10, &|_| true).unwrap();
+        assert_eq!(capped.scanned, 10, "the bound is on documents read");
+        assert_eq!(capped.matched, 10);
+        assert!(capped.partial, "and the shortfall is reported rather than passed off as the total");
+        assert_eq!(capped.groups[0].metrics["sum:v"].sum, Some(45.0), "0..10, not 0..40");
+
+        // The budget is spent on reads, not on matches: a filter selecting nothing still reads.
+        let filter = Some(crate::query::parse_filter(r#"{"v": {"$gte": 900}}"#).unwrap());
+        let filtered = col.aggregate(None, None, &filter, spec(), 10, &|_| true).unwrap();
+        assert_eq!((filtered.matched, filtered.scanned), (0, 10));
+        assert!(filtered.partial);
+
+        // Exactly the range is complete: the charge is taken before a read, so the last key is
+        // read rather than being the one the flag is raised over.
+        let exact = col.aggregate(None, None, &None, spec(), 40, &|_| true).unwrap();
+        assert_eq!(exact.scanned, 40);
+        assert!(!exact.partial);
+
+        // A key this node does not own is not a read, so it does not spend the budget.
+        let odd = col.aggregate(None, None, &None, spec(), 20,
+            &|key| key[1..].parse::<u32>().unwrap() % 2 == 1).unwrap();
+        assert_eq!((odd.matched, odd.scanned), (20, 20));
+        assert!(!odd.partial, "twenty owned keys under a budget of twenty is the whole range");
     }
 
     #[tokio::test]

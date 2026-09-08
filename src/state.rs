@@ -117,6 +117,9 @@ pub struct AppState {
     /// Node-wide cap on concurrent outbound replication requests. Shared across every write, unlike
     /// a per-call semaphore, which bounds one write's fan-out and nothing else.
     pub replication_slots: Arc<tokio::sync::Semaphore>,
+    /// Node-wide cap on concurrent aggregation scans. A request's `max_docs` bounds one walk;
+    /// this bounds how many of them hold blocking threads at once (IB-025).
+    pub scan_slots: Arc<tokio::sync::Semaphore>,
     /// The live topology. Seeded from config on a node's first boot, durable thereafter, and the
     /// only thing the routing path reads -- `config.shard_map` is a bootstrap value, not an authority.
     pub cluster: Arc<RwLock<ClusterMetadata>>,
@@ -546,6 +549,7 @@ impl AppState {
             db: None,
             replication: None,
             replication_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            scan_slots: Arc::new(tokio::sync::Semaphore::new(crate::aggregate::MAX_CONCURRENT_SCANS)),
             client: reqwest::Client::new(),
             stream_client: reqwest::Client::new(),
             config: Arc::new(config),
@@ -601,6 +605,7 @@ impl AppState {
             }))),
             replication_slots: Arc::new(tokio::sync::Semaphore::new(
                 config.flow_control.max_inflight_requests.max(1))),
+            scan_slots: Arc::new(tokio::sync::Semaphore::new(crate::aggregate::MAX_CONCURRENT_SCANS)),
             client: reqwest::Client::new(),
             stream_client: reqwest::Client::new(),
             config: Arc::new(config),
