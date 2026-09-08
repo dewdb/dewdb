@@ -3,7 +3,7 @@
 use super::frame::{Configuration, HandoverRecord, LogEntry};
 use super::index::{AppliedMeta, AppliedPos, IndexEntry, IndexSnapshot, LsnMeta, ReadCacheConfig, INDEX_FILENAME};
 use super::secondary::{index_values, IndexChange, IndexKey, IndexSpec, IndexStatus, Indexes, Selection, BUILD_CHUNK};
-use super::wal::WalsState;
+use super::wal::{WalCut, WalsState};
 use crate::model::MAX_QUERY_LIMIT;
 use crate::aggregate::{AggregateResult, AggregateSpec, Aggregator};
 use crate::changefeed::{ChangeEvent, ChangeOp, Changefeed, ChangefeedConfig};
@@ -86,6 +86,9 @@ pub struct Collection {
     // Durable but uncommitted. The index holds committed state only: a leader change can still revoke these.
     pub pending: std::sync::Mutex<BTreeMap<u64, StagedApply>>,
     pub applied_lsn: AtomicU64,
+    /// A cut whose WAL truncation failed part-way. Set, nothing may be appended until the recorded
+    /// cut is re-applied: the doomed bytes are still on disk and the pending buffer no longer has them.
+    pub(super) truncation_fence: std::sync::Mutex<Option<WalCut>>,
     watermark_recorded: AtomicBool,
     /// Highest `applied_lsn` `applied.meta` is known to cover, and the lock that serializes writers
     /// to it. Together they collapse concurrent commits into one fsync -- see `persist_watermark`.
@@ -216,6 +219,10 @@ impl Collection {
              }
         }
 
+        // Before the scan: a cut recorded but not finished left doomed frames on disk, and replay
+        // would take them for a log that continues.
+        WalCut::complete_recorded(&root_path)?;
+
         for entry in fs::read_dir(&root_path)? {
             let entry = entry?;
             let path = entry.path();
@@ -336,6 +343,7 @@ impl Collection {
             durable_lsn: AtomicU64::new(boot_lsn),
             pending: std::sync::Mutex::new(pending),
             applied_lsn: AtomicU64::new(applied_at),
+            truncation_fence: std::sync::Mutex::new(None),
             watermark_recorded: AtomicBool::new(applied_through != u64::MAX),
             watermark_saved: AtomicU64::new(if applied_through == u64::MAX { 0 } else { applied_through }),
             watermark_write: std::sync::Mutex::new(()),
@@ -346,6 +354,12 @@ impl Collection {
             db_next_lsn,
             db_last_log_term,
         })
+    }
+
+    /// A cut this collection could not finish. Its WAL still holds frames the log no longer has, and
+    /// the writer's tail still names them, so nothing may append or ship the log until it completes.
+    pub fn truncation_fenced(&self) -> bool {
+        self.truncation_fence.lock().unwrap().is_some()
     }
 
     pub fn build_entry(&self, wal_id: u64, offset: u64, payload: &[u8]) -> IndexEntry {

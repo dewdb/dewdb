@@ -543,6 +543,7 @@ pub async fn heartbeat_handler(
     };
 
     let role = if state.is_leader() { "primary" } else { "replica" };
+    let cluster_id = state.cluster_view_id();
     let mut load = state.metrics.node_load();
     load.inflight = load.inflight.saturating_sub(1);
     (StatusCode::OK, Json(serde_json::json!({
@@ -550,8 +551,11 @@ pub async fn heartbeat_handler(
         "role": role,
         "node_id": state.config.node_id,
         "novote_ms": novote_ms,
-        // Lets a peer notice a topology change without fetching the whole view every poll.
-        "cluster_version": state.cluster_version(),
+        // Lets a peer notice a topology change without fetching the whole view every poll. The
+        // version alone cannot order two concurrent publications, so the tiebreak rides with it.
+        "cluster_version": cluster_id.version,
+        "cluster_updated_by": cluster_id.updated_by,
+        "cluster_seeded": cluster_id.seeded,
         "durable_lsn": state.db.as_ref().map_or(0, |db| db.durable_lsn.load(Ordering::SeqCst)),
         "commit_index": state.max_committed_lsn(),
         "load": {
@@ -809,6 +813,24 @@ mod tests {
         assert!(hb["commit_index"].as_u64().unwrap() > 0, "the write is committed and advertised");
         assert!(hb["committed"]["t"].as_u64().unwrap() > 0);
         leader
+    }
+
+    /// IB-023: the gate that decides whether to fetch a peer's view orders by the same pair
+    /// adoption does, so the whole pair has to reach the wire and read back unchanged.
+    #[tokio::test]
+    async fn the_heartbeat_advertises_the_whole_view_ordering_identity() {
+        let root = temp_root();
+        let mut node = TestNode::new("solo", next_test_port(), &root, "primary");
+        node.heartbeat_timeout_secs = 30;
+        node.start();
+
+        let hb = heartbeat(&node).await;
+        let ours = node.state.clone().unwrap().cluster_view_id();
+        assert_eq!(hb["cluster_version"].as_u64(), Some(ours.version));
+        assert_eq!(hb["cluster_updated_by"].as_str(), ours.updated_by.as_deref());
+        assert_eq!(hb["cluster_seeded"].as_bool(), Some(ours.seeded));
+        assert_eq!(crate::cluster::probe::parse_view_id(&hb), ours,
+            "a peer must read back the identity this node holds, or the gate compares a guess");
     }
 
     /// The promise a leader's lease is built on, at the handler that has to keep it. Nothing here

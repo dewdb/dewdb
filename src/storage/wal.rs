@@ -14,6 +14,98 @@ use tracing::warn;
 
 const WAL_ROTATION_LIMIT: u64 = 50 * 1024 * 1024;
 const DRAIN_ATTEMPTS: usize = 5;
+const CUT_FILENAME: &str = "wal.cut";
+
+/// A truncation that has been decided and is not yet known to be finished on disk. Written before
+/// the first byte moves and removed only once every doomed frame is gone, so a failure part-way --
+/// in this process or across a crash -- leaves a cut that can be re-applied rather than a tail
+/// nothing can identify. Idempotent: re-applying it empties files already emptied.
+#[derive(Clone, Copy)]
+pub struct WalCut {
+    pub wal_id: u64,
+    pub offset: u64,
+    pub prev_lsn: u64,
+    pub prev_term: u64,
+}
+
+impl WalCut {
+    fn encode(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out[0..8].copy_from_slice(&self.wal_id.to_le_bytes());
+        out[8..16].copy_from_slice(&self.offset.to_le_bytes());
+        out[16..24].copy_from_slice(&self.prev_lsn.to_le_bytes());
+        out[24..32].copy_from_slice(&self.prev_term.to_le_bytes());
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let b: &[u8; 32] = bytes.try_into().ok()?;
+        let word = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        Some(WalCut { wal_id: word(0), offset: word(8), prev_lsn: word(16), prev_term: word(24) })
+    }
+
+    fn record(&self, root_path: &std::path::Path) -> io::Result<()> {
+        crate::util::write_atomic(root_path, CUT_FILENAME, &self.encode())
+    }
+
+    fn load(root_path: &std::path::Path) -> io::Result<Option<Self>> {
+        let bytes = match fs::read(root_path.join(CUT_FILENAME)) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        // A short or torn record predates the truncation it describes, so nothing was cut yet.
+        Ok(Self::decode(&bytes))
+    }
+
+    fn clear(root_path: &std::path::Path) -> io::Result<()> {
+        match fs::remove_file(root_path.join(CUT_FILENAME)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
+    /// Empties every WAL above the cut, then shrinks the cut file. The reverse order leaves frames
+    /// above a truncation point after a crash, and replay cannot tell those from a log that continues.
+    fn truncate_files(&self, root_path: &std::path::Path) -> io::Result<()> {
+        for entry in fs::read_dir(root_path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = match name.to_str() {
+                Some(n) => n,
+                None => continue,
+            };
+            if !name.starts_with("wal-") || !name.ends_with(".log") {
+                continue;
+            }
+            match name[4..name.len() - 4].parse::<u64>() {
+                Ok(id) if id > self.wal_id => {},
+                _ => continue,
+            }
+            let emptied = OpenOptions::new().write(true).open(entry.path())?;
+            emptied.set_len(0)?;
+            emptied.sync_all()?;
+        }
+
+        let path = root_path.join(format!("wal-{:05}.log", self.wal_id));
+        // Through a write handle, not the writer's: an append-mode handle carries no write access
+        // on Windows and `set_len` on one is refused outright.
+        let shrinking = OpenOptions::new().write(true).open(&path)?;
+        shrinking.set_len(self.offset)?;
+        shrinking.sync_all()
+    }
+
+    /// Boot half of the fence: finish a cut the process that decided it did not live to finish.
+    pub fn complete_recorded(root_path: &std::path::Path) -> io::Result<()> {
+        let Some(cut) = Self::load(root_path)? else {
+            return Ok(());
+        };
+        warn!(target: "wal", dir = %root_path.display(), wal_id = cut.wal_id, offset = cut.offset,
+            "Completing a WAL truncation left unfinished");
+        cut.truncate_files(root_path)?;
+        Self::clear(root_path)
+    }
+}
 
 pub struct WalsState {
     pub current_wal: File,
@@ -204,6 +296,8 @@ impl Collection {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Collection handle is no longer active"));
         }
 
+        self.heal_fenced_cut(&mut wal)?;
+
         if wal.current_wal_size >= WAL_ROTATION_LIMIT {
             wal.current_wal.sync_all()?;
             self.open_next_wal(&mut wal)?;
@@ -302,8 +396,15 @@ impl Collection {
             if doomed.is_empty() {
                 return Ok(None);
             }
-            let cut = pending.get(&doomed[0]).map(|s| (s.wal_id, s.offset));
+            let cut = match pending.get(&doomed[0]) {
+                Some(staged) => WalCut {
+                    wal_id: staged.wal_id, offset: staged.offset, prev_lsn, prev_term,
+                },
+                None => return Ok(None),
+            };
             self.rewind_index_tail(prev_lsn, prev_term)?;
+            // Recorded before a byte moves, and before the entries that identify it leave memory.
+            cut.record(&self.root_path)?;
             for lsn in doomed {
                 if let Some(dropped) = pending.remove(&lsn) {
                     self.release_staged(&dropped.effect);
@@ -312,37 +413,56 @@ impl Collection {
             cut
         };
 
-        if let Some((wal_id, offset)) = cut {
-            self.shrink_wal_to(wal, wal_id, offset)?;
-            // The fsynced tail is now the cut. Left high, a promotion would count durability this
-            // node no longer has toward the quorum that decides a commit index.
-            self.durable_lsn.store(prev_lsn, Ordering::SeqCst);
-        }
+        self.apply_cut(wal, cut)?;
         Ok(Some(()))
     }
 
-    /// Later WALs are emptied before the cut file shrinks. The reverse order leaves frames above a
-    /// truncation point after a crash, and replay cannot tell those from a log that continues.
-    fn shrink_wal_to(&self, wal: &mut WalsState, cut_wal_id: u64, cut_offset: u64) -> io::Result<()> {
-        for id in (cut_wal_id + 1)..=wal.current_wal_id {
-            let path = self.root_path.join(format!("wal-{:05}.log", id));
-            if path.exists() {
-                let emptied = OpenOptions::new().write(true).open(&path)?;
-                emptied.set_len(0)?;
-                emptied.sync_all()?;
+    /// Carries out a recorded cut and lifts the fence. Every step is idempotent, so a failure fences
+    /// the collection and the same cut is retried rather than recomputed from a buffer it emptied.
+    fn apply_cut(&self, wal: &mut WalsState, cut: WalCut) -> io::Result<()> {
+        // The record goes before the fence lifts: left on disk, a later boot would re-apply the cut
+        // over frames appended since.
+        if let Err(e) = self.shrink_wal_to(wal, cut).and_then(|()| WalCut::clear(&self.root_path)) {
+            *self.truncation_fence.lock().unwrap() = Some(cut);
+            warn!(target: "wal", collection = %self.name, wal_id = cut.wal_id, offset = cut.offset,
+                error = %e, "WAL truncation failed; refusing appends until the cut completes");
+            return Err(e);
+        }
+        wal.last_appended_lsn = cut.prev_lsn;
+        wal.last_appended_term = cut.prev_term;
+        // The fsynced tail is now the cut. Left high, a promotion would count durability this
+        // node no longer has toward the quorum that decides a commit index.
+        self.durable_lsn.store(cut.prev_lsn, Ordering::SeqCst);
+        *self.truncation_fence.lock().unwrap() = None;
+        Ok(())
+    }
+
+    /// Retries a fenced cut before anything is written: the doomed bytes have to be gone before a
+    /// new frame can take their place. Also drops any pending entry the failed attempt left above it.
+    fn heal_fenced_cut(&self, wal: &mut WalsState) -> io::Result<()> {
+        let fenced = *self.truncation_fence.lock().unwrap();
+        let Some(cut) = fenced else {
+            return Ok(());
+        };
+        {
+            let mut pending = self.pending.lock().unwrap();
+            let doomed: Vec<u64> = pending.range((cut.prev_lsn + 1)..).map(|(lsn, _)| *lsn).collect();
+            for lsn in doomed {
+                if let Some(dropped) = pending.remove(&lsn) {
+                    self.release_staged(&dropped.effect);
+                }
             }
         }
+        self.apply_cut(wal, cut)
+    }
 
-        let path = self.root_path.join(format!("wal-{:05}.log", cut_wal_id));
-        // Through a write handle, not the writer's: an append-mode handle carries no write access
-        // on Windows and `set_len` on one is refused outright.
-        let shrinking = OpenOptions::new().write(true).open(&path)?;
-        shrinking.set_len(cut_offset)?;
-        shrinking.sync_all()?;
+    fn shrink_wal_to(&self, wal: &mut WalsState, cut: WalCut) -> io::Result<()> {
+        cut.truncate_files(&self.root_path)?;
 
+        let path = self.root_path.join(format!("wal-{:05}.log", cut.wal_id));
         wal.current_wal = OpenOptions::new().create(true).append(true).read(true).open(&path)?;
-        wal.current_wal_id = cut_wal_id;
-        wal.current_wal_size = cut_offset;
+        wal.current_wal_id = cut.wal_id;
+        wal.current_wal_size = cut.offset;
         Ok(())
     }
 
@@ -373,6 +493,8 @@ impl Collection {
             return Err(io::Error::new(io::ErrorKind::NotFound, "Collection handle is no longer active"));
         }
 
+        self.heal_fenced_cut(&mut wal)?;
+
         let last = wal.last_appended_lsn;
         let last_term = wal.last_appended_term;
 
@@ -392,8 +514,6 @@ impl Collection {
             if self.rewind_to(&mut wal, header.prev_lsn, header.prev_term)?.is_none() {
                 return Ok(ReplicaApply::Divergent { last_lsn: last, last_term });
             }
-            wal.last_appended_lsn = header.prev_lsn;
-            wal.last_appended_term = header.prev_term;
         } else if header.prev_term != last_term {
             // Raft log matching: same position, different history. The conflict is at or below our
             // tail, so there is nothing here to truncate to -- the leader has to back up further.
@@ -730,6 +850,121 @@ mod tests {
         assert_eq!(col.last_appended(), (2, 2));
         assert_eq!(col.pending_len(), 1);
         assert!(!col.exists_including_staged("old"));
+    }
+
+    fn ib034_lock_wal(path: &std::path::Path, locked: bool) {
+        let mut perms = fs::metadata(path).unwrap().permissions();
+        perms.set_readonly(locked);
+        fs::set_permissions(path, perms).unwrap();
+    }
+
+    /// A committed prefix and a doomed tail spanning two WALs, cut back to the prefix with one WAL
+    /// unwritable. `at_cut_file` picks which half of IB-034's partial state the failure leaves: the
+    /// later WAL already emptied with the cut file intact, or neither file touched.
+    fn ib034_partial_truncation(root: &std::path::Path, at_cut_file: bool)
+        -> (Collection, PathBuf, Vec<u8>)
+    {
+        let col = ib007_open(root);
+        col.append_raw_frame(&make_frame(1, 1, 0, 0, "safe", 1)).unwrap();
+        col.sync_wal().unwrap();
+        col.apply_committed(1).unwrap();
+        col.append_raw_frame(&make_frame(1, 100, 1, 1, "old", 100)).unwrap();
+        col.sync_wal().unwrap();
+        let cut_id = col.wal_writer.lock().unwrap().current_wal_id;
+        col.open_next_wal(&mut col.wal_writer.lock().unwrap()).unwrap();
+        col.append_raw_frame(&make_frame(1, 200, 100, 1, "later", 200)).unwrap();
+        col.sync_wal().unwrap();
+        col.save_index().unwrap();
+        assert_eq!(col.pending_floor().unwrap().0, cut_id);
+
+        let locked_id = if at_cut_file { cut_id } else { cut_id + 1 };
+        let locked = root.join(format!("wal-{:05}.log", locked_id));
+        ib034_lock_wal(&locked, true);
+        let replacement = make_frame(2, 2, 1, 1, "new", 2);
+        assert!(col.append_raw_frame(&replacement).is_err());
+        (col, locked, replacement)
+    }
+
+    #[test]
+    fn ib034_a_failed_truncation_fences_the_collection_and_the_retry_completes_the_cut() {
+        for at_cut_file in [false, true] {
+            let root = temp_root();
+            let (col, locked, replacement) = ib034_partial_truncation(&root, at_cut_file);
+
+            // Fenced: neither path may write over bytes the cut has not removed yet.
+            assert!(col.append_raw_frame(&replacement).is_err());
+            assert!(col.put("leader".into(), serde_json::json!({"v": 9}), 2).is_err());
+            assert!(col.truncation_fenced());
+            assert!(WalCut::load(&root).unwrap().is_some());
+
+            ib034_lock_wal(&locked, false);
+            assert!(matches!(col.append_raw_frame(&replacement).unwrap(),
+                ReplicaApply::Applied { lsn: 2 }));
+            col.sync_wal().unwrap();
+            assert!(!col.truncation_fenced());
+            assert!(WalCut::load(&root).unwrap().is_none());
+            assert_eq!(col.last_appended(), (2, 2));
+            assert_eq!(col.durable_lsn.load(Ordering::SeqCst), 2);
+            assert!(!col.exists_including_staged("old"));
+            assert!(!col.exists_including_staged("later"));
+
+            drop(col);
+            let col = ib007_open(&root);
+            assert_eq!(col.last_appended(), (2, 2));
+            assert_eq!(col.applied_lsn(), 1);
+            assert_eq!(col.pending_len(), 1);
+            assert_eq!(col.get("safe").unwrap(), Some(serde_json::json!({"v": 1})));
+            assert!(!col.exists_including_staged("old"));
+            assert!(!col.exists_including_staged("later"));
+        }
+    }
+
+    #[test]
+    fn ib034_a_recorded_cut_is_completed_at_open() {
+        for at_cut_file in [false, true] {
+            let root = temp_root();
+            let (col, locked, _) = ib034_partial_truncation(&root, at_cut_file);
+            drop(col);
+            ib034_lock_wal(&locked, false);
+
+            let col = ib007_open(&root);
+            assert_eq!(col.last_appended(), (1, 1));
+            assert!(WalCut::load(&root).unwrap().is_none());
+            assert_eq!(col.durable_lsn.load(Ordering::SeqCst), 1);
+            assert_eq!(col.applied_lsn(), 1);
+            assert_eq!(col.pending_len(), 0);
+            assert_eq!(col.get("safe").unwrap(), Some(serde_json::json!({"v": 1})));
+            assert!(!col.exists_including_staged("old"));
+            assert!(!col.exists_including_staged("later"));
+            // The completed cut is the log's end, and the next append chains to it.
+            let (frame, _, _, next) = col.put("next".into(), serde_json::json!({"v": 3}), 3).unwrap();
+            assert_eq!(next, 2);
+            let header = FrameHeader::parse(&frame).unwrap();
+            assert_eq!((header.prev_term, header.prev_lsn), (1, 1));
+        }
+    }
+
+    #[test]
+    fn ib034_an_unfinished_cut_survives_a_reopen_that_cannot_finish_it() {
+        for at_cut_file in [false, true] {
+            let root = temp_root();
+            let (col, locked, _) = ib034_partial_truncation(&root, at_cut_file);
+            drop(col);
+
+            // Still unwritable: open refuses rather than replaying frames the cut deleted.
+            assert!(Collection::open("c".into(), root.to_path_buf(),
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                ReadCacheConfig::default(), crate::changefeed::ChangefeedConfig::default()).is_err());
+            assert!(WalCut::load(&root).unwrap().is_some());
+
+            ib034_lock_wal(&locked, false);
+            let col = ib007_open(&root);
+            assert_eq!(col.last_appended(), (1, 1));
+            assert!(!col.exists_including_staged("old"));
+            assert!(!col.exists_including_staged("later"));
+        }
     }
 
     #[test]

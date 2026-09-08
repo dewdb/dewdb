@@ -1,7 +1,7 @@
 //! AppState: shared handle to storage, config, replication state, router caches.
 
 use crate::cluster::metadata::{
-    adopt, merge_catalog, Adoption, ClusterMetadata, IndexCatalog, Migration,
+    adopt, merge_catalog, Adoption, ClusterMetadata, IndexCatalog, Migration, ViewId,
 };
 use crate::cluster::migration::MigrationRuns;
 use crate::cluster::ownership::{classify, group_owner, group_owns, Ownership};
@@ -798,6 +798,12 @@ impl AppState {
 
     pub fn cluster_view(&self) -> ClusterMetadata {
         self.cluster.read().unwrap().clone()
+    }
+
+    /// What a heartbeat advertises, so a peer can order this node's view against its own without
+    /// fetching it.
+    pub fn cluster_view_id(&self) -> ViewId {
+        self.cluster.read().unwrap().view_id()
     }
 
     pub fn cluster_version(&self) -> u64 {

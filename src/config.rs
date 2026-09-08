@@ -9,7 +9,7 @@ use crate::maintenance::MaintenanceConfig;
 use crate::ring::{validate_shard_ring, HashRing, ShardInfo};
 use crate::storage::ReadCacheConfig;
 use crate::webhook::WebhookConfig;
-use crate::util::{endpoint_of, same_endpoint};
+use crate::util::{node_key, same_endpoint};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
 
@@ -255,7 +255,7 @@ pub fn config_warnings(cfg: &NodeConfig) -> Vec<String> {
 
         let mut seen = HashSet::new();
         for replica in &cfg.replicas {
-            if !seen.insert(endpoint_of(replica)) {
+            if !seen.insert(node_key(replica)) {
                 out.push(format!("replicas lists {} more than once", replica));
             }
         }

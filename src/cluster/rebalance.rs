@@ -4,7 +4,7 @@ use crate::api::migrate::{begin_migration, MigrationLaunch};
 use crate::cluster::metadata::ClusterMetadata;
 use crate::ring::{keyspace_movement, HashRing, RingShard};
 use crate::state::AppState;
-use crate::util::{endpoint_of, node_key, same_endpoint};
+use crate::util::{cmp_endpoint, node_key, same_endpoint};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -116,7 +116,7 @@ fn replica_placements(
     }
 
     for replicas in placements.values_mut() {
-        replicas.sort_by(|a, b| endpoint_of(a).cmp(endpoint_of(b)));
+        replicas.sort_by(|a, b| cmp_endpoint(a, b));
         replicas.dedup_by(|a, b| same_endpoint(a, b));
     }
     placements
@@ -135,7 +135,7 @@ pub fn desired_ring(view: &ClusterMetadata) -> Result<Option<HashRing>, String> 
         .iter()
         .filter(|m| m.role == "shard" && m.shard_role.as_deref() == Some("primary"))
         .map(|m| m.url.clone())
-        .filter(|url| seen.insert(endpoint_of(url).to_string()))
+        .filter(|url| seen.insert(node_key(url)))
         .collect();
 
     if primaries.is_empty() {
@@ -143,7 +143,7 @@ pub fn desired_ring(view: &ClusterMetadata) -> Result<Option<HashRing>, String> 
             "automatic rebalancing needs at least one member with shard_role 'primary'".to_string(),
         );
     }
-    primaries.sort_by(|a, b| endpoint_of(a).cmp(endpoint_of(b)));
+    primaries.sort_by(|a, b| cmp_endpoint(a, b));
     let replicas = replica_placements(view, current, &primaries);
 
     let target = HashRing {
@@ -152,7 +152,7 @@ pub fn desired_ring(view: &ClusterMetadata) -> Result<Option<HashRing>, String> 
             .into_iter()
             .map(|node_url| {
                 let replica_urls = replicas
-                    .get(endpoint_of(&node_url))
+                    .get(&node_key(&node_url))
                     .cloned()
                     .unwrap_or_default();
                 RingShard {
@@ -172,11 +172,11 @@ fn target_signature(target: &HashRing) -> Vec<(String, Vec<String>)> {
         .iter()
         .map(|shard| {
             (
-                endpoint_of(&shard.node_url).to_string(),
+                node_key(&shard.node_url),
                 shard
                     .replica_urls
                     .iter()
-                    .map(|url| endpoint_of(url).to_string())
+                    .map(|url| node_key(url))
                     .collect(),
             )
         })
@@ -188,7 +188,7 @@ pub(crate) fn is_coordinator(state: &AppState, view: &ClusterMetadata) -> bool {
     let first = match view
         .ring
         .as_ref()
-        .and_then(|r| r.shards.iter().min_by_key(|s| endpoint_of(&s.node_url)))
+        .and_then(|r| r.shards.iter().min_by_key(|s| node_key(&s.node_url)))
     {
         Some(first) => first,
         None => return false,

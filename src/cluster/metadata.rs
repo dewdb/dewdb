@@ -5,7 +5,7 @@ use crate::ring::{validate_shard_ring, HashRing, ShardInfo};
 use crate::storage::secondary::{
     valid_field_path, valid_index_name, IndexChange, IndexSpec, MAX_INDEXES_PER_COLLECTION,
 };
-use crate::util::{endpoint_of, write_atomic};
+use crate::util::{node_key, write_atomic};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -140,6 +140,38 @@ pub enum MigrationPhase {
     Finalizing,
 }
 
+/// The three fields the total order over views is computed from. A heartbeat advertises this
+/// rather than the version alone: a poller gated on `version >` will not fetch a peer whose view
+/// wins the `updated_by` tiebreak at the same version, so two nodes that published concurrently
+/// during a partition stayed split with no poll that would ever repair it (IB-023).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ViewId {
+    pub version: u64,
+    /// `None` from a peer that predates the advertised field. Equal versions are unorderable
+    /// then, so the comparison falls back to strictly-greater rather than guessing a winner.
+    pub updated_by: Option<String>,
+    pub seeded: bool,
+}
+
+impl ViewId {
+    /// `ClusterMetadata::supersedes` reads nothing else, so a decision made here and one made
+    /// against the whole view cannot disagree.
+    pub fn supersedes(&self, other: &ViewId) -> bool {
+        // A shard seeds an empty ring. Letting that outrank a router's seeded ring on a tiebreak
+        // would route every key nowhere, so a seed loses to everything and wins against nothing.
+        if self.seeded {
+            return false;
+        }
+        if other.seeded {
+            return self.version >= other.version;
+        }
+        match (&self.updated_by, &other.updated_by) {
+            (Some(mine), Some(theirs)) => (self.version, mine) > (other.version, theirs),
+            _ => self.version > other.version,
+        }
+    }
+}
+
 impl ClusterMetadata {
     /// The bootstrap view, used only when no durable copy exists. Config is a seed, not an
     /// authority: once version 1 is on disk, later config edits no longer move the cluster.
@@ -195,21 +227,23 @@ impl ClusterMetadata {
         }
     }
 
+    /// Everything the total order reads, and nothing else, so a peer can be asked whether
+    /// fetching its view would gain anything without fetching it.
+    pub fn view_id(&self) -> ViewId {
+        ViewId {
+            version: self.version,
+            updated_by: Some(self.updated_by.clone()),
+            seeded: self.seeded,
+        }
+    }
+
     /// Total order over views, so every node converges on the same one.
     ///
     /// The `updated_by` tiebreak makes equal versions converge instead of splitting the cluster's
     /// routing view, which is the failure that actually loses writes. It does so by discarding one
     /// of two concurrent updates: nothing here makes concurrent updates safe, only deterministic.
     pub fn supersedes(&self, other: &Self) -> bool {
-        // A shard seeds an empty ring. Letting that outrank a router's seeded ring on a tiebreak
-        // would route every key nowhere, so a seed loses to everything and wins against nothing.
-        if self.seeded {
-            return false;
-        }
-        if other.seeded {
-            return self.version >= other.version;
-        }
-        (self.version, self.updated_by.as_str()) > (other.version, other.updated_by.as_str())
+        self.view_id().supersedes(&other.view_id())
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -357,12 +391,12 @@ impl ClusterMetadata {
     /// out of it — one joining or leaving moves no key, and a scan must not be disturbed by it.
     pub fn partition_fingerprint(&self) -> u64 {
         let mut parts: Vec<String> = match &self.ring {
-            // Vnode tokens come from endpoint and index alone, so the owning set fixes the mapping.
+            // Vnode tokens come from `node_key` and index alone, so the owning set fixes the mapping.
             Some(ring) => std::iter::once(format!("vnodes={}", ring.vnodes))
-                .chain(ring.shards.iter().map(|s| crate::util::node_key(&s.node_url)))
+                .chain(ring.shards.iter().map(|s| node_key(&s.node_url)))
                 .collect(),
             None => self.shards.iter()
-                .map(|s| format!("{}-{}@{}", s.start_hash, s.end_hash, endpoint_of(&s.node_url)))
+                .map(|s| format!("{}-{}@{}", s.start_hash, s.end_hash, node_key(&s.node_url)))
                 .collect(),
         };
         if let Some(m) = &self.migration {

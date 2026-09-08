@@ -3,7 +3,7 @@
 //! Ranges came first and are kept for clusters already running on them. The token ring is what
 //! makes a topology change cost `1/n` of the keyspace instead of a hand-written re-partition.
 
-use crate::util::endpoint_of;
+use crate::util::{cmp_endpoint, node_key};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 
@@ -48,10 +48,11 @@ pub struct HashRing {
     pub shards: Vec<RingShard>,
 }
 
-/// Positions for one shard. Hashed from the endpoint rather than the raw URL so a trailing slash
-/// or a scheme change does not silently move a node to a different part of the ring.
+/// Positions for one shard. Hashed from `node_key` rather than the raw URL so a trailing slash, a
+/// scheme change or host case does not silently move a node to a different part of the ring.
+/// Hashing anything `same_endpoint` calls equal would give one node two token sets (IB-022).
 pub fn vnode_token(node_url: &str, index: u32) -> u64 {
-    xxhash_rust::xxh64::xxh64(format!("{}#{}", endpoint_of(node_url), index).as_bytes(), 0)
+    xxhash_rust::xxh64::xxh64(format!("{}#{}", node_key(node_url), index).as_bytes(), 0)
 }
 
 impl HashRing {
@@ -80,27 +81,27 @@ impl HashRing {
             if shard.node_url.trim().is_empty() {
                 return Err("ring shard node_url must not be empty".to_string());
             }
-            if !seen.insert(endpoint_of(&shard.node_url)) {
+            if !seen.insert(node_key(&shard.node_url)) {
                 return Err(format!("ring lists {} more than once", shard.node_url));
             }
         }
         let primaries = seen;
         let mut placed = HashSet::new();
         for shard in &self.shards {
-            let primary = endpoint_of(&shard.node_url);
+            let primary = node_key(&shard.node_url);
             let mut local = HashSet::new();
             for replica in &shard.replica_urls {
                 if replica.trim().is_empty() {
                     return Err(format!("shard {} has an empty replica url", shard.node_url));
                 }
-                let endpoint = endpoint_of(replica);
+                let endpoint = node_key(replica);
                 if endpoint == primary {
                     return Err(format!("shard {} lists itself as a replica", shard.node_url));
                 }
-                if primaries.contains(endpoint) {
+                if primaries.contains(&endpoint) {
                     return Err(format!("primary {} cannot also be a replica", replica));
                 }
-                if !local.insert(endpoint) {
+                if !local.insert(endpoint.clone()) {
                     return Err(format!(
                         "shard {} lists replica {} more than once",
                         shard.node_url, replica));
@@ -124,8 +125,8 @@ impl HashRing {
         // two tokens collide, and the shard list can arrive in any order.
         tokens.sort_unstable_by(|a, b| {
             a.0.cmp(&b.0)
-                .then_with(|| endpoint_of(&self.shards[a.1 as usize].node_url)
-                    .cmp(endpoint_of(&self.shards[b.1 as usize].node_url)))
+                .then_with(|| cmp_endpoint(&self.shards[a.1 as usize].node_url,
+                    &self.shards[b.1 as usize].node_url))
         });
         BuiltRing { tokens, shards: self.shards.clone() }
     }
@@ -497,6 +498,35 @@ mod consistent_hashing_tests {
         assert!(placed(&["http://r"], &["https://r/"])
             .validate().unwrap_err().contains("more than one shard"));
         assert!(placed(&["http://r1"], &["http://r2"]).validate().is_ok());
+    }
+
+    /// IB-022: `same_endpoint` went case-insensitive (L16) while `vnode_token` and the duplicate
+    /// set still hashed raw endpoints, so one host spelled two ways was two ring owners with
+    /// different tokens and one node to every ownership check.
+    #[test]
+    fn one_host_spelled_two_ways_is_one_ring_owner() {
+        let (upper, lower) = ("http://LOCALHOST:8080", "http://localhost:8080");
+        assert!(crate::util::same_endpoint(upper, lower));
+        assert_eq!(vnode_token(upper, 0), vnode_token(lower, 0),
+            "an alias-only change must not move the node to a different part of the ring");
+
+        assert!(ring(&[upper, lower]).validate().unwrap_err().contains("more than once"));
+
+        let aliased = HashRing {
+            vnodes: 16,
+            shards: vec![RingShard {
+                node_url: "http://A".into(),
+                replica_urls: vec!["http://r".into(), "http://R/".into()],
+            }],
+        };
+        assert!(aliased.validate().unwrap_err().contains("more than once"));
+
+        // Placement is identity, not spelling: the two rings must route every key alike.
+        let canonical = |r: &HashRing, keys: &[u64]| owners(&r.build(), keys)
+            .iter().map(|url| crate::util::node_key(url)).collect::<Vec<_>>();
+        let keys = sample_keys(500);
+        assert_eq!(canonical(&ring(&[upper, "http://b"]), &keys),
+            canonical(&ring(&[lower, "http://b"]), &keys));
     }
 
     #[test]

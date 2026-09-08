@@ -5,7 +5,7 @@ use super::lease;
 use super::progress::{ProgressMeta, PROGRESS_FLUSH_INTERVAL_SECS};
 use super::state::{apply_demotion, ReplicationMeta};
 use crate::cluster::metadata::Adoption;
-use crate::cluster::probe::fetch_cluster_view;
+use crate::cluster::probe::{fetch_cluster_view, parse_view_id};
 use crate::replication::snapshot::replica_sync_from_primary;
 use crate::state::AppState;
 use crate::util::same_endpoint;
@@ -473,8 +473,10 @@ pub fn heartbeat_poll_task(state: AppState) {
                                 }
                             }
 
-                            let advertised = hb.get("cluster_version").and_then(|v| v.as_u64()).unwrap_or(0);
-                            if advertised > state.cluster_version() {
+                            // Ordered by the tiebreak too, not by version alone: a leader whose
+                            // view wins at an equal version is one this follower must still fetch
+                            // (IB-023).
+                            if parse_view_id(&hb).supersedes(&state.cluster_view_id()) {
                                 follow_cluster_view(&state, &primary_addr).await;
                             }
                         }

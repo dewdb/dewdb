@@ -217,6 +217,10 @@ fn stream_snapshot(
             .wal_writer
             .lock()
             .map_err(|_| lock_error("WAL"))?;
+        if collection.truncation_fenced() {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock,
+                "collection has an unfinished WAL truncation"));
+        }
         wal.current_wal.sync_data()?;
         let frozen_through = wal.current_wal_id;
 

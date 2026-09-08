@@ -1,5 +1,6 @@
 //! Dependency-free helpers shared across subsystems.
 
+use std::cmp::Ordering;
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -24,10 +25,24 @@ pub fn same_endpoint(a: &str, b: &str) -> bool {
     endpoint_of(a).eq_ignore_ascii_case(endpoint_of(b))
 }
 
-/// The same identity as an owned map key. Anything keyed by node has to agree with
-/// `same_endpoint`, or one node spelled two ways gets two entries.
+/// The canonical node identity: what to hash, what to key by, what to sort by. Anything that
+/// decides whether two urls name one node has to agree with `same_endpoint`, or one node spelled
+/// two ways gets two ring tokens while ownership treats it as one (IB-022).
 pub fn node_key(url: &str) -> String {
     endpoint_of(url).to_ascii_lowercase()
+}
+
+/// `node_key` ordering without the allocation, for sorts and tie-breaks that must not disagree
+/// with it.
+pub fn cmp_endpoint(a: &str, b: &str) -> Ordering {
+    let (a, b) = (endpoint_of(a).as_bytes(), endpoint_of(b).as_bytes());
+    for (x, y) in a.iter().zip(b) {
+        match x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase()) {
+            Ordering::Equal => {}
+            unequal => return unequal,
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 /// One path segment of a forwarded URL. Anything outside RFC 3986 unreserved is escaped, so a key
@@ -247,6 +262,20 @@ mod tests {
         // What no string comparison settles, and the entry does not claim to.
         assert!(!same_endpoint("localhost:8080", "127.0.0.1:8080"));
         assert!(!same_endpoint("host:8080", "host:8081"), "the port is not case, it is identity");
+    }
+
+    /// IB-022: a sort or tie-break that disagrees with `node_key` puts one node in two places.
+    #[test]
+    fn canonical_ordering_agrees_with_the_canonical_key() {
+        assert_eq!(cmp_endpoint("http://HOST:1", "host:1/x"), Ordering::Equal);
+        assert_eq!(cmp_endpoint("http://Alpha:1", "beta:1"), Ordering::Less);
+        assert_eq!(cmp_endpoint("host:10", "host:2"), Ordering::Less, "ordering is bytewise");
+
+        let mut urls = ["http://Beta:1", "alpha:1", "http://BETA:1/x", "Gamma:1"];
+        urls.sort_by(|a, b| cmp_endpoint(a, b));
+        let mut keyed = urls;
+        keyed.sort_by_key(|url| node_key(url));
+        assert_eq!(urls, keyed);
     }
 
     /// M20: the standard alphabet's `+` is a space in a query string, and a cursor exists to be put
