@@ -319,7 +319,8 @@ fn progress_key(key: &WebhookKey) -> String {
     serde_json::to_string(key).expect("webhook keys serialize")
 }
 
-fn replicated_position(state: &AppState, key: &WebhookKey) -> u64 {
+/// The group's acknowledged cursor as this node holds it, which is what a promotion resumes from.
+pub(crate) fn replicated_position(state: &AppState, key: &WebhookKey) -> u64 {
     state.db.as_ref()
         .and_then(|db| db.existing_collection(WEBHOOK_PROGRESS_LOG))
         .and_then(|col| col.get(&progress_key(key)).ok().flatten())

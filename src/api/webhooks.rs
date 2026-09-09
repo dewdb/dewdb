@@ -257,8 +257,9 @@ pub async fn delete_webhook(
 #[cfg(test)]
 mod tests {
     use crate::test_support::{
-        leaders, next_test_port, put_value, router_for, single_node, temp_root, three_node_cluster,
-        three_node_cluster_with_timeout, wait_for, TestNode, WebhookSink,
+        get_raw, leaders, next_test_port, node_by_id, put_value, router_for, settle_leader,
+        single_node, temp_root, three_node_cluster, three_node_cluster_with_timeout, wait_for,
+        TestNode, WebhookSink,
     };
     use crate::webhook::sign;
     use axum::http::StatusCode;
@@ -588,7 +589,8 @@ mod tests {
     }
 
     /// IB-030: the acknowledged cursor belongs to the group, and every registered replica keeps
-    /// the bounded feed window that cursor resumes inside before it becomes leader.
+    /// the bounded feed window that cursor resumes inside before it becomes leader. The boundary
+    /// asserted is at-least-once, which is what failover promises (IB-041).
     #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
     async fn a_promoted_replica_resumes_webhook_delivery_after_the_last_acknowledged_event() {
         let root = temp_root();
@@ -613,32 +615,58 @@ mod tests {
         let first = sink.wait_for_events(1, SETTLE).await;
         assert_eq!(first.iter().filter_map(|event| event["key"].as_str()).collect::<Vec<_>>(),
             vec!["before"], "the initial event was not delivered exactly once: {:?}", first);
-        assert!(wait_for(SETTLE, || {
-            n1.state.as_ref().and_then(|state| state.webhooks.get(
-                &("c".to_string(), "orders".to_string())))
-                .is_some_and(|subscription| subscription.delivery.position > 0)
-        }).await, "the acknowledged position did not become durable");
+        // A promotion resumes from the group's cursor, so the precondition is the majority commit
+        // rather than the deliverer's own copy of it (IB-041).
+        let key = ("c".to_string(), "orders".to_string());
+        let acknowledged = |node: &TestNode| node.state.as_ref()
+            .map_or(0, |state| crate::webhook::replicated_position(state, &key));
+        assert!(wait_for(SETTLE, || [&n1, &n2, &n3].into_iter()
+            .filter(|node| acknowledged(node) > 0).count() >= 2).await,
+            "the acknowledged position did not reach a majority");
 
         n1.kill();
-        assert!(wait_for(Duration::from_secs(30), || leaders(&[&n2, &n3]).len() == 1).await,
-            "the surviving quorum did not elect a leader");
-        let promoted = if n2.is_leader() { &n2 } else { &n3 };
+        // Settled rather than merely counted: a node that is leading at the moment of the pick and
+        // steps down before the write refuses it as a replica would.
+        let holder = settle_leader(&[&n2, &n3], Duration::from_secs(30)).await
+            .expect("the surviving quorum did not settle on one leader");
+        let promoted = node_by_id(&[&n2, &n3], &holder);
+
+        // The write the assertion is about reaches the feed once, so a lost response is not
+        // retried into a second change that reads back as a redelivery (IB-041).
         let deadline = std::time::Instant::now() + SETTLE;
-        loop {
-            let status = put_value(&c, &promoted.url(), "c", "after",
-                serde_json::json!({"v": 2}), "").await;
-            if status.is_success() {
+        let mut accepted = put_value(&c, &promoted.url(), "c", "after",
+            serde_json::json!({"v": 2}), "").await;
+        while !accepted.is_success() {
+            assert!(std::time::Instant::now() < deadline,
+                "the promoted leader never accepted the write the assertion is about: {}", accepted);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if get_raw(&c, &promoted.url(), "c", "after").await {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline,
-                "the promoted leader did not become ready for writes: {}", status);
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            accepted = put_value(&c, &promoted.url(), "c", "after",
+                serde_json::json!({"v": 2}), "").await;
         }
 
-        let events = sink.wait_for_events(2, SETTLE).await;
+        assert!(wait_for(SETTLE, || sink.events().iter()
+            .any(|event| event["key"].as_str() == Some("after"))).await,
+            "the promoted leader did not deliver the write it accepted: {:?}", sink.events());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // At-least-once across a promotion: the batch straddling the cursor may be sent again, so
+        // `before` is bounded rather than exact and has to repeat the `lsn` it is deduped on.
+        // Exactness is owed only to what the promoted leader acknowledged itself.
+        let events = sink.events();
         let keys: Vec<&str> = events.iter().filter_map(|event| event["key"].as_str()).collect();
-        assert_eq!(keys, vec!["before", "after"],
-            "promotion redelivered or skipped around the acknowledged cursor: {:?}", events);
+        assert_eq!(keys.iter().filter(|key| **key == "after").count(), 1,
+            "an event the promoted leader acknowledged was delivered twice: {:?}", events);
+        assert!(keys.split_last().is_some_and(|(last, earlier)|
+                *last == "after" && earlier.iter().all(|key| *key == "before")),
+            "promotion skipped or reordered around the acknowledged cursor: {:?}", events);
+        let before_lsns: std::collections::HashSet<u64> = events.iter()
+            .filter(|event| event["key"].as_str() == Some("before"))
+            .filter_map(|event| event["lsn"].as_u64()).collect();
+        assert_eq!(before_lsns.len(), 1,
+            "a redelivery has to carry the lsn the endpoint dedups on: {:?}", events);
         let delivery = state_of(&c, &promoted.url(), "orders").await;
         assert_eq!(delivery["delivery"]["gaps"].as_u64(), Some(0), "{}", delivery);
 

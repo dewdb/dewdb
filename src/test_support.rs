@@ -592,6 +592,42 @@ pub fn leaders(nodes: &[&TestNode]) -> Vec<String> {
     nodes.iter().filter(|n| n.is_leader()).map(|n| n.node_id.clone()).collect()
 }
 
+/// Moves office to `to`, retrying until it leads or `deadline` passes. A handover competes with
+/// the rest of the suite for the runtime, and the API answers `503` while the old leader still
+/// holds office, so one attempt timing out or losing is not a refusal (internal_bugs.md IB-050).
+/// `Err` carries the last answer; a `422` returns straight away, since retrying a refusal of the
+/// request itself only spends the deadline.
+pub async fn hand_over_leadership(
+    client: &reqwest::Client,
+    from: &TestNode,
+    to: &TestNode,
+    deadline: Duration,
+) -> Result<(), String> {
+    let start = std::time::Instant::now();
+    let mut last = "no attempt completed".to_string();
+    while start.elapsed() < deadline {
+        if to.is_leader() {
+            return Ok(());
+        }
+        let attempt = client.post(format!("{}/cluster/transfer-leadership", from.url()))
+            .timeout(Duration::from_secs(15))
+            .json(&serde_json::json!({"to": to.url()}))
+            .send().await;
+        match attempt {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(response) if response.status() == StatusCode::UNPROCESSABLE_ENTITY =>
+                return Err(format!("refused: {}", response.text().await.unwrap_or_default())),
+            Ok(response) => {
+                let status = response.status();
+                last = format!("{}: {}", status, response.text().await.unwrap_or_default());
+            },
+            Err(e) => last = e.to_string(),
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Err(last)
+}
+
 pub async fn settle_leader(nodes: &[&TestNode], deadline: Duration) -> Option<String> {
     let start = std::time::Instant::now();
     let mut candidate: Option<(String, std::time::Instant)> = None;

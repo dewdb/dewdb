@@ -409,7 +409,7 @@ mod tests {
     /// leader publishes nothing further and silence is indistinguishable from a quiet collection.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_leader_only_stream_ends_when_the_node_stops_leading() {
-        use crate::test_support::{leaders, three_node_cluster, wait_for};
+        use crate::test_support::{hand_over_leadership, leaders, three_node_cluster, wait_for};
 
         let root = temp_root();
         let (n1, n2, n3) = three_node_cluster(&root).await;
@@ -421,10 +421,9 @@ mod tests {
         let tap = watch(&c, &n1.url(), "?read=primary").await;
         let opened = tap.named("open")[0].data["position"].as_u64().unwrap();
 
-        let handover = c.post(format!("{}/cluster/transfer-leadership", n1.url()))
-            .timeout(Duration::from_secs(30)).json(&serde_json::json!({"to": n2.url()}))
-            .send().await.unwrap();
-        assert!(handover.status().is_success(), "{}", handover.text().await.unwrap());
+        if let Err(why) = hand_over_leadership(&c, &n1, &n2, Duration::from_secs(60)).await {
+            panic!("office never moved off n1, so nothing here could end the stream: {}", why);
+        }
 
         let ended = tap.wait_for_events("error", 1, SETTLE).await;
         assert_eq!(ended.len(), 1, "the stream carried on without the leadership it asked for");
