@@ -6,6 +6,7 @@
 //! Only the group's leader delivers. The stream is opened `read=primary` for that reason, and a
 //! step-down ends it in place rather than leaving two nodes pushing the same events.
 
+use crate::auth::digest_admitted;
 use crate::cdc::{CdcEnd, CdcFilter, CdcStream};
 use crate::changefeed::{ChangeEvent, Changefeed, FeedPin, SubscribeError};
 use crate::replication::write_concern::DEFAULT_WTIMEOUT_MS;
@@ -114,6 +115,26 @@ pub struct WebhookSpec {
     pub filter: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ops: Option<String>,
+    /// SHA-256 of the API key the registration was created with, and absent when it was created
+    /// against an open API. A registration outlives the process that accepted it, so the sender
+    /// asks again whether a key the node still holds hashes to this (IB-026). The key itself is
+    /// never written down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator: Option<String>,
+}
+
+/// The route a registration was accepted on, which is the gate its credential has to keep
+/// clearing. `POST` rather than the delivery: nothing about pushing a batch is an HTTP request to
+/// this node.
+pub fn registration_route(collection: &str) -> String {
+    format!("/collections/{}/webhooks", collection)
+}
+
+impl WebhookSpec {
+    pub fn still_authorized(&self, auth: &crate::auth::AuthConfig) -> bool {
+        digest_admitted(auth, self.creator.as_deref(),
+            &registration_route(&self.collection), "POST")
+    }
 }
 
 /// Where delivery got to, and what it has been doing. Durable, because the position is the only
@@ -430,6 +451,11 @@ async fn post_until_acknowledged(
         if !state.is_leader() {
             return Err(Stop::NotLeading);
         }
+        // Alongside the leadership check and for the same reason: a retry can outlast the
+        // credential, and the batch in hand is not owed to an endpoint that lost its registration.
+        if revoked(state, key, &subscription.spec) {
+            return Err(Stop::Done);
+        }
         let timestamp = unix_now();
         let body = body_of(&subscription.spec, &state.config.node_id, &delivery_id, events);
         let mut request = client.post(&subscription.spec.url)
@@ -488,10 +514,29 @@ async fn post_until_acknowledged(
     }
 }
 
+/// Whether the credential this registration was created with has stopped being accepted, and if
+/// so disables it. A registration is durable, so a restart does not end one the way it ends a
+/// connection: without this a key removed from the config keeps posting the collection's documents
+/// to the endpoint it named, indefinitely (IB-026).
+fn revoked(state: &AppState, key: &WebhookKey, spec: &WebhookSpec) -> bool {
+    if spec.still_authorized(&state.auth()) {
+        return false;
+    }
+    state.webhooks.note(key, |d| d.disabled = Some(
+        "the credential this subscription was registered with is no longer accepted; \
+         register it again".to_string()));
+    warn!(target: "webhook", subscription = %key.1, collection = %key.0,
+        "The registering credential is no longer accepted; subscription disabled");
+    true
+}
+
 /// Opens this subscription's feed at its durable position. `None` means try again: the collection
 /// is not there, or the handle was replaced.
 fn open(state: &AppState, key: &WebhookKey) -> Option<CdcStream> {
     let subscription = state.webhooks.get(key)?;
+    if revoked(state, key, &subscription.spec) {
+        return None;
+    }
     let db = state.db.as_ref()?;
     if db.existing_collection(WEBHOOK_PROGRESS_LOG)
         .is_some_and(|progress| progress.pending_len() > 0) {
@@ -541,7 +586,8 @@ async fn deliver(state: AppState, key: WebhookKey) {
 
     loop {
         let Some(mut stream) = open(&state, &key) else {
-            if state.webhooks.get(&key).is_none() || !state.is_leader() {
+            if !state.is_leader() || state.webhooks.get(&key)
+                .is_none_or(|s| s.delivery.disabled.is_some()) {
                 return;
             }
             tokio::time::sleep(REOPEN_DELAY).await;
@@ -627,6 +673,7 @@ mod tests {
             secret: Some("s3cret".to_string()),
             filter: None,
             ops: None,
+            creator: None,
         }
     }
 

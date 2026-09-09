@@ -348,6 +348,7 @@ impl TestNode {
 
                 let state = AppState {
                     db,
+                    auth: Arc::new(RwLock::new(config.auth.clone())),
                     config: Arc::new(config.clone()),
                     client: build_client(&config.auth, &config.own_url()),
                     stream_client: crate::auth::build_stream_client(&config.auth, &config.own_url()),
@@ -769,9 +770,24 @@ impl WsTap {
     /// `Err` is the status the handshake was refused with: every refusal this endpoint owes a
     /// client is answered before the upgrade, so a test can assert on it as an HTTP status.
     pub async fn open(url: &str) -> Result<Self, StatusCode> {
+        Self::open_as(url, None).await
+    }
+
+    /// With a credential on the handshake, which is the only way a socket carries one.
+    pub async fn open_with_key(url: &str, key: &str) -> Result<Self, StatusCode> {
+        Self::open_as(url, Some(key)).await
+    }
+
+    async fn open_as(url: &str, key: Option<&str>) -> Result<Self, StatusCode> {
         use futures::StreamExt;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let ws_url = url.replacen("http://", "ws://", 1);
-        let socket = match tokio_tungstenite::connect_async(&ws_url).await {
+        let mut request = ws_url.as_str().into_client_request().unwrap();
+        if let Some(key) = key {
+            request.headers_mut().insert(
+                crate::auth::API_KEY_HEADER, key.parse().unwrap());
+        }
+        let socket = match tokio_tungstenite::connect_async(request).await {
             Ok((socket, _)) => socket,
             Err(tokio_tungstenite::tungstenite::Error::Http(res)) => {
                 return Err(StatusCode::from_u16(res.status().as_u16()).unwrap());

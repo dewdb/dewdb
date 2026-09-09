@@ -1,6 +1,6 @@
 //! Authentication and latency-recording middleware, and the gates on collection names.
 
-use crate::auth::{authorize, AuthOutcome, API_KEY_HEADER, INTERNAL_SECRET_HEADER};
+use crate::auth::{AuthOutcome, Credential};
 use crate::consensus::config::{is_system_collection, valid_collection_name, MAX_COLLECTION_NAME_LEN};
 use crate::model::err_json;
 use crate::state::AppState;
@@ -113,31 +113,24 @@ pub fn client_collection(
     }
 }
 
+/// The credential is put back into the request rather than dropped after the verdict: a change
+/// stream answers past the request that opened it and has to be judged again (IB-026).
 pub async fn auth_middleware(
     State(state): State<AppState>,
-    req: axum::extract::Request,
+    mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let path = req.uri().path().to_string();
     let method = req.method().as_str().to_string();
+    let credential = Credential::presented(&path, &method, req.headers());
 
-    let headers = req.headers();
-    let secret = headers.get(INTERNAL_SECRET_HEADER).and_then(|v| v.to_str().ok()).map(str::to_string);
-    let api_key = headers.get(API_KEY_HEADER).and_then(|v| v.to_str().ok()).map(str::to_string);
-    let authorization = headers.get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok()).map(str::to_string);
-
-    let outcome = authorize(
-        &path,
-        &method,
-        &state.config.auth,
-        secret.as_deref(),
-        api_key.as_deref(),
-        authorization.as_deref(),
-    );
-
+    // Bound before the match: the guard would otherwise live to the end of it, across the await.
+    let outcome = credential.outcome(&state.auth());
     match outcome {
-        AuthOutcome::Allow => next.run(req).await,
+        AuthOutcome::Allow => {
+            req.extensions_mut().insert(credential);
+            next.run(req).await
+        },
         AuthOutcome::Deny(reason) => {
             warn!(target: "auth", path = %path, method = %method, reason,
                 "Rejected unauthenticated request");

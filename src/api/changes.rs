@@ -2,14 +2,15 @@
 
 use crate::api::docs::not_the_primary;
 use crate::api::middleware::{client_collection, CollectionPath};
-use crate::cdc::{CdcFilter, CdcFrame, CdcSession, CdcStream};
+use crate::auth::Credential;
+use crate::cdc::{CdcFilter, CdcFrame, CdcSession, CdcStream, ChangeSource, ChangeStream};
 use crate::changefeed::SubscribeError;
-use crate::cluster::changestream::router_stream_changes;
+use crate::cluster::changestream::open_cluster_stream;
 use crate::cluster::router::{parse_read_pref, ReadPreference};
 use crate::model::err_json;
 use crate::state::AppState;
 use crate::storage::Collection;
-use axum::extract::{Query, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
@@ -134,38 +135,53 @@ pub(crate) fn router_rejects_replica_reads(pref: &ReadPreference) -> Option<axum
             .to_string()))
 }
 
+/// Everything both transports do before they start rendering frames: the request is parsed, the
+/// feed is opened on whichever side of the cluster this node sits on, and the credential that
+/// cleared the gate rides along so the connection can be judged again while it runs.
+pub(crate) async fn open_change_stream(
+    state: &AppState,
+    col_name: String,
+    params: &ChangeParams,
+    headers: &HeaderMap,
+    credential: Option<Credential>,
+) -> Result<ChangeStream, axum::response::Response> {
+    let (filter, pref, after) = parse_request(params, headers)?;
+
+    let source = if state.config.role == "router" {
+        if let Some(refusal) = router_rejects_replica_reads(&pref) {
+            return Err(refusal);
+        }
+        ChangeSource::Cluster(
+            open_cluster_stream(state, col_name, params, after.as_deref()).await?)
+    } else {
+        ChangeSource::Shard(
+            open_shard_session(state, col_name, after.as_deref(), filter, &pref)?)
+    };
+    Ok(ChangeStream::new(source, state, credential))
+}
+
 pub async fn stream_changes(
     State(state): State<AppState>,
     CollectionPath(col_name): CollectionPath<String>,
     Query(params): Query<ChangeParams>,
+    credential: Option<Extension<Credential>>,
     headers: HeaderMap,
 ) -> axum::response::Response {
-    let (filter, pref, after) = match parse_request(&params, &headers) {
-        Ok(parsed) => parsed,
-        Err(refusal) => return refusal,
-    };
-
-    if state.config.role == "router" {
-        if let Some(refusal) = router_rejects_replica_reads(&pref) {
-            return refusal;
-        }
-        return router_stream_changes(&state, col_name, &params, after.as_deref()).await;
-    }
-
-    let session = match open_shard_session(&state, col_name, after.as_deref(), filter, &pref) {
-        Ok(session) => session,
+    let stream = match open_change_stream(
+        &state, col_name, &params, &headers, credential.map(|Extension(c)| c)).await {
+        Ok(stream) => stream,
         Err(refusal) => return refusal,
     };
 
     // Held by the `unfold` rather than a spawned task, so a client that disconnects drops the
     // subscription and the feed sees it leave.
-    let stream = futures::stream::unfold(session, |mut session| async move {
-        let frame = session.next_frame().await?;
+    let stream = futures::stream::unfold(stream, |mut stream| async move {
+        let frame = stream.next_frame().await?;
         let event = match frame.name {
             "open" => sse_event(&frame).retry(RETRY_HINT),
             _ => sse_event(&frame),
         };
-        Some((Ok::<Event, Infallible>(event), session))
+        Some((Ok::<Event, Infallible>(event), stream))
     });
 
     Sse::new(stream).keep_alive(KeepAlive::new().interval(KEEPALIVE_INTERVAL)).into_response()
@@ -174,6 +190,7 @@ pub async fn stream_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::API_KEY_HEADER;
     use crate::test_support::{next_test_port, single_node, temp_root, SseTap, TestNode};
 
     const SETTLE: Duration = Duration::from_secs(5);
@@ -349,6 +366,42 @@ mod tests {
         let c = reqwest::Client::new();
         put(&c, &router.url(), "seed", serde_json::json!({"v": 0})).await;
         assert_eq!(changes(&c, &router.url(), "").await.status(), StatusCode::OK);
+    }
+
+    /// IB-026: the same holds for the credential. A stream was authorized when it opened and never
+    /// again, so a key removed from the node's set kept reading the collection's writes until the
+    /// process restarted or the peer went away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stream_ends_when_the_key_it_opened_with_stops_being_accepted() {
+        let root = temp_root();
+        let mut n = TestNode::new("solo", next_test_port(), &root, "primary");
+        n.auth = serde_json::json!({"api_keys": ["old", "new"]});
+        n.start();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let c = reqwest::Client::new();
+        let subscribe = format!("{}/collections/c/changes", n.url());
+        assert!(c.put(format!("{}/collections/c/docs/seed", n.url()))
+            .header(API_KEY_HEADER, "old").json(&serde_json::json!({"value": {"v": 0}}))
+            .send().await.unwrap().status().is_success());
+
+        let opened = c.get(&subscribe).header(API_KEY_HEADER, "old").send().await.unwrap();
+        assert_eq!(opened.status(), StatusCode::OK);
+        let tap = SseTap::open(opened);
+        assert_eq!(tap.wait_for_events("open", 1, SETTLE).await.len(), 1);
+
+        let state = n.state.as_ref().expect("the node is running");
+        assert!(state.rotate_client_keys(vec!["new".to_string()], Vec::new()));
+
+        let ended = tap.wait_for_events("error", 1, SETTLE).await;
+        assert_eq!(ended.len(), 1, "the stream outlived the credential it was opened with");
+        assert_eq!(ended[0].data["error"].as_str(), Some(crate::cdc::REVOKED),
+            "the end has to say why, the way an overrun does: {:?}", ended[0]);
+
+        assert_eq!(c.get(&subscribe).header(API_KEY_HEADER, "old").send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED, "the rotated key must not open a new stream either");
+        assert_eq!(c.get(&subscribe).header(API_KEY_HEADER, "new").send().await.unwrap().status(),
+            StatusCode::OK, "a key that is still held is untouched");
     }
 
     /// A stream is one request that keeps answering, so `read=primary` is a promise it has to keep

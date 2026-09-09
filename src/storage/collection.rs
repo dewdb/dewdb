@@ -179,7 +179,8 @@ impl Collection {
         // Seeded from the watermark because compaction retires the drop and config frames replay
         // would otherwise find them in.
         let mut dropped = applied.as_ref().is_some_and(|m| m.dropped);
-        let mut committed_config = applied.as_ref().and_then(|m| m.config.clone());
+        let mut committed_config = applied.as_ref().and_then(|m| m.config.clone())
+            .map(Configuration::canonicalized);
         let mut committed_indexes = applied.as_ref().map(|m| m.indexes.clone()).unwrap_or_default();
         let mut committed_handover = applied.and_then(|m| m.handover);
 
@@ -1179,7 +1180,7 @@ impl Collection {
             LogEntry::Del { key, .. } => StagedEffect::Remove { key: key.clone() },
             LogEntry::Barrier { .. } => StagedEffect::Nothing,
             LogEntry::Drop { .. } => StagedEffect::Clear,
-            LogEntry::Config { config, .. } => StagedEffect::Configure(config.clone()),
+            LogEntry::Config { config, .. } => StagedEffect::Configure(config.clone().canonicalized()),
             LogEntry::Handover { handover, .. } => StagedEffect::RecordHandover(handover.clone()),
             LogEntry::Index { change, .. } => StagedEffect::DefineIndex(change.clone()),
         };

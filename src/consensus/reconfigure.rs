@@ -81,6 +81,15 @@ fn validate(state: &AppState, current: &Configuration, next: &[String]) -> Resul
     if next.is_empty() {
         return Err(ChangeError::Refused("a configuration needs at least one voter".to_string()));
     }
+    // Refused rather than deduped, so the caller learns the set it asked for is not the set it
+    // named. `node_key` is the rule `ClusterMetadata::validate` already applies to the member list.
+    let mut seen = std::collections::HashSet::new();
+    for voter in next {
+        if !seen.insert(crate::util::node_key(voter)) {
+            return Err(ChangeError::Refused(format!(
+                "{} appears more than once; each node counts once toward a majority", voter)));
+        }
+    }
     if current.is_joint() && !resumes(current, next) {
         return Err(ChangeError::Refused(format!(
             "a change to {:?} is already in flight; finish or retry that one first", current.voters)));
@@ -469,6 +478,43 @@ mod tests {
         drop(col);
         let _ = std::fs::remove_file(tombstone);
         assert_eq!(change_membership(&state, target.clone()).await.unwrap(), Configuration::simple(target));
+        drop(state);
+        node.kill();
+    }
+
+    /// The membership API is the way an inflated voter set gets into `CONFIG_LOG`; `validate`
+    /// refused an empty set, a concurrent change and a non-member, but not a node named twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ib043_a_voter_named_twice_is_refused_and_a_stored_one_reads_back_deduped() {
+        let root = temp_root();
+        let mut node = single_node(&root).await;
+        let state = node.state.clone().unwrap();
+        let own = node.url();
+
+        for duplicated in [vec![own.clone(), own.clone()],
+                           vec![own.clone(), own.to_uppercase(), format!("{}/", own)]] {
+            let refused = change_membership(&state, duplicated).await;
+            assert!(matches!(refused, Err(ChangeError::Refused(_))), "{:?}", refused);
+        }
+        assert!(configurations(&state).is_empty(), "a refused change must append nothing");
+
+        // What a pre-fix leader left behind: an entry naming one node twice in each half.
+        let col = state.db.as_ref().unwrap().get_collection(CONFIG_LOG).unwrap();
+        let inflated = Configuration {
+            voters: vec![own.clone(), own.to_uppercase()],
+            outgoing: Some(vec![own.clone(), own.clone(), "http://gone".into()]),
+        };
+        let lsn = col.configure(inflated, state.current_term()).unwrap().3;
+        col.apply_committed(lsn).unwrap();
+        state.refresh_configuration();
+
+        let in_force = state.quorum_config();
+        assert_eq!(in_force.voters, vec![own.clone()]);
+        assert_eq!(in_force.outgoing, Some(vec![own.clone(), "http://gone".to_string()]));
+        assert!(!in_force.has_quorum(&[own.clone()]),
+            "the outgoing half is two nodes, and this one alone is not a majority of it");
+
+        drop(col);
         drop(state);
         node.kill();
     }

@@ -4,7 +4,7 @@
 //! groups. The subscriber therefore gets a position per group, stamped with the partitioning those
 //! positions were taken against, and an ordering guarantee that is per group rather than global.
 
-use crate::api::changes::{sse_event, ChangeParams, KEEPALIVE_INTERVAL, RETRY_HINT};
+use crate::api::changes::ChangeParams;
 use crate::cdc::CdcFrame;
 use crate::cluster::router::{
     collection_absent_response, no_primary_response, read_targets, refusal_response,
@@ -15,12 +15,10 @@ use crate::query::{decode_cursor, encode_cursor};
 use crate::state::AppState;
 use crate::util::{encode_path_segment, same_endpoint};
 use axum::http::StatusCode;
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
-use std::convert::Infallible;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -376,7 +374,7 @@ async fn supervise(
 
 /// The merged feed as a transport consumes it. Frames rather than SSE events, so the WebSocket
 /// endpoint delivers the same fan-out without a second merge.
-pub(crate) struct ClusterStream {
+pub struct ClusterStream {
     rx: mpsc::Receiver<Merged>,
     collection: String,
     cursor: ClusterChangeCursor,
@@ -386,7 +384,7 @@ pub(crate) struct ClusterStream {
 }
 
 impl ClusterStream {
-    pub(crate) async fn next_frame(&mut self) -> Option<CdcFrame> {
+    pub async fn next_frame(&mut self) -> Option<CdcFrame> {
         if !self.opened {
             self.opened = true;
             return Some(CdcFrame {
@@ -457,7 +455,7 @@ impl ClusterStream {
 
 /// One subscription per shard group, merged. `after` is a `ClusterChangeCursor`, not an LSN: an
 /// LSN belongs to one group's log and says nothing about where the others are.
-pub(crate) async fn open_cluster_stream(
+pub async fn open_cluster_stream(
     state: &AppState,
     col_name: String,
     params: &ChangeParams,
@@ -555,28 +553,6 @@ pub(crate) async fn open_cluster_stream(
         opened: false,
         ended: false,
     })
-}
-
-pub async fn router_stream_changes(
-    state: &AppState,
-    col_name: String,
-    params: &ChangeParams,
-    after: Option<&str>,
-) -> axum::response::Response {
-    let cluster = match open_cluster_stream(state, col_name, params, after).await {
-        Ok(stream) => stream,
-        Err(refusal) => return refusal,
-    };
-
-    let stream = futures::stream::unfold(cluster, |mut cluster| async move {
-        let frame = cluster.next_frame().await?;
-        let event = match frame.name {
-            "open" => sse_event(&frame).retry(RETRY_HINT),
-            _ => sse_event(&frame),
-        };
-        Some((Ok::<Event, Infallible>(event), cluster))
-    });
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(KEEPALIVE_INTERVAL)).into_response()
 }
 
 #[cfg(test)]

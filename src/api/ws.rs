@@ -4,66 +4,35 @@
 //! without one -- gets the identical frame sequence here. The refusals happen before the upgrade,
 //! so an unusable position is an HTTP status rather than a socket that opens and immediately closes.
 
-use crate::api::changes::{
-    open_shard_session, parse_request, router_rejects_replica_reads, ChangeParams,
-    KEEPALIVE_INTERVAL,
-};
+use crate::api::changes::{open_change_stream, ChangeParams, KEEPALIVE_INTERVAL};
 use crate::api::middleware::CollectionPath;
-use crate::cdc::{CdcFrame, CdcSession};
-use crate::cluster::changestream::{open_cluster_stream, ClusterStream};
+use crate::auth::Credential;
+use crate::cdc::ChangeStream;
 use crate::state::AppState;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Query, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::HeaderMap;
-
-/// One collection's changes, from whichever side of the cluster this node sits on.
-enum Feed {
-    Shard(CdcSession),
-    Cluster(ClusterStream),
-}
-
-impl Feed {
-    async fn next_frame(&mut self) -> Option<CdcFrame> {
-        match self {
-            Self::Shard(session) => session.next_frame().await,
-            Self::Cluster(stream) => stream.next_frame().await,
-        }
-    }
-}
 
 pub async fn ws_changes(
     State(state): State<AppState>,
     CollectionPath(col_name): CollectionPath<String>,
     Query(params): Query<ChangeParams>,
+    credential: Option<Extension<Credential>>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> axum::response::Response {
-    let (filter, pref, after) = match parse_request(&params, &headers) {
-        Ok(parsed) => parsed,
-        Err(refusal) => return refusal,
-    };
-
     // Opened before the handshake: a client that learns its position is unusable from a `410` can
     // act on it, where one that learns it from a close frame has to parse the close reason.
-    let feed = if state.config.role == "router" {
-        if let Some(refusal) = router_rejects_replica_reads(&pref) {
-            return refusal;
-        }
-        match open_cluster_stream(&state, col_name, &params, after.as_deref()).await {
-            Ok(stream) => Feed::Cluster(stream),
-            Err(refusal) => return refusal,
-        }
-    } else {
-        match open_shard_session(&state, col_name, after.as_deref(), filter, &pref) {
-            Ok(session) => Feed::Shard(session),
-            Err(refusal) => return refusal,
-        }
+    let feed = match open_change_stream(
+        &state, col_name, &params, &headers, credential.map(|Extension(c)| c)).await {
+        Ok(feed) => feed,
+        Err(refusal) => return refusal,
     };
 
     upgrade.on_upgrade(move |socket| serve(socket, feed))
 }
 
-async fn serve(mut socket: WebSocket, mut feed: Feed) {
+async fn serve(mut socket: WebSocket, mut feed: ChangeStream) {
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
     keepalive.tick().await;
 
@@ -183,6 +152,40 @@ mod tests {
             "a position the buffer lost is an HTTP refusal, not a socket that closes at once");
         assert_eq!(refused(&n.url(), "?ops=upsert").await, StatusCode::BAD_REQUEST);
         assert_eq!(refused(&n.url(), "?read=quorum").await, StatusCode::BAD_REQUEST);
+    }
+
+    /// IB-026: a socket is authorized on its handshake and never again, so the same re-check the
+    /// SSE stream gets has to end this one too -- and in-band, because the frame is all a client
+    /// has to tell a refusal from a change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_socket_ends_when_the_key_its_handshake_carried_stops_being_accepted() {
+        use crate::auth::API_KEY_HEADER;
+
+        let root = temp_root();
+        let mut n = TestNode::new("solo", next_test_port(), &root, "primary");
+        n.auth = serde_json::json!({"api_keys": ["old", "new"]});
+        n.start();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let c = reqwest::Client::new();
+        assert!(c.put(format!("{}/collections/c/docs/seed", n.url()))
+            .header(API_KEY_HEADER, "old").json(&serde_json::json!({"value": {"v": 0}}))
+            .send().await.unwrap().status().is_success());
+
+        let socket = format!("{}/collections/c/changes/ws", n.url());
+        let tap = WsTap::open_with_key(&socket, "old").await.expect("the socket must open");
+        assert_eq!(tap.wait_for("open", 1, SETTLE).await.len(), 1);
+
+        let state = n.state.as_ref().expect("the node is running");
+        assert!(state.rotate_client_keys(vec!["new".to_string()], Vec::new()));
+
+        let ended = tap.wait_for("error", 1, SETTLE).await;
+        assert_eq!(ended.len(), 1, "the socket outlived the credential its handshake carried");
+        assert_eq!(ended[0]["error"].as_str(), Some(crate::cdc::REVOKED), "{:?}", ended[0]);
+
+        assert_eq!(WsTap::open_with_key(&socket, "old").await.err(),
+            Some(StatusCode::UNAUTHORIZED), "the rotated key must not open a new socket either");
+        assert!(WsTap::open_with_key(&socket, "new").await.is_ok());
     }
 
     /// A router serves the collection over a socket the same way it serves it over SSE: one

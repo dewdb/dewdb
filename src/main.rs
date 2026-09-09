@@ -92,6 +92,62 @@ fn load_cluster_view(config: &NodeConfig) -> ClusterMetadata {
     }
 }
 
+/// Between reads of the config file for a credential change. A rotation is operator-driven, so
+/// this is a bound on noticing one rather than something a request waits on.
+const AUTH_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Re-reads `auth.api_keys` and `auth.admin_keys` from the config file when the file changes, so
+/// removing a compromised key takes effect on this node -- and ends the change streams and webhook
+/// subscriptions opened under it -- without a restart (IB-026). Nothing else in the file is
+/// re-read: the cluster view is durable and every other field is wired into a task at boot.
+///
+/// `internal_secret` and `upstream_api_key` are deliberately not rotatable here. Both are baked
+/// into this node's outbound clients at boot, so taking a new one would leave it presenting a
+/// credential its peers no longer expect.
+fn auth_reload_task(state: AppState, path: String) {
+    tokio::spawn(async move {
+        let mut seen = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        loop {
+            tokio::time::sleep(AUTH_RELOAD_INTERVAL).await;
+            let stamp = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            if stamp == seen {
+                continue;
+            }
+            seen = stamp;
+            match reload_auth(&path) {
+                Ok(next) => {
+                    if next.internal_secret != state.config.auth.internal_secret
+                        || next.upstream_api_key != state.config.auth.upstream_api_key {
+                        warn!(target: "auth",
+                            "auth.internal_secret and auth.upstream_api_key are wired into this \
+                             node's outbound clients at boot and were not reloaded; restart the \
+                             node to change either");
+                    }
+                    if state.rotate_client_keys(next.api_keys.clone(), next.admin_keys.clone()) {
+                        info!(target: "auth", api_keys = next.api_keys.len(),
+                            admin_keys = next.admin_keys.len(),
+                            "Reloaded the credential set from the config file");
+                    }
+                },
+                // The set in force is left alone: a half-written file must not unlock the API.
+                Err(e) => warn!(target: "auth", path = %path, error = %e,
+                    "Could not re-read the credential set; keeping the one in force"),
+            }
+        }
+    });
+}
+
+fn reload_auth(path: &str) -> Result<crate::auth::AuthConfig, String> {
+    let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let file: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    let auth: crate::auth::AuthConfig = match file.get("auth") {
+        Some(section) => serde_json::from_value(section.clone()).map_err(|e| e.to_string())?,
+        None => Default::default(),
+    };
+    auth.validate()?;
+    Ok(auth)
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -219,6 +275,7 @@ async fn main() -> io::Result<()> {
 
     let state = AppState {
         db: db.clone(),
+        auth: Arc::new(RwLock::new(config.auth.clone())),
         config: Arc::new(config.clone()),
         client: client.clone(),
         stream_client: crate::auth::build_stream_client(&config.auth, &config.own_url()),
@@ -291,6 +348,7 @@ async fn main() -> io::Result<()> {
     // name every shard group, so it is what carries a definition between them.
     index_catalog_task(state.clone());
     webhook_task(state.clone());
+    auth_reload_task(state.clone(), config_path.clone());
 
     if state.db.is_some() {
         if config.maintenance.enabled {
@@ -305,4 +363,43 @@ async fn main() -> io::Result<()> {
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reload_auth;
+    use std::fs;
+
+    /// The reload is the only live half of `auth`, and it has to be exact about which fields it
+    /// takes: a file that names a new `internal_secret` must not be read as one, and a file that
+    /// cannot be parsed must not be read as an empty key set.
+    #[test]
+    fn a_credential_reload_takes_the_client_tiers_and_refuses_a_file_it_cannot_trust() {
+        let dir = std::env::temp_dir().join(format!("dew-auth-reload-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node.json");
+        let write = |body: &str| fs::write(&path, body).unwrap();
+
+        write(r#"{"node_id":"n","role":"shard","listen_addr":"127.0.0.1:1",
+            "auth":{"api_keys":["alpha"],"admin_keys":["root"],"internal_secret":"s"}}"#);
+        let loaded = reload_auth(path.to_str().unwrap()).expect("a valid file has to load");
+        assert_eq!(loaded.api_keys, vec!["alpha".to_string()]);
+        assert_eq!(loaded.admin_keys, vec!["root".to_string()]);
+        assert_eq!(loaded.internal_secret.as_deref(), Some("s"),
+            "the reader still reports it; whether it is applied is the caller's rule");
+
+        write(r#"{"node_id":"n","role":"shard","listen_addr":"127.0.0.1:1"}"#);
+        assert!(reload_auth(path.to_str().unwrap()).unwrap().api_keys.is_empty(),
+            "no auth section is the same open API it is at boot");
+
+        write("{ not json");
+        assert!(reload_auth(path.to_str().unwrap()).is_err(),
+            "a half-written file must not be read as an empty key set");
+
+        write(r#"{"auth":{"api_keys":[""]}}"#);
+        assert!(reload_auth(path.to_str().unwrap()).is_err(),
+            "a key that could not go in a header would silently disable the check");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

@@ -98,6 +98,10 @@ const NODE_LOAD_TTL_SECS: u64 = 10;
 pub struct AppState {
     pub db: Option<Arc<Database>>,
     pub config: Arc<NodeConfig>,
+    /// The credential set in force, seeded from config and re-read from the config file while the
+    /// node runs. Read through `auth()`, never from `config.auth`, so a key removed from the file
+    /// stops being accepted without a restart (IB-026).
+    pub(crate) auth: Arc<RwLock<crate::auth::AuthConfig>>,
     pub client: reqwest::Client,
     /// The same credentials without a request deadline. Only the router-coordinated change stream
     /// uses it: every other call to a peer is one request that must not outlive its own timeout.
@@ -171,6 +175,23 @@ impl AppState {
         locks.entry(key)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    pub fn auth(&self) -> std::sync::RwLockReadGuard<'_, crate::auth::AuthConfig> {
+        self.auth.read().unwrap()
+    }
+
+    /// Replaces the two client tiers, returning whether they moved. `internal_secret` and
+    /// `upstream_api_key` are not rotatable here: both are baked into this node's outbound clients
+    /// at boot, so changing one would leave it presenting a credential its peers no longer expect.
+    pub fn rotate_client_keys(&self, api_keys: Vec<String>, admin_keys: Vec<String>) -> bool {
+        let mut held = self.auth.write().unwrap();
+        if held.api_keys == api_keys && held.admin_keys == admin_keys {
+            return false;
+        }
+        held.api_keys = api_keys;
+        held.admin_keys = admin_keys;
+        true
     }
 
     pub fn is_leader(&self) -> bool {
@@ -552,6 +573,7 @@ impl AppState {
             scan_slots: Arc::new(tokio::sync::Semaphore::new(crate::aggregate::MAX_CONCURRENT_SCANS)),
             client: reqwest::Client::new(),
             stream_client: reqwest::Client::new(),
+            auth: Arc::new(RwLock::new(config.auth.clone())),
             config: Arc::new(config),
             primary_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),
             shard_failover_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -608,6 +630,7 @@ impl AppState {
             scan_slots: Arc::new(tokio::sync::Semaphore::new(crate::aggregate::MAX_CONCURRENT_SCANS)),
             client: reqwest::Client::new(),
             stream_client: reqwest::Client::new(),
+            auth: Arc::new(RwLock::new(config.auth.clone())),
             config: Arc::new(config),
             primary_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),
             shard_failover_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),

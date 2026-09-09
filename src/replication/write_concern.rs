@@ -1,5 +1,6 @@
 //! How many acknowledgements a write needs before the client hears success.
 
+use crate::consensus::config::voter_count;
 use crate::consensus::election::majority;
 use crate::storage::frame::Configuration;
 use serde::Deserialize;
@@ -69,9 +70,9 @@ impl WriteQuorum {
         match self {
             Self::Count(n) => *n,
             Self::Majority(config) => {
-                let new = majority(config.voters.len());
+                let new = majority(voter_count(&config.voters));
                 match &config.outgoing {
-                    Some(old) => new.max(majority(old.len())),
+                    Some(old) => new.max(majority(voter_count(old))),
                     None => new,
                 }
             },

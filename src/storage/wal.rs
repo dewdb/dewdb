@@ -204,7 +204,7 @@ impl Collection {
                             indexes.clear();
                             StagedEffect::Clear
                         },
-                        LogEntry::Config { config, .. } => StagedEffect::Configure(config),
+                        LogEntry::Config { config, .. } => StagedEffect::Configure(config.canonicalized()),
                         LogEntry::Handover { handover, .. } => StagedEffect::RecordHandover(handover),
                         // In force from here on, the way the append path puts it in force: every
                         // staged frame above this one indexes for it.

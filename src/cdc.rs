@@ -2,7 +2,9 @@
 //! transport. SSE, WebSocket and webhook delivery all consume this rather than the feed directly,
 //! so the filtering, the resume position and the end conditions are stated in one place.
 
+use crate::auth::Credential;
 use crate::changefeed::{ChangeEvent, ChangeOp, FeedEnd, Subscription};
+use crate::cluster::changestream::ClusterStream;
 use crate::query::{parse_filter, Filter};
 use crate::state::AppState;
 use std::collections::VecDeque;
@@ -12,6 +14,8 @@ use std::time::Duration;
 /// How often a leader-only stream re-checks that it still leads. A stream is one request that keeps
 /// answering, so leadership is not a thing it can check once the way every other read does.
 const LEADERSHIP_POLL: Duration = Duration::from_secs(1);
+/// How often a connection re-checks the credential it opened with, for the same reason (IB-026).
+const AUTH_RECHECK: Duration = Duration::from_secs(2);
 
 /// Which ops a subscriber asked for. A list rather than a set: there are four.
 pub struct OpFilter(Option<Vec<ChangeOp>>);
@@ -201,6 +205,75 @@ impl CdcSession {
                 }
                 Some(CdcFrame { name: "error", id: None, body })
             },
+        }
+    }
+}
+
+/// One collection's changes as a transport reads them, from whichever side of the cluster the node
+/// answering sits on.
+pub enum ChangeSource {
+    Shard(CdcSession),
+    Cluster(ClusterStream),
+}
+
+impl ChangeSource {
+    async fn next_frame(&mut self) -> Option<CdcFrame> {
+        match self {
+            Self::Shard(session) => session.next_frame().await,
+            Self::Cluster(stream) => stream.next_frame().await,
+        }
+    }
+}
+
+/// Ended in-band with the same `error` frame an overrun uses, so a subscriber learns why rather
+/// than seeing a stream that went quiet.
+pub const REVOKED: &str =
+    "the credential this stream was opened with is no longer accepted; resubscribe";
+
+/// A change stream and the re-authorization it needs because it answers past the request that
+/// opened it. Every other endpoint is one request, so per-request and per-answer are the same
+/// thing there; here a revoked key has to end the stream rather than have been checked once.
+pub struct ChangeStream {
+    source: ChangeSource,
+    /// Absent only where nothing authorized the stream in the first place, which is a test
+    /// building one without going through the middleware.
+    credential: Option<(AppState, Credential)>,
+    revoked: bool,
+}
+
+impl ChangeStream {
+    pub fn new(source: ChangeSource, state: &AppState, credential: Option<Credential>) -> Self {
+        Self {
+            source,
+            credential: credential.map(|c| (state.clone(), c)),
+            revoked: false,
+        }
+    }
+
+    pub async fn next_frame(&mut self) -> Option<CdcFrame> {
+        if self.revoked {
+            return None;
+        }
+        if self.credential.is_none() {
+            return self.source.next_frame().await;
+        }
+        loop {
+            // `next_frame` waits on a `watch` or an `mpsc`, both cancel-safe, so a lapsed poll
+            // drops no event.
+            let polled = tokio::time::timeout(AUTH_RECHECK, self.source.next_frame()).await;
+            if let Ok(frame) = polled {
+                return frame;
+            }
+            let gone = self.credential.as_ref()
+                .is_some_and(|(state, credential)| !credential.allowed(&state.auth()));
+            if gone {
+                self.revoked = true;
+                return Some(CdcFrame {
+                    name: "error",
+                    id: None,
+                    body: serde_json::json!({"error": REVOKED}),
+                });
+            }
         }
     }
 }

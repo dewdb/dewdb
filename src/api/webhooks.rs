@@ -5,6 +5,7 @@
 //! the same destinations, or a failover would quietly stop delivering.
 
 use crate::api::middleware::{client_collection, CollectionPath};
+use crate::auth::Credential;
 use crate::model::err_json;
 use crate::state::AppState;
 use crate::util::encode_path_segment;
@@ -12,7 +13,7 @@ use crate::webhook::{
     valid_webhook_id, valid_webhook_url, WebhookKey, WebhookSpec, MAX_WEBHOOK_ID_LEN,
     MAX_WEBHOOK_URL_LEN,
 };
-use axum::extract::{Query, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -28,6 +29,10 @@ pub struct CreateWebhook {
     pub ops: Option<String>,
     #[serde(default)]
     pub position: Option<u64>,
+    /// Set on the copy the leader pushes: the whole group holds one registration, so it holds one
+    /// creating credential, and each node judges that same digest against its own key set.
+    #[serde(default)]
+    pub creator: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -96,6 +101,7 @@ pub async fn create_webhook(
     State(state): State<AppState>,
     CollectionPath(col_name): CollectionPath<String>,
     Query(params): Query<WebhookParams>,
+    credential: Option<Extension<Credential>>,
     Json(payload): Json<CreateWebhook>,
 ) -> axum::response::Response {
     if state.config.role == "router" {
@@ -129,6 +135,12 @@ pub async fn create_webhook(
         Err(resp) => return resp,
     };
 
+    // A pushed copy carries the client's digest, not the pushing leader's: the group's nodes hold
+    // one registration between them, and it is the client's credential that created it.
+    let creator = match params.local {
+        true => payload.creator.clone(),
+        false => credential.and_then(|Extension(c)| c.digest()),
+    };
     let spec = WebhookSpec {
         id: payload.id.clone(),
         collection: col_name.clone(),
@@ -136,6 +148,7 @@ pub async fn create_webhook(
         secret: payload.secret.clone(),
         filter: payload.filter.clone(),
         ops: payload.ops.clone(),
+        creator: creator.clone(),
     };
     let feed_position = col.applied_lsn();
     // Covers commits between sampling the initial cursor and transferring ownership to the store.
@@ -160,6 +173,7 @@ pub async fn create_webhook(
         let forwarded = serde_json::json!({
             "id": payload.id, "url": payload.url, "secret": payload.secret,
             "filter": payload.filter, "ops": payload.ops, "position": subscription.delivery.position,
+            "creator": creator,
         });
         let (took, missed) = push_to_group(&state, &col_name, Some(&forwarded), &payload.id).await;
         body["replicated_to"] = serde_json::json!(took);
@@ -516,6 +530,61 @@ mod tests {
                 .send().await.unwrap().status(), StatusCode::NOT_FOUND,
                 "a removal has to reach the group too, or a failover resurrects the destination");
         }
+    }
+
+    /// IB-026: a registration is durable, so a restart does not end one the way it ends a
+    /// connection. Without a re-check, a key removed from the config kept posting the collection's
+    /// documents to the endpoint it named, indefinitely and across restarts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_registration_stops_delivering_once_the_key_that_created_it_is_gone() {
+        use crate::auth::API_KEY_HEADER;
+
+        let root = temp_root();
+        let port = next_test_port();
+        let mut n = TestNode::new("solo", port, &root, "primary");
+        n.auth = serde_json::json!({"api_keys": ["old", "new"]});
+        n.start();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let sink = WebhookSink::start().await;
+        let c = reqwest::Client::new();
+        let write = |base: String, key: &'static str, doc: &'static str| c
+            .put(format!("{}/collections/c/docs/{}", base, doc)).header(API_KEY_HEADER, key)
+            .json(&serde_json::json!({"value": {"v": 1}})).send();
+
+        assert!(write(n.url(), "old", "seed").await.unwrap().status().is_success());
+        assert_eq!(c.post(format!("{}/collections/c/webhooks", n.url()))
+            .header(API_KEY_HEADER, "old")
+            .json(&serde_json::json!({"id": "orders", "url": sink.url}))
+            .send().await.unwrap().status(), StatusCode::CREATED);
+
+        assert!(write(n.url(), "old", "before").await.unwrap().status().is_success());
+        assert_eq!(sink.wait_for_events(1, SETTLE).await.len(), 1, "nothing was delivered");
+        n.kill();
+
+        // The registration comes back off disk; the key that created it does not come back at all.
+        let mut back = TestNode::new("solo", port, &root, "primary");
+        back.auth = serde_json::json!({"api_keys": ["new"]});
+        back.start();
+        assert!(wait_for(SETTLE, || back.is_leader()).await, "the node has to lead to deliver");
+        assert!(write(back.url(), "new", "after").await.unwrap().status().is_success());
+
+        let held = format!("{}/collections/c/webhooks/orders", back.url());
+        let mut state = serde_json::Value::Null;
+        let deadline = std::time::Instant::now() + SETTLE;
+        while std::time::Instant::now() < deadline {
+            state = c.get(&held).header(API_KEY_HEADER, "new")
+                .send().await.unwrap().json().await.unwrap();
+            if state["delivery"]["disabled"].as_str().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(state["delivery"]["disabled"].as_str()
+            .is_some_and(|d| d.contains("no longer accepted")),
+            "the registration has to stop and say why: {}", state);
+        assert_eq!(sink.received().len(), 1,
+            "a committed change reached the endpoint under a credential the node no longer holds");
     }
 
     /// IB-030: the acknowledged cursor belongs to the group, and every registered replica keeps

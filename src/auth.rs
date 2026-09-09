@@ -1,6 +1,8 @@
 //! Credential config and the authorization decision for a request path.
 
+use axum::http::HeaderMap;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 pub const INTERNAL_SECRET_HEADER: &str = "x-dew-internal-secret";
@@ -180,6 +182,73 @@ pub fn authorize(
         Some(_) if accepted(&cfg.api_keys) || accepted(&cfg.admin_keys) => AuthOutcome::Allow,
         Some(_) => AuthOutcome::Deny("invalid api key"),
     }
+}
+
+/// SHA-256 of a key, hex. What a durable registration keeps instead of the key it was created
+/// with, so re-authorizing it later costs no plaintext credential on disk.
+pub fn key_digest(key: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(key.as_bytes());
+    digest.finalize().iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// What one request presented, kept whole so a connection that keeps answering past that request
+/// can be judged again against the keys the node holds now (IB-026).
+#[derive(Clone, Debug)]
+pub struct Credential {
+    route: String,
+    method: String,
+    secret: Option<String>,
+    api_key: Option<String>,
+    authorization: Option<String>,
+}
+
+impl Credential {
+    pub fn presented(route: &str, method: &str, headers: &HeaderMap) -> Self {
+        let value = |name: &str| headers.get(name)
+            .and_then(|v| v.to_str().ok()).map(str::to_string);
+        Self {
+            route: route.to_string(),
+            method: method.to_string(),
+            secret: value(INTERNAL_SECRET_HEADER),
+            api_key: value(API_KEY_HEADER),
+            authorization: value(axum::http::header::AUTHORIZATION.as_str()),
+        }
+    }
+
+    pub fn outcome(&self, cfg: &AuthConfig) -> AuthOutcome {
+        authorize(&self.route, &self.method, cfg, self.secret.as_deref(),
+            self.api_key.as_deref(), self.authorization.as_deref())
+    }
+
+    pub fn allowed(&self, cfg: &AuthConfig) -> bool {
+        self.outcome(cfg) == AuthOutcome::Allow
+    }
+
+    /// The key this rests on, for a subject that outlives the process that accepted it. `None` is
+    /// a request that presented none, which only an open API admits.
+    pub fn digest(&self) -> Option<String> {
+        presented_api_key(self.api_key.as_deref(), self.authorization.as_deref()).map(key_digest)
+    }
+}
+
+/// Whether a subject registered under `digest` is still admitted on `route`. The key itself was
+/// never written down, so the question is whether one the node holds now hashes to it and clears
+/// the same gate.
+pub fn digest_admitted(
+    cfg: &AuthConfig,
+    digest: Option<&str>,
+    route: &str,
+    method: &str,
+) -> bool {
+    let admits = |key: Option<&str>| authorize(route, method, cfg, None, key, None) == AuthOutcome::Allow;
+    // An unlocked gate admits every subject, whatever it presented when it was created.
+    if admits(None) {
+        return true;
+    }
+    let Some(held) = digest else { return false };
+    cfg.api_keys.iter().chain(cfg.admin_keys.iter())
+        .any(|key| constant_time_eq(&key_digest(key), held) && admits(Some(key)))
 }
 
 /// Longer than the change feed's keep-alive, so a connection that has gone quiet is a dead one
@@ -403,6 +472,55 @@ mod tests {
         let cfg = with_admin(None, &["client"], &["root"]);
         assert_eq!(authorize("/collections/c/docs", "POST", &cfg, None, Some("root"), None),
             AuthOutcome::Allow, "an operator must not need a second credential to read what it drops");
+    }
+
+    /// IB-026: a subject that outlives the request that created it -- a change stream, a webhook
+    /// registration -- is judged against the keys the node holds now, from a digest, because the
+    /// key itself is never kept.
+    #[test]
+    fn a_digest_is_admitted_only_while_a_held_key_still_hashes_to_it() {
+        let route = "/collections/c/webhooks";
+        let alpha = key_digest("alpha");
+        let cfg = auth_cfg(None, &["alpha", "beta"]);
+
+        assert!(digest_admitted(&cfg, Some(&alpha), route, "POST"));
+        assert!(!digest_admitted(&cfg, Some(&key_digest("never-held")), route, "POST"));
+        assert!(!digest_admitted(&cfg, None, route, "POST"),
+            "a locked gate admits no subject that presented nothing");
+
+        assert!(!digest_admitted(&auth_cfg(None, &["beta"]), Some(&alpha), route, "POST"),
+            "removing a key has to end what it created");
+
+        let open = auth_cfg(None, &[]);
+        assert!(digest_admitted(&open, None, route, "POST"));
+        assert!(digest_admitted(&open, Some(&alpha), route, "POST"),
+            "an unlocked gate admits every subject, whatever created it");
+
+        // The tier is part of the question, not just the key: locking the admin surface takes the
+        // webhook routes with it, and a client key stops clearing them.
+        let tiered = with_admin(None, &["alpha"], &["root"]);
+        assert!(!digest_admitted(&tiered, Some(&alpha), route, "POST"));
+        assert!(digest_admitted(&tiered, Some(&key_digest("root")), route, "POST"));
+    }
+
+    /// The credential is kept whole for the connections that outlive their own request, so the
+    /// same presented value has to be re-judgeable against a set that moved under it.
+    #[test]
+    fn a_credential_is_re_judged_against_the_set_in_force() {
+        let mut headers = HeaderMap::new();
+        headers.insert(API_KEY_HEADER, "alpha".parse().unwrap());
+        let credential = Credential::presented("/collections/c/changes", "GET", &headers);
+
+        assert!(credential.allowed(&auth_cfg(None, &["alpha", "beta"])));
+        assert!(!credential.allowed(&auth_cfg(None, &["beta"])));
+        assert_eq!(credential.digest().as_deref(), Some(key_digest("alpha").as_str()));
+
+        let mut bearer = HeaderMap::new();
+        bearer.insert(axum::http::header::AUTHORIZATION, "Bearer alpha".parse().unwrap());
+        assert_eq!(Credential::presented("/collections/c/changes", "GET", &bearer).digest(),
+            credential.digest(), "the two ways of presenting one key are one credential");
+
+        assert_eq!(Credential::presented("/health", "GET", &HeaderMap::new()).digest(), None);
     }
 
     #[test]

@@ -39,34 +39,69 @@ pub fn valid_collection_name(name: &str) -> bool {
         && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'.'))
 }
 
+/// The physical nodes a voter slice names, first spelling of each kept. Every majority is taken
+/// over this rather than the slice: two entries naming one node would otherwise both count toward
+/// a threshold the second one raised, so one node alone could satisfy it (bugs.md C8).
+fn distinct(voters: &[String]) -> impl Iterator<Item = &String> + '_ {
+    voters.iter().enumerate()
+        .filter(move |(i, v)| !voters[..*i].iter().any(|w| same_endpoint(w, v.as_str())))
+        .map(|(_, v)| v)
+}
+
+/// Physical nodes in one half. What `majority` is taken of, and what a client is told a write needs.
+pub fn voter_count(voters: &[String]) -> usize {
+    distinct(voters).count()
+}
+
 /// Majority of one half, by endpoint. `held` answers for a member this node has evidence about.
 fn half_quorum_lsn(voters: &[String], held: &impl Fn(&str) -> u64) -> u64 {
-    if voters.is_empty() {
+    let mut lsns: Vec<u64> = distinct(voters).map(|v| held(v)).collect();
+    if lsns.is_empty() {
         return 0;
     }
-    let mut lsns: Vec<u64> = voters.iter().map(|v| held(v)).collect();
     lsns.sort_unstable_by(|a, b| b.cmp(a));
     lsns[majority(lsns.len()) - 1]
 }
 
 fn half_has_quorum(voters: &[String], granted: &[String]) -> bool {
-    if voters.is_empty() {
+    let total = voter_count(voters);
+    if total == 0 {
         return true;
     }
-    let count = voters.iter()
+    let count = distinct(voters)
         .filter(|v| granted.iter().any(|g| same_endpoint(g, v)))
         .count();
-    count >= majority(voters.len())
+    count >= majority(total)
+}
+
+/// One entry per physical node, first spelling kept.
+fn canonical(voters: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(voters.len());
+    for url in voters {
+        if !out.iter().any(|u| same_endpoint(u, &url)) {
+            out.push(url);
+        }
+    }
+    out
 }
 
 impl Configuration {
     pub fn simple(voters: Vec<String>) -> Self {
-        Self { voters, outgoing: None }
+        Self { voters: canonical(voters), outgoing: None }
     }
 
     /// The transitional entry. Both halves decide together until it commits and `simple` replaces it.
     pub fn joint(outgoing: Vec<String>, voters: Vec<String>) -> Self {
-        Self { voters, outgoing: Some(outgoing) }
+        Self { voters: canonical(voters), outgoing: Some(canonical(outgoing)) }
+    }
+
+    /// A configuration decoded from a log frame or a snapshot. Deduped on the way in, because an
+    /// entry appended before the duplicate rule existed is a stored fact and cannot be refused.
+    pub fn canonicalized(self) -> Self {
+        match self.outgoing {
+            Some(outgoing) => Self::joint(outgoing, self.voters),
+            None => Self::simple(self.voters),
+        }
     }
 
     pub fn is_joint(&self) -> bool {
@@ -199,6 +234,52 @@ mod tests {
         let c = Configuration::joint(urls(&["a", "b", "c"]), urls(&["b", "c", "d"]));
         assert_eq!(c.target(), Configuration::simple(urls(&["b", "c", "d"])));
         assert!(!c.target().is_joint());
+    }
+
+    /// A stored entry, so the constructors are bypassed the way a decoded frame bypasses them.
+    fn stored(outgoing: Option<&[&str]>, voters: &[&str]) -> Configuration {
+        Configuration { voters: urls(voters), outgoing: outgoing.map(urls) }
+    }
+
+    #[test]
+    fn ib043_a_duplicated_voter_does_not_inflate_a_majority() {
+        let c = stored(None, &["a", "a", "d"]);
+
+        assert!(!c.has_quorum(&urls(&["a"])),
+            "two entries naming one node let it reach the threshold its own duplicate raised");
+        assert!(c.has_quorum(&urls(&["a", "d"])), "both physical nodes is the majority of two");
+        assert_eq!(c.quorum_lsn(|url| if crate::util::endpoint_of(url) == "a" { 9 } else { 0 }), 0,
+            "a duplicated voter's lsn entered the median twice");
+
+        let aliased = Configuration {
+            voters: vec!["http://A:1".into(), "http://a:1/".into(), "http://d:1".into()],
+            outgoing: None,
+        };
+        assert!(!aliased.has_quorum(&["http://a:1".to_string()]),
+            "identity is the endpoint, so two spellings are one voter");
+    }
+
+    #[test]
+    fn ib043_a_duplicate_in_either_half_of_a_stored_joint_entry_is_one_voter() {
+        let c = stored(Some(&["a", "a", "b"]), &["c", "c", "d"]);
+
+        assert!(!c.has_quorum(&urls(&["a", "c"])), "neither half is decided by one node of two");
+        assert!(c.has_quorum(&urls(&["a", "b", "c", "d"])));
+    }
+
+    #[test]
+    fn ib043_constructed_and_decoded_configurations_name_each_node_once() {
+        assert_eq!(Configuration::simple(urls(&["a", "a", "d"])).voters, urls(&["a", "d"]));
+
+        let joint = Configuration::joint(urls(&["a", "a", "b"]), urls(&["b", "b"]));
+        assert_eq!(joint.voters, urls(&["b"]));
+        assert_eq!(joint.outgoing, Some(urls(&["a", "b"])));
+        assert_eq!(joint.target(), Configuration::simple(urls(&["b"])));
+        assert_eq!(voter_count(&urls(&["a", "a", "d"])), 2);
+
+        let decoded = stored(Some(&["a", "a", "b"]), &["c", "c"]).canonicalized();
+        assert_eq!(decoded, Configuration::joint(urls(&["a", "b"]), urls(&["c"])));
+        assert_eq!(decoded.clone().canonicalized(), decoded, "canonicalising is idempotent");
     }
 
     #[test]
