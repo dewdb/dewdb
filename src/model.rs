@@ -25,6 +25,7 @@ pub const DEFAULT_QUERY_LIMIT: usize = 100;
 
 #[derive(Deserialize)]
 pub struct QueryParams {
+    pub max_docs: Option<usize>,
     pub start: Option<String>,
     pub end: Option<String>,
     pub limit: Option<usize>,

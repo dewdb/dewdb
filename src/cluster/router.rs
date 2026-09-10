@@ -78,6 +78,29 @@ fn authoritative_write_status(s: StatusCode) -> bool {
         || s == StatusCode::UNPROCESSABLE_ENTITY
 }
 
+/// One attempt at `base`, graded, following a `409` naming an owner once. The `bool` marks an
+/// outcome reached through a redirect: it names the key's owner, never the group's primary.
+async fn attempt_write<F: Fn(&str) -> reqwest::RequestBuilder>(
+    send: F,
+    base: &str,
+    path: &str,
+) -> Option<(ShardReply, bool)> {
+    let r = send(&format!("{}{}", base, path)).send().await.ok()?;
+    let reply = ShardReply::of(r).await;
+    let owner = match reply.redirect() {
+        Some(o) => o,
+        None => return authoritative_write_status(reply.status).then_some((reply, false)),
+    };
+    info!(target: "router", node = base, %owner, path, "Shard redirected the write; our ring is stale");
+    if let Ok(r2) = send(&format!("{}{}", owner, path)).send().await {
+        let second = ShardReply::of(r2).await;
+        if authoritative_write_status(second.status) && second.redirect().is_none() {
+            return Some((second, true));
+        }
+    }
+    Some((reply, true))
+}
+
 pub async fn router_forward_write(
     state: &AppState,
     col_name: &str,
@@ -98,29 +121,15 @@ pub async fn router_forward_write(
     let path = format!("/collections/{}/docs/{}{}",
         encode_path_segment(col_name), encode_path_segment(key), wc_query);
 
-    let full_url = format!("{}{}", effective_url, path);
-    if let Ok(r) = build_forward(&state.client, &method, &full_url, body).send().await {
-        let reply = ShardReply::of(r).await;
-        // The shard says the key is not its own, which means this router's ring is behind. Its
-        // answer names the owner, so one retry gets the write to the right place instead of
-        // handing the client a conflict it can do nothing about.
-        if let Some(owner) = reply.redirect() {
-            info!(target: "router", key, %owner, "Shard redirected the write; our ring is stale");
-            let retry = format!("{}{}", owner, path);
-            if let Ok(r2) = build_forward(&state.client, &method, &retry, body).send().await {
-                let second = ShardReply::of(r2).await;
-                if authoritative_write_status(second.status) && second.redirect().is_none() {
-                    return Ok(second);
-                }
-            }
-            return Ok(reply);
+    // Every attempt below follows a redirect, because one write can meet a stale ring and a dead
+    // primary at once; none of them caches an override off a reply that only disowned the key.
+    let send = |url: &str| build_forward(&state.client, &method, url, body);
+
+    if let Some((reply, redirected)) = attempt_write(&send, &effective_url, &path).await {
+        if !redirected && effective_url != original_url {
+            state.set_primary_override(&original_url, &effective_url);
         }
-        if authoritative_write_status(reply.status) {
-            if effective_url != original_url {
-                state.set_primary_override(&original_url, &effective_url);
-            }
-            return Ok(reply);
-        }
+        return Ok(reply);
     }
 
     let failover_lock = {
@@ -133,30 +142,43 @@ pub async fn router_forward_write(
 
     if let Some((latest_url, _, _)) = state.get_effective_shard_url(hash) {
         if latest_url != effective_url {
-            let retry_url = format!("{}{}", latest_url, path);
-            if let Ok(r) = build_forward(&state.client, &method, &retry_url, body).send().await {
-                let reply = ShardReply::of(r).await;
-                if authoritative_write_status(reply.status) {
-                    return Ok(reply);
-                }
+            if let Some((reply, _)) = attempt_write(&send, &latest_url, &path).await {
+                return Ok(reply);
             }
         }
     }
 
     state.primary_overrides.lock().unwrap().remove(&original_url);
     for replica in &replica_urls {
-        let fallback_url = format!("{}{}", replica, path);
-        if let Ok(r) = build_forward(&state.client, &method, &fallback_url, body).send().await {
-            let reply = ShardReply::of(r).await;
-            if authoritative_write_status(reply.status) {
+        if let Some((reply, redirected)) = attempt_write(&send, replica, &path).await {
+            if !redirected {
                 state.set_primary_override(&original_url, replica);
                 info!(target: "router", "Cached new primary: {} -> {}", original_url, replica);
-                return Ok(reply);
             }
+            return Ok(reply);
         }
     }
 
     Err((StatusCode::BAD_GATEWAY, "All shard nodes unreachable").into_response())
+}
+
+/// The body a shard's whole-batch refusal carries. `err_json` refusals are objects and are passed
+/// through whole, so the fields naming a bound survive; a plain-text refusal becomes one.
+fn refusal_body(reply: &ShardReply) -> serde_json::Map<String, serde_json::Value> {
+    if let Ok(serde_json::Value::Object(o)) = serde_json::from_str(&reply.body) {
+        if o.contains_key("error") {
+            return o;
+        }
+    }
+    let text = reply.body.trim();
+    let message = if text.is_empty() {
+        reply.status.canonical_reason().unwrap_or("shard refused the batch")
+    } else {
+        text
+    };
+    let mut o = serde_json::Map::new();
+    o.insert("error".to_string(), serde_json::Value::String(message.to_string()));
+    o
 }
 
 async fn router_forward_bulk(
@@ -167,16 +189,17 @@ async fn router_forward_bulk(
     replica_urls: &[String],
     body: &[serde_json::Value],
     wc_query: &str,
-) -> Result<reqwest::Response, String> {
+) -> Result<ShardReply, String> {
     let path = format!("/collections/{}/docs/bulk{}", encode_path_segment(col_name), wc_query);
-    let full_url = format!("{}{}", effective_url, path);
-    if let Ok(r) = state.client.post(&full_url).json(body).send().await {
-        if authoritative_write_status(r.status()) {
-            if effective_url != original_url {
-                state.set_primary_override(original_url, effective_url);
-            }
-            return Ok(r);
+    // Retrying the whole slice at the owner a refusal names is safe because that target re-checks
+    // every key before writing anything: a slice spanning owners is refused, not half applied.
+    let send = |url: &str| state.client.post(url).json(body);
+
+    if let Some((reply, redirected)) = attempt_write(&send, effective_url, &path).await {
+        if !redirected && effective_url != original_url {
+            state.set_primary_override(original_url, effective_url);
         }
+        return Ok(reply);
     }
 
     let failover_lock = {
@@ -189,13 +212,12 @@ async fn router_forward_bulk(
 
     state.primary_overrides.lock().unwrap().remove(original_url);
     for replica in replica_urls {
-        let fallback_url = format!("{}{}", replica, path);
-        if let Ok(r) = state.client.post(&fallback_url).json(body).send().await {
-            if authoritative_write_status(r.status()) {
+        if let Some((reply, redirected)) = attempt_write(&send, replica, &path).await {
+            if !redirected {
                 state.set_primary_override(original_url, replica);
                 info!(target: "router", "Cached new primary: {} -> {}", original_url, replica);
-                return Ok(r);
             }
+            return Ok(reply);
         }
     }
 
@@ -237,21 +259,41 @@ pub async fn bulk_router_forward(
     });
 
     let results = futures::future::join_all(futures).await;
+    let group_count = results.len();
 
     let mut ordered: Vec<serde_json::Value> = vec![serde_json::Value::Null; n];
+    let mut refusals: Vec<(StatusCode, serde_json::Map<String, serde_json::Value>)> = Vec::new();
     for (items, resp) in results {
         match resp {
-            Ok(r) => {
-                let shard_results: Vec<serde_json::Value> = r.json::<serde_json::Value>().await.ok()
+            Ok(reply) => {
+                let shard_results = serde_json::from_str::<serde_json::Value>(&reply.body).ok()
                     .and_then(|b| b.get("results").and_then(|v| v.as_array().cloned()))
-                    .unwrap_or_default();
-                if shard_results.len() == items.len() {
-                    for ((idx, _, _), res) in items.iter().zip(shard_results.into_iter()) {
-                        ordered[*idx] = res;
+                    .filter(|rs| rs.len() == items.len());
+                match shard_results {
+                    Some(rs) => {
+                        for ((idx, _, _), res) in items.iter().zip(rs.into_iter()) {
+                            ordered[*idx] = res;
+                        }
                     }
-                } else {
-                    for (idx, id, _) in &items {
-                        ordered[*idx] = serde_json::json!({"id": id, "status": "error", "error": "malformed shard response"});
+                    // An authoritative non-2xx carries no `results`, so it is this shard's answer
+                    // for every document it was sent rather than a protocol fault (IB-044).
+                    None if !reply.status.is_success() => {
+                        let body = refusal_body(&reply);
+                        let message = body.get("error").cloned().unwrap_or(serde_json::Value::Null);
+                        for (idx, id, _) in &items {
+                            ordered[*idx] = serde_json::json!({
+                                "id": id,
+                                "status": "error",
+                                "code": reply.status.as_u16(),
+                                "error": message.clone(),
+                            });
+                        }
+                        refusals.push((reply.status, body));
+                    }
+                    None => {
+                        for (idx, id, _) in &items {
+                            ordered[*idx] = serde_json::json!({"id": id, "status": "error", "error": "malformed shard response"});
+                        }
                     }
                 }
             }
@@ -267,6 +309,18 @@ pub async fn bulk_router_forward(
     // was still `201 Created`; so was a group whose writes did not meet their concern (M19).
     let all_created = ordered.iter().all(|r| r.get("status").and_then(|s| s.as_str()) == Some("created")
         && r.get("warning").is_none());
+
+    // One refusal answering for the whole batch is not a partial success: a `207` would claim some
+    // document was written and bury the status the client acts on, which for `413` is the one
+    // refusal no retry can satisfy (IB-044).
+    let whole_batch = refusals.first()
+        .filter(|(s, _)| refusals.len() == group_count && refusals.iter().all(|(o, _)| o == s));
+    if let Some((status, body)) = whole_batch {
+        let mut body = body.clone();
+        body.insert("results".to_string(), serde_json::Value::Array(ordered));
+        return (*status, Json(serde_json::Value::Object(body))).into_response();
+    }
+
     let status = if all_created { StatusCode::CREATED } else { StatusCode::MULTI_STATUS };
     (status, Json(serde_json::json!({"results": ordered}))).into_response()
 }
@@ -307,7 +361,7 @@ fn forwarded_read_pref(pref: &ReadPreference) -> Option<&'static str> {
 /// owners mid-scan sits behind a position that never covered it, and no amount of adapting the
 /// positions recovers it — the scan has to start again. A sorted scan is not affected: its cursor
 /// is a position in the sort order, which every shard answers the same way.
-fn stale_ring_response() -> axum::response::Response {
+pub(crate) fn stale_ring_response() -> axum::response::Response {
     err_json(
         StatusCode::CONFLICT,
         "cursor was issued against a different shard layout; restart the scan".to_string(),
@@ -706,27 +760,39 @@ pub async fn router_list_collections(state: &AppState) -> axum::response::Respon
     (StatusCode::OK, Json(serde_json::json!({"collections": out}))).into_response()
 }
 
-/// The union of what each shard group reports, since an index is defined per group and a client
-/// asked the cluster. `state` is the weakest of the groups': one still building answers rows the
-/// planner is not using yet.
+/// Every group must answer before counts and readiness can be merged.
 pub async fn router_list_indexes(state: &AppState, col_name: &str) -> axum::response::Response {
-    let mut targets = Vec::new();
-    for (original, _) in unique_shards(state) {
-        targets.push(state.effective_primary(&original));
-    }
-    targets.sort();
-    targets.dedup();
-
-    let per_shard = futures::future::join_all(targets.into_iter().map(|node| {
-        let client = state.client.clone();
-        let col_name = col_name.to_string();
+    let per_shard = futures::future::join_all(unique_shards(state).into_iter().map(|(original, replicas)| {
         async move {
-            let url = format!("{}/collections/{}/indexes", node, encode_path_segment(&col_name));
-            admin_call_with(&client, AdminMethod::Get, &url, None).await
+            let primary = state.effective_primary(&original);
+            let mut candidates = vec![primary];
+            for node in std::iter::once(original.clone()).chain(replicas) {
+                if !candidates.contains(&node) {
+                    candidates.push(node);
+                }
+            }
+            for node in candidates {
+                let url = format!("{}/collections/{}/indexes", node, encode_path_segment(col_name));
+                if let Some((status, body)) = admin_call_with(&state.client, AdminMethod::Get, &url, None).await {
+                    if status == StatusCode::NOT_FOUND
+                        || (status == StatusCode::OK && body.get("indexes").is_some_and(|v| v.is_array())) {
+                        return (original, Some((status, body)));
+                    }
+                }
+            }
+            (original, None)
         }
     })).await;
 
-    match merge_index_listings(per_shard.into_iter().flatten()) {
+    let mut replies = Vec::with_capacity(per_shard.len());
+    for (original, reply) in per_shard {
+        let Some(reply) = reply else {
+            return err_json(StatusCode::BAD_GATEWAY,
+                format!("no node in shard group '{}' could list its indexes", original));
+        };
+        replies.push(reply);
+    }
+    match merge_index_listings(replies.into_iter()) {
         Some(indexes) => (StatusCode::OK,
             Json(serde_json::json!({"collection": col_name, "indexes": indexes}))).into_response(),
         None => collection_absent_response(col_name),
@@ -807,6 +873,7 @@ fn shard_shares(limit: usize, shards: usize) -> Vec<usize> {
 }
 
 enum ShardQueryOutcome {
+    Refused(ShardReply),
     Page(QueryPage),
     /// Every candidate refused a `read=primary` query. Distinct from `Failed`: the shard is up.
     /// Carries the effective primary's own refusal when that is who refused, so the router does not
@@ -898,6 +965,7 @@ pub async fn router_query(
             if let Some(s) = &params.start { q.push(("start".to_string(), s.clone())); }
             if let Some(e) = &params.end { q.push(("end".to_string(), e.clone())); }
             if let Some(f) = &params.filter { q.push(("filter".to_string(), f.clone())); }
+            if let Some(n) = params.max_docs { q.push(("max_docs".to_string(), n.to_string())); }
             if let Some(s) = &params.sort { q.push(("sort".to_string(), s.clone())); }
             if let Some(a) = &after { q.push(("cursor".to_string(), a.clone())); }
             if let Some(v) = forwarded_read_pref(&pref) { q.push(("read".to_string(), v.to_string())); }
@@ -922,6 +990,11 @@ pub async fn router_query(
                             if let Ok(page) = res.json::<QueryPage>().await {
                                 return (original, ShardQueryOutcome::Page(page));
                             }
+                        } else if matches!(res.status(),
+                            // 409 is the shard's own stale-ring refusal (IB-047). Answered here
+                            // rather than retried: the next replica holds the same view.
+                            StatusCode::BAD_REQUEST | StatusCode::TOO_MANY_REQUESTS | StatusCode::CONFLICT) {
+                            return (original, ShardQueryOutcome::Refused(ShardReply::of(res).await));
                         } else if res.status() == StatusCode::SERVICE_UNAVAILABLE && primary_only {
                             refused = true;
                             if crate::util::same_endpoint(&target, &primary) {
@@ -971,6 +1044,7 @@ pub async fn router_query(
                     },
                     ShardQueryOutcome::NoPrimary(from_primary) => return refusal_response(from_primary),
                     ShardQueryOutcome::Absent => absent += 1,
+                    ShardQueryOutcome::Refused(reply) => return passthrough(reply),
                     ShardQueryOutcome::Failed => return (StatusCode::BAD_GATEWAY, "Shard query failed").into_response(),
                 }
             }
@@ -1013,7 +1087,8 @@ pub async fn router_query(
                 ShardQueryOutcome::NoPrimary(from_primary) => return refusal_response(from_primary),
                 // No position carried either: there is nothing here to resume from next page.
                 ShardQueryOutcome::Absent => absent += 1,
-                ShardQueryOutcome::Failed => return (StatusCode::BAD_GATEWAY, "Shard query failed").into_response(),
+                ShardQueryOutcome::Refused(reply) => return passthrough(reply),
+                    ShardQueryOutcome::Failed => return (StatusCode::BAD_GATEWAY, "Shard query failed").into_response(),
             }
         }
         if present == 0 && absent > 0 && positions.is_empty() {
@@ -1449,6 +1524,74 @@ mod tests {
         (StatusCode::OK, serde_json::json!({"indexes": rows}))
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ib039_index_listing_requires_an_answer_from_every_group() {
+        use crate::test_support::{router_for, temp_root};
+
+        async fn peer(status: StatusCode, body: serde_json::Value) -> (String, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let app = axum::Router::new().route("/collections/t/indexes", axum::routing::get(
+                move || { let body = body.clone(); async move {
+                    (status, [(axum::http::header::CONNECTION, "close")], axum::Json(body))
+                } }));
+            let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+            (url, task)
+        }
+
+        let root = temp_root();
+        let (ready, ready_task) = peer(StatusCode::OK,
+            serde_json::json!({"indexes": [row("i", "ready", 10)]})).await;
+        let (building, mut building_task) = peer(StatusCode::OK,
+            serde_json::json!({"indexes": [row("i", "building", 4)]})).await;
+        let (absent, absent_task) = peer(StatusCode::NOT_FOUND, serde_json::Value::Null).await;
+        let (failed, failed_task) = peer(StatusCode::SERVICE_UNAVAILABLE, serde_json::Value::Null).await;
+        let (malformed, malformed_task) = peer(StatusCode::OK, serde_json::json!({})).await;
+        let mut router = router_for(&root, &[(ready.clone(), vec![]), (building.clone(), vec![])]).await;
+        let state = router.state.as_ref().unwrap();
+
+        for (candidate, expected) in [
+            (&building, StatusCode::OK),
+            (&absent, StatusCode::OK),
+            (&failed, StatusCode::BAD_GATEWAY),
+            (&malformed, StatusCode::BAD_GATEWAY),
+        ] {
+            state.set_primary_override(&building, candidate);
+            // Remove the original candidate so failures cannot recover through it.
+            if candidate == &failed {
+                building_task.abort();
+                let _ = (&mut building_task).await;
+            }
+            let response = super::router_list_indexes(state, "t").await;
+            assert_eq!(response.status(), expected);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            if candidate == &building {
+                assert_eq!(body["indexes"][0]["documents"], 14);
+                assert_eq!(body["indexes"][0]["values"], 2);
+                assert_eq!(body["indexes"][0]["state"], "building");
+            } else if expected == StatusCode::BAD_GATEWAY {
+                assert!(body["error"].as_str().unwrap().contains(&building));
+            } else {
+                assert_eq!(body["indexes"][0]["documents"], 10);
+                assert_eq!(body["indexes"][0]["state"], "ready");
+            }
+        }
+        state.set_primary_override(&ready, &absent);
+        assert_eq!(super::router_list_indexes(state, "t").await.status(), StatusCode::BAD_GATEWAY);
+        state.set_primary_override(&building, &absent);
+        assert_eq!(super::router_list_indexes(state, "t").await.status(), StatusCode::NOT_FOUND);
+        router.kill();
+
+        let fallback_root = temp_root();
+        let mut fallback = router_for(&fallback_root, &[(building.clone(), vec![ready.clone()])]).await;
+        assert_eq!(super::router_list_indexes(fallback.state.as_ref().unwrap(), "t").await.status(), StatusCode::OK);
+        fallback.state.as_ref().unwrap().set_primary_override(&building, &malformed);
+        assert_eq!(super::router_list_indexes(fallback.state.as_ref().unwrap(), "t").await.status(), StatusCode::OK);
+        fallback.kill();
+        for task in [ready_task, absent_task, failed_task, malformed_task] { task.abort(); }
+    }
+
     fn row(name: &str, state: &str, documents: u64) -> serde_json::Value {
         serde_json::json!({"name": name, "field": "age", "state": state,
             "documents": documents, "values": 1})
@@ -1492,5 +1635,293 @@ mod tests {
         assert!(super::merge_index_listings([
             (StatusCode::NOT_FOUND, serde_json::Value::Null),
         ].into_iter()).is_none(), "nowhere at all is the client's error");
+    }
+
+    /// IB-044: a bounded shard's `413` reached the client as `207` with "malformed shard response"
+    /// on every item, which reads as a protocol fault and hides the one refusal no retry fixes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_bulk_refusal_carries_the_shard_status_and_message_through_the_router() {
+        use crate::test_support::{router_for, temp_root, next_test_port, TestNode};
+
+        let root = temp_root();
+        let mut shard = TestNode::new("bnd", next_test_port(), &root, "primary");
+        // Flow control is inert without replication configured, and these never have to answer.
+        shard.replicas = vec![
+            format!("http://127.0.0.1:{}", next_test_port()),
+            format!("http://127.0.0.1:{}", next_test_port()),
+        ];
+        shard.flow_control = serde_json::json!({ "max_uncommitted_frames": 2 });
+        shard.start();
+        let mut router = router_for(&root, &[(shard.url(), Vec::new())]).await;
+        let c = reqwest::Client::new();
+
+        let ten: Vec<serde_json::Value> =
+            (0..10).map(|i| serde_json::json!({"id": format!("k{}", i), "value": {"v": i}})).collect();
+        let r = c.post(format!("{}/collections/t/docs/bulk", router.url()))
+            .json(&ten).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::PAYLOAD_TOO_LARGE,
+            "the whole batch was refused, so `207` would claim a document was written");
+
+        let body: serde_json::Value = r.json().await.unwrap();
+        let message = body["error"].as_str().unwrap();
+        assert!(message.contains("10") && message.contains("max_uncommitted_frames"),
+            "the message has to name the batch size and the bound: {}", message);
+
+        let items = body["results"].as_array().unwrap();
+        assert_eq!(items.len(), 10);
+        for (i, item) in items.iter().enumerate() {
+            assert_eq!(item["id"], format!("k{}", i), "per-item order is still the request's");
+            assert_eq!(item["code"], 413);
+            assert_eq!(item["error"], message);
+        }
+
+        router.kill();
+        shard.kill();
+    }
+
+    /// The other half of IB-044: one shard refusing must not rewrite the answers of a shard that
+    /// wrote, so a mixed batch stays a `207` and each slice keeps its own status.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refusal_on_one_shard_leaves_the_other_shards_answers_intact() {
+        use crate::test_support::{router_for, temp_root, next_test_port, TestNode};
+
+        let root = temp_root();
+        let mut bounded = TestNode::new("s1", next_test_port(), &root, "primary");
+        bounded.replicas = vec![
+            format!("http://127.0.0.1:{}", next_test_port()),
+            format!("http://127.0.0.1:{}", next_test_port()),
+        ];
+        bounded.flow_control = serde_json::json!({ "max_uncommitted_frames": 2 });
+        bounded.start();
+        let mut open = TestNode::new("s2", next_test_port(), &root, "primary");
+        open.start();
+        let mut router = router_for(&root, &[(bounded.url(), Vec::new()), (open.url(), Vec::new())]).await;
+        let c = reqwest::Client::new();
+
+        let docs: Vec<serde_json::Value> =
+            (0..40).map(|i| serde_json::json!({"id": format!("k{}", i), "value": {"v": i}})).collect();
+        let r = c.post(format!("{}/collections/t/docs/bulk", router.url()))
+            .json(&docs).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::MULTI_STATUS);
+
+        let body: serde_json::Value = r.json().await.unwrap();
+        let items = body["results"].as_array().unwrap();
+        assert_eq!(items.len(), 40);
+        let refused = items.iter().filter(|i| i["code"] == 413).count();
+        let created = items.iter().filter(|i| i["status"] == "created").count();
+        assert_eq!(refused + created, 40, "no item is left as a protocol fault: {}", body);
+        assert!(refused > 0 && created > 0, "both shards have to be exercised: {}", body);
+        assert!(!items.iter().any(|i| i["error"] == "malformed shard response"));
+
+        router.kill();
+        bounded.kill();
+        open.kill();
+    }
+
+    #[test]
+    fn a_refusal_body_keeps_its_fields_and_a_plain_text_one_becomes_a_message() {
+        let structured = ShardReply {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            body: r#"{"error":"batch of 10 documents exceeds max_uncommitted_frames (2)","bound":2}"#.to_string(),
+        };
+        let body = refusal_body(&structured);
+        assert_eq!(body["bound"], 2);
+        assert!(body["error"].as_str().unwrap().contains("exceeds"));
+
+        let text = ShardReply {
+            status: StatusCode::BAD_REQUEST,
+            body: "Key not owned by any shard".to_string(),
+        };
+        assert_eq!(refusal_body(&text)["error"], "Key not owned by any shard");
+
+        let empty = ShardReply { status: StatusCode::CONFLICT, body: String::new() };
+        assert_eq!(refusal_body(&empty)["error"], "Conflict", "an empty body still names the status");
+    }
+
+    /// IB-052: `router_forward_write` retried a `409` at the owner the shard named and the bulk
+    /// path did not, so a batch sent through a stale ring failed for a whole slice where the same
+    /// writes sent singly succeeded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_redirected_bulk_slice_is_retried_at_the_owner_the_shard_names() {
+        let (s1, s2, router, keys) = stale_ring_cluster(4, 0).await;
+        let c = reqwest::Client::new();
+
+        let docs: Vec<serde_json::Value> = keys.iter()
+            .map(|k| serde_json::json!({"id": k, "value": {"k": k}}))
+            .collect();
+        let r = c.post(format!("{}/collections/t/docs/bulk", router.url()))
+            .json(&docs).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED,
+            "the shard named the owner, so one retry lands the slice: {}",
+            r.text().await.unwrap());
+
+        for key in &keys {
+            let url = format!("/collections/t/docs/{}", encode_path_segment(key));
+            assert_eq!(c.get(format!("{}{}", s2.url(), url)).send().await.unwrap().status(),
+                StatusCode::OK, "the retry has to write at the new owner");
+            assert_eq!(c.get(format!("{}{}", s1.url(), url)).send().await.unwrap().status(),
+                StatusCode::CONFLICT, "and not at the shard the stale ring picked");
+        }
+
+        drop_stale_ring_cluster(s1, s2, router);
+    }
+
+    /// The safety half of IB-052: the shard names the owner of the *first* key it disowns, so a
+    /// slice can span owners. Retrying it whole is safe only because the retry target re-checks
+    /// every key, which makes it refuse rather than write the half it does own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_bulk_slice_spanning_owners_is_refused_whole_rather_than_half_applied() {
+        let (s1, s2, router, keys) = stale_ring_cluster(1, 1).await;
+        let c = reqwest::Client::new();
+        let (moved, stayed) = (&keys[0], &keys[1]);
+
+        // `stayed` first, so the shard reaches it as its own and refuses on `moved` behind it.
+        let docs = serde_json::json!([
+            {"id": stayed, "value": {"n": 1}},
+            {"id": moved, "value": {"n": 2}},
+        ]);
+        let r = c.post(format!("{}/collections/t/docs/bulk", router.url()))
+            .json(&docs).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::CONFLICT,
+            "neither shard owns the whole slice, so the original refusal stands");
+
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["error"], "this shard does not own that key");
+        assert_eq!(body["owner"], s2.url(), "the refusal still names where the router should go");
+        for item in body["results"].as_array().unwrap() {
+            assert_eq!(item["code"], 409);
+        }
+
+        // Each key read at the shard that owns it under the shards' own ring: a `404` there is the
+        // only way to see that the retry wrote nothing.
+        for (key, owner) in [(stayed, &s1), (moved, &s2)] {
+            let r = c.get(format!("{}/collections/t/docs/{}", owner.url(), encode_path_segment(key)))
+                .send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::NOT_FOUND,
+                "a refused slice must not half apply at {}", owner.url());
+        }
+
+        drop_stale_ring_cluster(s1, s2, router);
+    }
+
+    /// Two shards holding a ring the router does not have, which is the handover window the
+    /// redirect exists for. `s1`'s group has no replicas.
+    async fn stale_ring_cluster(moved: usize, stayed: usize)
+        -> (crate::test_support::TestNode, crate::test_support::TestNode,
+            crate::test_support::TestNode, Vec<String>)
+    {
+        use crate::test_support::{temp_root, two_shard_cluster};
+
+        // `temp_root` is a guard; the nodes outlive this function, so it has to be leaked rather
+        // than dropped here, which is why the caller kills the nodes instead of the directory.
+        let root = Box::leak(Box::new(temp_root()));
+        let (s1, s2, router) = two_shard_cluster(root).await;
+        let keys = split_rings(&router, &s1, &s2, &[], moved, stayed);
+        (s1, s2, router, keys)
+    }
+
+    /// Moves the shards on to a ring the router is behind on. Returns `moved` keys (`s1` under the
+    /// router's ring, `s2` under the shards') followed by `stayed` keys (`s1` under both).
+    fn split_rings(
+        router: &crate::test_support::TestNode,
+        s1: &crate::test_support::TestNode,
+        s2: &crate::test_support::TestNode,
+        s1_replicas: &[&crate::test_support::TestNode],
+        moved: usize,
+        stayed: usize,
+    ) -> Vec<String> {
+        use crate::cluster::metadata::Adoption;
+        use crate::ring::{HashRing, RingShard};
+
+        let shards = vec![
+            RingShard { node_url: s1.url(), replica_urls: s1_replicas.iter().map(|n| n.url()).collect() },
+            RingShard { node_url: s2.url(), replica_urls: Vec::new() },
+        ];
+        let routers_ring = HashRing { vnodes: 32, shards: shards.clone() };
+        let shards_ring = HashRing { vnodes: 64, shards };
+        let (stale, current) = (routers_ring.build(), shards_ring.build());
+
+        let owned_by = |built: &crate::ring::BuiltRing, key: &str, url: &str| {
+            built.owner(hash_key("t", key)).is_some_and(|o| o.node_url == url)
+        };
+        let mut keys: Vec<String> = (0..200_000).map(|i| format!("ib052-{}", i))
+            .filter(|k| owned_by(&stale, k, &s1.url()) && owned_by(&current, k, &s2.url()))
+            .take(moved)
+            .collect();
+        assert_eq!(keys.len(), moved, "a vnode change must move keys from s1 to s2");
+        keys.extend((0..200_000).map(|i| format!("ib052-{}", i))
+            .filter(|k| owned_by(&stale, k, &s1.url()) && owned_by(&current, k, &s1.url()))
+            .take(stayed));
+        assert_eq!(keys.len(), moved + stayed, "and must leave some of s1's keys where they were");
+
+        let mut view = router.state.as_ref().unwrap().cluster_view();
+        view.version += 1;
+        view.updated_by = "ib052-shards".to_string();
+        view.seeded = false;
+        view.migration = None;
+        view.ring = Some(shards_ring);
+        for node in [s1, s2].into_iter().chain(s1_replicas.iter().copied()) {
+            let state = node.state.as_ref().unwrap();
+            assert!(matches!(state.adopt_cluster(view.clone()), Adoption::Adopted { .. }));
+        }
+
+        // The router's view carries the older ring at a higher version, so the total order keeps
+        // it stale for the test rather than converging under it.
+        let mut behind = view.clone();
+        behind.version += 5;
+        behind.updated_by = "ib052-router".to_string();
+        behind.ring = Some(routers_ring);
+        let router_state = router.state.as_ref().unwrap();
+        assert!(matches!(router_state.adopt_cluster(behind), Adoption::Adopted { .. }));
+
+        for key in &keys[..moved] {
+            let (effective, _, _) = router_state.get_effective_shard_url(hash_key("t", key)).unwrap();
+            assert_eq!(effective, s1.url(),
+                "the precondition is a router that still routes a moved key to its old owner");
+        }
+        keys
+    }
+
+    /// IB-053: past the failover lock the replica loop graded a `409` as this node's answer, so a
+    /// write meeting a dead primary and a moved key returned it and cached the redirector.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_redirect_in_the_failover_loop_is_followed_and_caches_no_primary() {
+        use crate::test_support::{next_test_port, temp_root, two_shard_cluster, TestNode};
+
+        let root = Box::leak(Box::new(temp_root()));
+        let (mut s1, mut s2, mut router) = two_shard_cluster(root).await;
+        let mut s3 = TestNode::new("s3", next_test_port(), root, "primary");
+        s3.start();
+        let keys = split_rings(&router, &s1, &s2, &[&s3], 1, 0);
+        let path = format!("/collections/t/docs/{}", encode_path_segment(&keys[0]));
+
+        // The failover loop is only reached once the ring's owner is unreachable.
+        s1.kill();
+
+        let c = reqwest::Client::new();
+        let r = c.put(format!("{}{}", router.url(), path))
+            .json(&serde_json::json!({"value": {"n": 1}})).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED,
+            "the replica named the owner, so the failover loop has to follow it: {}",
+            r.text().await.unwrap());
+
+        assert_eq!(c.get(format!("{}{}", s2.url(), path)).send().await.unwrap().status(),
+            StatusCode::OK, "the write lands at the owner the redirect named");
+        assert_eq!(router.state.as_ref().unwrap().cached_primary(&s1.url()), None,
+            "a reply that only disowned the key is no evidence about who leads the group");
+
+        router.kill();
+        s3.kill();
+        s2.kill();
+    }
+
+    fn drop_stale_ring_cluster(
+        mut s1: crate::test_support::TestNode,
+        mut s2: crate::test_support::TestNode,
+        mut router: crate::test_support::TestNode,
+    ) {
+        router.kill();
+        s1.kill();
+        s2.kill();
     }
 }

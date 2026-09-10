@@ -37,6 +37,11 @@ pub struct ShardCursor {
 #[serde(deny_unknown_fields)]
 pub struct KeyCursor {
     pub key: String,
+    /// The shard's partitioning when the position was taken: a key skipped as unowned leaves the
+    /// position behind it, so after a flip that position readmits or strands it (IB-047).
+    /// `None` predates the stamp and resumes unpinned, so a page in flight across an upgrade ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ring: Option<u64>,
 }
 
 /// Where a sorted scan stopped, as a position in the sort order rather than in the keyspace. One

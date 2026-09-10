@@ -210,18 +210,15 @@ pub fn replication_drive_task(state: AppState) {
                     if !due {
                         continue;
                     }
-                    // No cursor means we have never sent here and have nothing to resume from;
-                    // the reactive path still establishes one on the next write.
-                    let cursor = match state.sent_through(replica, &name) {
-                        Some(c) => c,
-                        None => continue,
-                    };
-                    if cursor < tail {
-                        work.push((replica.clone(), name.clone(), cursor, false));
-                    } else if state.matched_lsn(replica, &name) < tail {
-                        // Nothing to send and nothing proving this replica holds the tail. Asking is
-                        // the only way a leader learns that on an idle cluster (bugs.md C30).
-                        work.push((replica.clone(), name.clone(), cursor, true));
+                    let cursor = state.sent_through(replica, &name);
+                    match cursor {
+                        Some(c) if c < tail => work.push((replica.clone(), name.clone(), c, false)),
+                        // Nothing to send, or no cursor to send from (IB-055, bugs.md C30): the
+                        // tail frame asks either way, and a refusal names where the next tick resumes.
+                        _ if state.matched_lsn(replica, &name) < tail => {
+                            work.push((replica.clone(), name.clone(), cursor.unwrap_or(0), true));
+                        },
+                        _ => {},
                     }
                 }
             }
@@ -279,8 +276,8 @@ pub(crate) async fn catch_up_replica(state: &AppState, replica: &str) -> bool {
         if tail == 0 || state.matched_lsn(replica, &name) >= tail {
             continue;
         }
-        // Same split the drive task makes: with a backlog we stream it, with none and no ack on
-        // record the tail frame is re-sent to be answered (bugs.md C30).
+        // With a backlog we stream it, with none and no ack on record the tail frame is re-sent to
+        // be answered (bugs.md C30). A missing cursor streams from 0 here, unlike the driver (IB-058).
         match state.sent_through(replica, &name) {
             Some(cursor) if cursor >= tail => { confirm_tail(state, replica, &name).await; },
             cursor => {
@@ -1466,6 +1463,32 @@ mod tests {
                 "k{} must reach the returning replica without a write to trigger it; replication that \
                  only runs on client traffic leaves an idle cluster permanently diverged", i);
         }
+    }
+
+    /// IB-055: a collection first written while a peer was unreachable leaves the leader no send
+    /// cursor for it, and the drive task skipped every collection it held none for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_collection_whose_first_write_a_peer_missed_still_reaches_it() {
+        let root = temp_root();
+        let (n1, _n2, mut n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+
+        assert!(put_doc_at(&client, &n1.url(), "t", "k0", 0, "?w=all&wtimeout=4000").await.is_success());
+        assert!(wait_for_doc(&client, &n3.url(), "t", "k0", 0, Duration::from_secs(10)).await);
+
+        n3.kill();
+        // 'late' is created by a write n3 cannot receive, so nothing ever seeds its cursor: not
+        // promotion, which ran before the collection existed, and not this send, which fails.
+        assert!(put_doc_at(&client, &n1.url(), "late", "k1", 1, "?w=majority&wtimeout=4000")
+            .await.is_success());
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        // Deliberately no write after this point, to either collection.
+        n3.start();
+
+        assert!(wait_for_doc(&client, &n3.url(), "late", "k1", 1, Duration::from_secs(20)).await,
+            "the driver has to bootstrap a missing cursor; unfixed it skips 'late' forever and the \
+             document arrives only if a client writes to that collection again");
     }
 
     /// C30: a snapshot install carries the leader's log to a replica and produces no ack, so the

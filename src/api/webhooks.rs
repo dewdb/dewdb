@@ -1,8 +1,6 @@
 //! Webhook subscription administration.
 //!
-//! A registration is node-local durable state rather than a replicated log entry, so the leader
-//! that accepts one also pushes it to the rest of its group: whichever node leads next has to hold
-//! the same destinations, or a failover would quietly stop delivering.
+//! Registrations commit through the group log; pushes only accelerate local reconciliation.
 
 use crate::api::middleware::{client_collection, CollectionPath};
 use crate::auth::Credential;
@@ -64,8 +62,7 @@ fn missing(key: &WebhookKey) -> axum::response::Response {
         format!("collection '{}' has no webhook subscription '{}'", key.0, key.1))
 }
 
-/// Best effort, and reported as such: a peer that missed the registration keeps delivering nothing
-/// until it is reachable again, and an operator that is told which one can re-run the request.
+/// Best-effort wakeup; the committed catalogue repairs a missed push.
 async fn push_to_group(
     state: &AppState,
     collection: &str,
@@ -89,7 +86,7 @@ async fn push_to_group(
         };
         match request.send().await {
             // A `404` on a delete is the peer already agreeing there is nothing there.
-            Ok(r) if r.status().is_success() || r.status() == StatusCode::NOT_FOUND =>
+            Ok(r) if r.status().is_success() || (body.is_none() && r.status() == StatusCode::NOT_FOUND) =>
                 took.push(peer),
             _ => missed.push(peer),
         }
@@ -160,10 +157,27 @@ pub async fn create_webhook(
     } else {
         feed_position
     };
-    let subscription = match state.webhooks.upsert(spec, initial_position, state.config.webhooks.max_subscriptions) {
-        Ok(subscription) => subscription,
-        Err(max) => return err_json(StatusCode::CONFLICT, format!(
-            "this node already holds the maximum of {} webhook subscriptions", max)),
+    let key = (col_name.clone(), payload.id.clone());
+    if params.local {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Err(e) = crate::webhook::reconcile_registrations(&state) {
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+            }
+            if state.webhooks.get(&key).is_some_and(|s| s.spec == spec) { break; }
+            if tokio::time::Instant::now() >= deadline {
+                return err_json(StatusCode::SERVICE_UNAVAILABLE, "registration is still catching up".into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    } else if let Err(response) = crate::webhook::commit_registration(
+        &state, &key, Some((spec, initial_position)),
+    ).await {
+        return response;
+    }
+    let Some(subscription) = state.webhooks.get(&key) else {
+        return err_json(StatusCode::SERVICE_UNAVAILABLE,
+            "registration has not replicated to this node yet".into());
     };
     state.webhooks.sync_pins(state.db.as_ref().unwrap());
     drop(registration_pin);
@@ -229,7 +243,25 @@ pub async fn delete_webhook(
     }
 
     let key = (col_name.clone(), id.clone());
-    let removed = state.webhooks.remove(&key);
+    let removed = if params.local {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Err(e) = crate::webhook::reconcile_registrations(&state) {
+                return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+            }
+            if state.webhooks.get(&key).is_none() { break; }
+            if tokio::time::Instant::now() >= deadline {
+                return err_json(StatusCode::SERVICE_UNAVAILABLE, "removal is still catching up".into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        true
+    } else {
+        match crate::webhook::commit_registration(&state, &key, None).await {
+            Ok(removed) => removed,
+            Err(response) => return response,
+        }
+    };
     state.webhooks.sync_pins(state.db.as_ref().unwrap());
     if params.local {
         return match removed {
@@ -266,6 +298,41 @@ mod tests {
     use std::time::Duration;
 
     const SETTLE: Duration = Duration::from_secs(10);
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ib031_offline_replica_recovers_registration_and_removal() {
+        let root = temp_root();
+        let (n1, n2, mut n3) = three_node_cluster(&root).await;
+        let sink = WebhookSink::start().await;
+        let c = reqwest::Client::new();
+        assert!(wait_for(SETTLE, || n1.is_leader()).await);
+        assert!(put_value(&c, &n1.url(), "c", "seed", serde_json::json!({"v": 0}),
+            "?w=all").await.is_success());
+        n3.kill();
+        let response = register(&c, &n1.url(), serde_json::json!({
+            "id": "offline", "url": sink.url, "secret": "kept",
+        })).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let key = ("c".to_string(), "offline".to_string());
+        n3.start();
+        assert!(wait_for(SETTLE, || n3.state.as_ref().unwrap().webhooks.get(&key)
+            .is_some_and(|s| s.spec.secret.as_deref() == Some("kept"))).await,
+            "catch-up must restore the registration without another POST");
+        n3.kill();
+        let holder = settle_leader(&[&n1, &n2], SETTLE).await.unwrap();
+        let leader = node_by_id(&[&n1, &n2], &holder);
+        assert_eq!(c.delete(format!("{}/collections/c/webhooks/offline", leader.url()))
+            .send().await.unwrap().status(), StatusCode::OK);
+        n3.start();
+        assert!(wait_for(SETTLE, || {
+            let state = n3.state.as_ref().unwrap();
+            state.webhooks.get(&key).is_none() && state.db.as_ref().unwrap()
+                .existing_collection(crate::webhook::WEBHOOK_PROGRESS_LOG)
+                .and_then(|log| log.get("registrations").ok().flatten())
+                .is_some_and(|v| v["subscriptions"].as_array().is_some_and(|s| s.is_empty()))
+        }).await,
+            "catch-up must remove a stale destination without another DELETE");
+    }
 
     async fn put(client: &reqwest::Client, base: &str, key: &str, v: i64) {
         assert!(put_value(client, base, "c", key, serde_json::json!({"v": v}), "").await
@@ -485,8 +552,7 @@ mod tests {
             .send().await.unwrap().status(), StatusCode::NOT_FOUND);
     }
 
-    /// The registration is node-local, so the leader pushes it to the rest of the group: whichever
-    /// node leads next has to hold the same destinations, or a failover stops delivering silently.
+    // A reachable follower reconciles the committed catalogue before the request returns.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_registration_reaches_the_rest_of_the_group() {
         let root = temp_root();

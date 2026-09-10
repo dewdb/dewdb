@@ -59,10 +59,30 @@ impl WalCut {
     }
 
     fn clear(root_path: &std::path::Path) -> io::Result<()> {
+        Self::clear_with_sync(root_path, |dir| {
+            #[cfg(not(windows))]
+            { File::open(dir)?.sync_all() }
+            #[cfg(windows)]
+            {
+                // Match write_atomic's best-effort directory sync on Windows.
+                if let Ok(directory) = File::open(dir) {
+                    directory.sync_all()?;
+                }
+                Ok(())
+            }
+        })
+    }
+
+    fn clear_with_sync(
+        root_path: &std::path::Path,
+        sync: impl FnOnce(&std::path::Path) -> io::Result<()>,
+    ) -> io::Result<()> {
         match fs::remove_file(root_path.join(CUT_FILENAME)) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {},
         }
+        // A retry must sync even when an earlier unlink succeeded but its sync failed.
+        sync(root_path)
     }
 
     /// Empties every WAL above the cut, then shrinks the cut file. The reverse order leaves frames
@@ -712,6 +732,26 @@ mod tests {
     use crate::test_support::{disk_put, live_put, make_frame, temp_root};
     use std::io::Write;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn ib045_marker_clear_syncs_after_unlink_and_retries_failed_sync() {
+        let root = temp_root();
+        fs::create_dir_all(&root).unwrap();
+        let cut = WalCut { wal_id: 1, offset: 0, prev_lsn: 0, prev_term: 0 };
+        cut.record(&root).unwrap();
+        let error = WalCut::clear_with_sync(&root, |dir| {
+            assert_eq!(dir, &*root);
+            assert!(!dir.join(CUT_FILENAME).exists());
+            Err(io::Error::new(io::ErrorKind::Other, "injected directory sync failure"))
+        }).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        let mut synced = false;
+        WalCut::clear_with_sync(&root, |_| { synced = true; Ok(()) }).unwrap();
+        assert!(synced, "an absent marker still needs its deletion synced");
+        fs::create_dir(root.join(CUT_FILENAME)).unwrap();
+        assert!(WalCut::clear_with_sync(&root, |_| panic!("unlink failed")).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn ib007_open(path: &std::path::Path) -> Collection {
         use std::sync::atomic::AtomicU64;

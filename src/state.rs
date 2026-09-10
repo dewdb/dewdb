@@ -38,6 +38,7 @@ pub(crate) struct ScanOwnership {
     ring: Option<Arc<BuiltRing>>,
     group: Option<String>,
     collection: String,
+    fingerprint: u64,
 }
 
 impl ScanOwnership {
@@ -47,6 +48,12 @@ impl ScanOwnership {
             Some(ring) => self.group.as_deref()
                 .is_some_and(|group| group_owns(ring, group, &self.collection, key)),
         }
+    }
+
+    /// The partitioning this verdict was taken against, taken from the same view as the ring so
+    /// the two cannot disagree. Stamped into the page's cursor and compared on the next one.
+    pub fn fingerprint(&self) -> u64 {
+        self.fingerprint
     }
 }
 
@@ -121,7 +128,7 @@ pub struct AppState {
     /// Node-wide cap on concurrent outbound replication requests. Shared across every write, unlike
     /// a per-call semaphore, which bounds one write's fan-out and nothing else.
     pub replication_slots: Arc<tokio::sync::Semaphore>,
-    /// Node-wide cap on concurrent aggregation scans. A request's `max_docs` bounds one walk;
+    /// Node-wide cap on concurrent aggregation and sorted-query scans. A request's `max_docs` bounds one walk;
     /// this bounds how many of them hold blocking threads at once (IB-025).
     pub scan_slots: Arc<tokio::sync::Semaphore>,
     /// The live topology. Seeded from config on a node's first boot, durable thereafter, and the
@@ -134,7 +141,7 @@ pub struct AppState {
     /// Progress of a handover this node is driving. Runtime only: a half-copied shard is this
     /// node's business, not a fact the cluster needs to agree on.
     pub migrations: Arc<std::sync::Mutex<MigrationRuns>>,
-    /// Node-local webhook registrations and counters; acknowledged cursors live in `_webhooks`.
+    /// Local mirror of the `_webhooks` registration catalogue, plus node-local delivery counters.
     pub webhooks: Arc<crate::webhook::WebhookStore>,
     /// The barrier that holds writes still on this node. Data movement drains it -- taken and
     /// dropped, to settle writes that decided ownership under the old view -- and a leadership
@@ -558,6 +565,9 @@ impl AppState {
         }
         if collection == CONFIG_LOG {
             self.refresh_configuration();
+        }
+        if collection == crate::webhook::WEBHOOK_PROGRESS_LOG {
+            crate::webhook::reconcile_registrations(self)?;
         }
         Ok(())
     }
@@ -1079,6 +1089,7 @@ impl AppState {
             ring,
             group,
             collection: collection.to_string(),
+            fingerprint: view.partition_fingerprint(),
         }
     }
 

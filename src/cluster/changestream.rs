@@ -586,7 +586,7 @@ mod tests {
         assert!(decode_cursor::<ClusterChangeCursor>("412").is_none());
         assert!(decode_cursor::<ClusterChangeCursor>("!!!not base64 json!!!").is_none());
         assert!(decode_cursor::<ClusterChangeCursor>(&encode_cursor(&crate::query::KeyCursor {
-            key: "k1".to_string() })).is_none(), "a query cursor names no group positions");
+            key: "k1".to_string(), ring: None })).is_none(), "a query cursor names no group positions");
     }
 
     fn feed(blocks: &[&str]) -> SseReader {

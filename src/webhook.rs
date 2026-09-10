@@ -1,7 +1,7 @@
 //! Webhook delivery: a CDC consumer that pushes to an endpoint instead of holding a connection.
 //!
-//! Registrations and counters are durable node-local state. An acknowledged position advances
-//! through the group's `_webhooks` log before the local cursor, so failover remains at-least-once.
+//! Registrations and acknowledged positions commit through the group's `_webhooks` log.
+//! Local counters are coalesced on a blocking worker.
 //!
 //! Only the group's leader delivers. The stream is opened `read=primary` for that reason, and a
 //! step-down ends it in place rather than leaving two nodes pushing the same events.
@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 const WEBHOOK_FILE: &str = "webhooks.meta";
-const WEBHOOK_PROGRESS_LOG: &str = "_webhooks";
+pub(crate) const WEBHOOK_PROGRESS_LOG: &str = "_webhooks";
 /// How often the sender set is reconciled against the registrations and this node's leadership.
 /// A registration change wakes it early, so this is a bound on noticing a failover rather than
 /// something a request waits on.
@@ -102,7 +102,7 @@ impl WebhookConfig {
 
 /// What the operator registered. `filter` and `ops` are the change endpoint's own, kept as the
 /// strings they arrived as so a reload parses them the same way the request did.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct WebhookSpec {
     pub id: String,
     pub collection: String,
@@ -139,7 +139,7 @@ impl WebhookSpec {
 
 /// Where delivery got to, and what it has been doing. Durable, because the position is the only
 /// thing that says which events the endpoint has already been told about.
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Delivery {
     /// The LSN of the last event acknowledged with a `2xx`.
     pub position: u64,
@@ -159,8 +159,10 @@ pub struct Delivery {
     pub disabled: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Subscription {
+    #[serde(default)]
+    generation: String,
     #[serde(flatten)]
     pub spec: WebhookSpec,
     #[serde(default)]
@@ -199,6 +201,10 @@ pub struct WebhookStore {
     /// Wakes the supervisor, so a registration starts delivering at once rather than at the next
     /// poll -- the window between registering and subscribing is one the feed can move under.
     changed: Notify,
+    pub(crate) administration: tokio::sync::Mutex<()>,
+    dirty: std::sync::atomic::AtomicBool,
+    flushing: std::sync::Mutex<()>,
+    reconciling: std::sync::Mutex<()>,
 }
 
 impl WebhookStore {
@@ -215,11 +221,23 @@ impl WebhookStore {
             subscriptions: std::sync::Mutex::new(subscriptions),
             pinned: std::sync::Mutex::new(HashMap::new()),
             changed: Notify::new(),
+            administration: tokio::sync::Mutex::new(()),
+            dirty: std::sync::atomic::AtomicBool::new(false),
+            flushing: std::sync::Mutex::new(()),
+            reconciling: std::sync::Mutex::new(()),
         }
     }
 
-    fn persist(&self, held: &BTreeMap<WebhookKey, Subscription>) {
+    fn mark_dirty(&self) {
+        self.dirty.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn flush(&self) {
+        let _serial = self.flushing.lock().unwrap();
+        if !self.dirty.swap(false, std::sync::atomic::Ordering::AcqRel) { return; }
+        let held = self.subscriptions.lock().unwrap();
         let meta = WebhookMeta { subscriptions: held.values().cloned().collect() };
+        drop(held);
         let bytes = match serde_json::to_vec(&meta) {
             Ok(b) => b,
             Err(e) => {
@@ -228,6 +246,7 @@ impl WebhookStore {
             },
         };
         if let Err(e) = write_atomic(Path::new(&self.data_dir), WEBHOOK_FILE, &bytes) {
+            self.dirty.store(true, std::sync::atomic::Ordering::Release);
             // Delivery carries on: losing the record costs a redelivery after a restart, where
             // stopping would cost the events themselves.
             warn!(target: "webhook", error = %e, "Could not persist the webhook registrations");
@@ -236,6 +255,7 @@ impl WebhookStore {
 
     /// `Err` names the ceiling. Re-registering an id replaces the destination and restarts it from
     /// `position`, which is what makes rotating a secret possible without losing the cursor.
+    #[cfg(test)]
     pub fn upsert(&self, spec: WebhookSpec, position: u64, max: usize) -> Result<Subscription, usize> {
         let key = (spec.collection.clone(), spec.id.clone());
         let mut held = self.subscriptions.lock().unwrap();
@@ -244,6 +264,7 @@ impl WebhookStore {
             return Err(max);
         }
         let subscription = Subscription {
+            generation: uuid::Uuid::new_v4().to_string(),
             spec,
             // A replaced registration keeps its position but loses whatever stopped it.
             delivery: Delivery {
@@ -254,16 +275,17 @@ impl WebhookStore {
             },
         };
         held.insert(key, subscription.clone());
-        self.persist(&held);
+        self.mark_dirty();
         self.changed.notify_waiters();
         Ok(subscription)
     }
 
+    #[cfg(test)]
     pub fn remove(&self, key: &WebhookKey) -> bool {
         let mut held = self.subscriptions.lock().unwrap();
         let removed = held.remove(key).is_some();
         if removed {
-            self.persist(&held);
+            self.mark_dirty();
             self.changed.notify_waiters();
         }
         removed
@@ -311,8 +333,93 @@ impl WebhookStore {
         let mut held = self.subscriptions.lock().unwrap();
         let Some(subscription) = held.get_mut(key) else { return };
         change(&mut subscription.delivery);
-        self.persist(&held);
+        self.mark_dirty();
     }
+}
+
+
+#[derive(Serialize, Deserialize)]
+struct RegistrationCatalog {
+    subscriptions: Vec<Subscription>,
+}
+
+const CATALOG_KEY: &str = "registrations";
+
+pub(crate) fn reconcile_registrations(state: &AppState) -> std::io::Result<()> {
+    let _serial = state.webhooks.reconciling.lock().unwrap();
+    let Some(db) = state.db.as_ref() else { return Ok(()) };
+    let Some(log) = db.existing_collection(WEBHOOK_PROGRESS_LOG) else { return Ok(()) };
+    let Some(value) = log.get(CATALOG_KEY)? else { return Ok(()) };
+    let catalog: RegistrationCatalog = serde_json::from_value(value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut held = state.webhooks.subscriptions.lock().unwrap();
+    let mut wanted = BTreeMap::new();
+    for mut subscription in catalog.subscriptions {
+        let key = (subscription.spec.collection.clone(), subscription.spec.id.clone());
+        if let Some(old) = held.get(&key) {
+            if old.generation == subscription.generation {
+                subscription.delivery = old.delivery.clone();
+            } else {
+                subscription.delivery.position = subscription.delivery.position.max(old.delivery.position);
+            }
+        }
+        wanted.insert(key, subscription);
+    }
+    if *held == wanted { return Ok(()); }
+    *held = wanted;
+    state.webhooks.mark_dirty();
+    drop(held);
+    state.webhooks.sync_pins(db);
+    state.webhooks.changed.notify_waiters();
+    Ok(())
+}
+
+pub(crate) async fn commit_registration(
+    state: &AppState, key: &WebhookKey, replacement: Option<(WebhookSpec, u64)>,
+) -> Result<bool, axum::response::Response> {
+    use axum::http::StatusCode;
+    let _serial = state.webhooks.administration.lock().await;
+    let db = state.db.as_ref().unwrap();
+    let log = db.get_collection(WEBHOOK_PROGRESS_LOG)
+        .map_err(|e| crate::model::err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if log.pending_len() > 0 {
+        return Err(crate::model::err_json(StatusCode::SERVICE_UNAVAILABLE,
+            "webhook metadata has an unsettled write; retry after it commits".into()));
+    }
+    reconcile_registrations(state)
+        .map_err(|e| crate::model::err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut subscriptions = state.webhooks.subscriptions.lock().unwrap().clone();
+    let existed = subscriptions.contains_key(key);
+    if let Some((spec, position)) = replacement {
+        if !existed && subscriptions.len() >= state.config.webhooks.max_subscriptions {
+            return Err(crate::model::err_json(StatusCode::CONFLICT,
+                "maximum webhook subscriptions reached".into()));
+        }
+        let delivery = subscriptions.get(key).map(|s| s.delivery.clone())
+            .unwrap_or(Delivery { position, ..Default::default() });
+        subscriptions.insert(key.clone(), Subscription {
+            generation: uuid::Uuid::new_v4().to_string(),
+            spec,
+            delivery: Delivery {
+                disabled: None, last_error: None, failures: 0, ..delivery
+            },
+        });
+    } else {
+        subscriptions.remove(key);
+    }
+    let value = serde_json::to_value(RegistrationCatalog {
+        subscriptions: subscriptions.into_values().collect(),
+    }).unwrap();
+    let outcome = crate::api::write::local_write(state, WEBHOOK_PROGRESS_LOG,
+        CATALOG_KEY.into(), Some(value), WriteConcern::Majority,
+        Duration::from_millis(DEFAULT_WTIMEOUT_MS)).await?;
+    if !outcome.met {
+        return Err(crate::model::err_json(StatusCode::SERVICE_UNAVAILABLE,
+            "webhook metadata has not reached a quorum; it may still commit".into()));
+    }
+    reconcile_registrations(state)
+        .map_err(|e| crate::model::err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(existed)
 }
 
 fn progress_key(key: &WebhookKey) -> String {
@@ -630,11 +737,25 @@ pub fn webhook_task(state: AppState) {
     }
     // Before the caller binds its listener, not on the first tick: a change written while the
     // supervisor was still starting would otherwise never be built.
+    if let Err(e) = reconcile_registrations(&state) {
+        warn!(target: "webhook", error = %e, "Could not restore registrations");
+        return;
+    }
     state.webhooks.sync_pins(state.db.as_ref().unwrap());
 
     tokio::spawn(async move {
         let mut senders: HashMap<WebhookKey, JoinHandle<()>> = HashMap::new();
         loop {
+            let worker = state.clone();
+            let refreshed = tokio::task::spawn_blocking(move || {
+                reconcile_registrations(&worker)?;
+                worker.webhooks.flush();
+                Ok::<_, std::io::Error>(())
+            }).await;
+            if !matches!(refreshed, Ok(Ok(()))) {
+                tokio::time::sleep(SUPERVISE_INTERVAL).await;
+                continue;
+            }
             // A sender that returned is one whose subscription ended or whose leadership went;
             // reconciling against the registrations decides whether it comes back.
             senders.retain(|_, handle| !handle.is_finished());
@@ -665,6 +786,63 @@ pub fn webhook_task(state: AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ib031_catalogue_replacement_preserves_counters_and_overrules_stale_local_state() {
+        let root = crate::test_support::temp_root();
+        let node = crate::test_support::single_node(&root).await;
+        let state = node.state.as_ref().unwrap();
+        let key = ("c".to_string(), "hook".to_string());
+        assert!(commit_registration(state, &key, Some((spec("hook"), 7))).await.is_ok());
+        state.webhooks.note(&key, |d| {
+            d.position = 12;
+            d.delivered = 3;
+            d.disabled = Some("gone".into());
+        });
+        reconcile_registrations(state).unwrap();
+        assert!(state.webhooks.get(&key).unwrap().delivery.disabled.is_some());
+        assert!(commit_registration(state, &key, Some((spec("hook"), 99))).await.is_ok());
+        let current = state.webhooks.get(&key).unwrap();
+        assert_eq!(current.delivery.position, 12);
+        assert_eq!(current.delivery.delivered, 3);
+        assert!(current.delivery.disabled.is_none());
+        assert!(commit_registration(state, &key, None).await.unwrap());
+        state.webhooks.upsert(spec("hook"), 7, 4).unwrap();
+        reconcile_registrations(state).unwrap();
+        assert!(state.webhooks.get(&key).is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ib032_progress_is_coalesced_and_flush_does_not_hold_the_store_lock() {
+        let root = crate::test_support::temp_root();
+        let dir = root.to_string_lossy().to_string();
+        let store = Arc::new(WebhookStore::restored(&dir));
+        let key = ("c".to_string(), "hook".to_string());
+        store.upsert(spec("hook"), 0, 4).unwrap();
+        for position in 1..=100 {
+            store.note(&key, |d| d.position = position);
+        }
+        assert!(!Path::new(&dir).join(WEBHOOK_FILE).exists());
+        let serial = store.flushing.lock().unwrap();
+        let worker = store.clone();
+        let flushing = tokio::task::spawn_blocking(move || worker.flush());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!flushing.is_finished());
+        assert_eq!(store.get(&key).unwrap().delivery.position, 100);
+        store.note(&key, |d| d.position = 101);
+        drop(serial);
+        flushing.await.unwrap();
+        assert_eq!(WebhookStore::restored(&dir).get(&key).unwrap().delivery.position, 101);
+        std::fs::create_dir(Path::new(&dir).join("webhooks.meta.tmp")).unwrap();
+        store.note(&key, |d| d.position = 102);
+        let worker = store.clone();
+        tokio::task::spawn_blocking(move || worker.flush()).await.unwrap();
+        assert!(store.dirty.load(std::sync::atomic::Ordering::Acquire));
+        std::fs::remove_dir(Path::new(&dir).join("webhooks.meta.tmp")).unwrap();
+        let worker = store.clone();
+        tokio::task::spawn_blocking(move || worker.flush()).await.unwrap();
+        assert_eq!(WebhookStore::restored(&dir).get(&key).unwrap().delivery.position, 102);
+    }
 
     fn spec(id: &str) -> WebhookSpec {
         WebhookSpec {
@@ -743,6 +921,7 @@ mod tests {
         store.upsert(spec("hook"), 7, 4).unwrap();
         store.note(&key, |d| { d.position = 12; d.delivered = 3 });
 
+        store.flush();
         let reloaded = WebhookStore::restored(&dir);
         let back = reloaded.get(&key).expect("the registration has to come back");
         assert_eq!(back.delivery.position, 12, "a restart must not redeliver from the beginning");
@@ -751,6 +930,7 @@ mod tests {
             "the secret is what the endpoint verifies with, so it has to survive too");
 
         assert!(reloaded.remove(&key));
+        reloaded.flush();
         assert!(WebhookStore::restored(&dir).get(&key).is_none(), "a removal has to be durable");
     }
 
@@ -792,7 +972,7 @@ mod tests {
 
     #[test]
     fn a_secret_is_never_in_what_the_api_returns() {
-        let subscription = Subscription { spec: spec("hook"), delivery: Delivery::default() };
+        let subscription = Subscription { generation: String::new(), spec: spec("hook"), delivery: Delivery::default() };
         let shown = subscription.public().to_string();
 
         assert!(!shown.contains("s3cret"), "{}", shown);

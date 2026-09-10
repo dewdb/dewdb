@@ -883,9 +883,18 @@ impl Collection {
         filter: &Option<Filter>,
         limit: usize,
     ) -> io::Result<(Vec<SortedRow>, Option<String>)> {
-        self.query_page_owned(after, start, end, filter, limit, &|_| true)
+        self.query_page_owned(after, start, end, filter, limit,
+            crate::aggregate::DEFAULT_AGGREGATE_SCAN, &|_| true)
     }
 
+    /// One page of rows in key order, and the position the next page resumes from.
+    ///
+    /// `budget` is documents read, not rows returned: a filter matching nothing still reads what
+    /// the plan offered, and nothing bounded that before (IB-054). Spending it ends the page
+    /// instead of refusing it -- the cursor is a keyspace position and a rejected candidate is
+    /// decided, so the page resumes past everything it read and a client following the cursor
+    /// still sees every match. A sorted page refuses instead, having to read a whole range before
+    /// it can order any of it.
     pub(crate) fn query_page_owned(
         &self,
         after: Option<&str>,
@@ -893,6 +902,7 @@ impl Collection {
         end: Option<&str>,
         filter: &Option<Filter>,
         limit: usize,
+        budget: usize,
         owned: &dyn Fn(&str) -> bool,
     ) -> io::Result<(Vec<SortedRow>, Option<String>)> {
         // Ahead of the walk, not inside it: a cleared index yields no keys, so a scan of a released
@@ -902,12 +912,19 @@ impl Collection {
         let mut items = Vec::with_capacity(limit.min(MAX_QUERY_LIMIT));
         let mut last_key: Option<String> = None;
         let mut has_more = false;
+        let mut scanned = 0usize;
         let plan = self.index_plan(filter);
 
         self.scan_for::<io::Error, _>(plan.as_ref(), after, start, end, |key| {
             if !owned(key) {
                 return Ok(true);
             }
+            // Charged after the ownership test and before the read, as an aggregation charges it.
+            if scanned >= budget {
+                has_more = true;
+                return Ok(false);
+            }
+            scanned += 1;
             if items.len() >= limit {
                 match filter {
                     None => {
@@ -927,9 +944,12 @@ impl Collection {
                 let matched = filter.as_ref().map_or(true, |f| matches_filter(&value, f));
                 if matched {
                     items.push(SortedRow { key: key.to_string(), value });
-                    last_key = Some(key.to_string());
                 }
             }
+            // Every key walked past is decided -- emitted, rejected, or gone -- so the cursor
+            // passes it. Advancing on matches alone left a page stopped by its budget resuming
+            // where it started.
+            last_key = Some(key.to_string());
             Ok(true)
         })?;
 
@@ -937,10 +957,7 @@ impl Collection {
         Ok((items, next_cursor))
     }
 
-    /// Top `limit` rows of the range in sort order, holding at most `2 * limit` of them at once.
-    /// The scan is still the whole range unless the filter has an index to narrow it: nothing
-    /// indexes the sort field's order, so every page re-reads what it covers and pagination bounds
-    /// the memory rather than the work.
+    /// Top `limit` rows within the default read budget, holding at most `2 * limit` rows.
     #[cfg(test)]
     pub fn sorted_page(
         &self,
@@ -951,7 +968,7 @@ impl Collection {
         after: Option<&SortCursor>,
         limit: usize,
     ) -> io::Result<(Vec<SortedRow>, bool)> {
-        self.sorted_page_owned(start, end, filter, sort, after, limit, &|_| true)
+        self.sorted_page_owned(start, end, filter, sort, after, limit, crate::aggregate::DEFAULT_AGGREGATE_SCAN, &|_| true)
     }
 
     pub(crate) fn sorted_page_owned(
@@ -962,6 +979,7 @@ impl Collection {
         sort: &SortOrder,
         after: Option<&SortCursor>,
         limit: usize,
+        budget: usize,
         owned: &dyn Fn(&str) -> bool,
     ) -> io::Result<(Vec<SortedRow>, bool)> {
         self.check_live()?;
@@ -969,6 +987,7 @@ impl Collection {
         let spill = keep.saturating_mul(2).max(1);
         let mut rows: Vec<SortedRow> = Vec::new();
         let mut matched = 0usize;
+        let mut scanned = 0usize;
         // The filter's index, not the sort field's: a sorted page re-sorts whatever it reads, so
         // an index can narrow what that is but cannot supply the order.
         let plan = self.index_plan(filter);
@@ -977,6 +996,11 @@ impl Collection {
             if !owned(key) {
                 return Ok(true);
             }
+            if scanned >= budget {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput,
+                    format!("sorted query exceeded max_docs {}; narrow the range or filter", budget)));
+            }
+            scanned += 1;
             let value = match self.get(key)? {
                 Some(v) => v,
                 None => return Ok(true),
@@ -3288,6 +3312,44 @@ mod tests {
             "few enough documents hold the field for its postings to be the answer");
         assert!(indexed.index_plan(&filter_of(r#"{"$or": [{"age": 1}, {"age": 2}]}"#)).is_none(),
             "nothing inside an $or constrains every matching row");
+    }
+
+    /// IB-054: the page bounded its matches and not its reads, so a selective filter read every
+    /// owned candidate in the range -- and a page that stops on a budget has to resume past the
+    /// candidates it rejected, or it comes back to the same ones and never reaches a match.
+    #[tokio::test]
+    async fn an_unsorted_filtered_page_stops_at_its_budget_and_resumes_past_what_it_read() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+        for i in 0..30 {
+            put_json(&col, &format!("k{:02}", i), serde_json::json!({"n": i}));
+        }
+
+        // One match, at the far end: every earlier candidate is a read and none of them is a row.
+        let filter = filter_of(r#"{"n": 29}"#);
+        let page = |after: Option<&str>| col
+            .query_page_owned(after, None, None, &filter, 10, 4, &|_| true).unwrap();
+
+        let (rows, next) = page(None);
+        assert!(rows.is_empty(), "four reads reach no match, and the budget stops the fifth");
+        assert_eq!(next.as_deref(), Some("k03"),
+            "an empty page still carries the position it read to");
+
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..30 {
+            let (rows, next) = page(cursor.as_deref());
+            seen.extend(rows.into_iter().map(|r| r.key));
+            match next {
+                Some(k) => cursor = Some(k),
+                None => break,
+            }
+        }
+        assert_eq!(cursor.as_deref(), Some("k27"),
+            "thirty pages of four must have finished the range, not stalled inside it");
+        assert_eq!(seen, vec!["k29".to_string()],
+            "a bounded page is short, not lossy: following the cursor still finds every match");
     }
 
     /// A page resuming by key has to see the candidates in key order, or its cursor either repeats

@@ -22,7 +22,7 @@ pub const DEFAULT_AGGREGATE_SCAN: usize = 100_000;
 /// asked for an unbounded walk is told the walk is bounded instead of quietly getting a short one.
 pub const MAX_AGGREGATE_SCAN: usize = 1_000_000;
 
-/// Aggregation scans one node runs at once. A budget bounds one walk; this bounds how many walks
+/// Aggregation and sorted-query scans one node runs at once. A budget bounds one walk; this bounds how many walks
 /// share the blocking pool with the reads and group commits that also live there.
 pub const MAX_CONCURRENT_SCANS: usize = 4;
 

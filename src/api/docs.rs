@@ -7,7 +7,7 @@ use crate::aggregate::{
 };
 use crate::cluster::router::{
     parse_read_pref, router_aggregate, router_forward_write, router_read_doc, router_query,
-    bulk_router_forward, passthrough, ForwardMethod, ReadPreference,
+    bulk_router_forward, passthrough, stale_ring_response, ForwardMethod, ReadPreference,
 };
 use crate::consensus::read_index::read_index;
 use crate::json::{parse_fields, project};
@@ -409,22 +409,13 @@ pub async fn delete_doc(
 pub async fn list_docs(
     State(state): State<AppState>,
     CollectionPath(col_name): CollectionPath<String>,
-) -> impl axum::response::IntoResponse {
+    Query(params): Query<QueryParams>,
+    req: axum::extract::Request,
+) -> axum::response::Response {
     if state.config.role == "router" {
         return (StatusCode::NOT_IMPLEMENTED, "Use /query for cross-shard iteration").into_response();
     }
-
-    let col = match client_collection(&state, &col_name) {
-        Ok(c) => c,
-        Err(resp) => return resp,
-    };
-
-    let col_clone = col.clone();
-    match tokio::task::spawn_blocking(move || col_clone.list_all()).await {
-        Ok(Ok(vals)) => (StatusCode::OK, Json(vals)).into_response(),
-        Ok(Err(e)) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-        Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-    }
+    query_docs(State(state), CollectionPath(col_name), Query(params), req).await.into_response()
 }
 
 pub async fn query_docs(
@@ -433,6 +424,12 @@ pub async fn query_docs(
     Query(params): Query<QueryParams>,
     _req: axum::extract::Request,
 ) -> impl axum::response::IntoResponse {
+    let budget = match params.max_docs {
+        Some(n) if n > MAX_AGGREGATE_SCAN => return err_json(StatusCode::BAD_REQUEST,
+            format!("max_docs {} exceeds the maximum of {}", n, MAX_AGGREGATE_SCAN)),
+        Some(n) => n.max(1),
+        None => DEFAULT_AGGREGATE_SCAN,
+    };
     let limit = match params.limit {
         Some(n) if n > MAX_QUERY_LIMIT => return err_json(StatusCode::BAD_REQUEST,
             format!("limit {} exceeds the maximum of {}; page with `cursor`", n, MAX_QUERY_LIMIT)),
@@ -488,30 +485,47 @@ pub async fn query_docs(
     // one a shard issues for itself.
     let key_cursor = match (&sort, params.cursor.as_deref()) {
         (None, Some(c)) => match decode_cursor::<KeyCursor>(c) {
-            Some(c) => Some(c.key),
+            Some(c) => Some(c),
             None => return err_json(StatusCode::BAD_REQUEST,
                 "cursor does not belong to this unsorted query".to_string()),
         },
         _ => None,
     };
 
+    // Ahead of the collection handle and the scan slot: a refused page should cost neither.
+    let ownership = state.scan_ownership(&col_name);
+    // Pins the pagination session, where the snapshot alone pins only the page: a flip moves keys
+    // across positions taken before it, so the scan restarts rather than duplicate or drop (IB-047).
+    if key_cursor.as_ref().is_some_and(|c| c.ring.is_some_and(|r| r != ownership.fingerprint())) {
+        return stale_ring_response();
+    }
+
     let col = match client_collection(&state, &col_name) {
         Ok(c) => c,
         Err(resp) => return resp,
     };
 
+    let slot = if sort.is_some() {
+        match tokio::time::timeout(Duration::from_millis(SCAN_ADMISSION_WAIT_MS),
+            state.scan_slots.clone().acquire_owned()).await {
+            Ok(Ok(slot)) => Some(slot),
+            _ => return err_json(StatusCode::TOO_MANY_REQUESTS,
+                "too many scans running on this node; retry".to_string()),
+        }
+    } else { None };
     let col_clone = col.clone();
-    let after = key_cursor;
+    let after = key_cursor.map(|c| c.key);
     let start = params.start.clone();
     let end = params.end.clone();
     let want_keys = params.keys.unwrap_or(false);
-    let ownership = state.scan_ownership(&col_name);
+    let ring = ownership.fingerprint();
 
     let result = tokio::task::spawn_blocking(move || -> io::Result<(Vec<SortedRow>, Option<String>)> {
+        let _slot = slot;
         match &sort {
             Some(sort) => {
                 let (rows, more) = col_clone.sorted_page_owned(
-                    start.as_deref(), end.as_deref(), &filter_obj, sort, sort_cursor.as_ref(), limit,
+                    start.as_deref(), end.as_deref(), &filter_obj, sort, sort_cursor.as_ref(), limit, budget,
                     &|key| ownership.includes(key))?;
                 // The last row of the page is where the next one resumes, in sort order.
                 let next = match (more, rows.last()) {
@@ -523,9 +537,9 @@ pub async fn query_docs(
             },
             None => {
                 let (rows, next) = col_clone.query_page_owned(
-                    after.as_deref(), start.as_deref(), end.as_deref(), &filter_obj, limit,
+                    after.as_deref(), start.as_deref(), end.as_deref(), &filter_obj, limit, budget,
                     &|key| ownership.includes(key))?;
-                Ok((rows, next.map(|key| encode_cursor(&KeyCursor { key }))))
+                Ok((rows, next.map(|key| encode_cursor(&KeyCursor { key, ring: Some(ring) }))))
             },
         }
     }).await;
@@ -536,6 +550,8 @@ pub async fn query_docs(
             let items = rows.iter().map(|r| project(&r.value, &fields)).collect();
             (StatusCode::OK, Json(QueryPage { items, next_cursor, keys })).into_response()
         },
+        Ok(Err(e)) if e.kind() == io::ErrorKind::InvalidInput =>
+            err_json(StatusCode::BAD_REQUEST, e.to_string()),
         Ok(Err(e)) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
@@ -597,7 +613,7 @@ pub async fn aggregate_docs(
     // Admission before the walk, not a queue of walks: waiting costs a task, and a scan that has
     // started holds a blocking thread for as long as its budget lasts.
     let wait = Duration::from_millis(SCAN_ADMISSION_WAIT_MS);
-    let _slot = match tokio::time::timeout(wait, state.scan_slots.clone().acquire_owned()).await {
+    let slot = match tokio::time::timeout(wait, state.scan_slots.clone().acquire_owned()).await {
         Ok(Ok(slot)) => slot,
         // Retryable and shard-local, so a router tries the next replica rather than giving up.
         _ => return err_json(StatusCode::TOO_MANY_REQUESTS,
@@ -608,6 +624,7 @@ pub async fn aggregate_docs(
     let spec = AggregateSpec { group, metrics };
     let ownership = state.scan_ownership(&col_name);
     let result = tokio::task::spawn_blocking(move || {
+        let _slot = slot;
         col.aggregate(start.as_deref(), end.as_deref(), &filter_obj, spec, budget,
             &|key| ownership.includes(key))
     }).await;
@@ -636,6 +653,57 @@ mod tests {
     };
     use axum::http::StatusCode;
     use std::time::Duration;
+
+    /// IB-054: an unsorted filtered page had no read budget, so a selective filter read a shard's
+    /// whole owned range in one request. `max_docs` now bounds it, and because the page is
+    /// resumable the bound ends the page instead of refusing it the way a sorted one is refused.
+    /// The router already carries a short page with a position, so this is a shard-level change
+    /// only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unsorted_filtered_query_pages_within_its_read_budget_across_shards() {
+        let root = temp_root();
+        let (_s1, _s2, router) = two_shard_cluster(&root).await;
+        let client = reqwest::Client::new();
+
+        let rows = 40i64;
+        for i in 0..rows {
+            let value = serde_json::json!({"n": i, "hot": i % 20 == 19});
+            assert_eq!(put_value(&client, &router.url(), "t", &format!("k{:02}", i), value, "").await,
+                StatusCode::CREATED);
+        }
+
+        let mut seen: Vec<i64> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let mut q = vec![
+                ("filter".to_string(), r#"{"hot": true}"#.to_string()),
+                ("limit".to_string(), "10".to_string()),
+                // Two reads per shard per page: far short of what the filter has to walk past.
+                ("max_docs".to_string(), "2".to_string()),
+            ];
+            if let Some(c) = &cursor { q.push(("cursor".to_string(), c.clone())); }
+            let r = client.get(format!("{}/collections/t/query", router.url()))
+                .query(&q).send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK,
+                "a resumable page is bounded, not refused: {}", r.text().await.unwrap());
+            let body = r.json::<serde_json::Value>().await.unwrap();
+            seen.extend(body["items"].as_array().unwrap().iter()
+                .map(|v| v["n"].as_i64().unwrap()));
+            pages += 1;
+            assert!(pages <= 60, "the cursor stopped advancing after {} rows", seen.len());
+            match body["next_cursor"].as_str() {
+                Some(c) => cursor = Some(c.to_string()),
+                None => break,
+            }
+        }
+
+        seen.sort();
+        assert_eq!(seen, vec![19, 39],
+            "every match has to survive a budget that cannot reach it in one page");
+        assert!(pages > 2, "a budget of two reads per shard cannot have covered 40 keys in {} pages",
+            pages);
+    }
 
     /// H8: with `?sort=`, `cursor` was ignored and `next_cursor` was always `None` — sorted
     /// pagination was silently a no-op. The cursor is now a position in the sort order, which is one
@@ -1177,6 +1245,12 @@ mod tests {
         };
 
         let whole = aggregate(vec![("metrics", "count,sum:amount,avg:amount,min:amount,max:amount".into())]).await;
+        let sorted_refusal = client.get(format!("{}/collections/t/query", router.url()))
+            .query(&[("sort", "amount"), ("limit", "1"), ("max_docs", "1")])
+            .send().await.unwrap();
+        assert_eq!(sorted_refusal.status(), StatusCode::BAD_REQUEST);
+        assert!(sorted_refusal.json::<serde_json::Value>().await.unwrap()["error"]
+            .as_str().unwrap().contains("max_docs"));
         assert_eq!(whole["matched"].as_u64(), Some(20));
         assert_eq!(whole["groups"].as_array().map(Vec::len), Some(1));
         let m = &whole["groups"][0]["metrics"];
@@ -1295,6 +1369,10 @@ mod tests {
             .query(&[("metrics", "count")]).send().await.unwrap();
         assert_eq!(through_router.status(), StatusCode::TOO_MANY_REQUESTS);
 
+        let sorted_refusal = client.get(format!("{}/collections/t/query?sort=amount", router.url()))
+            .send().await.unwrap();
+        assert_eq!(sorted_refusal.status(), StatusCode::TOO_MANY_REQUESTS);
+
         drop(held);
         let admitted = client.get(&format!("{}/collections/t/aggregate", router.url()))
             .query(&[("metrics", "count")]).send().await.unwrap();
@@ -1380,6 +1458,13 @@ mod tests {
         assert_eq!(aggregate["groups"][0]["count"].as_u64(), Some(1));
         assert_eq!(aggregate["groups"][0]["metrics"]["sum:amount"]["sum"].as_f64(), Some(1.0));
 
+        for (node, count) in [(&s1, 1), (&s2, 0)] {
+            let r = client.get(format!("{}/collections/t/docs?limit=1", node.url())).send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+            let body = r.json::<serde_json::Value>().await.unwrap();
+            assert_eq!(body["items"].as_array().unwrap().len(), count);
+        }
+
         let flipped = view.with_ring("ib016", view.migration.as_ref().unwrap().target.clone());
         for state in [s1.state.as_ref().unwrap(), s2.state.as_ref().unwrap(),
             router.state.as_ref().unwrap()]
@@ -1398,6 +1483,156 @@ mod tests {
             .json::<serde_json::Value>().await.unwrap();
         assert_eq!(aggregate["matched"].as_u64(), Some(1));
         assert_eq!(aggregate["groups"][0]["metrics"]["sum:amount"]["sum"].as_f64(), Some(100.0));
+    }
+
+    /// IB-047: the ownership snapshot is per request, so a flip between two pages of one unsorted
+    /// scan leaves a moved key behind a position that never covered it -- the destination skipped
+    /// it while unowned without advancing, then returns it again as owner. The flip is applied to
+    /// the shards only, which is the half the router's own fingerprint check cannot see.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ib047_a_ring_flip_between_two_pages_of_one_scan_is_refused() {
+        let root = temp_root();
+        let (s1, s2, router) = two_shard_cluster(&root).await;
+        let current = HashRing {
+            vnodes: 32,
+            shards: vec![
+                RingShard { node_url: s1.url(), replica_urls: Vec::new() },
+                RingShard { node_url: s2.url(), replica_urls: Vec::new() },
+            ],
+        };
+        let target = HashRing { vnodes: 64, shards: current.shards.clone() };
+        let (before, after) = (current.build(), target.build());
+        let owner_is = |ring: &crate::ring::BuiltRing, key: &str, url: &str| {
+            ring.owner(hash_key("t", key)).is_some_and(|o| o.node_url == url)
+        };
+        let candidates = (0..200_000).map(|i| format!("k-{:06}", i));
+        // Two keys on the source: one that the flip moves away, and one that keeps the source in
+        // the scan so page one issues a position at all.
+        let mut moved = None;
+        let mut anchor = None;
+        for key in candidates {
+            if moved.is_none() && owner_is(&before, &key, &s1.url()) && owner_is(&after, &key, &s2.url()) {
+                moved = Some(key);
+            } else if anchor.is_none() && owner_is(&before, &key, &s1.url())
+                && owner_is(&after, &key, &s1.url()) {
+                anchor = Some(key);
+            }
+            if moved.is_some() && anchor.is_some() { break; }
+        }
+        let (moved, anchor) = (moved.expect("a key the flip moves"), anchor.expect("a key it does not"));
+
+        let mut view = router.state.as_ref().unwrap().cluster_view();
+        view.version += 1;
+        view.updated_by = "ib047".to_string();
+        view.seeded = false;
+        view.ring = Some(current);
+        view.migration = Some(Migration {
+            id: "ib047-copy".to_string(),
+            target,
+            started_by: "ib047".to_string(),
+            phase: MigrationPhase::Copy,
+        });
+        for state in [s1.state.as_ref().unwrap(), s2.state.as_ref().unwrap(),
+            router.state.as_ref().unwrap()]
+        {
+            assert!(matches!(state.adopt_cluster(view.clone()), Adoption::Adopted { .. }));
+        }
+
+        // `moved` exists on both: the source owns it, and the destination holds the copy it will
+        // own after the flip.
+        for (node, keys) in [(&s1, vec![moved.clone(), anchor.clone()]), (&s2, vec![moved.clone()])] {
+            let col = node.state.as_ref().unwrap().db.as_ref().unwrap()
+                .get_collection("t").unwrap();
+            for key in keys {
+                let (_, _, _, lsn) = col.put(key, serde_json::json!({"v": 1}), 1).unwrap();
+                col.apply_committed(lsn).unwrap();
+            }
+        }
+
+        let client = reqwest::Client::new();
+        let page = |base: String, limit: &'static str, cursor: Option<String>| {
+            let client = client.clone();
+            async move {
+                let mut q = vec![("limit".to_string(), limit.to_string()),
+                    ("keys".to_string(), "true".to_string())];
+                if let Some(c) = cursor { q.push(("cursor".to_string(), c)); }
+                client.get(format!("{}/collections/t/query", base)).query(&q).send().await.unwrap()
+            }
+        };
+
+        let first = page(router.url(), "2", None).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = first.json::<serde_json::Value>().await.unwrap();
+        let routed = first["next_cursor"].as_str().expect("the source has a key left to page to")
+            .to_string();
+        let direct = page(s1.url(), "1", None).await;
+        assert_eq!(direct.status(), StatusCode::OK);
+        let direct = direct.json::<serde_json::Value>().await.unwrap()["next_cursor"]
+            .as_str().expect("two owned keys, one per page").to_string();
+
+        let unchanged = page(router.url(), "2", Some(routed.clone())).await;
+        assert_eq!(unchanged.status(), StatusCode::OK,
+            "an unchanged layout must still resume: {}", unchanged.text().await.unwrap());
+
+        // Only the shards, so the router's own cursor check still passes the page through.
+        let flipped = view.with_ring("ib047", view.migration.as_ref().unwrap().target.clone());
+        for state in [s1.state.as_ref().unwrap(), s2.state.as_ref().unwrap()] {
+            assert!(matches!(state.adopt_cluster(flipped.clone()), Adoption::Adopted { .. }));
+        }
+
+        for (base, cursor, who) in [(router.url(), routed, "router"), (s1.url(), direct, "shard")] {
+            let stale = page(base, "2", Some(cursor)).await;
+            assert_eq!(stale.status(), StatusCode::CONFLICT,
+                "{}: a position taken against the old ring cannot resume against the new one", who);
+            let body = stale.json::<serde_json::Value>().await.unwrap();
+            assert!(body["error"].as_str().unwrap().contains("restart the scan"),
+                "{}: the client has to be told to start again, got {}", who, body);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ib040_sorted_budget_and_listing_pages() {
+        let root = temp_root();
+        let node = single_node(&root).await;
+        let client = reqwest::Client::new();
+        for i in 0..3 {
+            put_value(&client, &node.url(), "t", &format!("k{}", i),
+                serde_json::json!({"n": 3-i}), "").await;
+        }
+        for route in ["query", "docs"] {
+            let url = format!("{}/collections/t/{}", node.url(), route);
+            for extra in ["", "&filter=%7B%22n%22%3A99%7D"] {
+                let r = client.get(format!("{}?sort=n&limit=1&max_docs=2{}", url, extra))
+                    .send().await.unwrap();
+                assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+                let body = r.json::<serde_json::Value>().await.unwrap();
+                assert!(body["error"].as_str().unwrap().contains("max_docs"));
+                assert!(body.get("next_cursor").is_none());
+            }
+            let r = client.get(format!("{}?sort=n&limit=1&max_docs=3", url)).send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+            assert_eq!(r.json::<serde_json::Value>().await.unwrap()["items"][0]["n"], 1);
+            let mut cursor = None;
+            let mut seen = Vec::new();
+            loop {
+                let mut q = vec![("limit", "1".to_string()), ("keys", "true".to_string())];
+                if let Some(c) = cursor { q.push(("cursor", c)); }
+                let r = client.get(&url).query(&q).send().await.unwrap();
+                assert_eq!(r.status(), StatusCode::OK);
+                let body = r.json::<serde_json::Value>().await.unwrap();
+                seen.extend(body["keys"].as_array().unwrap().iter().cloned());
+                cursor = body["next_cursor"].as_str().map(str::to_string);
+                if cursor.is_none() { break; }
+                assert!(seen.len() < 4);
+            }
+            assert_eq!(seen, serde_json::json!(["k0", "k1", "k2"]).as_array().unwrap().clone());
+        }
+        let slots = node.state.as_ref().unwrap().scan_slots.clone();
+        let held = slots.clone().acquire_many_owned(MAX_CONCURRENT_SCANS as u32).await.unwrap();
+        let r = client.get(format!("{}/collections/t/query?sort=n", node.url())).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        drop(held);
+        assert_eq!(slots.available_permits(), MAX_CONCURRENT_SCANS);
     }
 
     /// M1: a filter the engine cannot evaluate is a client error. Before the fix it was dropped and
