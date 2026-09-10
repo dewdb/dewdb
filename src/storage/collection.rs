@@ -113,14 +113,13 @@ pub struct StagedApply {
     /// which is the difference between a duplicate and a truncation.
     pub term: u64,
     pub effect: StagedEffect,
+    pub migration: bool,
 }
 
 /// What committing a staged frame does to the index.
 pub enum StagedEffect {
-    /// `indexed` is what the secondary indexes in force at *append* time asked of this document,
-    /// computed here because the document is in hand and committing must cost no read. An index
-    /// defined above this frame is not in it, and does not need to be: its own build walks
-    /// everything committed below it, which by then includes this key.
+    /// `indexed` is what the indexes in force at append time asked of this document, computed here so
+    /// committing costs no read. An index defined above this frame builds from committed keys instead.
     Put { key: String, entry: IndexEntry, indexed: Vec<(String, IndexKey)> },
     Remove { key: String },
     /// A barrier: it occupies an LSN and touches nothing.
@@ -172,9 +171,8 @@ impl Collection {
 
         // Absent means no consensus history (fresh node, or standalone engine): replay everything.
         let applied = AppliedMeta::load(&root_path)?;
-        // The position file is normally ahead: `applied.meta` is rewritten only when the drop,
-        // config or handover beside the position changes, and replay re-derives those three from
-        // the frames above it, which compaction cannot have retired for exactly that reason.
+        // The position file is normally ahead: `applied.meta` is rewritten only when the drop, config
+        // or handover beside the position changes, and replay re-derives those from the frames above.
         let applied_through = Self::recorded_watermark(&root_path)?.unwrap_or(u64::MAX);
         // Seeded from the watermark because compaction retires the drop and config frames replay
         // would otherwise find them in.
@@ -446,6 +444,7 @@ impl Collection {
 
     pub fn put(&self, key: String, value: serde_json::Value, term: u64) -> io::Result<(Vec<u8>, u64, u64, u64)> {
         let entry = LogEntry::Put {
+            migration: false,
             key: key.clone(),
             value,
             ts: Self::current_timestamp(),
@@ -455,8 +454,18 @@ impl Collection {
 
     pub fn delete(&self, key: String, term: u64) -> io::Result<(Vec<u8>, u64, u64, u64)> {
         let entry = LogEntry::Del {
+            migration: false,
             key: key.clone(),
             ts: Self::current_timestamp(),
+        };
+        self.append(entry, term)
+    }
+
+    pub fn migration_write(&self, key: String, value: Option<serde_json::Value>, term: u64) -> io::Result<(Vec<u8>, u64, u64, u64)> {
+        let ts = Self::current_timestamp();
+        let entry = match value {
+            Some(value) => LogEntry::Put { key, value, ts, migration: true },
+            None => LogEntry::Del { key, ts, migration: true },
         };
         self.append(entry, term)
     }
@@ -467,9 +476,8 @@ impl Collection {
         self.append(LogEntry::Barrier { ts: Self::current_timestamp() }, term)
     }
 
-    /// The drop as a log entry. Appending it deletes nothing: it takes effect where every other
-    /// entry does, on commit, which is what makes a drop survive a leader change and reach a
-    /// replica that was down for it.
+    /// The drop as a log entry. Appending it deletes nothing: it takes effect on commit, which is what
+    /// makes a drop survive a leader change and reach a replica that was down for it.
     pub fn drop_marker(&self, term: u64) -> io::Result<(Vec<u8>, u64, u64, u64)> {
         self.append(LogEntry::Drop { ts: Self::current_timestamp() }, term)
     }
@@ -486,9 +494,8 @@ impl Collection {
         self.append(LogEntry::Handover { handover, ts: Self::current_timestamp() }, term)
     }
 
-    /// A secondary index definition. Appending it is what puts it in force for later entries, so
-    /// every frame above this one stages the values the new index asks for; the build that fills
-    /// in everything below runs when it commits.
+    /// A secondary index definition. Appending it puts it in force for later entries, so every frame
+    /// above stages the values it asks for; the build that fills in everything below runs on commit.
     pub fn define_index(&self, change: IndexChange, term: u64) -> io::Result<(Vec<u8>, u64, u64, u64)> {
         self.append(LogEntry::Index { change, ts: Self::current_timestamp() }, term)
     }
@@ -497,9 +504,8 @@ impl Collection {
         self.committed_indexes.lock().unwrap().clone()
     }
 
-    /// The definitions in force: committed, with every staged change laid over them in log order.
-    /// Same rule `latest_config` follows, and it gets the same thing from it -- a truncation that
-    /// drops a staged `Index` entry drops the definition with it, without a second bookkeeping path.
+    /// The definitions in force: committed, with every staged change laid over them in log order. Same
+    /// rule as `latest_config`, so a truncation that drops a staged `Index` drops the definition too.
     pub fn active_index_specs(&self) -> Vec<IndexSpec> {
         let pending = self.pending.lock().unwrap();
         Self::overlay_index_specs(&self.committed_indexes(), &pending)
@@ -538,9 +544,8 @@ impl Collection {
         self.committed_config.lock().unwrap().clone()
     }
 
-    /// The configuration in force: the newest one in the log, committed or not. Raft §6 — a node
-    /// uses the latest configuration it holds, because the one that replaces it may never commit
-    /// and the quorum that would commit it is the one it names.
+    /// The configuration in force: the newest in the log, committed or not. A node uses the latest it
+    /// holds, because the one replacing it may never commit and the quorum for that is the one it names.
     pub fn latest_config(&self) -> Option<Configuration> {
         let staged = {
             let pending = self.pending.lock().unwrap();
@@ -686,13 +691,8 @@ impl Collection {
         self.range_page(after, start, end, usize::MAX)
     }
 
-    /// Walks the range in `SCAN_CHUNK` slices, releasing the index lock between them. `visit`
-    /// returns `false` to stop early.
-    ///
-    /// Deliberately not a snapshot: a key written between chunks may or may not be seen. Every
-    /// caller either re-runs to convergence (handover planning, which does) or is already
-    /// cursor-paginated (query), and the alternative is a clone of the whole keyspace held under
-    /// the index lock while the caller does IO against it.
+    /// Walks the range in `SCAN_CHUNK` slices, releasing the index lock between them; `visit` returns
+    /// `false` to stop. Not a snapshot: a key written between chunks may or may not be seen.
     pub fn try_for_each_key<E, F>(
         &self,
         after: Option<&str>,
@@ -733,9 +733,8 @@ impl Collection {
         let _ = self.try_for_each_key::<(), _>(after, start, end, |key| Ok(visit(key)));
     }
 
-    /// The keys a secondary index offers for `filter`, or `None` when no index is eligible or the
-    /// candidate set is not narrow enough to be worth materialising. Public so a test can assert
-    /// the plan rather than infer it from how fast the answer came back.
+    /// The keys a secondary index offers for `filter`, or `None` when none is eligible or the candidate
+    /// set is not narrow enough to materialise. Public so a test can assert the plan.
     pub fn index_plan(&self, filter: &Option<Filter>) -> Option<Selection> {
         let filter = filter.as_ref()?;
         let total = self.index.read().unwrap().len();
@@ -745,13 +744,8 @@ impl Collection {
         Some(chosen)
     }
 
-    /// `try_for_each_key` over an index's candidates instead of the whole range. The candidates
-    /// arrive key-ordered and deduplicated, so the bounds apply the same way and a caller's cursor
-    /// resumes exactly where the full walk would have left it.
-    ///
-    /// The candidates are a snapshot and the walk is not, which is the same guarantee
-    /// `try_for_each_key` gives: neither is a consistent view of the collection, and a key written
-    /// during either may or may not be seen.
+    /// `try_for_each_key` over an index's candidates instead of the whole range. Candidates arrive
+    /// key-ordered and deduplicated, so bounds and cursors behave as in the full walk; still no snapshot.
     fn scan_candidates<E, F>(
         &self,
         candidates: &[String],
@@ -797,10 +791,8 @@ impl Collection {
         }
     }
 
-    /// Fills in the postings for every index the log has defined and this node has not built yet.
-    /// Documents are read without the index lock and filed under it in `BUILD_CHUNK` batches; a
-    /// write landing in between wins, because it holds the value that is current and this walk
-    /// holds the one it replaced.
+    /// Fills in the postings for every defined index this node has not built yet. Documents are read
+    /// without the index lock and filed under it in batches; a write landing in between wins.
     pub fn build_pending_indexes(&self) -> io::Result<()> {
         loop {
             let Some((name, field)) = self.indexes.read().unwrap().next_building() else {
@@ -887,14 +879,8 @@ impl Collection {
             crate::aggregate::DEFAULT_AGGREGATE_SCAN, &|_| true)
     }
 
-    /// One page of rows in key order, and the position the next page resumes from.
-    ///
-    /// `budget` is documents read, not rows returned: a filter matching nothing still reads what
-    /// the plan offered, and nothing bounded that before (IB-054). Spending it ends the page
-    /// instead of refusing it -- the cursor is a keyspace position and a rejected candidate is
-    /// decided, so the page resumes past everything it read and a client following the cursor
-    /// still sees every match. A sorted page refuses instead, having to read a whole range before
-    /// it can order any of it.
+    /// One page of rows in key order, and the position the next page resumes from. `budget` is documents
+    /// read, not rows returned; spending it ends the page past everything read, so no match is skipped.
     pub(crate) fn query_page_owned(
         &self,
         after: Option<&str>,
@@ -946,9 +932,8 @@ impl Collection {
                     items.push(SortedRow { key: key.to_string(), value });
                 }
             }
-            // Every key walked past is decided -- emitted, rejected, or gone -- so the cursor
-            // passes it. Advancing on matches alone left a page stopped by its budget resuming
-            // where it started.
+            // Every key walked past is decided -- emitted, rejected, or gone -- so the cursor passes it.
+            // Advancing on matches alone left a page stopped by its budget resuming where it started.
             last_key = Some(key.to_string());
             Ok(true)
         })?;
@@ -1030,13 +1015,8 @@ impl Collection {
         Ok((rows, matched > keep))
     }
 
-    /// Every matching document folded into `spec`, over the whole range rather than a page: an
-    /// aggregate is not resumable, so a partial one merged across shards would be wrong.
-    ///
-    /// `budget` is documents read, not groups produced or rows matched, and it is the only thing
-    /// bounding the walk -- a filter that matches nothing still reads what the plan offered. The
-    /// result says how many were read and whether the walk stopped short; refusing a short answer
-    /// is the caller's decision, not this one's.
+    /// Every matching document folded into `spec`, over the whole range rather than a page: an aggregate
+    /// is not resumable. `budget` is documents read, and the result says whether the walk stopped short.
     pub fn aggregate(
         &self,
         start: Option<&str>,
@@ -1117,10 +1097,8 @@ impl Collection {
             format!("Key '{}' kept moving while being read", key)))
     }
 
-    /// A handle whose directory a snapshot install has replaced. `release_handles` clears the index
-    /// and parks the writer, and the append path already refuses; without the same check here a
-    /// caller that took the handle before the install reads the cleared index and is told the
-    /// collection is empty (M14). A silent wrong answer here reads as data loss somewhere else.
+    /// A handle whose directory a snapshot install has replaced. Without this check a caller that took
+    /// the handle before the install reads the cleared index and is told the collection is empty (M14).
     fn check_live(&self) -> io::Result<()> {
         if self.released.load(Ordering::SeqCst) {
             return Err(io::Error::new(io::ErrorKind::NotFound,
@@ -1185,11 +1163,8 @@ impl Collection {
         self.pending.lock().unwrap().len()
     }
 
-    /// `entry` is None for a delete; keyed by LSN to drain in log order.
-    /// Staged under the append lock rather than by the caller: between an append and a separate
-    /// stage the frame is on disk and in neither the index nor `pending`, and a compaction retiring
-    /// its WAL would lose a write whose client is still waiting on the fsync. There is deliberately
-    /// no public way to stage, so no append path can grow that window back.
+    /// `entry` is None for a delete; keyed by LSN to drain in log order. Staged under the append lock,
+    /// or a compaction could retire the WAL of a frame in neither the index nor `pending` yet.
     pub(super) fn stage_appended(&self, lsn: u64, term: u64, entry: &LogEntry, wal_id: u64, offset: u64, payload: &[u8]) {
         let committed_specs = self.committed_indexes();
         let mut pending = self.pending.lock().unwrap();
@@ -1209,7 +1184,7 @@ impl Collection {
             LogEntry::Index { change, .. } => StagedEffect::DefineIndex(change.clone()),
         };
         // A frame landing on an LSN we already hold displaces it; its reservation goes with it.
-        if let Some(old) = pending.insert(lsn, StagedApply { wal_id, offset, term, effect }) {
+        if let Some(old) = pending.insert(lsn, StagedApply { wal_id, offset, term, effect, migration: entry.is_migration() }) {
             self.release_staged(&old.effect);
         }
     }
@@ -1228,20 +1203,8 @@ impl Collection {
         Ok(())
     }
 
-    /// A durable commit position covering at least `through`, before this returns. `dropped`,
-    /// `config`, `handover` and the index definitions ride `applied.meta` because compaction
-    /// retires the frames they came from, so a torn or unsynced copy loses state no replay can
-    /// rebuild (bugs.md C27).
-    ///
-    /// Concurrent commits coalesce onto one fsync: the first writer covers the rest. The check is
-    /// "is my position covered", never "did someone else just run" — a writer whose entry landed
-    /// after the running save read the watermark is not covered by it and takes its own turn. That
-    /// distinction is what H11 and H12 were both about.
-    ///
-    /// Two writes, not one, because the two have different costs and different rates. The position
-    /// moves on every commit and goes to `AppliedPos`, which is one `sync_data` into blocks that
-    /// already exist. The three fields beside it change rarely, and only that takes the full
-    /// `applied.meta` rewrite -- a create, an `fsync` on a new file and a rename (bugs.md H17).
+    /// A durable commit position covering at least `through` before this returns. Concurrent commits
+    /// coalesce onto one fsync; the position goes to `AppliedPos`, the rare fields to `applied.meta`.
     fn persist_watermark(&self, through: u64) -> io::Result<()> {
         if self.watermark_saved.load(Ordering::SeqCst) >= through
             && self.rich_gen.load(Ordering::SeqCst) == self.rich_saved.load(Ordering::SeqCst) {
@@ -1302,20 +1265,16 @@ impl Collection {
         Ok(())
     }
 
-    /// The position a restart recovers, over both files. `open` reads it through here so a test can
-    /// assert the durability invariant without depending on which of the two is carrying it.
-    ///
-    /// `None` only when there is no `applied.meta`: that is "never consensus-managed, replay
-    /// everything", and a position with no full record beside it is a first write that tore.
+    /// The position a restart recovers, over both files. `None` only when there is no `applied.meta`,
+    /// which is "never consensus-managed, replay everything".
     pub fn recorded_watermark(col_dir: &Path) -> io::Result<Option<u64>> {
         let meta = AppliedMeta::load(col_dir)?.map(|m| m.applied_lsn);
         let pos = AppliedPos::read(col_dir)?;
         Ok(meta.map(|m| m.max(pos.unwrap_or(0))))
     }
 
-    /// `applied.meta` covering the position on its own, whatever the position file says.
-    /// Compaction needs it: once a drop, config or handover frame is retired, that file is the only
-    /// copy, and replay can only re-derive one from a frame that is still there.
+    /// `applied.meta` covering the position on its own, whatever the position file says. Compaction
+    /// needs it: once a drop, config or handover frame is retired, that file is the only copy.
     pub fn flush_watermark_full(&self) -> io::Result<()> {
         let _one_writer = self.watermark_write.lock().unwrap();
         self.persist_watermark_full(self.rich_gen.load(Ordering::SeqCst))
@@ -1350,6 +1309,7 @@ impl Collection {
                 // key published without its postings or a posting without its key.
                 let mut secondary = self.indexes.write().unwrap();
                 for (lsn, staged) in ready.iter() {
+                    let watched = watched && !staged.migration;
                     match &staged.effect {
                         // `swap` rather than `store`: only a real flip is a change `applied.meta`
                         // has to be rewritten for, and a keyed write is the common case.
@@ -1629,6 +1589,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ib028_migration_is_silent_on_apply_replication_and_recovery() {
+        for replica in [false, true] {
+            for recover in [false, true] {
+                let root = temp_root();
+                let source_root = temp_root();
+                let source = ib004_open(&source_root);
+                let mut col = ib004_open(&root);
+                let mut frames = Vec::new();
+                frames.push(source.put("client".into(), serde_json::json!({"v": 1}), 1).unwrap());
+                frames.push(source.migration_write("moved".into(), Some(serde_json::json!({"v": 2})), 1).unwrap());
+                frames.push(source.migration_write("moved".into(), None, 1).unwrap());
+                frames.push(source.migration_write("moved".into(), Some(serde_json::json!({"v": 3})), 1).unwrap());
+                frames.push(source.delete("client".into(), 1).unwrap());
+                frames.push(source.migration_write("moved".into(), None, 1).unwrap());
+                frames.push(source.migration_write("retained".into(), Some(serde_json::json!({"v": 4})), 1).unwrap());
+                let through = frames.last().unwrap().3;
+                if replica {
+                    for (frame, ..) in &frames {
+                        assert!(matches!(col.append_raw_frame(frame).unwrap(), crate::storage::ReplicaApply::Applied { .. }));
+                    }
+                } else {
+                    drop(col);
+                    col = source.clone();
+                }
+                col.sync_wal().unwrap();
+                if recover {
+                    let path = col.root_path.clone();
+                    drop(col);
+                    drop(source);
+                    col = ib004_open(&path);
+                    assert_eq!(col.pending_len(), frames.len());
+                }
+                let mut sub = col.changefeed.subscribe(Some(0), 0).unwrap();
+                col.apply_committed(through).unwrap();
+                let events = tokio::time::timeout(std::time::Duration::from_secs(1), sub.next_batch()).await.unwrap().unwrap();
+                assert_eq!(events.iter().map(|e| (e.lsn, e.op)).collect::<Vec<_>>(),
+                    vec![(frames[0].3, ChangeOp::Insert), (frames[4].3, ChangeOp::Delete)]);
+                assert!(col.changefeed.subscribe(Some(through), through).is_ok());
+                assert!(col.get("client").unwrap().is_none());
+                assert!(col.get("moved").unwrap().is_none());
+                assert_eq!(col.get("retained").unwrap(), Some(serde_json::json!({"v": 4})));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn ib005_failed_position_save_retries_without_new_entries() {
         for recover_before_retry in [false, true] {
             let root = temp_root();
@@ -1827,9 +1833,8 @@ mod tests {
         IndexChange::Create { spec: IndexSpec { name: name.to_string(), field: field.to_string() } }
     }
 
-    /// Defines an index the way a committed log entry does, and waits out the build. Every test
-    /// below asserts against a *ready* index: a building one is deliberately not selected, so
-    /// without the wait they would all pass on the fallback scan.
+    /// Defines an index the way a committed log entry does, and waits out the build. A building index is
+    /// deliberately not selected, so without the wait every test below would pass on the fallback scan.
     async fn ready_index(col: &Arc<Collection>, name: &str, field: &str) {
         let lsn = col.define_index(create_spec(name, field), 1).unwrap().3;
         col.apply_committed(lsn).unwrap();
@@ -2322,9 +2327,8 @@ mod tests {
         assert_eq!(c2, None, "a full final page with nothing after must not emit a cursor");
     }
 
-    /// C27: `applied.meta` was a bare `fs::write` — no temp file, no rename, no fsync — and
-    /// `load` read anything unparseable as "no consensus history", which means replay everything.
-    /// A crash inside that write therefore published entries no client was ever promised.
+    /// C27: `applied.meta` was a bare `fs::write` and `load` read anything unparseable as "no consensus
+    /// history", so a crash inside that write published entries no client was ever promised.
     #[tokio::test]
     async fn a_damaged_watermark_is_refused_rather_than_read_as_a_fresh_collection() {
         let root = temp_root();
@@ -2407,12 +2411,8 @@ mod tests {
         );
     }
 
-    /// H17 was an attempt to take this fsync off the ack path, and a soak run lost 41 acknowledged
-    /// entries to it: `rewind_to`'s floor is this file's position, so a watermark behind a crash
-    /// returns published entries as staged and a leader is then allowed to truncate them.
-    ///
-    /// No `await` between the apply and the read: this must hold at the instant `apply_committed`
-    /// returns, not once some background task catches up.
+    /// `rewind_to`'s floor is this file's position, so a watermark behind a crash returns published
+    /// entries as staged and a leader may truncate them. No `await` between the apply and the read.
     #[tokio::test]
     async fn the_applied_watermark_is_durable_before_a_commit_is_reported() {
         let root = temp_root();
@@ -2427,9 +2427,8 @@ mod tests {
         }
     }
 
-    /// H17: an ordinary commit records only its position, so a restart has to take the higher of
-    /// the two files. Reading `applied.meta` alone would re-stage everything above it -- which is
-    /// the truncation the entry is about, arriving by a different route.
+    /// H17: an ordinary commit records only its position, so a restart takes the higher of the two
+    /// files. Reading `applied.meta` alone would re-stage everything above it.
     #[tokio::test]
     async fn a_restart_recovers_the_position_the_commits_recorded_not_the_full_records() {
         let root = temp_root();
@@ -2459,9 +2458,8 @@ mod tests {
         assert_eq!(fresh.pending_len(), 0, "nothing above the watermark, so nothing to re-stage");
     }
 
-    /// The other half of the split: `dropped`, `config` and `handover` are never in the position
-    /// file, so a commit that changes one has to take the full write. Compaction retires the frame
-    /// they came from and then that file is the only copy (bugs.md C27).
+    /// The other half of the split: `dropped`, `config` and `handover` are never in the position file,
+    /// so a commit that changes one takes the full write. After compaction that file is the only copy.
     #[tokio::test]
     async fn a_committed_drop_still_takes_the_full_record() {
         let root = temp_root();
@@ -2503,9 +2501,8 @@ mod tests {
         drop(col);
         db.release_collection("c").unwrap();
 
-        // Slots alternate on the sequence, not the lsn: two commits are seq 1 then 2, so the
-        // newer position is in slot 0 and the older is still in slot 1. Corrupting each in turn
-        // pins both the alternation and the fallback -- guessing one slot would pass either way.
+        // Slots alternate on the sequence, not the lsn: two commits are seq 1 then 2, so the newer
+        // position is in slot 0. Corrupting each in turn pins both the alternation and the fallback.
         let dir = root.join("c");
         let intact = std::fs::read(dir.join("applied.pos")).unwrap();
         for (slot, survivor, which) in [(0usize, older, "newer"), (512usize, newer, "older")] {
@@ -2779,9 +2776,8 @@ mod tests {
             "the key is gone, so neither counter may still hold its bytes");
     }
 
-    /// bugs.md M11: replay inlined a staged frame on value size alone, so a node restarting on a
-    /// large uncommitted tail came back over its configured budget, and committing those frames
-    /// pushed the tracked total over it too.
+    /// M11: replay inlined a staged frame on value size alone, so a node restarting on a large
+    /// uncommitted tail came back over its configured budget, and committing those frames kept it there.
     #[tokio::test]
     async fn a_restart_on_an_uncommitted_tail_stays_inside_the_inline_budget() {
         let root = temp_root();
@@ -3211,10 +3207,8 @@ mod tests {
         assert_eq!(col2.pending_len(), 0);
     }
 
-    /// M14: `release_handles` clears the index, and only the append path checked `released`. A
-    /// caller that took the handle before a snapshot install then read the cleared index and was
-    /// told the collection was empty -- which reads as data loss somewhere else, and cost three
-    /// debugging rounds looking like a consensus bug when it turned up in the C17 test.
+    /// M14: `release_handles` clears the index and only the append path checked `released`, so a caller
+    /// holding an older handle read the cleared index and was told the collection was empty.
     #[tokio::test]
     async fn a_released_handle_fails_reads_rather_than_answering_empty() {
         let root = temp_root();
@@ -3240,9 +3234,8 @@ mod tests {
         drop(col);
     }
 
-    /// The whole contract in one test: an index changes which keys a query reads, never which
-    /// rows it returns. Every filter is run against a second collection that has no index, and
-    /// the two answers have to agree.
+    /// The whole contract in one test: an index changes which keys a query reads, never which rows it
+    /// returns. Every filter also runs against an unindexed collection, and the two answers must agree.
     #[tokio::test]
     async fn an_indexed_query_answers_exactly_what_the_scan_would() {
         let root = temp_root();
@@ -3314,9 +3307,8 @@ mod tests {
             "nothing inside an $or constrains every matching row");
     }
 
-    /// IB-054: the page bounded its matches and not its reads, so a selective filter read every
-    /// owned candidate in the range -- and a page that stops on a budget has to resume past the
-    /// candidates it rejected, or it comes back to the same ones and never reaches a match.
+    /// IB-054: the page bounded its matches and not its reads. A page that stops on a budget has to
+    /// resume past the candidates it rejected, or it returns to them and never reaches a match.
     #[tokio::test]
     async fn an_unsorted_filtered_page_stops_at_its_budget_and_resumes_past_what_it_read() {
         let root = temp_root();
@@ -3422,9 +3414,8 @@ mod tests {
         assert_eq!(col.index_status()[0].documents, 1, "and the reverse map moved with them");
     }
 
-    /// The definitions are durable and the postings are not, so a restart has to rebuild them from
-    /// the keys it replayed. A collection that came back with an empty index would answer `200`
-    /// with no rows.
+    /// The definitions are durable and the postings are not, so a restart rebuilds them from the keys
+    /// it replayed. A collection that came back with an empty index would answer `200` with no rows.
     #[tokio::test]
     async fn a_restart_rebuilds_the_postings_from_a_definition_that_survived() {
         let root = temp_root();
@@ -3477,9 +3468,8 @@ mod tests {
         assert_eq!(page_keys(&col, &filter_of(r#"{"age": 2}"#), 100), vec!["k2".to_string()]);
     }
 
-    /// The definition is in force from the append, so a write appended above an uncommitted
-    /// definition indexes for it -- and committing the definition must not need a second pass over
-    /// keys that already staged their values.
+    /// The definition is in force from the append, so a write above an uncommitted definition indexes
+    /// for it -- and committing must not need a second pass over keys that already staged their values.
     #[tokio::test]
     async fn a_write_above_an_uncommitted_definition_is_indexed_when_both_commit() {
         let root = temp_root();

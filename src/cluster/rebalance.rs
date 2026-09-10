@@ -58,9 +58,8 @@ fn replica_placements(
     current: &HashRing,
     primaries: &[String],
 ) -> BTreeMap<String, Vec<String>> {
-    // Keyed by `node_key` throughout, not `endpoint_of`: the ring and the member list are two
-    // places one node can be spelled, and a case difference between them is a node that silently
-    // has no replicas rather than a node with two identities (L16).
+    // Keyed by `node_key` throughout, not `endpoint_of`: the ring and the member list are two places
+    // one node can be spelled, and a case difference there is a node with no replicas at all (L16).
     let primary_endpoints: HashSet<String> = primaries
         .iter()
         .map(|url| node_key(url))

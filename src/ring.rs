@@ -1,7 +1,5 @@
-//! Two ownership models: explicit hash ranges, and a consistent-hash token ring.
-//!
-//! Ranges came first and are kept for clusters already running on them. The token ring is what
-//! makes a topology change cost `1/n` of the keyspace instead of a hand-written re-partition.
+//! Two ownership models: explicit hash ranges, kept for clusters already running on them, and a
+//! consistent-hash token ring, which makes a topology change cost `1/n` of the keyspace.
 
 use crate::util::{cmp_endpoint, node_key};
 use serde::{Deserialize, Serialize};
@@ -25,9 +23,8 @@ pub const DEFAULT_VNODES: u32 = 128;
 // Tokens cost 16 bytes each and are rebuilt on every topology change; this bounds both.
 pub const MAX_VNODES: u32 = 4096;
 pub const MAX_RING_SHARDS: usize = 1024;
-/// `shards x vnodes`, which is what `build` allocates and sorts and what `keyspace_movement` then
-/// sorts twice over. Bounding either factor alone bounds nothing: 1024 shards at 1024 vnodes costs
-/// the same as 256 at 4096. At this ceiling a ring change is ~300 ms of CPU (see docs/bugs.md H14).
+/// `shards x vnodes`, which is what `build` allocates and sorts. Bounding either factor alone bounds
+/// nothing: 1024 shards at 1024 vnodes costs the same as 256 at 4096. At the ceiling, ~300 ms of CPU.
 pub const MAX_RING_TOKENS: usize = 1 << 20;
 
 fn default_vnodes() -> u32 { DEFAULT_VNODES }
@@ -48,9 +45,8 @@ pub struct HashRing {
     pub shards: Vec<RingShard>,
 }
 
-/// Positions for one shard. Hashed from `node_key` rather than the raw URL so a trailing slash, a
-/// scheme change or host case does not silently move a node to a different part of the ring.
-/// Hashing anything `same_endpoint` calls equal would give one node two token sets (IB-022).
+/// Positions for one shard, hashed from `node_key` rather than the raw URL so a trailing slash or host
+/// case cannot move a node. Hashing anything `same_endpoint` calls equal gives one node two sets (IB-022).
 pub fn vnode_token(node_url: &str, index: u32) -> u64 {
     xxhash_rust::xxh64::xxh64(format!("{}#{}", node_key(node_url), index).as_bytes(), 0)
 }
@@ -174,11 +170,8 @@ pub struct Movement {
     pub transfers: Vec<Transfer>,
 }
 
-/// Exactly how much of the keyspace changes hands between two rings.
-///
-/// Computed over arcs rather than by sampling keys: every token from either ring is a boundary, and
-/// between two adjacent boundaries ownership is constant on both sides, so the arc widths sum to an
-/// exact answer. Sampling would only ever approximate the number an operator is deciding on.
+/// Exactly how much of the keyspace changes hands between two rings. Computed over arcs, not samples:
+/// every token is a boundary and ownership is constant between two, so the widths sum to an exact answer.
 pub fn keyspace_movement(before: &BuiltRing, after: &BuiltRing) -> Movement {
     let mut boundaries: Vec<u64> = before.tokens.iter().map(|(t, _)| *t)
         .chain(after.tokens.iter().map(|(t, _)| *t))
@@ -364,9 +357,8 @@ mod consistent_hashing_tests {
                  node being added, never reshuffle between existing ones", was, now);
         }
 
-        // A node's share has roughly 1/sqrt(vnodes) relative spread, so at 128 tokens the fourth
-        // node lands anywhere near a quarter rather than on it. The bound is wide on purpose: the
-        // structural assertion above is the property, this only rules out a wholesale reshuffle.
+        // A node's share has roughly 1/sqrt(vnodes) relative spread, so at 128 tokens the fourth node
+        // lands near a quarter rather than on it. Wide on purpose -- this only rules out a reshuffle.
         let fraction = moved as f64 / keys.len() as f64;
         assert!((0.10..0.40).contains(&fraction),
             "expected roughly a quarter of the keyspace to move, got {:.1}%", fraction * 100.0);
@@ -500,9 +492,8 @@ mod consistent_hashing_tests {
         assert!(placed(&["http://r1"], &["http://r2"]).validate().is_ok());
     }
 
-    /// IB-022: `same_endpoint` went case-insensitive (L16) while `vnode_token` and the duplicate
-    /// set still hashed raw endpoints, so one host spelled two ways was two ring owners with
-    /// different tokens and one node to every ownership check.
+    /// IB-022: `same_endpoint` went case-insensitive while `vnode_token` still hashed raw endpoints, so
+    /// one host spelled two ways was two ring owners and one node to every ownership check.
     #[test]
     fn one_host_spelled_two_ways_is_one_ring_owner() {
         let (upper, lower) = ("http://LOCALHOST:8080", "http://localhost:8080");
@@ -577,9 +568,8 @@ mod tests {
         }
     }
 
-    /// H14: `MAX_VNODES` bounded one factor of a `shards x vnodes` allocation and the shard count
-    /// had no bound at all. Neither factor alone is the gate -- the product is what `build`
-    /// allocates and sorts, and what `keyspace_movement` then sorts twice over.
+    /// H14: `MAX_VNODES` bounded one factor of a `shards x vnodes` allocation and the shard count had
+    /// none. The product is what `build` allocates and sorts, and what `keyspace_movement` sorts twice.
     #[test]
     fn ring_layout_is_bounded_on_the_product_not_on_either_factor() {
         assert!(ring_of(MAX_RING_SHARDS, 1).validate().is_ok());

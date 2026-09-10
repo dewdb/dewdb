@@ -1,6 +1,5 @@
-//! Webhook subscription administration.
-//!
-//! Registrations commit through the group log; pushes only accelerate local reconciliation.
+//! Webhook subscription administration. Registrations commit through the group log; pushes only
+//! accelerate local reconciliation.
 
 use crate::api::middleware::{client_collection, CollectionPath};
 use crate::auth::Credential;
@@ -599,9 +598,8 @@ mod tests {
         }
     }
 
-    /// IB-026: a registration is durable, so a restart does not end one the way it ends a
-    /// connection. Without a re-check, a key removed from the config kept posting the collection's
-    /// documents to the endpoint it named, indefinitely and across restarts.
+    /// IB-026: a registration is durable, so a restart does not end one the way it ends a connection.
+    /// Without a re-check, a key removed from the config kept posting documents across restarts.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_registration_stops_delivering_once_the_key_that_created_it_is_gone() {
         use crate::auth::API_KEY_HEADER;
@@ -654,9 +652,8 @@ mod tests {
             "a committed change reached the endpoint under a credential the node no longer holds");
     }
 
-    /// IB-030: the acknowledged cursor belongs to the group, and every registered replica keeps
-    /// the bounded feed window that cursor resumes inside before it becomes leader. The boundary
-    /// asserted is at-least-once, which is what failover promises (IB-041).
+    /// IB-030: the acknowledged cursor belongs to the group, and every registered replica keeps the feed
+    /// window it resumes inside. The boundary asserted is at-least-once, which is what failover promises.
     #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
     async fn a_promoted_replica_resumes_webhook_delivery_after_the_last_acknowledged_event() {
         let root = temp_root();
@@ -719,8 +716,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // At-least-once across a promotion: the batch straddling the cursor may be sent again, so
-        // `before` is bounded rather than exact and has to repeat the `lsn` it is deduped on.
-        // Exactness is owed only to what the promoted leader acknowledged itself.
+        // `before` is bounded rather than exact and repeats the `lsn` it is deduped on.
         let events = sink.events();
         let keys: Vec<&str> = events.iter().filter_map(|event| event["key"].as_str()).collect();
         assert_eq!(keys.iter().filter(|key| **key == "after").count(), 1,

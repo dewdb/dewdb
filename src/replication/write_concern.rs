@@ -13,11 +13,8 @@ pub enum WriteConcern {
     N(usize),
 }
 
-/// `Err` rather than a fallback, the way `parse_read_pref` already does it. `quorum` is the
-/// spelling `?read=` uses for its strongest guarantee and so the obvious wrong guess here; silently
-/// reading it as `w=1` answers `200` to a client that asked for durability and gives it no way to
-/// find out it got none (M18). `w=0` stays `N(0)` and is floored at 1 by `required_acks` -- the
-/// same answer, but by a route the client can reason about.
+/// `Err` rather than a fallback: `quorum` is `?read=`'s spelling and the obvious wrong guess, and
+/// reading it as `w=1` answers `200` to a client that asked for durability (M18). `w=0` stays `N(0)`.
 pub fn parse_write_concern(w: Option<&str>) -> Result<WriteConcern, String> {
     match w {
         None | Some("1") => Ok(WriteConcern::Local),
@@ -40,8 +37,7 @@ pub fn required_acks(wc: &WriteConcern, replica_count: usize) -> usize {
 }
 
 /// What a write waits for, resolved against the configuration in force. `Majority` is not a count
-/// while a change is in flight: a majority of each half is needed, and any number of acks from one
-/// half alone is not one.
+/// while a change is in flight: acks from one half alone are never a majority of each.
 #[derive(Clone)]
 pub enum WriteQuorum {
     Count(usize),

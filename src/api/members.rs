@@ -19,9 +19,8 @@ pub struct LeaveParams {
     pub url: String,
 }
 
-/// Only a leader may publish a membership change. The view converges by version rather than being
-/// agreed, so two writers produce two versions of which one is discarded; one writer per shard
-/// group is the strongest ordering available before joint consensus.
+/// Only a leader may publish a membership change: the view converges by version rather than being
+/// agreed, so two writers produce two versions of which one is discarded.
 pub(crate) fn writable(state: &AppState) -> Result<(), axum::response::Response> {
     if !state.is_shard() {
         return Err(err_json(StatusCode::CONFLICT,
@@ -48,9 +47,8 @@ pub(crate) async fn publish(state: &AppState, next: ClusterMetadata) -> Result<u
     }
 }
 
-/// Pushes the new view straight at a node so it learns its role immediately rather than after a
-/// poll. Spawned rather than awaited: the change is already published and durable, and a control
-/// plane write must not hang on whether every node it names happens to be reachable.
+/// Pushes the new view straight at a node so it learns its role without waiting for a poll. Spawned:
+/// the change is already durable, and a control-plane write must not hang on reachability.
 pub(crate) fn nudge(state: &AppState, url: &str, view: &ClusterMetadata) {
     let client = state.client.clone();
     let endpoint = format!("{}/internal/cluster", url);
@@ -117,8 +115,7 @@ pub async fn join_handler(
 }
 
 /// What an operator asks for: the voting set they want, not the delta. Joint consensus makes an
-/// arbitrary set change safe, so the set is the primitive and add/remove are the caller's
-/// arithmetic over `GET /cluster/configuration`.
+/// arbitrary set change safe, so add/remove are the caller's arithmetic over the configuration.
 #[derive(Deserialize)]
 pub struct ConfigurationRequest {
     pub voters: Vec<String>,
@@ -265,9 +262,8 @@ mod tests {
         reqwest::Client::builder().timeout(Duration::from_secs(3)).build().unwrap()
     }
 
-    /// A node nobody has heard of: no peers, no primary, exactly what a fresh box looks like.
-    /// `membership_mode: learner` is what stops it electing itself; the heartbeat timeout is left
-    /// short deliberately, so any test that passes here passes without a timing cushion.
+    /// A node nobody has heard of: no peers, no primary, what a fresh box looks like. `membership_mode:
+    /// learner` is what stops it electing itself; the heartbeat timeout is left short deliberately.
     fn fresh_node(root: &std::path::Path, id: &str) -> TestNode {
         fresh_node_with_timeout(root, id, crate::test_support::DEFAULT_HEARTBEAT_TIMEOUT_SECS)
     }
@@ -296,9 +292,8 @@ mod tests {
         let root = temp_root();
         let c = client();
 
-        // No cluster at all: nothing to find, nothing to follow, nothing to stop it but the mode.
-        // Opting back into the short contact timeout the harness no longer defaults to: this
-        // guard is supposed to hold without a timing cushion, and the sleeps below are sized to it.
+        // No cluster at all: nothing to find, nothing to follow, nothing to stop it but the mode. Opts
+        // back into the short contact timeout, so this guard holds without a timing cushion.
         let mut n4 = fresh_node_with_timeout(&root, "n4", 1);
         assert_eq!(n4.heartbeat_timeout_secs, 1, "the guard must hold without a timing cushion");
         assert!(n4.state.as_ref().unwrap().is_learner(),
@@ -535,9 +530,8 @@ mod tests {
             "{} never took the office it was handed", successor);
         assert!(taken.term() > term_before, "a handover is still a new term");
 
-        // The successor holds what the old leader had, and leads for real rather than nominally.
-        // Waited on rather than read once: visibility is commit-gated, so an inherited entry
-        // surfaces when the new leader can prove a quorum holds it, not when it takes office.
+        // The successor holds what the old leader had, and leads for real. Waited on rather than read
+        // once: visibility is commit-gated, so an inherited entry surfaces when a quorum is provable.
         assert!(wait_for_doc(&c, &successor, "t", "before", 1, Duration::from_secs(10)).await,
             "the target was handed office without the entries that came with it");
         assert_eq!(put_doc_at(&c, &successor, "t", "after", 2, "?w=majority").await,

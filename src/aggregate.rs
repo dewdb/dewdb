@@ -1,8 +1,5 @@
-//! Aggregation: what a shard accumulates over its own documents, and how a router merges the
-//! partials into one answer.
-//!
-//! Every metric travels with the counts its merge needs rather than as a finished number, because
-//! an average of averages is not an average. A router sums `sum` and `count` and divides once.
+//! Aggregation: what a shard accumulates over its own documents, and how a router merges the partials.
+//! Every metric travels with the counts its merge needs -- an average of averages is not an average.
 
 use crate::json::get_path_value;
 use crate::json::json_cmp;
@@ -13,9 +10,8 @@ use std::collections::BTreeMap;
 /// merged across shards would be wrong, not merely short -- so the bound is a refusal.
 pub const MAX_AGGREGATE_GROUPS: usize = 10_000;
 
-/// Documents one aggregation may read on one shard before it stops, absent `max_docs`. It bounds
-/// the reads rather than the groups, which are the same number only when every document is its own
-/// group (IB-025).
+/// Documents one aggregation may read on one shard before it stops, absent `max_docs`. It bounds the
+/// reads rather than the groups, which are the same number only when every document is its own (IB-025).
 pub const DEFAULT_AGGREGATE_SCAN: usize = 100_000;
 
 /// Ceiling on `max_docs`. Above it the request is refused rather than clamped, so a client that

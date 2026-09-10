@@ -1,6 +1,5 @@
-//! Change data capture: one collection's committed changes, filtered once and delivered to any
-//! transport. SSE, WebSocket and webhook delivery all consume this rather than the feed directly,
-//! so the filtering, the resume position and the end conditions are stated in one place.
+//! Change data capture: one collection's committed changes, filtered once and delivered to any transport.
+//! SSE, WebSocket and webhook delivery all consume this, so filtering and resume are stated once.
 
 use crate::auth::Credential;
 use crate::changefeed::{ChangeEvent, ChangeOp, FeedEnd, Subscription};
@@ -50,9 +49,8 @@ impl CdcFilter {
         })
     }
 
-    /// The document filter governs the events that carry a document and nothing else: suppressing a
-    /// delete it cannot test would leave a subscriber believing the match it was watching is still
-    /// there. An op list still excludes one, because that was asked for by name.
+    /// The document filter governs events that carry a document and nothing else: suppressing a delete it
+    /// cannot test would leave a subscriber believing the match is still there. An op list still excludes.
     pub fn admits(&self, event: &ChangeEvent) -> bool {
         if !self.ops.admits(event.op) {
             return false;
@@ -230,9 +228,8 @@ impl ChangeSource {
 pub const REVOKED: &str =
     "the credential this stream was opened with is no longer accepted; resubscribe";
 
-/// A change stream and the re-authorization it needs because it answers past the request that
-/// opened it. Every other endpoint is one request, so per-request and per-answer are the same
-/// thing there; here a revoked key has to end the stream rather than have been checked once.
+/// A change stream and the re-authorization it needs because it answers past the request that opened
+/// it: a revoked key has to end the stream rather than have been checked once.
 pub struct ChangeStream {
     source: ChangeSource,
     /// Absent only where nothing authorized the stream in the first place, which is a test

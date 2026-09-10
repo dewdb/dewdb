@@ -123,8 +123,7 @@ impl MigrationRuns {
 }
 
 /// The part of a handover that has to outlive the process: what this node handed over, and which
-/// sources it has already reset for. Both drive a deletion, and a lost record leaves a stale copy
-/// that shadows the live one if the node comes back into the ring.
+/// sources it reset. A lost record leaves a stale copy that shadows the live one on re-entry.
 #[derive(Serialize, Deserialize, Default)]
 pub struct MigrationMeta {
     pub completed: Option<CompletedHandover>,
@@ -154,9 +153,8 @@ impl MigrationMeta {
     }
 }
 
-/// Written when a phase finishes, not per batch: an unfinished record is never read back, since a
-/// restart mid-copy re-plans from the view. Restoring one would be worse than losing it, because
-/// `ensure_running` reads a matching id and phase as already running and would not restart.
+/// Written when a phase finishes, not per batch: a restart mid-copy re-plans from the view, and
+/// `ensure_running` would read a restored record's id and phase as already running.
 fn persist(state: &AppState) {
     let meta = {
         let runs = state.migrations.lock().unwrap();
@@ -195,9 +193,8 @@ pub fn ensure_running(state: &AppState, migration: &Migration) {
         return;
     }
     {
-        // Claimed before the keyspace scan below, so two adoptions racing here cannot both push.
-        // Keyed by phase, not by plan: the next phase must be startable while the last one's task
-        // is still winding down, or the handover stops at the phase boundary.
+        // Claimed before the keyspace scan below, so two adoptions racing cannot both push. Keyed by
+        // phase, or the handover stops at a boundary while the last phase's task winds down.
         let mut runs = state.migrations.lock().unwrap();
         if runs.pushing.as_ref() == Some(&key) {
             return;
@@ -260,9 +257,8 @@ impl Drop for PushGuard {
     }
 }
 
-/// Retries for as long as the plan is in the view. A destination that is briefly down, or has not
-/// yet adopted the plan and so refuses the batch, is the normal case rather than a failure -- and
-/// giving up would leave ownership frozen with no way forward but an abort.
+/// Retries for as long as the plan is in the view: a destination briefly down, or one that has not
+/// adopted the plan yet, is the normal case, and giving up freezes ownership with only an abort out.
 async fn push_until_done(state: AppState, migration: Migration) {
     let id = migration.id.clone();
     let mut attempt: u32 = 0;
@@ -279,11 +275,8 @@ async fn push_until_done(state: AppState, migration: Migration) {
             return;
         }
 
-        // Taken and dropped, not held: what the barrier has to close is the window where a write
-        // decided it owned a key under the pre-finalizing view and has not appended yet. Draining
-        // those settles it -- every write that starts after this sees `Ownership::Moving` and is
-        // refused, so the scan and the round trips below cannot be overtaken. Holding it across
-        // them instead blocks every write on the node for the length of a keyspace scan.
+        // Taken and dropped, not held: what has to close is the window where a write decided it owned
+        // a key under the old view. Holding it would block every write for a whole keyspace scan.
         if migration.phase == MigrationPhase::Finalizing {
             drop(state.write_gate.write().await);
         }
@@ -551,12 +544,8 @@ async fn push_all(
 /// Per record, which is one per phase completion and small: an id and a ring.
 const HANDOVER_COMMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Puts the handover record in this group's replicated log. `migration.meta` brings it back through
-/// a restart of the same process but not to a peer elected in its place, and after the flip the plan
-/// is out of the view, so a new leader has nothing to re-derive it from (bugs.md `C18`).
-///
-/// Not awaited by the caller's success: the handover itself is already done, and a record that did
-/// not commit leaves cleanup exactly where it was before this existed rather than worse.
+/// Puts the handover record in this group's replicated log: `migration.meta` does not reach a peer
+/// elected in this node's place, and after the flip the plan is out of the view (C18). Not awaited.
 pub(crate) async fn replicate_handover(state: &AppState, record: HandoverRecord) {
     let db = match state.db.as_ref() {
         Some(db) => db.clone(),
@@ -608,8 +597,7 @@ pub(crate) async fn replicate_handover(state: &AppState, record: HandoverRecord)
 }
 
 /// The ring this node moved keys for under `id`, from the replicated record if it is there and from
-/// this node's own run if it is not. Both answer the same question; only the first survives the
-/// group electing someone else.
+/// this node's own run otherwise. Only the first survives the group electing someone else.
 fn handover_target(state: &AppState, id: &str) -> Option<HashRing> {
     let recorded = state.db.as_ref()
         .and_then(|db| db.existing_collection(CONFIG_LOG))
@@ -622,9 +610,8 @@ fn handover_target(state: &AppState, id: &str) -> Option<HashRing> {
     })
 }
 
-/// Every key this node holds that `ring` says belongs to another group. A node the ring does not
-/// name at all owns nothing, which is the shard dropped from the ring -- the one most likely to be
-/// sitting on a whole shard's worth of copies.
+/// Every key this node holds that `ring` says belongs to another group. A node the ring does not name
+/// owns nothing -- the shard dropped from the ring, most likely holding a whole shard of copies.
 fn keys_not_ours(state: &AppState, ring: &HashRing) -> HashSet<(String, String)> {
     let db = match state.db.as_ref() {
         Some(db) => db,
@@ -657,13 +644,8 @@ fn keys_not_ours(state: &AppState, ring: &HashRing) -> HashSet<(String, String)>
     out
 }
 
-/// Keys this node handed over, but only once the ring it was handing them over *for* is the ring
-/// actually in force. An abandoned plan leaves the same record behind, and acting on it would
-/// delete keys this node still owns.
-///
-/// Derived rather than remembered: the set of moved keys has no bound, so a log entry carrying it
-/// would fit in neither a frame nor a replicate body, and the ring that moved them answers the same
-/// question in one small record. The caller re-checks live ownership per key regardless.
+/// Keys this node handed over, but only once the ring it handed them over for is the ring in force:
+/// an abandoned plan leaves the same record. Derived, since the moved set has no bound.
 pub fn handed_over_after_flip(state: &AppState, id: &str) -> HashSet<(String, String)> {
     let live = match state.cluster_view().ring {
         Some(ring) => ring,

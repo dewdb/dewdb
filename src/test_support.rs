@@ -53,10 +53,8 @@ pub async fn cleanup(root: &Path) {
     leaked(root);
 }
 
-/// A `temp_root` that removes itself, so a test that panics or returns early does not leak one
-/// (bugs.md L14). Tests bind it before the nodes under it, and reverse drop order then closes their
-/// files first; a node outliving it prints `LEAKED` instead of failing, since a transient lock is
-/// not the test's own defect.
+/// A `temp_root` that removes itself, so a test that panics does not leak one (L14). Bound before the
+/// nodes under it; one outliving it prints `LEAKED`, since a transient lock is not the test's defect.
 pub struct TempRoot {
     path: PathBuf,
 }
@@ -95,6 +93,7 @@ pub fn temp_root() -> TempRoot {
 
 pub fn make_frame(term: u64, lsn: u64, prev_lsn: u64, prev_term: u64, key: &str, v: i64) -> Vec<u8> {
     let entry = LogEntry::Put {
+        migration: false,
         key: key.to_string(),
         value: serde_json::json!({"v": v}),
         ts: 0,
@@ -194,9 +193,8 @@ pub struct TestNode {
 // concurrent callers, so the counter rather than the OS guarantees uniqueness.
 static NEXT_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(20000);
 
-/// Slack by default, short only where a test opts in. One second leaves a follower less margin
-/// than its own poll interval, so under load the group churns terms and every deadline downstream
-/// ends up racing the scheduler (bugs.md L8b).
+/// Slack by default, short only where a test opts in: one second leaves a follower less margin than its
+/// own poll interval, so under load the group churns terms and every downstream deadline races (L8b).
 pub const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 5;
 
 pub fn next_test_port() -> u16 {
@@ -592,11 +590,8 @@ pub fn leaders(nodes: &[&TestNode]) -> Vec<String> {
     nodes.iter().filter(|n| n.is_leader()).map(|n| n.node_id.clone()).collect()
 }
 
-/// Moves office to `to`, retrying until it leads or `deadline` passes. A handover competes with
-/// the rest of the suite for the runtime, and the API answers `503` while the old leader still
-/// holds office, so one attempt timing out or losing is not a refusal (internal_bugs.md IB-050).
-/// `Err` carries the last answer; a `422` returns straight away, since retrying a refusal of the
-/// request itself only spends the deadline.
+/// Moves office to `to`, retrying until it leads or `deadline` passes -- the API answers `503` while the
+/// old leader holds office. `Err` carries the last answer; a `422` returns straight away (IB-050).
 pub async fn hand_over_leadership(
     client: &reqwest::Client,
     from: &TestNode,
@@ -875,17 +870,14 @@ pub async fn put_value(
     }
 }
 
-/// The default is deliberately slack. A one-second contact timeout leaves a follower 500ms of
-/// margin over its own poll interval, so any test holding a leader across multi-second work was one
-/// scheduler stall away from an election it never asked for (bugs.md L8b). Tests that *wait* for a
-/// failover want the short timeout and say so with `three_node_cluster_with_timeout`.
+/// The default is deliberately slack: a one-second contact timeout leaves 500ms of margin over a poll
+/// interval (L8b). Tests that wait for a failover use `three_node_cluster_with_timeout`.
 pub async fn three_node_cluster(root: &Path) -> (TestNode, TestNode, TestNode) {
     three_node_cluster_with_timeout(root, DEFAULT_HEARTBEAT_TIMEOUT_SECS).await
 }
 
-/// A longer contact timeout than the default 1s, for tests that deliberately leave the leader
-/// without a quorum: CheckQuorum steps such a leader down, and one second is not enough runway to
-/// assert what it does while it still holds office.
+/// A longer contact timeout than the default, for tests that deliberately leave the leader without a
+/// quorum: CheckQuorum steps it down, and one second is no runway to assert what it does first.
 pub async fn three_node_cluster_with_timeout(
     root: &Path,
     heartbeat_timeout_secs: u64,
@@ -927,12 +919,8 @@ pub async fn voter_group(root: &Path, n: usize, heartbeat_timeout_secs: u64) -> 
 
 const CONVERGE_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Blocks until exactly one of `nodes` leads and every other has heard from it.
-///
-/// Not a sleep, and every hand-rolled group needs it as much as `voter_group` does: a follower
-/// polls 500ms after boot and campaigns at `heartbeat_timeout_secs`, so a fixed wait shorter than
-/// both hands the test a leader that is already being deposed -- and every assertion downstream
-/// then fails on its own subject instead of on the real cause (bugs.md L8b).
+/// Blocks until exactly one of `nodes` leads and every other has heard from it. Not a sleep: a follower
+/// polls 500ms after boot and campaigns at `heartbeat_timeout_secs`, so a fixed wait races both (L8b).
 pub async fn await_converged(nodes: &[&TestNode]) {
     let deadline = std::time::Instant::now() + CONVERGE_TIMEOUT;
     while !cluster_converged(nodes) {
@@ -959,9 +947,8 @@ fn ids(nodes: &[&TestNode], f: impl Fn(&TestNode) -> bool) -> Vec<String> {
     nodes.iter().filter(|n| f(n)).map(|n| n.node_id.clone()).collect()
 }
 
-/// Keys that hash into the first or second half of the ring for `col`, which is the half a
-/// `sharded_cluster(_, 2)` group owns. A test that needs a collection present on one group only
-/// picks its keys from here; the collection is part of the hash, so the answer differs per name.
+/// Keys that hash into the first or second half of the ring for `col`, the half a `sharded_cluster(_, 2)`
+/// group owns. The collection is part of the hash, so the answer differs per name.
 pub fn keys_for_group(col: &str, first: bool, n: usize) -> Vec<String> {
     let half = 1u64 << 63;
     (0..1000).map(|i| format!("k{:04}", i))

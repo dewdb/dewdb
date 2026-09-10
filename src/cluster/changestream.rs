@@ -1,8 +1,5 @@
 //! Cluster-wide change streams: one upstream subscription per shard group, merged behind a router.
-//!
-//! A group's feed is a position in that group's own log, so nothing about it is comparable across
-//! groups. The subscriber therefore gets a position per group, stamped with the partitioning those
-//! positions were taken against, and an ordering guarantee that is per group rather than global.
+//! A position is per group and stamped with the partitioning it was taken against; ordering is too.
 
 use crate::api::changes::ChangeParams;
 use crate::cdc::CdcFrame;
@@ -42,8 +39,7 @@ const MERGE_BUFFER: usize = 512;
 const MAX_UPSTREAM_EVENT: usize = 4 * crate::storage::frame::MAX_PUBLIC_BODY;
 
 /// Where each shard group's feed stopped, and the partitioning those positions were taken against.
-/// Encoded like the query cursors, and issued as every event's SSE `id`, so a browser's own
-/// `Last-Event-ID` reconnect resumes each group exactly.
+/// Issued as every event's SSE `id`, so a browser's own `Last-Event-ID` reconnect resumes each group.
 #[derive(Serialize, Deserialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ClusterChangeCursor {
@@ -51,9 +47,8 @@ pub struct ClusterChangeCursor {
     pub positions: BTreeMap<String, u64>,
 }
 
-/// 409, not 410: the positions were correct when they were issued and no position replaces them.
-/// Ownership moved while nobody was watching the seam, so the changes that crossed it were
-/// published on groups this stream had no subscription to, and no resume covers them.
+/// 409, not 410: the positions were correct when issued and nothing replaces them. Ownership moved
+/// unwatched, so changes crossing the seam went to groups this stream never subscribed to.
 fn stale_partitioning_response() -> axum::response::Response {
     err_json(
         StatusCode::CONFLICT,
@@ -101,10 +96,8 @@ fn forwarded_params(params: &ChangeParams) -> Vec<(String, String)> {
     q
 }
 
-/// Subscribes to one group, trying its leader first and its replicas after. `read=primary` is not
-/// a freshness preference here but the thing that makes a position portable: every node in the
-/// group numbers the same log, so a resume survives a failover only if whoever answers is the one
-/// whose log the group agrees on.
+/// Subscribes to one group, leader first and replicas after. `read=primary` is what makes a position
+/// portable: a resume survives failover only if whoever answers numbers the log the group agrees on.
 async fn open_group(
     state: &AppState,
     col: &str,
@@ -309,8 +302,7 @@ async fn run_group(reader: GroupReader, initial: Option<reqwest::Response>) {
 }
 
 /// Re-reads the shard set and keeps one reader per group in force. Owns the reader handles, so a
-/// subscriber that disconnects takes every upstream subscription with it rather than leaving them
-/// to notice on their own next keep-alive.
+/// disconnecting subscriber takes every upstream subscription with it.
 async fn supervise(
     state: AppState,
     col: String,
@@ -499,9 +491,8 @@ pub async fn open_cluster_stream(
         match upstream {
             Upstream::Live(response) => live.push((group, replicas, after, response)),
             Upstream::Absent => absent.push((group, replicas)),
-            // The group's own answer, passed through: it knows why the position or the filter is
-            // unusable, and this router would only be guessing at it. Named, because a
-            // `resume_floor` in it is a position in that group's log and in nobody else's.
+            // The group's own answer, passed through: it knows why the position or filter is unusable.
+            // Named, because a `resume_floor` in it is a position in that group's log and no other.
             Upstream::Refused(reply) => {
                 let mut body: serde_json::Value = serde_json::from_str(&reply.body)
                     .unwrap_or(serde_json::Value::String(reply.body));
@@ -739,9 +730,8 @@ mod tests {
             "nor skip what it missed: {:?}", after);
     }
 
-    /// The seam a subscriber was not present for. Its positions were taken against a layout that no
-    /// longer maps keys the same way, and the changes that crossed the seam were published on
-    /// groups it had no subscription to, so the position is refused rather than resumed past them.
+    /// The seam a subscriber was not present for: its positions were taken against a layout that maps
+    /// keys differently now, and the changes that crossed went to groups it never subscribed to.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_position_from_another_shard_layout_is_refused() {
         let root = temp_root();

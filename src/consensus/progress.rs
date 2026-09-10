@@ -11,9 +11,8 @@ use std::time::{Duration, Instant};
 
 const PROGRESS_FILE: &str = "progress.meta";
 
-/// Send cursors carried across a leader restart, purely to avoid re-probing every collection.
-/// Never quorum evidence: a stale entry only costs a rejected frame and a rewind, so this is
-/// flushed lazily and an absent or unreadable file is not an error.
+/// Send cursors carried across a leader restart, purely to avoid re-probing every collection. Never
+/// quorum evidence: a stale entry costs a rejected frame and a rewind, so an absent file is fine.
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct ProgressMeta {
     pub sent_through: HashMap<String, HashMap<String, u64>>,
@@ -39,11 +38,8 @@ impl ProgressMeta {
     }
 }
 
-// LSNs come from one database-wide counter but replication is per collection.
-// An ack of lsn 7 for "users" says nothing about "orders"; a global watermark over-claims.
-//
-// `matched` is quorum evidence and is term-scoped. `sent_through` is only a send cursor:
-// it may be restored from disk, and must never be read as evidence a replica holds anything.
+// LSNs come from one database-wide counter but replication is per collection, so a global watermark
+// over-claims. `matched` is term-scoped quorum evidence; `sent_through` is only a send cursor.
 #[derive(Default)]
 pub struct Progress {
     matched: HashMap<String, HashMap<String, u64>>,
@@ -93,13 +89,8 @@ impl Progress {
             .insert(collection.to_string(), lsn);
     }
 
-    /// On winning an election: forget all quorum evidence, and seed each send cursor at our own
-    /// tail the way Raft does. A persisted hint may only lower it -- raising it would skip frames
-    /// the replica lacks, and the chain check would then have to catch what we should not have sent.
-    ///
-    /// `applied` seeds the watermark at what this node has already published, which a previous
-    /// leader must have committed for it to be published at all. Counting starts from there rather
-    /// than from zero, so promotion does not report a commit index behind its own visible state.
+    /// On winning an election: forget all quorum evidence and seed each send cursor at our own tail.
+    /// A persisted hint may only lower it. `applied` seeds the watermark at what we already published.
     pub fn reinit_as_leader(
         &mut self,
         replicas: &[String],
@@ -126,11 +117,8 @@ impl Progress {
         }
     }
 
-    /// Starts tracking a replica admitted mid-term, at cursor 0 rather than at our tail.
-    /// `reinit_as_leader` assumes at the top and backs off on rejection, which is right for a node
-    /// that was already following; a node we have never sent to holds nothing, and starting at the
-    /// top would leave the driver seeing no gap and shipping nothing until the next write.
-    /// Existing cursors are left alone so a re-add cannot rewind a catch-up in flight.
+    /// Starts tracking a replica admitted mid-term at cursor 0, not our tail: it holds nothing, and
+    /// starting at the top would ship nothing until the next write. Existing cursors are left alone.
     pub fn begin_tracking(&mut self, replica: &str, collections: &[String]) {
         // Same grace `reinit_as_leader` gives: a member admitted mid-term has not answered us yet,
         // and counting it as long-silent would push a healthy leader under `contact_quorum`.
@@ -180,12 +168,8 @@ impl Progress {
         }
     }
 
-    /// Raft's CheckQuorum, from the leader's side of the wire: a majority of the configuration
-    /// answered us inside `within`. Counts this node for itself, so a lone voter always holds.
-    ///
-    /// A member seen here for the first time is stamped now, not treated as long silent: joining
-    /// the configuration is not the same as having gone quiet, and a config change that admits two
-    /// voters would otherwise depose the leader that installed it.
+    /// Raft's CheckQuorum from the leader's side: a majority answered inside `within`. Counts this
+    /// node, so a lone voter always holds. A member first seen here is stamped now, not long silent.
     pub fn contact_quorum(&mut self, config: &Configuration, own_url: &str, now: Instant, within: Duration) -> bool {
         let outgoing = config.outgoing.iter().flatten();
         for member in config.voters.iter().chain(outgoing) {
@@ -215,15 +199,8 @@ impl Progress {
         self.committed.values().copied().max().unwrap_or(0)
     }
 
-    /// Highest LSN the configuration's quorum holds, counting the leader for itself. Never moves
-    /// backwards: a resynced replica can report a lower match than before.
-    ///
-    /// Raft §5.4.2: a majority holding a *prior-term* entry is not proof a later leader will keep
-    /// it, so counting may only commit at or above this leader's own first append. Entries below
-    /// the floor commit indirectly, when a current-term entry above them does.
-    ///
-    /// A joint configuration takes the lower of the two halves, so an entry only the outgoing half
-    /// holds cannot commit while the incoming half could still elect a leader that lacks it.
+    /// Highest LSN a quorum holds, counting the leader for itself; never moves backwards. Floored at
+    /// this leader's own first append (Raft 5.4.2), and a joint configuration takes the lower half.
     pub fn advance(
         &mut self,
         collection: &str,

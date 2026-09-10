@@ -1,9 +1,5 @@
-//! Who is allowed to hold a key, decided from the node's own view of the ring.
-//!
-//! Routing alone cannot make a handover safe. Views converge rather than switch together, so during
-//! a ring change two routers can disagree about a key's owner for as long as propagation takes. The
-//! shard refusing keys it does not own is what makes that window harmless: the losing router gets
-//! told where to go instead of writing a second copy.
+//! Who is allowed to hold a key, decided from the node's own view of the ring. Views converge rather
+//! than switch together, so a shard refusing keys it does not own is what makes the window harmless.
 
 use crate::cluster::metadata::{ClusterMetadata, MigrationPhase};
 use crate::ring::{hash_key, BuiltRing, RingShard};
@@ -38,16 +34,8 @@ pub(crate) fn group_owns(built: &BuiltRing, group: &str, collection: &str, key: 
         .is_some_and(|owner| same_endpoint(&owner.node_url, group))
 }
 
-/// `None` only when there is no ring at all, which is a single shard or a range-based cluster and
-/// must not be broken by a check meant for sharded ones.
-///
-/// A node that is *outside* an existing ring owns nothing, so every key is elsewhere. That case is
-/// not theoretical: a shard removed by a handover keeps its data until cleanup, and a router that
-/// has not adopted the new ring yet still sends keys to it. Returning `None` there answered those
-/// requests with a 404 -- a wrong answer, where a redirect sends the caller to the real owner.
-/// `built` and `built_target` are the caller's cached rings. Token layout is derived from
-/// membership and costs `shards x vnodes` to lay out, so it is built once per cluster version
-/// rather than once per key.
+/// `None` only when there is no ring at all -- a single shard or a range cluster; a node outside an
+/// existing ring owns nothing and redirects rather than 404s. `built`/`built_target` are cached rings.
 pub fn classify(
     view: &ClusterMetadata,
     built: &BuiltRing,
@@ -135,8 +123,7 @@ mod tests {
         let key = key_owned_by(&two, "http://a");
 
         // The shape a shard has just after a handover removed it: still holding data, no longer an
-        // owner. Answering from here would serve a stale value or a 404 to a router that has not
-        // caught up; redirecting sends it to whoever owns the key now.
+        // owner. Answering from here would serve a stale value or a 404 to a router behind the ring.
         assert_eq!(classify_view(&v, "http://departed", "t", &key),
             Some(Ownership::Elsewhere("http://a".into())));
 

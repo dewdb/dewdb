@@ -8,26 +8,21 @@ use std::time::Duration;
 
 const DIR_REMOVE_ATTEMPTS: usize = 5;
 
-/// The `host:port` of `url`, with scheme, path, query and fragment cut away. Parsing only: two
-/// nodes are the same node by `same_endpoint`, and identity as a map key is `node_key`.
-/// Configs mix "http://host:port" and "host:port", and one port has one listener, so a scheme
-/// cannot name a second node — a path can, which is why it is cut rather than compared.
+/// The `host:port` of `url`, with scheme, path, query and fragment cut away. Parsing only: sameness is
+/// `same_endpoint` and map identity is `node_key`. A path can name a second node, so it is cut.
 pub fn endpoint_of(url: &str) -> &str {
     let authority = url.split_once("//").map_or(url, |(_, rest)| rest);
     authority.split(['/', '?', '#']).next().unwrap_or(authority)
 }
 
-/// Host case is insensitive per the DNS spec, so `LOCALHOST:8080` and `localhost:8080` are one
-/// node. Two spellings counted as two is `C8`'s failure: a majority over an inflated voter set is
-/// not a majority (L16). Compared rather than lowercased so this stays allocation-free -- it runs
-/// per voter per decision. What no string comparison can settle is name versus address.
+/// Host case is insensitive per the DNS spec, so `LOCALHOST:8080` and `localhost:8080` are one node --
+/// two spellings counted twice inflate a voter set (L16). Compared, not lowercased, to stay allocation-free.
 pub fn same_endpoint(a: &str, b: &str) -> bool {
     endpoint_of(a).eq_ignore_ascii_case(endpoint_of(b))
 }
 
-/// The canonical node identity: what to hash, what to key by, what to sort by. Anything that
-/// decides whether two urls name one node has to agree with `same_endpoint`, or one node spelled
-/// two ways gets two ring tokens while ownership treats it as one (IB-022).
+/// The canonical node identity: what to hash, key by and sort by. It has to agree with `same_endpoint`,
+/// or one node spelled two ways gets two ring tokens while ownership treats it as one (IB-022).
 pub fn node_key(url: &str) -> String {
     endpoint_of(url).to_ascii_lowercase()
 }
@@ -46,8 +41,7 @@ pub fn cmp_endpoint(a: &str, b: &str) -> Ordering {
 }
 
 /// One path segment of a forwarded URL. Anything outside RFC 3986 unreserved is escaped, so a key
-/// carrying `/`, `?` or `#` stays one segment instead of restructuring the request it is spliced
-/// into -- the shard would otherwise store, and the router would have hashed, different keys.
+/// carrying `/`, `?` or `#` stays one segment instead of restructuring the request it is spliced into.
 pub fn encode_path_segment(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
     for b in segment.bytes() {
@@ -149,11 +143,8 @@ pub mod base64_bytes {
         encode_with(input, STANDARD)
     }
 
-    /// `+` in a query string is a space, and a pagination cursor exists to be pasted into one
-    /// (M20). Roughly one character in 32 encodes to `+` or `/`, so most cursors carry at least
-    /// one. Kept separate from `base64_encode` rather than replacing it: the replication frame
-    /// encoding is on the wire between nodes, and changing it would break a rolling upgrade in the
-    /// direction where a new leader ships to a peer that has not restarted.
+    /// `+` in a query string is a space, and a cursor exists to be pasted into one (M20). Kept apart from
+    /// `base64_encode`, which is on the wire between nodes and cannot change under a rolling upgrade.
     pub fn base64_encode_url(input: &[u8]) -> String {
         encode_with(input, URL_SAFE)
     }
@@ -278,9 +269,8 @@ mod tests {
         assert_eq!(urls, keyed);
     }
 
-    /// M20: the standard alphabet's `+` is a space in a query string, and a cursor exists to be put
-    /// in one. Only the cursor encoding moved -- replicated frames travel in a JSON body, where
-    /// `+/` is fine, and changing that would break a rolling upgrade.
+    /// M20: the standard alphabet's `+` is a space in a query string. Only the cursor encoding moved --
+    /// replicated frames travel in a JSON body, where `+/` is fine.
     #[test]
     fn cursor_encoding_survives_a_query_string_and_still_reads_the_old_one() {
         use base64_bytes::{base64_decode, base64_encode, base64_encode_url};

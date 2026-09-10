@@ -1,10 +1,5 @@
-//! Directional link faults for cluster tests.
-//!
-//! Test-only, and deliberately so: a live switch that black-holes traffic between two nodes has no
-//! place in a shipped database. Nodes name themselves in `auth::NODE_HEADER`, the receiving node's
-//! middleware looks the pair up here, and a cut link hangs until the sender's own timeout
-//! fires -- a partition the sender sees as `Err`, which is what distinguishes it from a node that
-//! is up and refusing.
+//! Directional link faults for cluster tests, test-only by design. Nodes name themselves in
+//! `auth::NODE_HEADER` and a cut link hangs, so the sender sees the `Err` a partition gives it.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -117,9 +112,8 @@ mod cluster {
         all.iter().copied().filter(|u| !same_endpoint(u, one)).collect()
     }
 
-    /// bugs.md H10. The leader can still be *reached* -- every follower poll succeeds and every
-    /// lease promise lands -- so nothing inbound tells it anything is wrong. Only its own probes
-    /// failing can.
+    /// H10: the leader can still be reached -- every follower poll succeeds and every lease promise
+    /// lands -- so nothing inbound tells it anything is wrong. Only its own probes failing can.
     #[tokio::test]
     async fn an_asymmetric_partition_of_the_leaders_outbound_path_still_replaces_it() {
         let root = temp_root();
@@ -237,9 +231,8 @@ mod cluster {
         let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
         let slow = others(&refs, &leader_url)[0].to_string();
 
-        // Wide on purpose: the assertion below separates "did not wait" (milliseconds) from
-        // "waited" (this delay), and a threshold set at the delay itself has no room for a
-        // scheduler stall between them (bugs.md L8b).
+        // Wide on purpose: the assertion below separates "did not wait" from "waited", and a threshold
+        // at the delay itself leaves no room for a scheduler stall (L8b).
         delay(&leader_url, &slow, Duration::from_secs(6));
         let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
         let started = std::time::Instant::now();

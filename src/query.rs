@@ -15,12 +15,8 @@ pub const MAX_FILTER_DEPTH: usize = 16;
 /// Sort keys allowed in one `?sort=`. Each one costs a path lookup per comparison.
 pub const MAX_SORT_KEYS: usize = 8;
 
-/// Per-shard scan positions for an unsorted page. `Some(key)` resumes after that key, `None` is a
-/// shard the page ahead of this one had no rows to spend on, and an absent shard has been drained.
-///
-/// `ring` is the partitioning these positions were taken against. An unsorted scan walks keyspaces
-/// per shard, so a key moving between shards mid-scan puts it behind a position it was never
-/// covered by; the fingerprint is what makes that visible instead of a silently short answer.
+/// Per-shard scan positions for an unsorted page. `Some(key)` resumes after that key, `None` is a shard
+/// with no rows spent, and an absent shard is drained. `ring` is the partitioning they were taken against.
 #[derive(Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ShardCursor {
@@ -28,18 +24,14 @@ pub struct ShardCursor {
     pub positions: BTreeMap<String, Option<String>>,
 }
 
-/// Where an unsorted scan stopped on one shard: a position in that shard's keyspace. It was a bare
-/// key on the wire, which any string is a valid one of, so a sorted or router-issued cursor handed
-/// to an unsorted query was read as a start key and answered `200` with rows after whatever that
-/// string sorts as (L18). Encoded like the other two so the three are told apart rather than
-/// guessed at; `deny_unknown_fields` on all of them is what makes that work.
+/// Where an unsorted scan stopped on one shard: a position in that shard's keyspace. It was a bare key on
+/// the wire, so a foreign cursor read as a start key (L18); encoded now so the three are told apart.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyCursor {
     pub key: String,
-    /// The shard's partitioning when the position was taken: a key skipped as unowned leaves the
-    /// position behind it, so after a flip that position readmits or strands it (IB-047).
-    /// `None` predates the stamp and resumes unpinned, so a page in flight across an upgrade ends.
+    /// The shard's partitioning when the position was taken: a key skipped as unowned leaves the position
+    /// behind it (IB-047). `None` predates the stamp and resumes unpinned, ending a page across an upgrade.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ring: Option<u64>,
 }
@@ -799,9 +791,8 @@ mod tests {
         assert_eq!(ns_of(&merged), vec![9, 7, 3]);
     }
 
-    /// H8: a sorted page resumes from a position in the sort order, so rows that tie on the sort
-    /// field have to be separated by something. Without the key the merge picks a tied row
-    /// arbitrarily and the cursor built from it either repeats its twin or skips it.
+    /// H8: a sorted page resumes from a position in the sort order, so rows tying on the sort field need
+    /// the key to separate them, or the cursor built from a tied row repeats its twin or skips it.
     #[test]
     fn ties_on_the_sort_field_are_broken_by_key() {
         let asc = order("n");

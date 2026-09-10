@@ -105,9 +105,8 @@ const NODE_LOAD_TTL_SECS: u64 = 10;
 pub struct AppState {
     pub db: Option<Arc<Database>>,
     pub config: Arc<NodeConfig>,
-    /// The credential set in force, seeded from config and re-read from the config file while the
-    /// node runs. Read through `auth()`, never from `config.auth`, so a key removed from the file
-    /// stops being accepted without a restart (IB-026).
+    /// The credential set in force, seeded from config and re-read while the node runs. Read through
+    /// `auth()`, never `config.auth`, so a key removed from the file stops working without a restart.
     pub(crate) auth: Arc<RwLock<crate::auth::AuthConfig>>,
     pub client: reqwest::Client,
     /// The same credentials without a request deadline. Only the router-coordinated change stream
@@ -135,17 +134,15 @@ pub struct AppState {
     /// only thing the routing path reads -- `config.shard_map` is a bootstrap value, not an authority.
     pub cluster: Arc<RwLock<ClusterMetadata>>,
     /// Token ring for the current view. Derived, never authoritative: keyed by version so it cannot
-    /// drift from the view it came from, and rebuilt on the first lookup after a change rather than
-    /// on every request.
+    /// drift from the view it came from, and rebuilt on the first lookup after a change.
     pub ring_cache: Arc<std::sync::Mutex<RingCache>>,
     /// Progress of a handover this node is driving. Runtime only: a half-copied shard is this
     /// node's business, not a fact the cluster needs to agree on.
     pub migrations: Arc<std::sync::Mutex<MigrationRuns>>,
     /// Local mirror of the `_webhooks` registration catalogue, plus node-local delivery counters.
     pub webhooks: Arc<crate::webhook::WebhookStore>,
-    /// The barrier that holds writes still on this node. Data movement drains it -- taken and
-    /// dropped, to settle writes that decided ownership under the old view -- and a leadership
-    /// transfer holds it, because a target has to reach a tail that is not moving.
+    /// The barrier that holds writes still on this node. Data movement drains it, to settle writes that
+    /// decided ownership under the old view; a leadership transfer holds it to stop the tail moving.
     pub write_gate: Arc<tokio::sync::RwLock<()>>,
     pub campaign: Arc<tokio::sync::Mutex<()>>,
     pub election_history: Arc<tokio::sync::RwLock<()>>,
@@ -189,8 +186,7 @@ impl AppState {
     }
 
     /// Replaces the two client tiers, returning whether they moved. `internal_secret` and
-    /// `upstream_api_key` are not rotatable here: both are baked into this node's outbound clients
-    /// at boot, so changing one would leave it presenting a credential its peers no longer expect.
+    /// `upstream_api_key` are baked into this node's outbound clients at boot and are not rotatable.
     pub fn rotate_client_keys(&self, api_keys: Vec<String>, admin_keys: Vec<String>) -> bool {
         let mut held = self.auth.write().unwrap();
         if held.api_keys == api_keys && held.admin_keys == admin_keys {
@@ -212,9 +208,8 @@ impl AppState {
         self.config.role == "shard"
     }
 
-    /// Admits a write of `frames` frames. Checked before the append: the staging buffer only drains
-    /// on commit, so this is the last point where growth can still be refused. The reservation must
-    /// outlive the append -- until it stages, a frame is counted nowhere at all (IB-014).
+    /// Admits a write of `frames` frames, before the append: the staging buffer drains only on commit,
+    /// so this is the last refusal point. The reservation outlives the append (IB-014).
     pub fn admit_write(&self, collection: &str, frames: usize)
         -> Result<Option<FrameReservation>, Refusal>
     {
@@ -268,9 +263,8 @@ impl AppState {
         g.is_leader.then_some(g.term)
     }
 
-    /// Whether an append made under `term` still has leadership behind it. Both halves of a
-    /// step-down are caught: `relinquish_leadership` keeps the term and drops the claim, while
-    /// `apply_demotion` moves the term.
+    /// Whether an append made under `term` still has leadership behind it. Catches both halves of a
+    /// step-down: `relinquish_leadership` keeps the term and drops the claim, `apply_demotion` moves it.
     pub fn still_leading(&self, term: u64) -> bool {
         self.leader_term() == Some(term)
     }
@@ -343,9 +337,8 @@ impl AppState {
         }
     }
 
-    /// Whether this leader has appended to the collection in its own term. `advance` needs one
-    /// before it can commit anything a previous leader left behind, so a leader without one holds
-    /// an inherited tail it can never publish.
+    /// Whether this leader has appended to the collection in its own term. `advance` needs one before
+    /// it can commit an inherited tail, so a leader without one can never publish it.
     pub fn has_term_floor(&self, collection: &str) -> bool {
         match self.replication.as_ref() {
             Some(r) => {
@@ -369,10 +362,8 @@ impl AppState {
         }
     }
 
-    /// The voter half of a leader's lease round: how long this node goes on refusing votes, and a
-    /// record of the deadline. Never more than the ask, and never more than this node's own contact
-    /// already commits it to, so a leader cannot buy silence past the point the voter would
-    /// otherwise be free to campaign.
+    /// The voter half of a leader's lease round: how long this node refuses votes, and the deadline.
+    /// Never more than the ask, nor more than this node's own contact already commits it to.
     pub fn grant_novote(&self, asker_term: u64, asked: std::time::Duration) -> std::time::Duration {
         let repl = match self.replication.as_ref() {
             Some(r) => r,
@@ -394,13 +385,8 @@ impl AppState {
         granted
     }
 
-    /// Records what a voter granted in reply to our probe, dated from before that probe was sent.
-    /// Both ends of the interval are this node's own clock, so nothing is converted between two of
-    /// them. A grant from outside the configuration is dropped: it buys nothing, and keeping the
-    /// map to the voting set is also what bounds it.
-    ///
-    /// `term` is the term the probe went out at. A reply that outlives its term arrives after the
-    /// transition cleared the leases, and would otherwise resurrect one the transition retired.
+    /// Records what a voter granted in reply to our probe, dated from before the probe was sent, both
+    /// ends on our clock. `term` is the probe's; a reply outliving it would resurrect a retired lease.
     pub fn note_lease_grant(
         &self,
         voter: &str,
@@ -422,13 +408,8 @@ impl AppState {
         }
     }
 
-    /// Whether a majority is still promising not to vote, which is the fact a quorum read would
-    /// otherwise spend a heartbeat round establishing.
-    ///
-    /// A handover in flight answers no whatever the promises say: this node has told a voter to
-    /// stand, that voter will grant past its own promise, and nothing tells this node the promise
-    /// broke until it is asked for a vote. Reads pay the confirmation round for that window, and
-    /// that round asks the voters themselves -- which is exactly what learns of the new term.
+    /// Whether a majority still promises not to vote, which is what a quorum read would otherwise spend
+    /// a round on. A handover in flight answers no: the target will grant past its own promise.
     pub fn holds_read_lease(&self) -> bool {
         let config = self.quorum_config();
         let own = self.own_url();
@@ -461,14 +442,8 @@ impl AppState {
         }
     }
 
-    /// Whether this node would accept `from` handing its own office away: a voter answers for the
-    /// leader it is following, and a leader answers for itself. Nothing else is a leader here, so
-    /// nothing else can spend a leader's authority.
-    ///
-    /// It is what lets a transferred election past `lease::withholds_vote`, which every voter of a
-    /// healthy cluster is otherwise inside. Claiming it buys a node nothing: the only name that
-    /// passes is the leader this voter already obeys, and the vote still has to clear log freshness
-    /// and membership behind it.
+    /// Whether this node would accept `from` handing its own office away: a voter answers for the leader
+    /// it follows, a leader for itself. It is what lets a transferred election past `withholds_vote`.
     pub fn honours_transfer(&self, from: Option<&str>) -> bool {
         let (Some(from), Some(repl)) = (from, self.replication.as_ref()) else { return false };
         let own = self.own_url();
@@ -662,12 +637,8 @@ impl AppState {
         }
     }
 
-    /// The quorum every decision is taken against: the newest configuration in the config log once
-    /// that log has one, and the view-derived voting set until then. A cluster that has never
-    /// reconfigured therefore behaves exactly as it did before configuration entries existed.
-    ///
-    /// Never call while holding the replication lock: the fallback reaches the cluster view, and
-    /// `learner_replicas` takes those two the other way round.
+    /// The quorum every decision is taken against: the newest configuration in the config log, and the
+    /// view-derived voting set until there is one. Never call while holding the replication lock.
     pub fn quorum_config(&self) -> Configuration {
         if let Some(repl) = self.replication.as_ref() {
             let installed = repl.read().unwrap().configuration.clone();
@@ -697,12 +668,8 @@ impl AppState {
         true
     }
 
-    /// Re-reads the configuration in force from the config log. Every path a configuration entry
-    /// can arrive on has to call this -- a leader's own append, a replica's apply, a commit, a
-    /// snapshot install, boot -- because the entry takes effect where it lands, not where it commits.
-    ///
-    /// A log with no configuration in it never uninstalls one: a resync that has not delivered the
-    /// entry yet is indistinguishable from a group that never had it, and only one of those is safe.
+    /// Re-reads the configuration in force. Every arrival path must call it, because the entry takes
+    /// effect where it lands. A log with no configuration never uninstalls one -- a resync looks the same.
     pub fn refresh_configuration(&self) {
         let latest = self.db.as_ref()
             .and_then(|db| db.existing_collection(CONFIG_LOG))
@@ -715,10 +682,8 @@ impl AppState {
         }
     }
 
-    /// Quorum membership, this node included, derived from the view. The live view's voting shards
-    /// when it is a real view that names this node one, and config otherwise: a seed is one node's
-    /// opinion of the cluster, and a published view that forgets `voting` would otherwise strip the
-    /// quorum to nothing.
+    /// Quorum membership, this node included, derived from the view when that view is real and names
+    /// this node; config otherwise, since a seed is one node's opinion of the cluster.
     fn view_voting_set(&self) -> Vec<String> {
         let own = self.own_url();
         {
@@ -800,27 +765,14 @@ impl AppState {
         self.voting_replicas().iter().any(|v| crate::util::same_endpoint(v, url))
     }
 
-    /// Non-voting for either reason: booted that way, or named so by the view.
-    ///
-    /// The config half is what covers a node between boot and admission, when no view has arrived
-    /// and `peers` is empty -- the window in which a majority of one is otherwise reachable. It is
-    /// also why the restriction survives a restart that never reaches the leader.
+    /// Non-voting for either reason: booted that way, or named so by the view. The config half covers
+    /// the window between boot and admission, where `peers` is empty and a majority of one is reachable.
     pub fn is_learner(&self) -> bool {
         self.config.is_learner() || self.view_names_us_learner()
     }
 
-    /// Whether this node is in the quorum, which is one question and not two: standing for election
-    /// and granting a vote are the same right, and a node that has one and not the other either
-    /// cannot be elected by the set counting it or can push a candidate past a bar it is absent from.
-    ///
-    /// A configuration decides it outright when there is one, in both directions: it reached this
-    /// node through the log, which means a quorum agreed to it, and that is the authority the
-    /// config-and-view rule below was standing in for.
-    ///
-    /// Without one, admission never promotes -- a node booted as a learner stays one for this
-    /// process's life. That covers the window between boot and admission, where no view has arrived
-    /// and `peers` is empty, so a majority of one is otherwise reachable. A node in that window has
-    /// no configuration entry either, so the two rules never disagree.
+    /// Whether this node is in the quorum: standing for election and granting a vote are one right. A
+    /// configuration decides it outright; without one, admission never promotes a node booted a learner.
     pub fn in_quorum(&self) -> bool {
         let installed = self.replication.as_ref()
             .and_then(|r| r.read().unwrap().configuration.clone());
@@ -860,10 +812,8 @@ impl AppState {
         (view.partition_fingerprint(), view.shard_owners())
     }
 
-    /// Persists only what it adopted. A view refused in memory must not reach disk, or the next
-    /// boot would come up on a topology this node already rejected.
-    /// Durable before visible. Publishing first left a window in which a node served a topology it
-    /// would forget on restart, so a crash there silently rewound it to the config seed.
+    /// Persists only what it adopted, and durable before visible: a view refused in memory must not
+    /// reach disk, and a node must not serve a topology a restart would rewind to the config seed.
     pub fn adopt_cluster(&self, mut incoming: ClusterMetadata) -> Adoption {
         // Ahead of the validate and the save, not only of `adopt`: what this persists when the view
         // wins is `incoming` itself, and an unaddressable catalogue entry must not reach disk.
@@ -905,9 +855,8 @@ impl AppState {
             (outcome, moved)
         };
 
-        // What reaches disk is the merge, not what arrived, so this runs after the adoption rather
-        // than before it -- the durable-before-visible rule above covers the topology, which is
-        // the half a restart could serve wrongly.
+        // What reaches disk is the merge, not what arrived, so this runs after the adoption. The
+        // durable-before-visible rule above covers the topology, the half a restart could serve wrongly.
         if catalog_moved {
             self.persist_cluster_view();
         }
@@ -918,9 +867,8 @@ impl AppState {
         outcome
     }
 
-    /// Records an index definition as a fact about the collection rather than about this group.
-    /// Returns whether the catalogue moved. Not a topology publish: it changes no version every
-    /// other node compares against, so it needs no leader and cannot lose a routing view.
+    /// Records an index definition as a fact about the collection rather than about this group; returns
+    /// whether the catalogue moved. Not a topology publish, so it needs no leader.
     pub fn record_index_catalog(&self, collection: &str, change: &crate::storage::IndexChange) -> bool {
         let moved = {
             let mut view = self.cluster.write().unwrap();
@@ -974,22 +922,18 @@ impl AppState {
         }
     }
 
-    /// Every view adoption is a chance for a handover to have started, finished, or been abandoned.
-    /// Driving it from here rather than from the endpoint means a node that learns about a plan by
-    /// propagation participates in it exactly as if it had been told directly.
+    /// Every view adoption is a chance for a handover to have started, finished, or been abandoned, so a
+    /// node that learns of a plan by propagation participates exactly as one told directly.
     pub fn react_to_migration(&self) {
         let migration = match self.migration() {
             Some(m) => m,
-            // The plan is gone: either it landed as a new ring or it was abandoned. The record
-            // stays, because cleanup still needs the list of keys handed over -- and it checks the
-            // ring before acting, so an abandoned plan cannot be mistaken for a completed one.
-            // Writes unfreeze regardless: the freeze is read from the view, not from this record.
+            // The plan is gone: it landed as a new ring or was abandoned. The record stays, because
+            // cleanup needs the handed-over keys and checks the ring first. Writes unfreeze regardless.
             None => return,
         };
         crate::cluster::migration::ensure_running(self, &migration);
-        // Coordination resumes from here rather than from promotion alone, so a leader that learns
-        // of the plan afterwards -- by adoption, or by booting into it -- picks it up too. The
-        // rebalancer would, on its tick, but it is off by default (bugs.md L21).
+        // Coordination resumes from here, not from promotion alone, so a leader that learns of the plan
+        // afterwards picks it up too. The rebalancer would on its tick, but it is off by default.
         if self.is_leader()
             && crate::cluster::rebalance::is_coordinator(self, &self.cluster_view())
         {
@@ -997,9 +941,8 @@ impl AppState {
         }
     }
 
-    /// Points a node admitted at runtime at the primary the view assigned it. Without this it has
-    /// no one to poll, so it never hears a commit watermark and everything it is sent stays staged
-    /// and invisible -- replicated, durable, and unreadable.
+    /// Points a node admitted at runtime at the primary the view assigned it. Without this it polls
+    /// nobody, never hears a commit watermark, and holds everything it is sent staged and unreadable.
     pub fn follow_from_view(&self) {
         // Read and drop the cluster lock before touching replication: learner_replicas takes them
         // in the opposite order, and neither may hold both.
@@ -1233,11 +1176,8 @@ mod tests {
         assert!(state.admit_write("t", 1).is_ok(), "backpressure must lift once commits catch up");
     }
 
-    /// C26: this asserted the opposite, reasoning that a follower refusing replicated frames would
-    /// look like a gap to the leader. Nothing on the replication path calls `admit_write` -- a
-    /// replica's frames arrive through `replicate_handler` -- so the skip only ever reached the
-    /// four local write paths, where a non-leader is either refused at the handler or is a leader
-    /// deposed mid-write. The bound is what that node needs most, not least.
+    /// C26: nothing on the replication path calls `admit_write`, so the skip only reached the local
+    /// write paths, where a non-leader is refused at the handler or deposed mid-write.
     #[tokio::test]
     async fn a_deposed_leader_is_still_backpressured_and_zero_disables_the_bound() {
         let root = temp_root();
@@ -1256,9 +1196,8 @@ mod tests {
         assert!(unbounded.admit_write("t", 10).is_ok(), "0 opts out of the bound");
     }
 
-    /// IB-014: the bound was checked against a pre-append count and nothing was reserved, so one
-    /// bulk request appended as many frames as it liked and concurrent single writes each passed
-    /// the same sample.
+    /// IB-014: the bound was checked against a pre-append count with nothing reserved, so one bulk
+    /// request appended as many frames as it liked and concurrent writes each passed the same sample.
     #[tokio::test]
     async fn a_batch_is_admitted_as_a_whole_and_reservations_stop_concurrent_writes_sharing_a_count() {
         let root = temp_root();

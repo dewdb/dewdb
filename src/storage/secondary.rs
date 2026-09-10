@@ -1,15 +1,5 @@
-//! Secondary indexes: definitions carried by the collection's own log, postings derived from the
-//! committed index.
-//!
-//! Two halves with different durability. A definition is a `LogEntry::Index`, so it replicates,
-//! survives a leader change and rides `applied.meta` past the compaction that retires its frame --
-//! the same treatment `Config` and `Handover` get, for the same reason. The postings are derived
-//! state, rebuilt by a background walk whenever a definition appears or a collection opens, so
-//! nothing on disk can disagree with the documents it indexes.
-//!
-//! Maintenance is exact rather than best-effort: a query uses an index to *narrow* the keys it
-//! reads and then re-applies the filter, so a false positive costs a read and a false negative is
-//! a missing row. Every path that changes a key changes the postings with it.
+//! Secondary indexes: definitions travel in the collection's log like `Config` and `Handover`, and
+//! postings are derived state rebuilt on open. Maintenance is exact -- a false negative is a lost row.
 
 use crate::json::{get_path_value, json_cmp};
 use crate::query::{Condition, Filter, JsonKind, Op};
@@ -22,9 +12,8 @@ pub const MAX_INDEX_NAME_LEN: usize = 64;
 pub const MAX_FIELD_PATH_LEN: usize = 256;
 pub const MAX_FIELD_PATH_SEGMENTS: usize = 16;
 
-/// A candidate set this small is used whatever the collection's size. Without it a filter matching
-/// two of five documents would scan, which is correct but makes the planner's behaviour depend on
-/// how much unrelated data happens to sit beside them.
+/// A candidate set this small is used whatever the collection's size, so the planner's behaviour does
+/// not depend on how much unrelated data sits beside the matching documents.
 const ALWAYS_WORTH_IT: usize = 64;
 
 /// Keys read per lock acquisition while building. Same trade as `SCAN_CHUNK`: the documents are
@@ -75,9 +64,8 @@ pub fn valid_field_path(field: &str) -> bool {
         && field.split('.').all(|part| !part.is_empty() && !part.starts_with('$'))
 }
 
-/// A JSON value ordered by `json_cmp`, which is the order the query layer already compares in.
-/// Equality is defined *as* that comparison so `Ord` and `Eq` cannot disagree, which a `BTreeMap`
-/// key may not do.
+/// A JSON value ordered by `json_cmp`, the order the query layer already compares in. Equality is
+/// defined as that comparison so `Ord` and `Eq` cannot disagree, which a `BTreeMap` key may not do.
 #[derive(Clone, Debug)]
 pub struct IndexKey(pub serde_json::Value);
 
@@ -315,9 +303,8 @@ pub struct Indexes {
 }
 
 impl Indexes {
-    /// Registers the committed definitions this collection opened with. Everything starts
-    /// `Building`: the postings are derived, so a restart rebuilds them rather than trusting a
-    /// file that no fsync ordering ties to the documents.
+    /// Registers the committed definitions this collection opened with. Everything starts `Building`:
+    /// postings are derived, and no fsync ordering ties a stored one to the documents.
     pub fn seed(specs: &[IndexSpec]) -> Self {
         let mut map = BTreeMap::new();
         for spec in specs {
@@ -427,13 +414,8 @@ impl Indexes {
         }).collect()
     }
 
-    /// The narrowest single-index answer to `filter`, or `None` to scan. `total_docs` is what the
-    /// choice is measured against: a candidate set that is most of the collection costs a sorted
-    /// materialisation to save nothing.
-    ///
-    /// One index, never an intersection of several: the caller re-applies the whole filter to
-    /// every candidate, so a second index would remove reads a first one already narrowed to a
-    /// page's worth.
+    /// The narrowest single-index answer to `filter`, or `None` to scan; `total_docs` is what the choice
+    /// is measured against. One index only -- the caller re-applies the whole filter to every candidate.
     pub fn select(&self, filter: &Filter, total_docs: usize) -> Option<Selection> {
         // Sorted, because two plans of equal size must not be picked differently on two shards.
         let mut fields = filter.conjuncts();

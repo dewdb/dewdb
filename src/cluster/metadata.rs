@@ -20,9 +20,8 @@ const CLUSTER_TMP: &str = "cluster.meta.tmp";
 // decision order rather than whichever fsync returned first.
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
-/// A node the cluster knows about. Identity is `url`: config only ever names peers by address and
-/// every existing comparison in this codebase is endpoint-based. `node_id` is informational until
-/// joins carry it.
+/// A node the cluster knows about. Identity is `url`: config names peers by address and every
+/// comparison here is endpoint-based. `node_id` is informational until joins carry it.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Member {
     pub url: String,
@@ -32,8 +31,7 @@ pub struct Member {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_role: Option<String>,
     /// Counted toward election and commit quorums. Runtime-added nodes are never voting: the view
-    /// converges rather than being agreed, and a quorum computed from disagreeing views can be two
-    /// disjoint majorities. Promoting a learner needs the joint consensus of commit 44.
+    /// converges rather than being agreed, and disagreeing views can yield two disjoint majorities.
     #[serde(default)]
     pub voting: bool,
     /// For a learner, the primary whose group it is catching up with. A leader ships frames only to
@@ -48,9 +46,8 @@ pub struct Member {
 pub struct ClusterMetadata {
     pub version: u64,
     pub updated_by: String,
-    /// Derived from one node's config rather than decided by the cluster. Every node seeds at
-    /// version 1 with different content -- a router seeds a ring, a shard seeds none -- so seeds
-    /// are not comparable views and must never travel.
+    /// Derived from one node's config rather than decided by the cluster. Every node seeds at version 1
+    /// with different content, so seeds are not comparable views and must never travel.
     #[serde(default)]
     pub seeded: bool,
     #[serde(default)]
@@ -72,19 +69,12 @@ pub struct ClusterMetadata {
     pub index_catalog: IndexCatalog,
 }
 
-/// Index definitions as a fact about a *collection* rather than about the shard group that happens
-/// to hold its keys today. `LogEntry::Index` stays the durable definition inside each group; this
-/// is what a group consults to find out which ones it is missing.
-///
-/// Versioned per collection and merged rather than replaced, because it changes on a different
-/// clock from the topology. A shard handed its ring by config never adopts anyone's topology --
-/// `supersedes` refuses a seed -- and replacing the catalogue with the winning view's would mean
-/// such a node never learns a definition either.
+/// Index definitions as a fact about a collection rather than about the group holding its keys today;
+/// `LogEntry::Index` stays the durable definition. Versioned per collection and merged, not replaced.
 pub type IndexCatalog = BTreeMap<String, CollectionIndexes>;
 
-/// One collection's definitions, and how far along they are. `updated_by` is the same tiebreak
-/// `supersedes` uses, for the same reason: two nodes that changed the same collection at the same
-/// version must converge on one of the two rather than alternate.
+/// One collection's definitions, and how far along they are. `updated_by` is `supersedes`'s tiebreak:
+/// two nodes changing one collection at the same version must converge, not alternate.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct CollectionIndexes {
     pub version: u64,
@@ -100,14 +90,12 @@ impl CollectionIndexes {
     }
 }
 
-/// Ceiling on how many collections the catalogue names. It rides every cluster view, and an entry
-/// survives the collection it describes so a drop cannot be resurrected by a stale copy, so the
-/// only bound on its growth is this one.
+/// Ceiling on how many collections the catalogue names. It rides every cluster view and an entry
+/// outlives the collection it describes, so nothing else bounds its growth.
 pub const MAX_CATALOG_COLLECTIONS: usize = 4096;
 
-/// Why no node could act on this entry, or `None`. Separate from `validate` because the rules it
-/// applies tighten between releases: an entry a newer rule made unaddressable must cost the entry
-/// and not the whole view carrying it, or a rolling upgrade takes routing down (IB-035).
+/// Why no node could act on this entry, or `None`. Separate from `validate` because these rules
+/// tighten between releases: a newly unaddressable entry must cost the entry, not the view (IB-035).
 fn unaddressable_entry(collection: &str, entry: &CollectionIndexes) -> Option<String> {
     // The same gate the API puts in front of a name that becomes a directory.
     if !crate::consensus::config::valid_collection_name(collection) {
@@ -132,9 +120,8 @@ fn unaddressable_entry(collection: &str, entry: &CollectionIndexes) -> Option<St
     None
 }
 
-/// Drops the entries no node could act on, returning one reason per drop. Runs on every catalogue
-/// arriving from disk or off the wire before the view is compared or stored, so the fingerprint is
-/// computed over what the node actually holds rather than over what it was handed.
+/// Drops the entries no node could act on, returning one reason per drop. Runs before a catalogue is
+/// compared or stored, so the fingerprint covers what the node holds rather than what it was handed.
 pub fn sanitize_catalog(catalog: &mut IndexCatalog) -> Vec<String> {
     let mut dropped = Vec::new();
     catalog.retain(|collection, entry| match unaddressable_entry(collection, entry) {
@@ -185,10 +172,8 @@ pub enum MigrationPhase {
     Finalizing,
 }
 
-/// The three fields the total order over views is computed from. A heartbeat advertises this
-/// rather than the version alone: a poller gated on `version >` will not fetch a peer whose view
-/// wins the `updated_by` tiebreak at the same version, so two nodes that published concurrently
-/// during a partition stayed split with no poll that would ever repair it (IB-023).
+/// The three fields the total order over views is computed from. A heartbeat advertises all three: a
+/// poller gated on `version >` would never fetch a peer that wins the tiebreak at equal version.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ViewId {
     pub version: u64,
@@ -282,11 +267,8 @@ impl ClusterMetadata {
         }
     }
 
-    /// Total order over views, so every node converges on the same one.
-    ///
-    /// The `updated_by` tiebreak makes equal versions converge instead of splitting the cluster's
-    /// routing view, which is the failure that actually loses writes. It does so by discarding one
-    /// of two concurrent updates: nothing here makes concurrent updates safe, only deterministic.
+    /// Total order over views, so every node converges on the same one. The `updated_by` tiebreak makes
+    /// equal versions converge by discarding one update -- deterministic, not safe.
     pub fn supersedes(&self, other: &Self) -> bool {
         self.view_id().supersedes(&other.view_id())
     }
@@ -325,9 +307,8 @@ impl ClusterMetadata {
         Ok(())
     }
 
-    /// `Ok(None)` is a node that has never been seeded. Unreadable is an error: falling back to a
-    /// config-derived map would route keys by a topology the cluster has already moved past.
-    /// Deleting the file is the documented way to force a re-seed from config.
+    /// `Ok(None)` is a node that has never been seeded; unreadable is an error, since a config-derived
+    /// map would route by a topology the cluster has moved past. Delete the file to force a re-seed.
     pub fn load(data_dir: &str) -> io::Result<Option<Self>> {
         let dir = Path::new(data_dir);
         let mut corrupt: Option<(String, String)> = None;
@@ -406,9 +387,8 @@ impl ClusterMetadata {
             .collect()
     }
 
-    /// True only for a node that is present and explicitly non-voting. An unknown node is not a
-    /// learner: a node missing from the view must keep behaving as its config says, or a view that
-    /// has not reached it yet would silently strip its vote.
+    /// True only for a node that is present and explicitly non-voting. An unknown node is not a learner,
+    /// or a view that has not reached it yet would silently strip its vote.
     pub fn is_learner(&self, url: &str) -> bool {
         self.member(url).map_or(false, |m| !m.voting && m.role == "shard")
     }
@@ -437,9 +417,8 @@ impl ClusterMetadata {
         self.seeded = false;
     }
 
-    /// Fingerprint of what maps a key to an owner: the ranges and the endpoints owning them, plus
-    /// the target of a migration in flight, since that moves keys too. Replicas are deliberately
-    /// out of it — one joining or leaving moves no key, and a scan must not be disturbed by it.
+    /// Fingerprint of what maps a key to an owner: the ranges, the endpoints owning them, and the target
+    /// of a migration in flight. Replicas are out of it -- one joining or leaving moves no key.
     pub fn partition_fingerprint(&self) -> u64 {
         let mut parts: Vec<String> = match &self.ring {
             // Vnode tokens come from `node_key` and index alone, so the owning set fixes the mapping.
@@ -484,13 +463,8 @@ impl ClusterMetadata {
         self.ring.is_some() || !self.shards.is_empty()
     }
 
-    /// The nodes sharing a shard group with `url`, `url` included. `members` is one flat list
-    /// across every group and `Member` carries no shard affinity, so the ring (or the legacy shard
-    /// map) is the only record of who belongs with whom.
-    ///
-    /// `None` when nothing in force names this node: either no groups are recorded, or one is and
-    /// this node is outside all of them. The two cases are different and `groups_known` tells them
-    /// apart -- callers must not treat the second as licence to fall back to the whole cluster.
+    /// The nodes sharing a shard group with `url`, `url` included; the ring is the only record of who
+    /// belongs with whom. `None` covers two cases that `groups_known` tells apart.
     pub fn shard_group(&self, url: &str) -> Option<Vec<String>> {
         let groups = self.shard_owners();
         let names = |group: &(String, Vec<String>), who: &str| {
@@ -528,13 +502,8 @@ impl ClusterMetadata {
         next
     }
 
-    /// Records `change` against this collection's entry. Returns whether anything moved: a create
-    /// naming a definition already there is not a version, or the fan-out that reaches every group
-    /// would bump one per group for a single client request.
-    ///
-    /// Deliberately not a `bump`: the topology version is a decision about routing, and a schema
-    /// change is not one. Bumping it would make a shard's seeded view outrank a router's seeded
-    /// ring and route every key nowhere.
+    /// Records `change` against this collection's entry, returning whether anything moved. Not a `bump`:
+    /// the topology version is a routing decision, and a seeded view outranking a router's routes nowhere.
     pub fn record_index_change(&mut self, by: &str, collection: &str, change: &IndexChange) -> bool {
         let current = self.index_catalog.get(collection);
         let mut indexes = current.map(|e| e.indexes.clone()).unwrap_or_default();
@@ -542,9 +511,8 @@ impl ClusterMetadata {
         if current.is_some_and(|e| e.indexes == indexes) {
             return false;
         }
-        // A drop naming an index of a collection the catalogue has never recorded changes nothing,
-        // and an entry would say more than that: an empty entry licenses reconciliation to remove
-        // whatever a group holds, and silence must not turn into that by way of a stray request.
+        // A drop naming an index of an unrecorded collection changes nothing, and an empty entry would
+        // say more: it licenses reconciliation to remove whatever a group holds.
         if current.is_none() && indexes.is_empty() {
             return false;
         }
@@ -587,8 +555,7 @@ impl ClusterMetadata {
     }
 
     /// The size bound only. Per-entry shape belongs to `unaddressable_entry`, which drops the entry
-    /// rather than failing the document; how many entries ride every view is a fact about the
-    /// document and has no per-entry answer.
+    /// rather than failing the document.
     fn validate_catalog(&self) -> Result<(), String> {
         if self.index_catalog.len() > MAX_CATALOG_COLLECTIONS {
             return Err(format!("index catalogue names more than {} collections",
@@ -632,9 +599,8 @@ pub fn adopt(current: &mut ClusterMetadata, mut incoming: ClusterMetadata) -> Ad
     if let Err(why) = incoming.validate() {
         return Adoption::Rejected(why);
     }
-    // Merged before the topology decision and kept across it, in both directions. The catalogue is
-    // versioned per collection, so a view that loses on topology can still carry a definition this
-    // node lacks -- and one that wins must not take away the definitions this node already had.
+    // Merged before the topology decision and kept across it, both ways: a view that loses on topology
+    // can still carry a definition this node lacks, and a winner must not take away the ones it has.
     let mut catalog = current.index_catalog.clone();
     merge_catalog(&mut catalog, &incoming.index_catalog);
 
@@ -720,12 +686,8 @@ pub fn plan_join(current: &ClusterMetadata, by: &str, leader_url: &str, req: &Jo
     next.validate().map(|_| next).map_err(|e| e)
 }
 
-/// The view caught up with a committed configuration. Descriptive, not decisive: the log is what
-/// moved the quorum, and this only records where it moved to, so a node that has not adopted the
-/// view yet is behind on routing rather than voting against the change.
-///
-/// A demoted node stays a member as a learner rather than being dropped. It keeps receiving frames,
-/// and `in_quorum` reads the view when no configuration entry has reached the node yet.
+/// The view caught up with a committed configuration. Descriptive, not decisive -- the log moved the
+/// quorum. A demoted node stays a member as a learner rather than being dropped.
 pub fn plan_configuration(
     current: &ClusterMetadata,
     by: &str,

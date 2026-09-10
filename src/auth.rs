@@ -87,9 +87,8 @@ fn presented_api_key<'a>(api_key_header: Option<&'a str>, authorization: Option<
     authorization.and_then(|a| a.strip_prefix("Bearer ")).map(|k| k.trim())
 }
 
-/// Topology, collection destruction, and index definitions. Segments are counted before
-/// percent-decoding, the way axum routes them, so an encoded slash cannot make a drop look like a
-/// document delete.
+/// Topology, collection destruction, and index definitions. Segments are counted before percent-decoding,
+/// the way axum routes them, so an encoded slash cannot make a drop look like a document delete.
 fn is_admin_route(path: &str, method: &str) -> bool {
     if path == "/cluster" || path.starts_with("/cluster/") {
         return true;
@@ -232,9 +231,8 @@ impl Credential {
     }
 }
 
-/// Whether a subject registered under `digest` is still admitted on `route`. The key itself was
-/// never written down, so the question is whether one the node holds now hashes to it and clears
-/// the same gate.
+/// Whether a subject registered under `digest` is still admitted on `route`. The key itself was never
+/// written down, so the question is whether one the node holds now hashes to it.
 pub fn digest_admitted(
     cfg: &AuthConfig,
     digest: Option<&str>,
@@ -474,9 +472,8 @@ mod tests {
             AuthOutcome::Allow, "an operator must not need a second credential to read what it drops");
     }
 
-    /// IB-026: a subject that outlives the request that created it -- a change stream, a webhook
-    /// registration -- is judged against the keys the node holds now, from a digest, because the
-    /// key itself is never kept.
+    /// IB-026: a subject that outlives the request that created it is judged against the keys the node
+    /// holds now, from a digest, because the key itself is never kept.
     #[test]
     fn a_digest_is_admitted_only_while_a_held_key_still_hashes_to_it() {
         let route = "/collections/c/webhooks";

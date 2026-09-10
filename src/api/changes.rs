@@ -126,18 +126,16 @@ pub(crate) fn open_shard_session(
     Ok(CdcSession::new(col_name, CdcStream::new(sub, filter, leader_only)))
 }
 
-/// A cluster-wide stream is served by each group's leader, so it has no replica preference to
-/// offer: a group's feed lags on a replica, and its positions are only honourable by a node whose
-/// log the group agrees on.
+/// A cluster-wide stream is served by each group's leader, so it has no replica preference to offer:
+/// a group's feed lags on a replica, and its positions bind only a node whose log the group agrees on.
 pub(crate) fn router_rejects_replica_reads(pref: &ReadPreference) -> Option<axum::response::Response> {
     matches!(pref, ReadPreference::Replica).then(|| err_json(StatusCode::BAD_REQUEST,
         "a cluster-wide change stream is served by each group's leader; drop `read=replica`"
             .to_string()))
 }
 
-/// Everything both transports do before they start rendering frames: the request is parsed, the
-/// feed is opened on whichever side of the cluster this node sits on, and the credential that
-/// cleared the gate rides along so the connection can be judged again while it runs.
+/// Everything both transports do before rendering frames. The credential that cleared the gate rides
+/// along, so a long-lived connection can be judged again while it runs.
 pub(crate) async fn open_change_stream(
     state: &AppState,
     col_name: String,
@@ -368,9 +366,8 @@ mod tests {
         assert_eq!(changes(&c, &router.url(), "").await.status(), StatusCode::OK);
     }
 
-    /// IB-026: the same holds for the credential. A stream was authorized when it opened and never
-    /// again, so a key removed from the node's set kept reading the collection's writes until the
-    /// process restarted or the peer went away.
+    /// IB-026: a stream was authorized when it opened and never again, so a key removed from the node's
+    /// set kept reading the collection's writes until the process restarted.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_stream_ends_when_the_key_it_opened_with_stops_being_accepted() {
         let root = temp_root();
@@ -404,9 +401,8 @@ mod tests {
             StatusCode::OK, "a key that is still held is untouched");
     }
 
-    /// A stream is one request that keeps answering, so `read=primary` is a promise it has to keep
-    /// past the moment it was checked. Ended in-band with the position, because a stepped-down
-    /// leader publishes nothing further and silence is indistinguishable from a quiet collection.
+    /// A stream is one request that keeps answering, so `read=primary` is a promise it keeps past the
+    /// check. Ended in-band, because a stepped-down leader's silence looks like a quiet collection.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_leader_only_stream_ends_when_the_node_stops_leading() {
         use crate::test_support::{hand_over_leadership, leaders, three_node_cluster, wait_for};

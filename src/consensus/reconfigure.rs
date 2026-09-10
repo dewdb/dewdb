@@ -1,9 +1,5 @@
-//! Membership changes as two log entries: the joint configuration, then the target.
-//!
-//! Raft §6. The joint entry names both voting sets and is in force from the moment it is appended,
-//! so between it and the target every decision needs a majority of each half. That overlap is what
-//! makes the change safe: there is no instant at which the leaving half and the joining half can
-//! each reach a majority on their own, which is what a one-shot swap of the voter list allows.
+//! Membership changes as two log entries: the joint configuration, then the target. The joint entry
+//! is in force from the moment it is appended, so every decision needs a majority of each half.
 
 use crate::consensus::config::CONFIG_LOG;
 use crate::consensus::transfer;
@@ -190,12 +186,8 @@ async fn append_and_commit(state: &AppState, config: Configuration, term: u64) -
     Ok(lsn)
 }
 
-/// A change that removes this node. Raft allows the leader to append it and requires it to step
-/// down once the target commits -- on a log this node would by then have no standing to replicate.
-/// So leadership moves first, to a voter the change keeps, and the change follows it there.
-///
-/// Nothing is appended either way, so a failure leaves the caller exactly where the refusal used to:
-/// still leading, with the same request to send somewhere else (bugs.md C21).
+/// A change that removes this node: leadership moves first, to a voter the change keeps, since this
+/// node could not replicate the log the target commits on. Nothing is appended, so failure is inert.
 async fn hand_over_first(state: &AppState, next: &[String]) -> Result<Configuration, ChangeError> {
     let eligible = transfer::eligible_targets(state, next);
     let Some(target) = transfer::best_target(state, &eligible) else {
@@ -212,9 +204,8 @@ async fn hand_over_first(state: &AppState, next: &[String]) -> Result<Configurat
     }
 }
 
-/// Moves the voting set to `next`. On `Stalled` the joint entry may be in the log and in force;
-/// that is a legal state to be in, and the next leader completes it from the log rather than
-/// rolling it back.
+/// Moves the voting set to `next`. On `Stalled` the joint entry may be in the log and in force; the
+/// next leader completes it from the log rather than rolling it back.
 pub async fn change_membership(
     state: &AppState,
     next: Vec<String>,
@@ -269,14 +260,8 @@ async fn change_membership_locked(
     }
 }
 
-/// A leader that inherits a committed joint configuration finishes the change. Left alone the group
-/// goes on needing a majority of each half indefinitely, which is availability the change was only
-/// ever meant to cost for the length of one round trip -- and the leader that would have ended it
-/// is the one that died.
-///
-/// Gated on the joint entry being *committed*: appending the target above an uncommitted joint entry
-/// would let a majority of the incoming half alone commit both, which is the hole joint consensus
-/// exists to close.
+/// A leader that inherits a committed joint configuration finishes the change; left alone the group
+/// keeps needing a majority of each half. Gated on committed, else the incoming half commits both.
 pub fn resume_change(state: &AppState) {
     let state = state.clone();
     let term = state.current_term();

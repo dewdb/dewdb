@@ -1,8 +1,5 @@
-//! Read/write benchmarks. Not part of the suite; each is `#[ignore]`d and run explicitly:
-//! `cargo test --release -- --ignored --nocapture bench`
-//!
-//! Every scenario is sampled several times and reported by median. A single run on a loopback
-//! cluster varies by more than most of the effects being measured, so one number proves nothing.
+//! Read/write benchmarks. Not part of the suite; each is `#[ignore]`d and run explicitly with
+//! `cargo test --release -- --ignored --nocapture bench`. Sampled several times, reported by median.
 
 use crate::test_support::{
     cleanup, get_raw, put_doc_at, put_value, sharded_cluster, single_node, temp_root,

@@ -28,9 +28,8 @@ const REPLICATION_BATCH_BYTES: usize = MAX_FRAME_SIZE as usize;
 const DRIVE_MISSES_BEFORE_BACKOFF: u32 = 2;
 const DRIVE_BACKOFF_SHIFT_CAP: u32 = 4;
 
-/// Per `(replica, collection)`, not per replica: collections are independent logs, and one lock
-/// for all of them means every repair but one returns immediately having done nothing.
-/// Prefixed because `repair_locks` is shared with `snapshot-install:` and `migration-reset:`.
+/// Per `(replica, collection)`, not per replica: one lock for independent logs means every repair but
+/// one returns having done nothing. Prefixed -- `repair_locks` is shared with the install paths.
 fn repair_lock(state: &AppState, replica_url: &str, collection: &str) -> Arc<tokio::sync::Mutex<()>> {
     let key = format!("repair:{}|{}", replica_url, collection);
     let mut locks = state.repair_locks.lock().unwrap();
@@ -164,11 +163,8 @@ pub fn replicate_to_peers(
     });
 }
 
-/// Replication was previously only ever started by a write, so a send that failed was never retried
-/// and an idle cluster left a lagging replica lagging forever. This makes progress the leader's
-/// standing job instead of a side effect of client traffic.
-///
-/// Safe to fire repeatedly: repair coalesces to one worker per replica and re-checks the tail.
+/// Makes progress the leader's standing job rather than a side effect of client traffic; an idle
+/// cluster used to leave a lagging replica lagging. Safe to fire repeatedly: repair coalesces.
 pub fn replication_drive_task(state: AppState) {
     let interval = Duration::from_millis(state.config.flow_control.drive_interval_ms.max(50));
     tokio::spawn(async move {
@@ -261,11 +257,7 @@ pub fn replication_drive_task(state: AppState) {
 }
 
 /// Drives one replica to this leader's tail on every collection, and reports whether it got there.
-/// What a leadership transfer needs before it hands over: a target short of the tail loses the
-/// election it is told to run, because every voter holding the missing frame refuses it.
-///
-/// One pass. The caller repeats it against a deadline, and holds the write gate while it does, or
-/// the tail moves out from under each pass.
+/// One pass -- the caller repeats it against a deadline, holding the write gate so the tail is still.
 pub(crate) async fn catch_up_replica(state: &AppState, replica: &str) -> bool {
     let Some(db) = state.db.as_ref().cloned() else { return false };
     let mut caught_up = true;
@@ -338,14 +330,8 @@ async fn trigger_resync(state: &AppState, replica_url: &str, collection: &str) -
     }
 }
 
-/// Asks a replica to confirm it holds our tail, by re-sending the tail frame. A leader with nothing
-/// left to send has no other way to learn where a replica is: `matched` is cleared at promotion and
-/// a snapshot install moves a replica without any ack, so the leader can hold a tail a majority
-/// already has and never be able to prove it -- which leaves it uncommitted, and an acknowledged
-/// write invisible on the node that acknowledged it (bugs.md C30).
-///
-/// A `duplicate` is the confirmation. The receiver only answers that after checking the term at
-/// that LSN, so it is evidence about our frame and not merely about its own log length.
+/// Asks a replica to confirm it holds our tail by re-sending it: `matched` is cleared at promotion and
+/// a snapshot install acks nothing, so a leader can hold a committed tail it cannot prove (C30).
 async fn confirm_tail(state: &AppState, replica_url: &str, collection: &str) -> bool {
     let db = match state.db.as_ref() {
         Some(d) => d.clone(),
@@ -435,15 +421,8 @@ async fn confirm_tail(state: &AppState, replica_url: &str, collection: &str) -> 
 // collection under sustained load cannot pin the task and the lock indefinitely.
 const REPAIR_PASSES: usize = 8;
 
-/// At most one repairer per replica: a second would re-read the same range and duplicate the work,
-/// which is what turned a single backlog into one request per queued write. Callers that find one
-/// running return false and rely on the holder, which re-checks the tail before it exits.
-///
-/// `reported_last_term` is `Some` only when the replica told us its tail term, and then the chain is
-/// validated against it so a divergent tail is caught here. `None` means we are driving from our own
-/// cursor, where the predecessor term comes from our own next frame's header.
-///
-/// Returns whether the replica reached `needed_lsn` — its ack for that frame; 0 when discarded.
+/// At most one repairer per replica; callers that find one running return false and rely on the holder,
+/// which re-checks the tail before it exits. Returns whether the replica reached `needed_lsn`.
 async fn repair_replica(
     state: AppState,
     replica_url: String,
@@ -455,15 +434,11 @@ async fn repair_replica(
     let lock = repair_lock(&state, &replica_url, &collection);
     let _guard = match lock.try_lock() {
         Ok(g) => g,
-        // Coalesced behind a repair already running for this replica and collection. A caller with
-        // no LSN to answer about -- gap, divergence, the periodic driver -- wanted the work done,
-        // and it is being done, so it leaves. Waiting here for an answer nobody reads serialises
-        // every frame of a bulk write behind a full repair pass (bugs.md H12).
+        // Coalesced behind a running repair. A caller with no LSN to answer about wanted the work done,
+        // and waiting here would serialise every frame of a bulk write behind a full pass (H12).
         Err(_) if needed_lsn == 0 => return false,
-        // A write concern does need the answer, and the running repair's frames are usually its
-        // frames too: reporting a miss without waiting fails a write a majority holds (H11). But
-        // a repair that read its target before this frame was appended never carried it, so if it
-        // came back short we keep the lock we just took and do the work ourselves.
+        // A write concern does need the answer, and reporting a miss without waiting fails a write a
+        // majority holds (H11). A repair that read its target too early never carried this frame.
         Err(_) => {
             let queued = lock.lock().await;
             if state.matched_lsn(&replica_url, &collection) >= needed_lsn {
@@ -670,12 +645,8 @@ async fn stream_chain_once(
     Some(prev)
 }
 
-/// Leader-driven: a cursor short of this frame's predecessor means the replica is behind, and
-/// sending only the newest frame would buy nothing but a rejection. Streaming from the cursor
-/// instead is what makes repair planned rather than a reaction to the replica's complaint.
-///
-/// `Some(caught_up)` means the backlog was handled here; `None` means send the frame normally.
-/// Both send paths route through this, or one of them silently reverts to reactive repair.
+/// Leader-driven: a cursor short of this frame's predecessor means the replica is behind, so stream
+/// from the cursor. `Some(caught_up)` handled it here; `None` means send the frame normally.
 async fn stream_backlog_if_behind(
     state: &AppState,
     replica_url: &str,
@@ -793,9 +764,8 @@ pub async fn replicate_and_await(
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Option<String>>(replicas.len());
     for replica_url in replicas {
-        // Learners are shipped the frame on the same path but report nothing: they hold the data
-        // and can be promoted later, yet counting them would let a write concern be met by nodes
-        // outside the quorum, and a leader elected without them would not have their entries.
+        // Learners are shipped the frame but report nothing: counting them would let a write concern
+        // be met by nodes outside the quorum, and an election without them would lose their entries.
         let counts = state.is_voting_replica(&replica_url);
         let state = state.clone();
         let col = collection.clone();
@@ -1230,9 +1200,8 @@ mod tests {
         assert_eq!(two_lsns, vec![3, 4], "a replica already at lsn 2 can still backfill");
     }
 
-    /// M15, and the other side of the test above: the same overwrites, the same replica three
-    /// frames behind, and a retention floor at its position. Nothing it needs is destroyed, so the
-    /// repair streams frames instead of escalating to a full-collection snapshot.
+    /// M15, the other side of the test above: a replica three frames behind with a retention floor at
+    /// its position. Nothing it needs is destroyed, so the repair streams frames instead of snapshotting.
     #[tokio::test]
     async fn a_retained_tail_keeps_the_chain_a_replica_repairs_over() {
         let root = temp_root();
@@ -1491,12 +1460,8 @@ mod tests {
              document arrives only if a client writes to that collection again");
     }
 
-    /// C30: a snapshot install carries the leader's log to a replica and produces no ack, so the
-    /// leader was left with `matched = 0` for a node holding everything -- and with the send cursor
-    /// still below the range compaction had retired, every drive tick read the same hole and
-    /// escalated the same snapshot again (21 of them in one soak run). On an idle cluster nothing
-    /// then advanced the commit index, so the leader's own tail stayed staged and writes it had
-    /// acknowledged at `w=majority` read back missing on it.
+    /// C30: a snapshot install produces no ack, so the leader held `matched = 0` for a node holding
+    /// everything and re-escalated the same snapshot every tick, leaving its own tail staged.
     #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
     async fn a_snapshot_install_leaves_the_leader_a_position_it_can_count() {
         let root = temp_root();
@@ -1530,10 +1495,8 @@ mod tests {
              its own tail {}", n3.url(), leader.matched_lsn(&n3.url(), "t"), tail);
     }
 
-    /// bugs.md H11, found by the churn soak: concurrent writes to one collection all take the
-    /// repair path, because each one's send cursor still sits behind its own predecessor. All but
-    /// the first coalesced onto the running repair and reported a miss, so a frame a majority held
-    /// came back 202 after the full wtimeout.
+    /// H11: concurrent writes to one collection all take the repair path, each cursor behind its own
+    /// predecessor. All but the first coalesced and reported a miss, so a held frame came back 202.
     #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
     async fn concurrent_writes_are_not_reported_as_missing_a_quorum_that_held() {
         let root = temp_root();

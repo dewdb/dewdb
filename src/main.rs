@@ -96,14 +96,8 @@ fn load_cluster_view(config: &NodeConfig) -> ClusterMetadata {
 /// this is a bound on noticing one rather than something a request waits on.
 const AUTH_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Re-reads `auth.api_keys` and `auth.admin_keys` from the config file when the file changes, so
-/// removing a compromised key takes effect on this node -- and ends the change streams and webhook
-/// subscriptions opened under it -- without a restart (IB-026). Nothing else in the file is
-/// re-read: the cluster view is durable and every other field is wired into a task at boot.
-///
-/// `internal_secret` and `upstream_api_key` are deliberately not rotatable here. Both are baked
-/// into this node's outbound clients at boot, so taking a new one would leave it presenting a
-/// credential its peers no longer expect.
+/// Re-reads `auth.api_keys` and `auth.admin_keys` when the config file changes, ending the streams and
+/// subscriptions opened under a removed key (IB-026). Nothing else in the file is re-read.
 fn auth_reload_task(state: AppState, path: String) {
     tokio::spawn(async move {
         let mut seen = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
@@ -370,9 +364,8 @@ mod tests {
     use super::reload_auth;
     use std::fs;
 
-    /// The reload is the only live half of `auth`, and it has to be exact about which fields it
-    /// takes: a file that names a new `internal_secret` must not be read as one, and a file that
-    /// cannot be parsed must not be read as an empty key set.
+    /// The reload is the only live half of `auth` and has to be exact about which fields it takes: a new
+    /// `internal_secret` must not be read as one, and an unparseable file must not read as no keys.
     #[test]
     fn a_credential_reload_takes_the_client_tiers_and_refuses_a_file_it_cannot_trust() {
         let dir = std::env::temp_dir().join(format!("dew-auth-reload-{}", std::process::id()));

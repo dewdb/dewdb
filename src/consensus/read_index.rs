@@ -35,17 +35,14 @@ impl ReadRefusal {
     }
 }
 
-/// Whether the leader has committed an entry of its own term for this collection. Raft §6.4: until
-/// it has, `commitIndex` can sit below entries a previous leader committed and this node holds
-/// staged, so a read at that index would miss them. An empty staging buffer says the same thing
-/// another way -- everything durable here is already applied.
+/// Whether the leader has committed an entry of its own term for this collection. Until then
+/// `commitIndex` can sit below entries a previous leader committed and this node holds staged.
 fn index_is_complete(state: &AppState, collection: &str, col: &Collection) -> bool {
     col.pending_len() == 0 || state.has_current_term_commit(collection)
 }
 
-/// One round of heartbeats, counted by identity. A voter reporting a term at or below ours has not
-/// moved to a higher one, and a leader elected above ours would have needed a majority to do so --
-/// two majorities intersect, so a majority answering at our term rules that out.
+/// One round of heartbeats, counted by identity. A leader elected above our term needed a majority,
+/// and two majorities intersect, so a majority answering at our term rules one out.
 async fn confirm_with_quorum(state: &AppState) -> Result<(), ReadRefusal> {
     let config = state.quorum_config();
     let own = state.own_url();
@@ -121,10 +118,8 @@ async fn wait_for_applied(col: &Arc<Collection>, index: u64) -> Result<(), ReadR
     Ok(())
 }
 
-/// Establishes the point a linearizable read may be answered at, and returns it once local state
-/// has caught up to it. The order is Raft's and none of it is optional: the index is sampled before
-/// leadership is confirmed so a write landing during a round cannot be required, the confirmation
-/// rules out a newer leader, and the wait makes the index readable and not merely known.
+/// Establishes the point a linearizable read may be answered at, then waits for local state to reach
+/// it. Order is Raft's: sample the index before confirming leadership, then wait.
 pub async fn read_index(state: &AppState, collection: &str) -> Result<u64, ReadRefusal> {
     if !state.is_leader() {
         return Err(ReadRefusal::NotLeader);
@@ -209,9 +204,8 @@ mod tests {
         leader.kill();
     }
 
-    /// Raft §6.4's first step. Staged entries with nothing of this term committed means the commit
-    /// index is a floor, not the answer -- a read there would miss what a previous leader committed
-    /// and this node has not published yet. C17's promotion barrier is what clears it.
+    /// Staged entries with nothing of this term committed means the commit index is a floor, not the
+    /// answer -- a read there would miss what a previous leader committed. C17's barrier clears it.
     #[tokio::test]
     async fn a_leader_with_an_unpublished_tail_refuses_until_its_own_term_commits() {
         let root = temp_root();

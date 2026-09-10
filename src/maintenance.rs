@@ -61,21 +61,16 @@ impl MaintenanceConfig {
     }
 }
 
-/// Compaction drops superseded frames, which breaks a replica's chain and forces the leader into a
-/// full snapshot resync on the next repair. Leader-only, on both this path and `/compact`.
-/// A mostly-dead but tiny log is not worth rewriting, so the ratio and the floor must both hold.
+/// Compaction breaks a replica's chain and forces a full snapshot resync on the next repair, so this is
+/// leader-only. A mostly-dead but tiny log is not worth rewriting: the ratio and the floor both hold.
 fn should_compact(usage: &SpaceUsage, cfg: &MaintenanceConfig, is_leader: bool) -> bool {
     is_leader
         && usage.total_bytes >= cfg.compaction_min_wal_bytes
         && usage.dead_ratio() >= cfg.compaction_dead_ratio
 }
 
-/// What a compaction of this collection must not destroy: the frames the furthest-behind
-/// replication target still needs. A target this node has heard nothing from for the collection
-/// counts as needing everything, which `max_bytes` is what bounds.
-///
-/// `min_reclaim_bytes` is the scheduler's guard and not an operator's: `/compact` asks for the
-/// space back and gets the rewrite whether or not the tail leaves much to reclaim.
+/// What a compaction of this collection must not destroy: the frames the furthest-behind target needs,
+/// bounded by `max_bytes`. `min_reclaim_bytes` is the scheduler's guard only -- `/compact` always runs.
 pub fn retention_for(state: &AppState, collection: &str, cfg: &MaintenanceConfig, scheduled: bool)
     -> Retention
 {

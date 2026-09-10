@@ -1,8 +1,5 @@
-//! Secondary index administration.
-//!
-//! A definition is a replicated log entry, so these take `?w=` and answer the way a write does: a
-//! `202` is a definition that is durable and staged but not yet agreed, and a later leader can
-//! still revoke it.
+//! Secondary index administration. A definition is a replicated log entry, so these take `?w=` and
+//! answer as a write does: `202` is durable and staged but not agreed, and a later leader can revoke it.
 
 use crate::api::middleware::{client_collection, CollectionPath};
 use crate::api::write::local_index_change;
@@ -61,11 +58,8 @@ pub async fn create_index(
         let body = serde_json::json!({"name": payload.name, "field": payload.field});
         let reply = router_fanout_index(
             &state, &col_name, "/indexes", true, Some(body), &params).await;
-        // A group that answered `404` holds none of the collection and so has no definition, and a
-        // group that failed has none either. Both are what the catalogue is for, so it is recorded
-        // for anything but the collection being nowhere -- reconciliation finishes the fan-out.
-        // A group that only staged its definition (`202`) is the same case: the entry is durable
-        // but revocable, and the catalogue is what puts it back if a later leader drops it.
+        // Recorded for anything but a `404`: a group that failed, or only staged its definition, is what
+        // the catalogue is for, and reconciliation finishes the fan-out from it.
         if reply.status() != StatusCode::NOT_FOUND {
             state.record_index_catalog(&col_name, &IndexChange::Create {
                 spec: IndexSpec { name: payload.name.clone(), field: payload.field.clone() },
@@ -124,9 +118,8 @@ pub async fn create_index(
     let change = IndexChange::Create {
         spec: IndexSpec { name: payload.name.clone(), field: payload.field.clone() },
     };
-    // Recorded before it is appended, so reconciliation can only ever be behind the catalogue and
-    // never ahead of it. The other order leaves a window where this group holds a definition the
-    // catalogue does not, which is exactly what a dropped index looks like.
+    // Recorded before it is appended, so reconciliation is only ever behind the catalogue. The other
+    // order leaves this group holding a definition the catalogue does not -- a dropped index's shape.
     state.record_index_catalog(&col_name, &change);
 
     if already.is_some() {
@@ -201,7 +194,7 @@ pub async fn drop_index(
     state.record_index_catalog(&col_name, &change);
 
     // Nothing to log, the way dropping an absent collection writes nothing: an entry here would
-    // define an index in order to remove it.
+    // define an index only to remove it.
     if !existed {
         return (StatusCode::OK, Json(serde_json::json!({
             "collection": col_name,
@@ -463,11 +456,8 @@ mod tests {
         cleanup(&root).await;
     }
 
-    /// IB-038: `router_fanout_index` counted every status below 300 as committed, so a definition
-    /// the owner could only stage read as a top-level `200` and a client asking for `majority` had
-    /// no way to tell the two apart. The same grading IB-020 fixed for a collection drop, on the
-    /// second copy of the rule. The `201` half is the same fan-out answering for a create that
-    /// every group did commit.
+    /// IB-038: `router_fanout_index` counted every status below 300 as committed, so a client asking for
+    /// `majority` could not tell a staged definition from an agreed one. The `201` half is a real create.
     #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
     async fn a_router_reports_a_staged_definition_as_accepted_not_ok() {
         let root = temp_root();

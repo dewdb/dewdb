@@ -16,10 +16,8 @@ const WAL_ROTATION_LIMIT: u64 = 50 * 1024 * 1024;
 const DRAIN_ATTEMPTS: usize = 5;
 const CUT_FILENAME: &str = "wal.cut";
 
-/// A truncation that has been decided and is not yet known to be finished on disk. Written before
-/// the first byte moves and removed only once every doomed frame is gone, so a failure part-way --
-/// in this process or across a crash -- leaves a cut that can be re-applied rather than a tail
-/// nothing can identify. Idempotent: re-applying it empties files already emptied.
+/// A truncation decided and not yet known finished on disk. Written before the first byte moves and
+/// removed once every doomed frame is gone, so a failure part-way leaves a re-appliable cut.
 #[derive(Clone, Copy)]
 pub struct WalCut {
     pub wal_id: u64,
@@ -202,6 +200,7 @@ impl Collection {
             if let Ok(entry) = serde_json::from_slice::<LogEntry>(&payload) {
                 if lsn > applied_through {
                     // Uncommitted at the last shutdown: keep it durable but unpublished.
+                    let migration = entry.is_migration();
                     let effect = match entry {
                         LogEntry::Put { key, value, .. } => {
                             let inline = if len <= cache.inline_max_value_bytes
@@ -233,7 +232,7 @@ impl Collection {
                             StagedEffect::DefineIndex(change)
                         },
                     };
-                    pending.insert(lsn, StagedApply { wal_id, offset, term, effect });
+                    pending.insert(lsn, StagedApply { wal_id, offset, term, effect, migration });
                     if lsn > max_lsn {
                         max_lsn = lsn;
                         max_term = term;
@@ -371,11 +370,8 @@ impl Collection {
         Ok(())
     }
 
-    /// `write_all` can write some bytes and then fail, leaving a frame on disk that the size counter
-    /// is not past. Carrying that counter forward records every later frame at an offset that is not
-    /// its own, and replay stops at the tear and truncates everything above it -- including frames
-    /// whose clients were told `200` (M21). Rotating leaves the tear last in its WAL, where replay
-    /// takes it and nothing else, and the writer continues on a clean file.
+    /// `write_all` can write some bytes and then fail, leaving a frame the size counter is not past;
+    /// rotating leaves the tear last in its WAL, where replay takes it and nothing above it (M21).
     fn rotate_past_torn_write(&self, wal: &mut WalsState, cause: io::Error) -> io::Error {
         match self.open_next_wal(wal) {
             Ok(()) => cause,
@@ -386,14 +382,8 @@ impl Collection {
         }
     }
 
-    /// Raft §5.3: entries past the leader's position came from a log it does not have, so they are
-    /// deleted. Only above the committed watermark -- below it they are agreed, and a leader asking
-    /// us to drop one is not a leader we can follow, so the caller answers `Divergent` and the
-    /// snapshot path takes over.
-    ///
-    /// `Some(())` means the log now ends at `prev_lsn` and the caller may set the tail to
-    /// `(prev_lsn, prev_term)`. The frame at `prev_lsn` is checked against `prev_term` when we hold
-    /// it staged; at the watermark itself it is committed, so both logs carry the same one.
+    /// Entries past the leader's position came from a log it does not have, so they are deleted -- only
+    /// above the watermark. `Some(())` means the log now ends at `prev_lsn`, checked against `prev_term`.
     fn rewind_to(&self, wal: &mut WalsState, prev_lsn: u64, prev_term: u64) -> io::Result<Option<()>> {
         let cut = {
             let mut pending = self.pending.lock().unwrap();
@@ -563,9 +553,8 @@ impl Collection {
         Ok(ReplicaApply::Applied { lsn: header.lsn })
     }
 
-    /// Frames in `(after_lsn, up_to_lsn]`, LSN-ordered and deduplicated. Refuses to return a set with
-    /// a hole in it: the caller cannot tell a compaction race from a genuine loss, and `chain_prefix`
-    /// turns either into a full snapshot resync.
+    /// Frames in `(after_lsn, up_to_lsn]`, LSN-ordered and deduplicated. Refuses a set with a hole in
+    /// it: the caller cannot tell a compaction race from a genuine loss, so both become a snapshot.
     pub fn read_frames_after(&self, after_lsn: u64, up_to_lsn: u64) -> io::Result<Vec<(u64, Vec<u8>)>> {
         let retired = self.retired_through.load(Ordering::SeqCst);
 
@@ -898,9 +887,8 @@ mod tests {
         fs::set_permissions(path, perms).unwrap();
     }
 
-    /// A committed prefix and a doomed tail spanning two WALs, cut back to the prefix with one WAL
-    /// unwritable. `at_cut_file` picks which half of IB-034's partial state the failure leaves: the
-    /// later WAL already emptied with the cut file intact, or neither file touched.
+    /// A committed prefix and a doomed tail spanning two WALs, cut back with one WAL unwritable.
+    /// `at_cut_file` picks which half of IB-034's partial state the failure leaves.
     fn ib034_partial_truncation(root: &std::path::Path, at_cut_file: bool)
         -> (Collection, PathBuf, Vec<u8>)
     {
@@ -1107,9 +1095,8 @@ mod tests {
         assert!(col3.get("key_post_corrupt").unwrap().is_some(), "Writes should continue after recovery");
     }
 
-    /// The half a process crash cannot reach: a machine losing power drops what the page cache
-    /// still held, so recovery meets a WAL cut off mid-record. Everything the cut did not reach
-    /// has to survive it, and the collection has to go on accepting writes.
+    /// The half a process crash cannot reach: power loss drops what the page cache held, so recovery
+    /// meets a WAL cut mid-record. What the cut did not reach survives, and writes go on.
     #[tokio::test]
     async fn a_wal_cut_off_mid_frame_keeps_every_record_before_the_cut() {
         let root = temp_root();

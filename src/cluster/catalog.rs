@@ -1,22 +1,5 @@
-//! The cluster-wide index catalogue: how it travels, and how a shard group catches up with it.
-//!
-//! `LogEntry::Index` stays the authoritative durable definition inside each shard group, and the
-//! postings stay derived from committed documents. What this adds is the one thing a per-group log
-//! cannot hold: a record of the collection's indexes that outlives which group owns its keys. A
-//! group that takes its first key for a collection after the index was defined -- a new shard, a
-//! handover, a ring change -- reads the catalogue, appends the definitions it is missing through
-//! the ordinary quorum path, and builds its postings before the planner may select them.
-//!
-//! The catalogue travels by gossip rather than by publication. It rides `ClusterMetadata`, but it
-//! is merged per collection instead of being replaced with the winning view, because a schema
-//! change is not a routing decision: shards handed their topology by config never adopt anyone's
-//! view (`supersedes` refuses a seed), and a catalogue carried only by the winner would never
-//! reach them.
-//!
-//! The round carries topology as well, in both directions. It is the only poll any node runs
-//! against another group's leader, so two leaders left holding conflicting views converge through
-//! no other path (IB-037). The two halves stay independent: `adopt_cluster` takes a view only if
-//! it wins the total order, and merges the catalogue whoever won.
+//! The cluster-wide index catalogue: a record of a collection's indexes that outlives which group owns
+//! its keys, gossiped per collection so a group taking its first key appends the definitions it lacks.
 
 use crate::api::write::local_index_change;
 use crate::cluster::metadata::{sanitize_catalog, Adoption, ClusterMetadata};
@@ -30,9 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
-/// One round of gossip and one reconciliation pass. Short because it is the convergence bound for
-/// a definition reaching a group that does not hold the collection yet, and affordable because a
-/// round between nodes already in step is one small `GET` per peer and no writes at all.
+/// One round of gossip and one reconciliation pass -- the convergence bound for a definition reaching
+/// a group that does not hold the collection yet. A round between nodes in step is one `GET` per peer.
 pub const CATALOG_SYNC_INTERVAL_SECS: u64 = 3;
 
 /// Serializes an admin change against reconciliation for one collection, so the reconciler cannot
@@ -55,9 +37,8 @@ pub fn index_catalog_task(state: AppState) {
     });
 }
 
-/// Every node this one can name: its own group from `members`, and one endpoint per shard group
-/// from the model in force. A router is the only node that knows every group, which is why it
-/// gossips too even though it holds no collection of its own.
+/// Every node this one can name: its own group from `members`, and one endpoint per shard group from
+/// the model in force. A router gossips too, being the only node that knows every group.
 fn gossip_targets(state: &AppState) -> Vec<String> {
     let own = state.own_url();
     let view = state.cluster_view();
@@ -84,12 +65,8 @@ fn gossip_targets(state: &AppState) -> Vec<String> {
     targets
 }
 
-/// Pulls every peer's catalogue and hands ours back to the ones that differ. Two directions
-/// because a definition can originate anywhere: at a shard leader a client asked directly, or at
-/// the router that fanned one out.
-///
-/// Fetched in parallel, the way the router probes: sequentially, one unreachable peer would cost
-/// the whole round its connect timeout and push convergence out by that much per dead node.
+/// Pulls every peer's catalogue and hands ours back to the ones that differ; a definition can
+/// originate at any shard leader or at the router. Fetched in parallel -- one dead peer per round.
 async fn gossip_catalog(state: &AppState) {
     let fetched = futures::future::join_all(gossip_targets(state).into_iter().map(|target| {
         let client = state.client.clone();
@@ -99,9 +76,8 @@ async fn gossip_catalog(state: &AppState) {
                 Ok(r) if r.status().is_success() => r.json::<ClusterMetadata>().await.ok(),
                 _ => None,
             };
-            // Validated before it is taken: this is a view off the wire, and every node that takes
-            // one stores it and hands it on. Sanitized ahead of the fingerprint below, or an entry
-            // this node drops and an older peer keeps reads as a difference every round (IB-035).
+            // Validated before it is taken: this is a view off the wire, and every node that takes one
+            // stores it and hands it on. Sanitized ahead of the fingerprint, or peers differ forever.
             let view = view.map(|mut v| {
                 sanitize_catalog(&mut v.index_catalog);
                 v
@@ -130,10 +106,8 @@ async fn gossip_catalog(state: &AppState) {
         }
     }
 
-    // No node polls another group's leader for a topology view, so two leaders holding conflicting
-    // ones do not converge (IB-037). The push below already offers a whole view to
-    // `/internal/cluster`; taking one here is the same authority in the other direction, decided
-    // by the same total order.
+    // No node polls another group's leader for a topology view, so two leaders holding conflicting ones
+    // do not converge (IB-037). Taking one here is the push's authority in the other direction.
     if let Some((source, view)) = winner {
         match state.adopt_cluster(view) {
             Adoption::Adopted { from, to } => info!(target: "catalog", peer = %source,
@@ -177,12 +151,8 @@ fn diff(want: &[IndexSpec], have: &[IndexSpec]) -> (Vec<IndexSpec>, Vec<String>)
     (create, drop)
 }
 
-/// Brings this group's log into line with the catalogue. Only the leader appends: a definition is
-/// an ordinary replicated write, so a follower gets it the way it gets every other one.
-///
-/// A collection the catalogue does not name is left alone. Silence is not an instruction to drop
-/// what a group already has -- a node whose catalogue was never populated would otherwise unindex
-/// the whole cluster on its first tick.
+/// Brings this group's log into line with the catalogue; only the leader appends, as an ordinary
+/// replicated write. A collection the catalogue does not name is left alone -- silence is not a drop.
 async fn reconcile_local_indexes(state: &AppState) {
     if !state.is_shard() || !state.is_leader() {
         return;
@@ -198,9 +168,8 @@ async fn reconcile_local_indexes(state: &AppState) {
             continue;
         }
 
-        // Gate before schema lock, the order the admin handlers take them in. The gate is an
-        // RwLock a data movement takes for writing, and tokio queues readers behind a waiting
-        // writer: the other order deadlocks against a request holding the gate and waiting here.
+        // Gate before schema lock, the order the admin handlers take them in: tokio queues readers
+        // behind a waiting writer, so the other order deadlocks against a request holding the gate.
         let _write_gate = state.write_gate.read().await;
         let lock = schema_lock(state, &name);
         let _held = lock.lock().await;
@@ -279,9 +248,8 @@ mod tests {
         assert!(drop.is_empty(), "the create replaces it; dropping it first would lose the name");
     }
 
-    /// Keys the router sends to one half of a two-group ring. Which group a key lands on is the
-    /// whole subject here, so they are picked by the hash the router routes by rather than hoped
-    /// for.
+    /// Keys the router sends to one half of a two-group ring, picked by the hash the router routes by:
+    /// which group a key lands on is the whole subject here.
     fn local_index(node: &TestNode, col: &str, index: &str) -> Option<&'static str> {
         node.state.as_ref()
             .and_then(|s| s.db.as_ref())
@@ -323,9 +291,8 @@ mod tests {
         false
     }
 
-    /// `IB-024`: the index is defined while one group holds none of the collection, and that group
-    /// takes its first key for it afterwards. Nothing in the ring carries schema, so before the
-    /// catalogue this group had no definition and no path ever created one.
+    /// IB-024: the index is defined while one group holds none of the collection, and that group takes
+    /// its first key for it afterwards. Nothing in the ring carries schema.
     #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
     async fn a_group_that_gains_the_collection_afterwards_picks_up_its_indexes() {
         let root = temp_root();
@@ -417,10 +384,8 @@ mod tests {
         cleanup(&root).await;
     }
 
-    /// `IB-037`: two shard leaders left holding conflicting equal-version views. Neither runs a
-    /// poller against the other -- `heartbeat_poll_task` only starts on a node that is not leader,
-    /// and `leader_contact_task` probes a leader's own replicas -- so the catalogue round is the
-    /// only place either of them hears the other's view.
+    /// IB-037: two shard leaders left holding conflicting equal-version views. Neither polls the other,
+    /// so the catalogue round is the only place either hears the other's view.
     #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
     async fn two_shard_leaders_converge_on_the_winning_view_through_the_catalogue_round() {
         let root = temp_root();

@@ -311,8 +311,7 @@ pub async fn bulk_router_forward(
         && r.get("warning").is_none());
 
     // One refusal answering for the whole batch is not a partial success: a `207` would claim some
-    // document was written and bury the status the client acts on, which for `413` is the one
-    // refusal no retry can satisfy (IB-044).
+    // document was written and bury the status the client acts on, `413` above all (IB-044).
     let whole_batch = refusals.first()
         .filter(|(s, _)| refusals.len() == group_count && refusals.iter().all(|(o, _)| o == s));
     if let Some((status, body)) = whole_batch {
@@ -357,10 +356,8 @@ fn forwarded_read_pref(pref: &ReadPreference) -> Option<&'static str> {
     }
 }
 
-/// 409, not 400: the cursor was well formed and correct when it was issued. A key that changed
-/// owners mid-scan sits behind a position that never covered it, and no amount of adapting the
-/// positions recovers it — the scan has to start again. A sorted scan is not affected: its cursor
-/// is a position in the sort order, which every shard answers the same way.
+/// 409, not 400: the cursor was well formed and correct when issued, and a key that changed owners
+/// mid-scan sits behind a position that never covered it. A sorted scan's cursor is unaffected.
 pub(crate) fn stale_ring_response() -> axum::response::Response {
     err_json(
         StatusCode::CONFLICT,
@@ -379,12 +376,8 @@ pub(crate) fn no_primary_response() -> axum::response::Response {
     ).into_response()
 }
 
-/// The primary's own refusal when it is the one that refused, rather than the router's guess at
-/// what every refusal meant. `read=primary` failing really is "no reachable primary", but
-/// `read=quorum` can be refused by a leader that answered and said it could not confirm leadership
-/// with a majority, or that its term is too new to read at -- a partition on the *leader's* side,
-/// which is the opposite diagnosis (L11). Same status class and same remedy either way, so this
-/// costs diagnosability only; `Retry-After` is kept because the remedy is still to retry.
+/// The primary's own refusal when it is the one that refused, rather than the router's guess: a
+/// `read=quorum` refusal can mean a partition on the leader's side, the opposite diagnosis (L11).
 pub(crate) fn refusal_response(from_primary: Option<ShardReply>) -> axum::response::Response {
     match from_primary {
         Some(reply) => {
@@ -586,9 +579,8 @@ pub async fn router_fanout_maintenance(state: &AppState, col_name: &str, action:
         }
     })).await;
 
-    // A node whose ring share never took a key for this collection does not hold one, and since
-    // reading stopped creating it on demand that is a normal answer, not a partial failure. Every
-    // node saying so is the collection being nowhere, which is the client's error.
+    // A node whose ring share never took a key for this collection does not hold one, which since
+    // reads stopped creating on demand is a normal answer. Every node saying so is the client's error.
     let node_status = |r: &serde_json::Value| r.get("status").and_then(|s| s.as_u64());
     let absent = results.iter().filter(|r| node_status(r) == Some(404)).count();
     let ok = results.iter().filter(|r| node_status(r).map_or(false, |s| s < 300)).count();
@@ -599,9 +591,8 @@ pub async fn router_fanout_maintenance(state: &AppState, col_name: &str, action:
     (status, Json(serde_json::json!({"nodes": results}))).into_response()
 }
 
-/// One replicated admin write per shard group, sent to whichever candidate answers
-/// authoritatively. `suffix` is appended to `/collections/<name>` already encoded, so a caller that
-/// splices a client-supplied segment into it has to encode that segment itself.
+/// One replicated admin write per shard group, sent to whichever candidate answers authoritatively.
+/// `suffix` is appended to `/collections/<name>` already encoded; a caller splicing in a segment encodes it.
 async fn fanout_to_owners(
     state: &AppState,
     col_name: &str,
@@ -666,11 +657,8 @@ pub async fn router_fanout_drop(
     (status, Json(serde_json::json!({"shards": results}))).into_response()
 }
 
-/// An index definition, to every shard group that holds the collection. A group that holds none of
-/// it answers `404`, which is not a failure here for the same reason it is not one in
-/// `router_fanout_maintenance` -- and not a definition either, which is why the caller records the
-/// change in the cluster index catalogue: that is what reaches a group taking its first key for
-/// this collection later. See `cluster::catalog`.
+/// An index definition, to every shard group that holds the collection. A group holding none answers
+/// `404` -- not a failure and not a definition, which is why the caller records it in the catalogue.
 pub async fn router_fanout_index(
     state: &AppState,
     col_name: &str,
@@ -683,10 +671,8 @@ pub async fn router_fanout_index(
     let method = if method_is_create { AdminMethod::Post } else { AdminMethod::Delete };
     let results = fanout_to_owners(state, col_name, suffix, &query, method, body).await;
 
-    // A shard answers 202 for a definition that is durable but short of its write concern, and a
-    // later leader can still revoke it, so it is graded apart from a committed one -- the same
-    // rule as `router_fanout_drop`, on the second copy of it (IB-038). 404 stays "holds none of
-    // the collection": not a failure, and not a definition either.
+    // A shard answers 202 for a definition that is durable but short of its write concern and a later
+    // leader can revoke it, so it is graded apart from a committed one (IB-038). 404 holds none.
     let node_status = |r: &serde_json::Value| r.get("status").and_then(|s| s.as_u64());
     let absent = results.iter().filter(|r| node_status(r) == Some(404)).count();
     let pending = results.iter().filter(|r| node_status(r) == Some(202)).count();
@@ -697,10 +683,8 @@ pub async fn router_fanout_index(
         return collection_absent_response(col_name);
     }
     let status = if done + absent == results.len() {
-        // `201` only when every group that holds the collection created it, which is what the
-        // shard route answers for the same request; a router answering `200` contradicted both it
-        // and the reference. A group that already held the definition answers `200
-        // {"status":"exists"}` and keeps the aggregate at `200`.
+        // `201` only when every group holding the collection created it, which is what the shard route
+        // answers. A group that already held the definition answers `200 {"status":"exists"}`.
         if method_is_create && created > 0 && created == done {
             StatusCode::CREATED
         } else {
@@ -714,11 +698,8 @@ pub async fn router_fanout_index(
     (status, Json(serde_json::json!({"shards": results}))).into_response()
 }
 
-/// The union of the collection lists of every shard group. A group that could not answer is not an
-/// empty group: its names would drop out of the union with nothing to tell a client they had, so
-/// the listing fails whole with the `502` a failed shard gets from `/query` (IB-021). Nothing of
-/// the group's own to pass through here, unlike the document path (L11): it answers from its own
-/// catalogue or not at all.
+/// The union of the collection lists of every shard group. A group that could not answer is not an empty
+/// group -- its names would vanish silently -- so the listing fails whole with `502` (IB-021).
 pub async fn router_list_collections(state: &AppState) -> axum::response::Response {
     let per_shard = futures::future::join_all(unique_shards(state).into_iter()
         .map(|(original, replicas)| {
@@ -831,10 +812,8 @@ fn merge_index_listings(
     if answered == 0 && absent > 0 {
         return None;
     }
-    // A group that does not hold the definition at all is not ready either, and reads as building
-    // for the same reason one still filling its postings does: half the fan-out is on a scan. This
-    // is what a client sees while reconciliation catches a group up that gained the collection
-    // after the index was defined.
+    // A group that does not hold the definition at all reads as building, like one still filling its
+    // postings: half the fan-out is on a scan. It is what a client sees while reconciliation catches up.
     for (name, row) in merged.iter_mut() {
         if holders.get(name).copied().unwrap_or(0) < answered {
             row["state"] = serde_json::json!("building");
@@ -856,13 +835,8 @@ fn merge_index_row(into: &mut serde_json::Value, row: &serde_json::Value) {
     }
 }
 
-/// Rows to ask each shard for, summing to exactly `limit`: `limit / n` each and one more to the
-/// first `limit % n`. A share that rounded up instead let the page exceed `limit`, and trimming it
-/// afterwards would strand the trimmed rows behind the cursor their shard already moved past.
-///
-/// Shares are allocated over the shards still in the scan, not every shard in the ring, or a
-/// drained shard would keep its share and a `limit` smaller than the ring would never reach the
-/// shards behind it.
+/// Rows to ask each shard for, summing to exactly `limit`: rounding up let a page exceed it, and
+/// trimming strands rows behind a moved cursor. Shares go to the shards still in the scan only.
 fn shard_shares(limit: usize, shards: usize) -> Vec<usize> {
     if shards == 0 {
         return Vec::new();
@@ -875,9 +849,8 @@ fn shard_shares(limit: usize, shards: usize) -> Vec<usize> {
 enum ShardQueryOutcome {
     Refused(ShardReply),
     Page(QueryPage),
-    /// Every candidate refused a `read=primary` query. Distinct from `Failed`: the shard is up.
-    /// Carries the effective primary's own refusal when that is who refused, so the router does not
-    /// answer for it (L11).
+    /// Every candidate refused a `read=primary` query. Distinct from `Failed`: the shard is up. Carries
+    /// the effective primary's own refusal when that is who refused, so the router does not answer for it.
     NoPrimary(Option<ShardReply>),
     /// The shard holds no such collection. Distinct from an empty page only in that it carries no
     /// position, and from `Failed` in that a collection narrower than the ring is not an error.
@@ -1115,12 +1088,8 @@ enum ShardAggregateOutcome {
     Failed,
 }
 
-/// Fans the aggregation out whole and merges the partials. Every shard sees the same filter and the
-/// same metrics, so the merge is over groups rather than over rows.
-///
-/// `max_docs` travels unchanged rather than divided the way a page's `limit` is: a limit bounds the
-/// answer, which is one cluster-wide number, and a read budget bounds a walk, which each node runs
-/// on its own thread and its own share of the keyspace.
+/// Fans the aggregation out whole and merges the partials; every shard sees the same filter and metrics.
+/// `max_docs` travels undivided, unlike a page's `limit`: a read budget bounds a walk, not an answer.
 pub async fn router_aggregate(
     state: &AppState,
     col_name: &str,
@@ -1241,9 +1210,8 @@ mod tests {
         HashMap::new()
     }
 
-    /// M3: `ceil(limit/n)` per shard summed to more than `limit`, and the fan-out concatenated the
-    /// pages without trimming. Shares that sum to `limit` make the trim unnecessary, which is the
-    /// point: a trimmed row is stranded behind the cursor its shard already returned.
+    /// M3: `ceil(limit/n)` per shard summed to more than `limit` and the fan-out concatenated without
+    /// trimming. Shares that sum to `limit` make the trim unnecessary, and a trimmed row is stranded.
     #[test]
     fn shard_shares_sum_to_the_limit() {
         assert_eq!(shard_shares(10, 3), vec![4, 3, 3], "ten over three, not four each");
@@ -1390,10 +1358,8 @@ mod tests {
         assert!(!authoritative_write_status(StatusCode::SERVICE_UNAVAILABLE));
     }
 
-    /// C28: the forward spliced the decoded key straight into a URL, so `a?x=1`, `a#frag` and
-    /// `a/b` all stopped being one segment. Two of them landed as the key `a` on two shards -- the
-    /// router having hashed the full key and the shard having stored the truncation -- and the
-    /// third 404'd on a path that matched no route.
+    /// C28: the forward spliced the decoded key straight into a URL, so `a?x=1`, `a#frag` and `a/b`
+    /// stopped being one segment -- two landing as the key `a` on two shards, the third 404ing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_key_the_client_escaped_reaches_the_shard_whole() {
         use crate::test_support::{temp_root, two_shard_cluster};
@@ -1428,9 +1394,8 @@ mod tests {
 
     }
 
-    /// H15's blast radius on a router. Reads stopped creating collections on demand, so a shard
-    /// whose ring share never took a key for one now answers `404` — which the fan-outs used to
-    /// read as a failed shard (`502`) and as a partial maintenance failure (`207`).
+    /// H15's blast radius on a router: reads stopped creating collections on demand, so a shard whose
+    /// ring share never took a key answers `404`, which the fan-outs read as `502` and as `207`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_collection_narrower_than_the_ring_still_reads_through_the_router() {
         use crate::test_support::{put_value, temp_root, two_shard_cluster};
@@ -1610,9 +1575,8 @@ mod tests {
             "a query only uses the index on the group that finished building it");
     }
 
-    /// The half `IB-024` showed up in: a group that gained the collection after the index was
-    /// defined has no definition at all, and a listing that called that "ready" would report a
-    /// cluster-wide index while half the fan-out was still scanning.
+    /// The half IB-024 showed up in: a group that gained the collection after the index was defined has
+    /// no definition, and calling that "ready" reports a cluster-wide index mid-scan.
     #[test]
     fn an_index_a_group_has_not_got_yet_reads_as_building() {
         let merged = super::merge_index_listings([
@@ -1738,9 +1702,8 @@ mod tests {
         assert_eq!(refusal_body(&empty)["error"], "Conflict", "an empty body still names the status");
     }
 
-    /// IB-052: `router_forward_write` retried a `409` at the owner the shard named and the bulk
-    /// path did not, so a batch sent through a stale ring failed for a whole slice where the same
-    /// writes sent singly succeeded.
+    /// IB-052: `router_forward_write` retried a `409` at the owner the shard named and the bulk path did
+    /// not, so a batch through a stale ring failed for a whole slice that succeeded sent singly.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_redirected_bulk_slice_is_retried_at_the_owner_the_shard_names() {
         let (s1, s2, router, keys) = stale_ring_cluster(4, 0).await;
@@ -1766,9 +1729,8 @@ mod tests {
         drop_stale_ring_cluster(s1, s2, router);
     }
 
-    /// The safety half of IB-052: the shard names the owner of the *first* key it disowns, so a
-    /// slice can span owners. Retrying it whole is safe only because the retry target re-checks
-    /// every key, which makes it refuse rather than write the half it does own.
+    /// The safety half of IB-052: the shard names the owner of the first key it disowns, so a slice can
+    /// span owners. Retrying it whole is safe only because the target re-checks every key.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_bulk_slice_spanning_owners_is_refused_whole_rather_than_half_applied() {
         let (s1, s2, router, keys) = stale_ring_cluster(1, 1).await;

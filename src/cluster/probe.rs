@@ -73,12 +73,8 @@ pub(crate) fn parse_view_id(v: &serde_json::Value) -> ViewId {
     }
 }
 
-/// Whoever is furthest ahead, so one pass converges even when only a replica has heard the update.
-///
-/// Ordered by the same total order adoption uses, not by version alone: two nodes that published
-/// concurrently sit at one version with different tiebreaks, and a `version >` gate would leave
-/// neither of them ever fetching the winner (IB-023). A peer that only looks ahead costs one
-/// request, since `adopt_cluster` compares again against whatever arrives.
+/// Whoever is furthest ahead, so one pass converges even when only a replica heard the update. Ordered
+/// by adoption's total order, not by version: a `version >` gate never fetches a tiebreak winner.
 fn best_cluster_source(probes: &[(String, Option<Probe>)], ours: &ViewId) -> Option<String> {
     probes.iter()
         .filter_map(|(url, res)| res.as_ref().map(|p| (&p.cluster, url)))
@@ -259,9 +255,8 @@ mod tests {
         assert_eq!(best_cluster_source(&[], &id(0, "op")), None);
     }
 
-    /// IB-023: adoption orders views by `(version, updated_by)` but this gate compared `version`
-    /// alone, so two nodes left holding conflicting equal-version views had no poll that would
-    /// ever fetch the tie-breaking winner.
+    /// IB-023: adoption orders views by `(version, updated_by)` but this gate compared `version` alone,
+    /// so two nodes holding conflicting equal-version views had no poll that would fetch the winner.
     #[test]
     fn an_equal_version_conflict_is_fetched_and_converges_one_way() {
         let peers = vec![published("http://bravo", 5, "bravo")];

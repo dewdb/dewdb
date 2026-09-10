@@ -1,15 +1,5 @@
-//! Leadership transfer: a leader hands office to a voter that can take it, Raft §3.10.
-//!
-//! Raft's rule for a leader outside the target configuration is that it steps down once that
-//! configuration commits. This node cannot append the entry it would step down on, so removing the
-//! leader means moving leadership first -- which is also the ops primitive a decommission wants on
-//! its own. See bugs.md C21.
-//!
-//! Three steps, and each one is load-bearing. Hold the writes, or the target chases a tail that
-//! keeps moving. Catch the target up, or every voter holding the frame it lacks refuses it and the
-//! election it is told to run fails. Then tell it to stand *now*, without the pre-vote and past the
-//! lease every voter of a healthy cluster is inside -- which is the step commit 50's outbound probe
-//! and `M16`'s leader-owned round made possible at all.
+//! Leadership transfer: a leader hands office to a voter that can take it, Raft 3.10. Hold writes,
+//! catch the target up, then tell it to stand now -- past the pre-vote and past every voter's lease.
 
 use super::reconfigure::pending_change;
 use crate::replication::stream::catch_up_replica;
@@ -64,8 +54,7 @@ impl TransferError {
 }
 
 /// Who could take over, out of `among`: the voters of the configuration in force, this node
-/// excluded. While joint that means *both* halves -- a target in only one of them cannot win an
-/// election that needs a majority of each.
+/// excluded. While joint that means both halves -- a target in one half cannot win.
 pub fn eligible_targets(state: &AppState, among: &[String]) -> Vec<String> {
     let quorum = state.quorum_config();
     let own = state.own_url();
@@ -98,12 +87,8 @@ pub fn best_target(state: &AppState, among: &[String]) -> Option<String> {
         .cloned()
 }
 
-/// Hands leadership to `to`, or to the readiest voter when it is `None`. Returns the node that took
-/// over.
-///
-/// On any error this node still leads and writes resume: nothing here appends, and the target is
-/// only ever *asked* to stand. The one thing that outlives a failure is a term the target raised
-/// and lost with, which is an ordinary failed election.
+/// Hands leadership to `to`, or to the readiest voter when `None`. Returns the node that took over.
+/// On any error this node still leads and writes resume: nothing here appends, the target is asked.
 pub async fn transfer_leadership(state: &AppState, to: Option<String>) -> Result<String, TransferError> {
     if !state.is_shard() {
         return Err(TransferError::Refused("a router has no leadership to transfer".to_string()));
@@ -169,9 +154,8 @@ pub async fn transfer_leadership(state: &AppState, to: Option<String>) -> Result
         tokio::time::sleep(Duration::from_millis(CATCH_UP_POLL_MS)).await;
     }
 
-    // Before the ask, not after: from here a voter may grant past the promise this node's leases
-    // are made of, and a read resting on one would be reading behind a leader that already exists.
-    // The guard clears it on every way out, the failures included.
+    // Before the ask, not after: from here a voter may grant past the promises this node's leases
+    // rest on. The guard clears it on every way out, failures included.
     state.set_handing_over(true);
     let _handover = HandoverGuard { state };
 
@@ -186,9 +170,8 @@ pub async fn transfer_leadership(state: &AppState, to: Option<String>) -> Result
         Err(e) => return Err(TransferError::Failed(format!("{} unreachable: {}", target, e))),
     }
 
-    // Stepping down is not this node's move to make: the target raises the term, and the vote it
-    // asks for is what demotes us. Relinquishing first would leave the group leaderless for a whole
-    // election timeout if that election then failed, which is the outage a transfer exists to avoid.
+    // The target raises the term, and the vote it asks for is what demotes us. Relinquishing first
+    // would leave the group leaderless for a full election timeout if that election then failed.
     while state.is_leader() && state.current_term() == term {
         if Instant::now() >= deadline {
             warn!(target: "transfer", to = %target, term,

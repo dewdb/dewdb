@@ -1,8 +1,5 @@
-//! The change stream over WebSocket: the same feed as `/changes`, framed as JSON text messages.
-//!
-//! A subscriber that cannot use SSE -- a browser behind a proxy that buffers it, a client library
-//! without one -- gets the identical frame sequence here. The refusals happen before the upgrade,
-//! so an unusable position is an HTTP status rather than a socket that opens and immediately closes.
+//! The change stream over WebSocket: the same feed as `/changes`, framed as JSON text messages. The
+//! refusals happen before the upgrade, so an unusable position is a status rather than a closed socket.
 
 use crate::api::changes::{open_change_stream, ChangeParams, KEEPALIVE_INTERVAL};
 use crate::api::middleware::CollectionPath;
@@ -154,9 +151,8 @@ mod tests {
         assert_eq!(refused(&n.url(), "?read=quorum").await, StatusCode::BAD_REQUEST);
     }
 
-    /// IB-026: a socket is authorized on its handshake and never again, so the same re-check the
-    /// SSE stream gets has to end this one too -- and in-band, because the frame is all a client
-    /// has to tell a refusal from a change.
+    /// IB-026: a socket is authorized on its handshake and never again, so the same re-check ends this
+    /// one too -- in-band, because the frame is all a client has to tell a refusal from a change.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_socket_ends_when_the_key_its_handshake_carried_stops_being_accepted() {
         use crate::auth::API_KEY_HEADER;

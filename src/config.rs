@@ -13,9 +13,8 @@ use crate::util::{node_key, same_endpoint};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
 
-/// `deny_unknown_fields` throughout the config tree: a typo taking a default silently is a node
-/// running something other than what the file says (L1). Deliberately not on `ShardInfo` or
-/// `HashRing`, which are also the wire format of the cluster view and have to survive version skew.
+/// `deny_unknown_fields` throughout the config tree: a typo taking a default silently is a node running
+/// something else (L1). Not on `ShardInfo` or `HashRing`, which are wire format and face version skew.
 #[derive(Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
@@ -30,9 +29,8 @@ pub struct NodeConfig {
     pub ring: Option<HashRing>,
     #[serde(default)]
     pub shard_role: Option<String>,
-    /// `voter` (default) or `learner`. A learner never campaigns, even with no peers and no leader
-    /// in sight. It is set in config rather than learned, because the window this closes is exactly
-    /// the one before any cluster view has arrived.
+    /// `voter` (default) or `learner`. A learner never campaigns, even with no peers in sight. Set in
+    /// config rather than learned, because the window this closes is the one before any view arrives.
     #[serde(default = "default_membership_mode")]
     pub membership_mode: String,
     #[serde(default)]
@@ -65,16 +63,14 @@ pub struct NodeConfig {
     pub auth: AuthConfig,
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
-    /// Development only. Lets a ring change that reassigns ownership through on a cluster that
-    /// already holds data, which leaves those keys unreadable at their new owners until commit 38
-    /// moves them. Off by default, and warned about loudly when on.
+    /// Development only: lets a ring change reassign ownership on a cluster that already holds data,
+    /// leaving those keys unreadable at their new owners. Off by default, warned about loudly when on.
     #[serde(default)]
     pub allow_unsafe_ring_changes: bool,
 }
 
-/// Bounds on how far the leader lets replication fall behind before it stops accepting writes.
-/// Without `max_uncommitted_frames` a leader that has lost quorum keeps staging frames in memory
-/// forever, since the staging buffer only drains on commit.
+/// Bounds on how far the leader lets replication fall behind before it stops accepting writes. Without
+/// `max_uncommitted_frames` a leader that lost quorum stages frames forever -- the buffer drains on commit.
 #[derive(Deserialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct FlowControlConfig {
@@ -142,9 +138,8 @@ impl NodeConfig {
         if self.data_dir.trim().is_empty() {
             return Err("data_dir must not be empty".into());
         }
-        // A replica without primary_addr used to be inert and so was rejected at boot. It can now
-        // be told who to follow by a runtime join, which is the whole point of joining one.
-        // config_warnings still flags it, since an unjoined node in that state does nothing.
+        // A replica without primary_addr used to be inert and rejected at boot; a runtime join can now
+        // tell it who to follow. `config_warnings` still flags it, since an unjoined node does nothing.
 
         if self.membership_mode != "voter" && self.membership_mode != MEMBERSHIP_LEARNER {
             return Err(format!(
@@ -154,9 +149,8 @@ impl NodeConfig {
             return Err("membership_mode 'learner' cannot be combined with shard_role 'primary'; \
                         a learner is never a leader".to_string());
         }
-        // Not clamped at the point of use like the flow_control knobs: at 0 this is not a slow
-        // setting but a different program -- `leader_contact_task` sleeps `ZERO` and pins a core,
-        // and `contact_lost` is permanently true, so every follower campaigns on every poll (L15).
+        // Not clamped at the point of use like the flow_control knobs: at 0 `leader_contact_task` sleeps
+        // `ZERO` and pins a core, and `contact_lost` is permanently true, so every poll campaigns (L15).
         if self.heartbeat_timeout_secs == 0 {
             return Err("heartbeat_timeout_secs must be at least 1".to_string());
         }
@@ -226,9 +220,8 @@ pub fn config_warnings(cfg: &NodeConfig) -> Vec<String> {
     }
 
     if cfg.role == "shard" {
-        // A node with no peers reaches a majority of one. Left as a voter it will campaign the
-        // moment its timeout expires and elect itself over an empty log, whatever the operator
-        // intended -- a race no timeout setting can win reliably.
+        // A node with no peers reaches a majority of one. Left a voter it elects itself over an empty log
+        // the moment its timeout expires, whatever the operator intended.
         if !cfg.is_learner()
             && cfg.peers.is_empty()
             && cfg.primary_addr.is_none()
@@ -431,9 +424,8 @@ mod tests {
         assert!(blank.validate().is_err(), "a blank data_dir would write into the process cwd");
     }
 
-    /// L15: `NodeConfig::validate` bounded every other knob. At 0 this one turns
-    /// `leader_contact_task` into `sleep(ZERO)` on every shard node and makes `contact_lost`
-    /// permanently true, so it is not a slow setting but a different program.
+    /// L15: at 0 this knob turns `leader_contact_task` into `sleep(ZERO)` on every shard node and makes
+    /// `contact_lost` permanently true -- not a slow setting but a different program.
     #[test]
     fn a_zero_heartbeat_timeout_is_refused_at_boot() {
         let cfg = |secs: u64| -> Result<(), String> {

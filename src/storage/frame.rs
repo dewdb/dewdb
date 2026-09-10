@@ -79,17 +79,20 @@ impl FrameHeader {
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum LogEntry {
     Put {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        migration: bool,
         key: String,
         value: serde_json::Value,
         ts: u64,
     },
     Del {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        migration: bool,
         key: String,
         ts: u64,
     },
-    /// A no-op occupying an LSN. A leader appends one per collection on promotion so the inherited
-    /// tail has a current-term entry above it to be committed by. It applies nothing, is never in
-    /// the index, and compaction therefore drops it like any superseded frame.
+    /// A no-op occupying an LSN, appended per collection on promotion so the inherited tail has a
+    /// current-term entry to be committed by. Applies nothing and is never in the index.
     Barrier {
         ts: u64,
     },
@@ -109,28 +112,30 @@ pub enum LogEntry {
         handover: HandoverRecord,
         ts: u64,
     },
-    /// A secondary index definition. Like `Config` it is in force from the append rather than the
-    /// commit, so every entry above it stages the values that definition asks for; unlike `Config`
-    /// what commits is the *build*, since the postings it names are derived from committed keys.
+    /// A secondary index definition. In force from the append, so every entry above it stages the
+    /// values it asks for; what commits is the build, since the postings derive from committed keys.
     Index {
         change: crate::storage::secondary::IndexChange,
         ts: u64,
     },
 }
 
-/// A completed handover as it travels in the log: the plan's id and the ring it moved keys *for*.
-/// The keys themselves are deliberately absent -- nothing bounds how many moved, and one frame
-/// carrying them all would pass neither `MAX_RECORD_SIZE` nor the replicate body limit on a real
-/// rebalance. Cleanup derives them by asking this ring which of the keys it holds are not its own.
+impl LogEntry {
+    pub fn is_migration(&self) -> bool {
+        matches!(self, Self::Put { migration: true, .. } | Self::Del { migration: true, .. })
+    }
+}
+
+/// A completed handover as it travels in the log: the plan's id and the ring it moved keys for. The
+/// keys are absent -- unbounded, and cleanup derives them from this ring instead.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct HandoverRecord {
     pub id: String,
     pub target: crate::ring::HashRing,
 }
 
-/// A quorum membership, as it travels in the log. `outgoing` is present only between the two
-/// entries of a change, and while it is, a decision needs a majority of each half separately.
-/// The arithmetic over this is `consensus::config`.
+/// A quorum membership, as it travels in the log. `outgoing` is present only between the two entries
+/// of a change, and while it is, a decision needs a majority of each half separately.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct Configuration {
     pub voters: Vec<String>,
@@ -150,6 +155,21 @@ pub enum ReplicaApply {
 mod tests {
     use super::*;
     use crate::util::base64_bytes::base64_encode;
+
+    #[test]
+    fn ib028_legacy_entries_remain_client_changes() {
+        for value in [serde_json::json!({"op": "put", "key": "k", "value": {}, "ts": 0}),
+            serde_json::json!({"op": "del", "key": "k", "ts": 0})] {
+            let entry: LogEntry = serde_json::from_value(value.clone()).unwrap();
+            assert!(!entry.is_migration());
+            assert_eq!(serde_json::to_value(entry).unwrap(), value);
+            let mut marked = value;
+            marked["migration"] = serde_json::json!(true);
+            let entry: LogEntry = serde_json::from_value(marked.clone()).unwrap();
+            assert!(entry.is_migration());
+            assert_eq!(serde_json::to_value(entry).unwrap(), marked);
+        }
+    }
 
     /// The chain's assertions are only as good as this arithmetic, and `base64_len` is a closed
     /// form for a loop that pads.

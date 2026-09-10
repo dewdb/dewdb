@@ -1,9 +1,5 @@
 //! Compaction: relocate live keys into a fresh WAL, carry forward the tail a replica still needs,
-//! retire the rest.
-//!
-//! Two invariants everything here rests on, and that it maintains: every WAL is LSN-ordered, and
-//! LSNs rise across WAL ids. Together they make the frames above any position one contiguous byte
-//! range at the end of the frozen set, which is what retention keeps -- see `Retention`.
+//! retire the rest. Rests on: every WAL is LSN-ordered, and LSNs rise across WAL ids.
 
 use super::collection::Collection;
 use super::frame::{FrameHeader, LogEntry, HEADER_LEN, MAX_RECORD_SIZE};
@@ -35,24 +31,18 @@ impl SpaceUsage {
     }
 }
 
-/// What a compaction run may not destroy, and when it is not worth running.
-///
-/// Dropping superseded frames breaks the chain a replica repairs over, so a replica behind the
-/// point a run reaches pays a full-collection snapshot for frames it was a few behind on. Raft's
-/// answer is a retention floor: keep what a replication target still needs, and stop keeping it
-/// once the tail costs more than the snapshot would. See bugs.md M15.
+/// What a compaction run may not destroy, and when it is not worth running. Dropping superseded
+/// frames breaks the chain a replica repairs over, so a retention floor keeps what a target needs.
 #[derive(Clone, Copy, Debug)]
 pub struct Retention {
     /// The lowest position any replication target still needs frames above. 0 protects nothing,
     /// which is what a node with no target to protect wants.
     pub above_lsn: u64,
-    /// Ceiling on the retained tail, and so on what one run copies forward. A target below what
-    /// fits here is further behind than the tail is worth and snapshots instead, which it would
-    /// have had to do anyway.
+    /// Ceiling on the retained tail, and so on what one run copies forward. A target below what fits
+    /// here is further behind than the tail is worth and snapshots instead.
     pub max_bytes: u64,
-    /// A run reclaiming less than this is refused. Retention is what makes the guard necessary: a
-    /// pinned tail of superseded frames holds `dead_ratio` above the scheduler's threshold, so
-    /// without it a replica stuck at one position has the same tail rewritten every interval.
+    /// A run reclaiming less than this is refused. A pinned tail of superseded frames holds
+    /// `dead_ratio` above the scheduler's threshold, so a stuck replica would be rewritten forever.
     pub min_reclaim_bytes: u64,
 }
 
@@ -135,9 +125,8 @@ impl Collection {
         Ok(SpaceUsage { total_bytes, live_bytes, live_keys: index.len() })
     }
 
-    /// `(offset, lsn)` for every frame in a WAL, in file order, plus the offset the last valid one
-    /// ends at. Stops at the first frame that does not parse: past that nothing is recoverable, and
-    /// the index references none of it. Headers only -- the payload is seeked over, not read.
+    /// `(offset, lsn)` for every frame in a WAL, in file order, plus where the last valid one ends.
+    /// Stops at the first frame that does not parse. Headers only -- the payload is seeked over.
     fn frame_offsets(&self, wal_id: u64) -> io::Result<(Vec<(u64, u64)>, u64)> {
         let path = self.root_path.join(format!("wal-{:05}.log", wal_id));
         let mut file = BufReader::new(File::open(&path)?);
@@ -163,9 +152,8 @@ impl Collection {
         Ok((frames, offset))
     }
 
-    /// Frozen WALs in id order: non-empty, above `retired_through`, and each with its first frame's
-    /// LSN. `None` if one of them does not start with a readable frame, where the only safe plan is
-    /// the one compaction had before retention -- keep nothing.
+    /// Frozen WALs in id order: non-empty, above `retired_through`, each with its first frame's LSN.
+    /// `None` if one does not start with a readable frame, where the only safe plan is to keep nothing.
     fn frozen_wals(&self, frozen_through: u64) -> io::Result<Option<Vec<FrozenWal>>> {
         let retired = self.retired_through.load(Ordering::SeqCst);
         let mut wals = Vec::new();
@@ -208,8 +196,7 @@ impl Collection {
     }
 
     /// What to keep, and whether keeping it leaves enough to be worth the rewrite. Runs before the
-    /// rotation, so a refusal costs nothing: a bail after rotating leaves one extra WAL id behind
-    /// on every scheduler interval.
+    /// rotation, so a refusal costs nothing; bailing after would leak a WAL id per interval.
     fn plan_compaction(
         &self,
         frozen_through: u64,
@@ -237,12 +224,8 @@ impl Collection {
         Ok(Plan { tail, reclaimable })
     }
 
-    /// The start of the frames above `retention.above_lsn`, bounded by `retention.max_bytes`.
-    ///
-    /// LSNs rise across WAL ids, so the first WAL that can hold anything above the floor is the
-    /// first whose *successor* starts above it; within that one the boundary is the lowest offset
-    /// holding a frame above the floor, taken as a minimum rather than a first match so a WAL that
-    /// is not internally ordered costs extra retention rather than a dropped frame.
+    /// The start of the frames above `retention.above_lsn`, bounded by `retention.max_bytes`. Taken as
+    /// a minimum offset, not a first match, so an unordered WAL costs retention, not a dropped frame.
     fn plan_tail(
         &self,
         wals: &[FrozenWal],
@@ -253,9 +236,8 @@ impl Collection {
             return Ok(None);
         }
 
-        // Anchored past the last frozen byte rather than given up on. Planning runs before the
-        // rotation, so a frame can be appended and committed after it; the tail has to reach the
-        // end of the frozen set for that frame to survive, even when there is nothing else to keep.
+        // Anchored past the last frozen byte rather than given up on: planning runs before the
+        // rotation, so a frame committed after it still needs the tail to reach the frozen end.
         let last = wals.last().expect("planning returns early on an empty frozen set");
         let end = TailStart { wal_id: last.id, offset: last.size, bytes: 0 };
         if retention.above_lsn >= last_lsn {
@@ -310,8 +292,7 @@ impl Collection {
     }
 
     // Frozen WALs are <= N, rewritten output N+1, new active N+2; only the writer swap takes the lock.
-    // The output carries the tail `retention` pins, so a replica inside it repairs from frames
-    // rather than a snapshot; everything below it is dropped and breaks the chain as it always did.
+    // The output carries the tail `retention` pins; everything below it is dropped and breaks the chain.
     pub fn compact(&self, retention: Retention) -> io::Result<()> {
         if self.compacting.swap(true, Ordering::SeqCst) {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "Compaction already in progress"));
@@ -327,9 +308,8 @@ impl Collection {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "Uncommitted frames pending"));
         }
 
-        // Before anything is retired: ordinary commits record only their position, so a drop,
-        // config or handover can sit in a frame this run is about to remove while `applied.meta`
-        // still predates it. Replay can only re-derive those three from a frame still on disk.
+        // Before anything is retired: ordinary commits record only their position, so a drop, config
+        // or handover frame this run removes must already be in `applied.meta` to be re-derivable.
         self.flush_watermark_full()?;
 
         let (planned_through, last_lsn) = {
@@ -387,9 +367,8 @@ impl Collection {
                     && !plan.tail.is_some_and(|t| t.covers(e.wal_id, e.offset)))
                 .map(|(k, e)| (k.clone(), e.wal_id, e.offset))
                 .collect();
-            // Source order, which is LSN order under the two invariants at the top of this file --
-            // and so the compacted output is LSN-ordered too, which is what lets the next run find
-            // its retention boundary in it by a single walk. Key order would not be.
+            // Source order, which is LSN order under this file's two invariants, so the output is
+            // LSN-ordered too and the next run finds its retention boundary in one walk.
             frozen.sort_by_key(|(_, wal_id, offset)| (*wal_id, *offset));
 
             (frozen, frozen_through, compact_id)
@@ -445,9 +424,8 @@ impl Collection {
                 }
             }
 
-            // The tail moved as bytes, so its live keys move by position rather than by key. No
-            // entry can be caught by both loops: the relocated ones now point at `compact_id`,
-            // which no source position is.
+            // The tail moved as bytes, so its live keys move by position rather than by key. No entry
+            // is caught by both loops: relocated ones point at `compact_id`, which no source does.
             for entry in index.values_mut() {
                 if let Some(offset) = written.moved.get(&(entry.wal_id, entry.offset)) {
                     entry.wal_id = compact_id;
@@ -464,8 +442,7 @@ impl Collection {
         }
 
         // The pivot. Until it lands the previous snapshot plus the intact frozen WALs still describe
-        // the collection; once it names a resume point above them, boot skips them by id and a
-        // failed unlink is wasted disk rather than a key coming back from the dead.
+        // the collection; after it, a failed unlink is wasted disk rather than a resurrected key.
         self.save_index()?;
 
         let mut orphaned = 0usize;
@@ -961,10 +938,8 @@ mod tests {
         assert_eq!(col2.index.read().unwrap().len(), 3);
     }
 
-    /// The retained tail sits above the relocated keys in one file, so replay in offset order
-    /// still ends on the newest version of everything -- including the deletes and overwrites the
-    /// relocation does not carry. Asserted twice: from the index snapshot, and with the snapshot
-    /// removed so boot has to rebuild the whole thing from the WALs.
+    /// The retained tail sits above the relocated keys in one file, so replay in offset order still
+    /// ends on the newest version of everything. Asserted from the index snapshot and without it.
     #[tokio::test]
     async fn a_compaction_that_retained_a_tail_replays_to_the_same_state() {
         let root = temp_root();
@@ -1142,9 +1117,8 @@ mod tests {
             "boot must resume above the retired WALs, or it replays whatever survived them");
     }
 
-    /// The two recovery inputs meeting: a compaction retires the WALs a crash would have replayed,
-    /// so what boot reads is the snapshot plus whatever was written after it. Both halves have to
-    /// be there, and the newer value has to win.
+    /// The two recovery inputs meeting: compaction retires the WALs a crash would have replayed, so
+    /// boot reads the snapshot plus what came after. Both halves present, newer value wins.
     #[tokio::test]
     async fn a_value_survives_a_compaction_and_the_crash_that_follows_it() {
         let root = temp_root();
@@ -1177,8 +1151,7 @@ mod tests {
     }
 
     /// C27's state: once the drop's frame is retired, `applied.meta` is the only record that this
-    /// collection is a tombstone. So the watermark has to already cover the drop when compaction
-    /// retires it, which is the invariant H17 would have broken -- see that entry.
+    /// collection is a tombstone, so the watermark must cover the drop before compaction retires it.
     #[tokio::test]
     async fn compaction_flushes_the_watermark_before_retiring_the_frames_behind_it() {
         let root = temp_root();

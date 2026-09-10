@@ -1,14 +1,5 @@
-//! Leader leases: what a voter grants when its leader asks, and the round it saves that leader.
-//!
-//! Commit 47 confirmed leadership per read, with a heartbeat round. The round asks whether any
-//! voter could have elected someone else; a voter that has heard from a leader recently answers
-//! that in advance by refusing to grant a vote. A majority of those refusals is a window in which
-//! no election can complete, which is a lease.
-//!
-//! The round is the leader's, Raft's shape: it stamps the interval before it sends the probe and
-//! the voter answers with a duration from its own clock, so the flight shortens the lease instead
-//! of being estimated by a margin. Commit 48 rode the answer along on the follower's poll instead,
-//! which meant converting one clock to the other across an unmeasured delay -- bugs.md M16.
+//! Leader leases: a voter with fresh contact refuses votes, so a majority of refusals is a window
+//! no election completes in. Grants are voter-clock durations dated from before the probe was sent.
 
 use super::failover::HEARTBEAT_POLL_INTERVAL_MS;
 use crate::storage::frame::Configuration;
@@ -20,9 +11,8 @@ use std::time::{Duration, Instant, SystemTime};
 /// NTP slew over a window this short (a few ms), well below any suspend, which is seconds at least.
 const STALL_TOLERANCE: Duration = Duration::from_millis(250);
 
-/// A voter withholds its vote while its leader contact is newer than this, and promises the leader
-/// whatever is left of the window. Half of what the contact timeout has after one poll interval of
-/// skew, so every voter is free to vote well before any of them times out and stands.
+/// A voter withholds its vote while leader contact is newer than this, and promises the leader the
+/// remainder. Half the contact timeout less a poll interval, so voters are free before any times out.
 pub fn refusal_window(heartbeat_timeout: Duration) -> Duration {
     heartbeat_timeout.saturating_sub(Duration::from_millis(HEARTBEAT_POLL_INTERVAL_MS)) / 2
 }
@@ -36,17 +26,8 @@ pub fn contact_age(
     [last_heartbeat, last_replication].into_iter().flatten().max().map(|t| t.elapsed())
 }
 
-/// The other half of the lease, and sound only because it is kept: everything below rests on a voter
-/// with fresh contact not voting, whatever term the candidate offers.
-///
-/// `granted_until` is a deadline this node handed a probing leader. Contact ageing out is the same
-/// instant by construction, so it adds no obligation -- it holds the one a transition that clears
-/// the contact clock would otherwise release while the leader is still counting it.
-///
-/// Boot counts the same as contact. A restart destroys the knowledge of whether this node was
-/// vote-eligible a moment ago, while a leader can still be counting the promise the process before
-/// it made, so a node that has just come up has to assume it owes that silence. Free at a cold
-/// start: the window is below the contact timeout, so it has lapsed before any candidate asks.
+/// A voter with fresh contact does not vote, whatever term is offered. `granted_until` holds that
+/// promise across a transition that clears contact; boot counts too, since a restart forgets one.
 pub fn withholds_vote(
     contact: Option<Duration>,
     granted_until: Option<Instant>,
@@ -60,13 +41,8 @@ pub fn withholds_vote(
         || granted_until.is_some_and(|until| until > now)
 }
 
-/// What a voter may grant a probing leader: the rest of its own refusal window, and nothing on
-/// credit. `None` contact is a node that has heard from no leader, which owes silence to none.
-///
-/// Counted from now on the voter's clock, and the leader dates it from before it sent the probe, so
-/// the delay between the two is subtracted from the lease rather than covered by a margin. It is
-/// also why this is never more than a voter is already committed to: a leader cannot buy silence
-/// past the point the voter would otherwise be free to campaign.
+/// The rest of this voter's refusal window and nothing on credit; `None` contact owes silence to
+/// nobody. Counted from now on the voter's clock, which the leader dates from before the probe.
 pub fn grantable(contact: Option<Duration>, heartbeat_timeout: Duration) -> Duration {
     match contact {
         Some(age) => refusal_window(heartbeat_timeout).saturating_sub(age),
@@ -74,10 +50,8 @@ pub fn grantable(contact: Option<Duration>, heartbeat_timeout: Duration) -> Dura
     }
 }
 
-/// A grant is worth no more than our own window, whatever a voter answers: nothing an honest one
-/// with the same contact timeout grants exceeds it, and a misconfigured or lying one must not be
-/// able to hand out an unbounded lease. A voter with a longer timeout loses some of its grant,
-/// which costs a round, not a read.
+/// A grant is capped at our own window: an honest voter never exceeds it, and a lying or
+/// misconfigured one must not hand out an unbounded lease. Losing part of a grant costs a round.
 pub fn accept_promise(claimed: Duration, heartbeat_timeout: Duration) -> Duration {
     claimed.min(refusal_window(heartbeat_timeout))
 }
@@ -89,10 +63,8 @@ struct Promise {
 }
 
 impl Promise {
-    /// A lease is a claim about real time and `Instant` is not: `CLOCK_MONOTONIC` does not advance
-    /// while the host is suspended, so a resumed leader would read a deadline measured in a clock
-    /// that stopped. The wall clock keeps time across that, so the two diverging retires the
-    /// promise -- which costs a round. A wall clock stepped backwards proves nothing here.
+    /// `Instant` does not advance while the host is suspended, so a resumed leader would read a
+    /// deadline in a stopped clock; the clocks diverging retires the promise, at the cost of a round.
     fn live(&self, now: Instant, wall_now: SystemTime) -> bool {
         if self.until <= now {
             return false;
@@ -115,12 +87,8 @@ impl Leases {
         self.promises.clear();
     }
 
-    /// `now` is when the probe was *sent*, which is at or before the voter started counting: the
-    /// deadline this records is therefore never later than the one the voter will keep.
-    ///
-    /// `until` extends only: a round granting less than one still outstanding says the voter's
-    /// contact aged, not that it withdrew anything. The clock pair is always the newest round's --
-    /// the reply arriving is fresh evidence that both clocks are running.
+    /// `now` is when the probe was sent, at or before the voter started counting, so this deadline is
+    /// never later than the voter's. `until` extends only; the clock pair is the newest round's.
     pub fn note_promise(
         &mut self,
         voter: &str,
@@ -135,9 +103,8 @@ impl Leases {
         self.promises.insert(voter.to_string(), Promise { until, at: now, at_wall: wall_now });
     }
 
-    /// Whether a majority still owes this node silence, and so whether a read needs no round.
-    /// Counting itself is sound because granting a vote steps a leader down, which the read path
-    /// checks on its own. A promise from a node the configuration has dropped counts for nothing.
+    /// Whether a majority still owes silence, so a read needs no round. Counting self is sound because
+    /// granting a vote steps a leader down. A promise from a dropped node counts for nothing.
     pub fn held(
         &self,
         config: &Configuration,
@@ -173,9 +140,8 @@ mod tests {
         TIMEOUT * 10
     }
 
-    /// The whole of M16's arithmetic: a grant is a duration on the voter's clock, and the leader
-    /// dates it from before it asked, so any flight at all leaves the leader's deadline the earlier
-    /// of the two. The old follower-carried promise had to guess that flight with a fixed margin.
+    /// A grant is a duration on the voter's clock dated from before the leader asked, so any flight
+    /// leaves the leader's deadline the earlier of the two.
     #[test]
     fn a_leaders_deadline_lands_at_or_before_the_voters_however_long_the_probe_took() {
         let window = refusal_window(TIMEOUT);

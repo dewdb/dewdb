@@ -1,10 +1,5 @@
 //! Webhook delivery: a CDC consumer that pushes to an endpoint instead of holding a connection.
-//!
-//! Registrations and acknowledged positions commit through the group's `_webhooks` log.
-//! Local counters are coalesced on a blocking worker.
-//!
-//! Only the group's leader delivers. The stream is opened `read=primary` for that reason, and a
-//! step-down ends it in place rather than leaving two nodes pushing the same events.
+//! Only the group's leader delivers, so the stream is `read=primary` and a step-down ends it in place.
 
 use crate::auth::digest_admitted;
 use crate::cdc::{CdcEnd, CdcFilter, CdcStream};
@@ -27,9 +22,8 @@ use tracing::{info, warn};
 
 const WEBHOOK_FILE: &str = "webhooks.meta";
 pub(crate) const WEBHOOK_PROGRESS_LOG: &str = "_webhooks";
-/// How often the sender set is reconciled against the registrations and this node's leadership.
-/// A registration change wakes it early, so this is a bound on noticing a failover rather than
-/// something a request waits on.
+/// How often the sender set is reconciled against the registrations and this node's leadership. A
+/// registration change wakes it early, so this bounds noticing a failover, not any request.
 const SUPERVISE_INTERVAL: Duration = Duration::from_millis(500);
 /// Between attempts to open a feed that is not there yet: the collection was dropped, or the
 /// handle was replaced under the sender.
@@ -115,17 +109,14 @@ pub struct WebhookSpec {
     pub filter: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ops: Option<String>,
-    /// SHA-256 of the API key the registration was created with, and absent when it was created
-    /// against an open API. A registration outlives the process that accepted it, so the sender
-    /// asks again whether a key the node still holds hashes to this (IB-026). The key itself is
-    /// never written down.
+    /// SHA-256 of the API key the registration was created with, absent when created against an open API.
+    /// The key itself is never written down, so the sender asks again whether one still hashes to this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creator: Option<String>,
 }
 
-/// The route a registration was accepted on, which is the gate its credential has to keep
-/// clearing. `POST` rather than the delivery: nothing about pushing a batch is an HTTP request to
-/// this node.
+/// The route a registration was accepted on, which is the gate its credential has to keep clearing.
+/// `POST` rather than the delivery: nothing about pushing a batch is an HTTP request to this node.
 pub fn registration_route(collection: &str) -> String {
     format!("/collections/{}/webhooks", collection)
 }
@@ -148,9 +139,8 @@ pub struct Delivery {
     /// Consecutive failures for the batch in flight. Reset by an acknowledgement, and what the
     /// backoff is computed from.
     pub failures: u64,
-    /// Events the feed dropped before this subscription read them, because delivery fell further
-    /// behind than `changefeed.buffer_events` holds. Not a count of events -- the feed cannot say
-    /// how many it evicted -- but of the times it happened.
+    /// Events the feed dropped before this subscription read them, delivery having fallen further behind
+    /// than `changefeed.buffer_events` holds. Counts the times it happened, not the events.
     pub gaps: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
@@ -543,9 +533,8 @@ fn sender_client(config: &WebhookConfig) -> reqwest::Client {
         .unwrap_or_default()
 }
 
-/// Retries until the endpoint acknowledges, this node stops leading, or the registration goes.
-/// There is no attempt ceiling: a bounded retry drops events, and dropping them silently is worse
-/// than a subscription that is visibly behind.
+/// Retries until the endpoint acknowledges, this node stops leading, or the registration goes. No attempt
+/// ceiling: a bounded retry drops events silently, which is worse than a visibly late subscription.
 async fn post_until_acknowledged(
     state: &AppState,
     client: &reqwest::Client,
@@ -622,10 +611,8 @@ async fn post_until_acknowledged(
     }
 }
 
-/// Whether the credential this registration was created with has stopped being accepted, and if
-/// so disables it. A registration is durable, so a restart does not end one the way it ends a
-/// connection: without this a key removed from the config keeps posting the collection's documents
-/// to the endpoint it named, indefinitely (IB-026).
+/// Whether the credential this registration was created with has stopped being accepted, and if so
+/// disables it. A registration is durable, so a restart does not end one the way it ends a connection.
 fn revoked(state: &AppState, key: &WebhookKey, spec: &WebhookSpec) -> bool {
     if spec.still_authorized(&state.auth()) {
         return false;
@@ -738,8 +725,7 @@ pub fn webhook_task(state: AppState) {
     // Before the caller binds its listener, not on the first tick: a change written while the
     // supervisor was still starting would otherwise never be built.
     if let Err(e) = reconcile_registrations(&state) {
-        warn!(target: "webhook", error = %e, "Could not restore registrations");
-        return;
+        warn!(target: "webhook", error = %e, "Could not restore registrations; supervisor will retry");
     }
     state.webhooks.sync_pins(state.db.as_ref().unwrap());
 
@@ -786,6 +772,36 @@ pub fn webhook_task(state: AppState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ib056_boot_reconcile_failure_retries_until_catalogue_recovers() {
+        let root = crate::test_support::temp_root();
+        let db = Arc::new(Database::new(&root).unwrap());
+        let config = serde_json::from_value(serde_json::json!({
+            "node_id": "solo", "role": "shard", "shard_role": "replica",
+            "listen_addr": "127.0.0.1:9601", "data_dir": root.to_string_lossy(),
+        })).unwrap();
+        let state = AppState::for_admission_test(config, db.clone(), false);
+        let log = db.get_collection(WEBHOOK_PROGRESS_LOG).unwrap();
+        let lsn = log.put(CATALOG_KEY.into(), serde_json::json!({"subscriptions": false}), 1).unwrap().3;
+        log.apply_committed(lsn).unwrap();
+        assert!(reconcile_registrations(&state).is_err());
+        let key = ("c".to_string(), "hook".to_string());
+        state.webhooks.upsert(spec("hook"), 7, 4).unwrap();
+
+        webhook_task(state.clone());
+        tokio::time::sleep(SUPERVISE_INTERVAL * 2).await;
+        assert!(state.webhooks.get(&key).is_some());
+        assert!(!root.join(WEBHOOK_FILE).exists());
+
+        let lsn = log.put(CATALOG_KEY.into(), serde_json::json!({"subscriptions": []}), 1).unwrap().3;
+        log.apply_committed(lsn).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.webhooks.get(&key).is_some() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("supervisor must reconcile after the catalogue recovers without a restart");
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ib031_catalogue_replacement_preserves_counters_and_overrules_stale_local_state() {

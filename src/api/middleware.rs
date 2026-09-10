@@ -48,12 +48,8 @@ pub async fn metrics_middleware(
     response
 }
 
-/// The one gate on collection names, in place of a check in each of the eleven
-/// `/collections/:name` handlers. It replaces `Path` in their signatures rather than sitting in a
-/// layer, because a layer judges the still-encoded URI while the handler acts on the decoded name:
-/// `%5Fconfig` passed the reserved check and reached `_config`, and `..%2F..%2Fx` reached a
-/// directory outside the data root. Internal replication carries a name in a body, not on a path,
-/// and is gated at `Database::collection_dir` instead.
+/// The one gate on collection names, replacing `Path` in the handlers rather than sitting in a layer:
+/// a layer judges the encoded URI, so `%5Fconfig` reached `_config` and `..%2F..%2Fx` left the root.
 pub struct CollectionPath<T>(pub T);
 
 /// Which captured segment is the collection: the whole capture on `/:name` routes, the first of
@@ -97,8 +93,7 @@ where
 }
 
 /// The second gate on a client-supplied name, after `CollectionPath` has judged its shape.
-/// `get_collection` opens on miss, so resolving with it let a typo in a read create a directory, a
-/// commit task and a map entry that nothing evicts (bugs.md `H15`).
+/// `get_collection` opens on miss, so resolving with it let a typo in a read create a collection (H15).
 pub fn client_collection(
     state: &AppState,
     name: &str,
@@ -139,9 +134,8 @@ pub async fn auth_middleware(
     }
 }
 
-/// Applies `chaos`'s link faults at the receiving end, where the sender is known from its
-/// `NODE_HEADER`. A cut hangs rather than answering, so the sender fails the way a partition makes
-/// it fail -- on its own timeout -- instead of learning that the peer is up and refusing.
+/// Applies `chaos`'s link faults at the receiving end, where `NODE_HEADER` names the sender. A cut hangs
+/// rather than answering, so the sender fails on its own timeout as a partition makes it fail.
 #[cfg(test)]
 pub async fn chaos_middleware(
     State(state): State<AppState>,

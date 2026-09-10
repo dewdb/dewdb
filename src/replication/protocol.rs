@@ -3,11 +3,8 @@
 use crate::util::base64_bytes;
 use serde::{Deserialize, Serialize};
 
-/// `wal_frame` is the first entry and `frames` the rest, ascending by LSN. Splitting them this way
-/// keeps a peer that predates batching correct: it applies the first and reports that LSN, so the
-/// leader advances one frame per round trip instead of misreading the batch as delivered.
-///
-/// `lsn`/`prev_lsn` describe `wal_frame` only. Later entries carry their own chain in their headers.
+/// `wal_frame` is the first entry and `frames` the rest, ascending by LSN; a peer that predates
+/// batching applies the first and reports it. `lsn`/`prev_lsn` describe `wal_frame` only.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ReplicateRequest {
     pub collection: String,
@@ -44,9 +41,8 @@ pub struct ResyncRequest {
     pub collection: String,
 }
 
-/// Both stream back. `applied` is the replica's committed watermark, which is the lowest point it
-/// will truncate to and so where a backed-up stream has to start; `None` is a peer that predates
-/// reporting it, and there is nothing to back up to but a snapshot.
+/// Both stream back. `applied` is the replica's committed watermark, the lowest point it will
+/// truncate to and so where a backed-up stream starts; `None` leaves nothing but a snapshot.
 pub enum ConflictKind {
     StaleTerm(u64),
     Gap(u64, u64),

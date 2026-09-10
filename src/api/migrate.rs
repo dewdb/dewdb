@@ -1,9 +1,5 @@
-//! Starting, watching, aborting and completing a handover.
-//!
-//! The coordinator is whichever leader was asked to start it. It owns no data movement -- each
-//! shard pushes its own keys -- it only waits for every source to finish and then publishes the
-//! ring that makes the move real. If the coordinator dies mid-move nothing is lost: the plan is in
-//! the view, sources keep pushing, and another operator call can finish or abandon it.
+//! Starting, watching, aborting and completing a handover. The coordinator moves no data -- each shard
+//! pushes its own keys -- and if it dies the plan is in the view, so another call can finish it.
 
 use crate::api::members::{publish, writable};
 use crate::api::ring::RingRequest;
@@ -108,9 +104,8 @@ pub(crate) async fn begin_migration(
     };
     let next = current.with_migration(&state.config.node_id, Some(migration));
 
-    // Handed out before this node adopts it. Adopting starts our own push immediately, and a
-    // destination that has not seen the plan yet refuses the batch -- survivable, since pushes
-    // retry, but it costs a backoff on every handover for no reason.
+    // Handed out before this node adopts it: adopting starts our own push at once, and a destination
+    // that has not seen the plan refuses the batch, costing a backoff on every handover.
     broadcast(state, &next, Some(&target));
 
     let version = match publish(state, next).await {
@@ -270,9 +265,8 @@ pub(crate) fn resume_migration_coordination(state: &AppState) {
     coordinate(state.clone(), plan.id, plan.target, sources);
 }
 
-/// Who answers as primary for a source group now. The ring names whoever led it when the plan was
-/// made; after a failover that node is a follower, and its progress is not the group's. Cached per
-/// group, so a healthy handover costs one probe round per override TTL rather than one per poll.
+/// Who answers as primary for a source group now: the ring names whoever led it when the plan was made.
+/// Cached per group, so a healthy handover costs one probe round per override TTL, not one per poll.
 async fn source_leader(state: &AppState, source: &str) -> Option<String> {
     if let Some(cached) = state.cached_primary(source) {
         return Some(cached);
@@ -349,12 +343,8 @@ async fn sources_pending(
     Ok(pending)
 }
 
-/// Asks everyone who might be holding a handed-over key to drop it: the shards that owned the
-/// keyspace before, plus the ones that own it now. A shard dropped from the ring is in the first
-/// list only, and it is the one most likely to be sitting on a whole shard's worth of copies.
-///
-/// Leftovers are unreachable while the node stays out of the ring, but they are not harmless: put
-/// that node back later and its stale values would shadow the current ones.
+/// Asks everyone who might hold a handed-over key to drop it, the previous owners included -- a shard
+/// dropped from the ring holds the most. Its leftovers would shadow live values if it came back.
 async fn cleanup(state: &AppState, id: &str, sources: &[String]) {
     let view = state.cluster_view();
     let body = serde_json::json!({ "migration_id": id });
@@ -366,9 +356,8 @@ async fn cleanup(state: &AppState, id: &str, sources: &[String]) {
         .collect();
 
     for node in nodes {
-        // The ring names a group by its configured primary, which is not necessarily the node
-        // leading it now, and only the leader can commit the deletions (bugs.md H16). Resolved the
-        // same way `sources_pending` resolves it, rather than trusting `node_url`.
+        // The ring names a group by its configured primary, which need not be the node leading it now,
+        // and only the leader can commit the deletions (H16). Resolved as `sources_pending` does it.
         let node = match source_leader(state, &node).await {
             Some(leader) => leader,
             None => {
@@ -378,9 +367,8 @@ async fn cleanup(state: &AppState, id: &str, sources: &[String]) {
             },
         };
 
-        // The final view first, and awaited. A node still holding the plan refuses to clean up --
-        // correctly, since from where it stands ownership has not moved yet. Relying on ordinary
-        // propagation to get there first would make cleanup a race it usually loses.
+        // The final view first, and awaited: a node still holding the plan refuses to clean up, so
+        // relying on ordinary propagation would make cleanup a race it usually loses.
         if !crate::util::same_endpoint(&node, &state.own_url()) {
             let handover = format!("{}/internal/cluster", node);
             if let Err(e) = state.client.post(&handover).json(&view).send().await {
@@ -668,9 +656,8 @@ mod tests {
             "a value deleted after the bulk copy must not reappear at cutover");
     }
 
-    /// Finalization has to freeze the keys that are moving. It does not have to freeze the node:
-    /// the barrier exists to drain writes that decided ownership under the previous view, which is
-    /// an instant, not the length of a keyspace scan plus every round trip in the pass.
+    /// Finalization has to freeze the keys that are moving, not the node: the barrier drains writes that
+    /// decided ownership under the previous view, which is an instant, not a whole keyspace scan.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn writes_the_handover_is_not_moving_keep_going_through_finalization() {
         let root = temp_root();
@@ -996,9 +983,8 @@ mod tests {
         )
     }
 
-    /// The ring names one node per shard, but a shard is a group. When its leader dies mid-handover
-    /// that name belongs to a node that is not leading, and everything the coordinator asks it is
-    /// answered by the wrong node -- if it answers at all.
+    /// The ring names one node per shard, but a shard is a group: when its leader dies mid-handover that
+    /// name belongs to a node that is not leading, and answers for the group it no longer speaks for.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_handover_finishes_when_the_source_group_elects_a_new_leader() {
         let root = temp_root();
@@ -1212,11 +1198,8 @@ mod tests {
     }
 
 
-    /// C18: the handover record went to the node-local `migration.meta`, so it came back through a
-    /// restart of the same process but never reached a peer elected in its place. After the flip
-    /// the plan is out of the view, so that peer has nothing to re-derive it from and its group
-    /// keeps the stale copies. H16 is the same hole from the other end, and once cleanup is
-    /// addressed to the current leader this is what decides whether that leader can act.
+    /// C18: the handover record went to the node-local `migration.meta`, so a peer elected in this
+    /// node's place had nothing to re-derive it from and its group kept the stale copies.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_handover_record_reaches_a_node_that_never_pushed_anything() {
         let root = temp_root();
@@ -1340,9 +1323,8 @@ mod tests {
         source.kill();
     }
 
-    /// Shrinking is where the tidy-up is easy to get wrong: the departing shard leaves the owner
-    /// list the moment the ring lands, so anything driven off the new owners misses it entirely.
-    /// Its copies are unreachable while it stays out, but adding it back would resurrect them.
+    /// Shrinking is where the tidy-up is easy to get wrong: the departing shard leaves the owner list the
+    /// moment the ring lands, so anything driven off the new owners misses its copies entirely.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_shard_removed_from_the_ring_does_not_keep_the_keys_it_gave_back() {
         let root = temp_root();

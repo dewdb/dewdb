@@ -69,12 +69,11 @@ pub async fn drop_collection(
         Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
 
-    // The definitions go with the documents, and the entry is emptied rather than removed: a node
-    // that missed the drop would otherwise win the merge and put them back on whoever recreates
-    // the collection. Ahead of the append, so the log can only be behind the catalogue.
+    // The definitions go with the documents, and the entry is emptied rather than removed: a node that
+    // missed the drop would win the merge. Ahead of the append, so the log stays behind the catalogue.
     state.forget_collection_indexes(&col_name);
 
-    // Nothing to log: appending a drop here would create the collection in order to tombstone it.
+    // Nothing to log: appending a drop here would create the collection just to tombstone it.
     if !present {
         return (StatusCode::OK, Json(serde_json::json!({
             "collection": col_name,

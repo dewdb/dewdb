@@ -100,9 +100,8 @@ pub async fn set_ring_handler(
         return err_json(StatusCode::UNPROCESSABLE_ENTITY, why);
     }
 
-    // Measured before publishing, so a dry run and the real thing report the same number. Off the
-    // request task: bounded by MAX_RING_TOKENS, this is still ~300 ms of CPU at the ceiling, and a
-    // dry run pays it in full without persisting anything (bugs.md H14).
+    // Measured before publishing, so a dry run and the real thing report the same number. Off the request
+    // task: bounded by MAX_RING_TOKENS, this is still ~300 ms of CPU at the ceiling (H14).
     let before = state.built_ring();
     let (proposed, movement) = match tokio::task::spawn_blocking(move || {
         let after = proposed.build();
@@ -125,9 +124,8 @@ pub async fn set_ring_handler(
         "moved_fraction": movement.as_ref().map(|m| m.moved_fraction),
         "transfers": movement.as_ref().map(|m| &m.transfers),
         "previous_model": previous_model,
-        // A null fraction is "not comparable", which a client would otherwise read as "nothing
-        // moves". This node has no ring to diff against, usually because the cluster's ring was
-        // never published to it -- config rings are per-node seeds and do not propagate.
+        // A null fraction is "not comparable", which a client would otherwise read as "nothing moves".
+        // This node has no ring to diff against; config rings are per-node seeds and do not propagate.
         "movement_known": movement.is_some(),
         "note": movement.is_none().then_some(
             "this node holds no ring to compare against, so the cost of the change is unknown \
@@ -140,9 +138,8 @@ pub async fn set_ring_handler(
         }))).into_response();
     }
 
-    // Ownership moves the instant each node adopts, and this endpoint moves nothing else. That is
-    // a deliberate outage of the moved keys, so it is refused rather than warned about and the
-    // caller is pointed at /cluster/migrate. A change proven to move nothing is always safe.
+    // Ownership moves the instant each node adopts and this endpoint moves nothing else, so it is a
+    // deliberate outage: refused, and the caller pointed at /cluster/migrate. A proven no-op is safe.
     let proven_no_op = movement.as_ref().is_some_and(|m| m.moved_fraction == 0.0);
     if !proven_no_op && !state.config.allow_unsafe_ring_changes {
         match cluster_holds_data(&state).await {
@@ -379,9 +376,8 @@ mod tests {
             "the warning must point at the endpoint that moves the data too");
     }
 
-    /// H14: `build` allocates `shards x vnodes` tokens and only `vnodes` was bounded. The refusal
-    /// has to land in `validate`, ahead of the `dry_run` branch -- a dry run paid the cost in full
-    /// and persisted nothing, which is what made it repeatable.
+    /// H14: `build` allocates `shards x vnodes` tokens and only `vnodes` was bounded. The refusal has to
+    /// land in `validate`, ahead of the `dry_run` branch, which paid the cost in full and persisted none.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_oversized_ring_is_refused_before_it_is_built() {
         use crate::test_support::single_node;

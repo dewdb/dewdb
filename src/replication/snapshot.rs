@@ -258,9 +258,8 @@ fn stream_snapshot(
         .map_err(io::Error::other)?;
         applied_file.sync_all()?;
 
-        // Rotation is what makes the streamed set immutable, and an active WAL with nothing appended
-        // to it already is: a run of requests on an idle leader then costs no files. Not below id 2,
-        // where there is no earlier WAL and the receiver refuses a snapshot carrying none.
+        // Rotation is what makes the streamed set immutable, and an idle active WAL already is, so a
+        // run of requests costs no files. Not below id 2, where the receiver refuses the snapshot.
         if wal.current_wal_size == 0 && frozen_through > 1 {
             frozen_through - 1
         } else {
@@ -453,10 +452,8 @@ async fn receive_snapshot<R: AsyncRead + Unpin>(
     Ok(file_count)
 }
 
-/// An install replaces rather than merges, so one stopping below `local_applied` -- this node's own
-/// watermark -- would retract entries a quorum committed on our ack. A legitimate leader holds every
-/// committed entry and so never sends one; divergent local frames are uncommitted and below the
-/// watermark, which is why comparing watermarks and not tails still allows a divergence repair.
+/// An install replaces rather than merges, so one stopping below `local_applied` would retract entries
+/// a quorum committed on our ack. Watermarks, not tails, so a divergence repair is still allowed.
 fn validate_staged_snapshot(target: &Path, local_applied: u64) -> io::Result<()> {
     let index: IndexSnapshot = bincode::deserialize_from(File::open(target.join(INDEX_FILENAME))?)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -899,9 +896,8 @@ mod tests {
         );
     }
 
-    /// H18: `snapshot_handler` resolved with `get_collection`, so being *asked* for a collection
-    /// created it -- a directory, a wal and an `Arc<Collection>` nothing evicts, per distinct name,
-    /// on a tier that is unauthenticated on the default config.
+    /// H18: `snapshot_handler` resolved with `get_collection`, so being asked for a collection created
+    /// it -- a directory, a wal and an uncached `Arc<Collection>` per name, on an unauthenticated tier.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_snapshot_of_a_collection_the_leader_does_not_have_is_refused() {
         let root = temp_root();

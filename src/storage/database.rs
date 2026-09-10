@@ -257,11 +257,8 @@ impl Database {
         Ok(col)
     }
 
-    /// Opens a collection only if it is already there. `get_collection` creates the directory, so
-    /// probing a system log with it would put an empty one on every node that never used it.
-    ///
-    /// `Ok(None)` is absent; a directory that is there and will not open stays an error, so a
-    /// caller answering a client does not report a broken collection as a missing one.
+    /// Opens a collection only if it is already there; `get_collection` would create the directory.
+    /// `Ok(None)` is absent, but a directory that will not open stays an error.
     pub fn lookup_collection(&self, name: &str) -> io::Result<Option<Arc<Collection>>> {
         if !valid_collection_name(name) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput,
@@ -435,9 +432,8 @@ impl Database {
         Ok(out)
     }
 
-    /// What a client sees. A tombstone is still a collection on disk — it holds the log the drop
-    /// lives in, which replication and compaction both still have work to do on — but it is gone as
-    /// far as the API is concerned.
+    /// What a client sees. A tombstone is still a collection on disk -- it holds the log the drop lives
+    /// in, which replication and compaction still work on -- but it is gone as far as the API goes.
     pub fn live_collections(&self) -> io::Result<Vec<String>> {
         let mut names = self.list_collections()?;
         names.retain(|name| !is_system_collection(name) && !self.is_dropped(name));
@@ -475,13 +471,8 @@ impl Database {
         }
     }
 
-    // The one place the watermark may fall: a snapshot can shrink the log.
-    /// Whether anything has ever been written here. Answered from directory entries rather than
-    /// from open collections: a collection that exists on disk but has not been opened yet still
-    /// holds data, and a check that missed it would report an empty node.
-    ///
-    /// A log containing only tombstones counts as data. Deliberately conservative -- this gates a
-    /// change that can make keys unreadable, so the cheap error is a false "populated".
+    /// Whether anything has ever been written here, answered from directory entries: an unopened
+    /// collection still holds data. Tombstones count -- this gates a change that can hide keys.
     pub fn has_any_data(&self) -> io::Result<bool> {
         for name in self.list_collections()? {
             let dir = self.root_path.join(&name);
@@ -683,8 +674,7 @@ mod tests {
     }
 
     /// M9: a drop that only unlinks files is invisible to every node but the one that ran it. The
-    /// collection survives its own drop as a tombstone holding the log entry, which is what a
-    /// replica and a later leader read it from.
+    /// collection survives its own drop as a tombstone holding the log entry.
     #[tokio::test]
     async fn a_committed_drop_empties_the_collection_and_hides_it() {
         let root = temp_root();

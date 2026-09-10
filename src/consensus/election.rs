@@ -37,9 +37,8 @@ pub struct VoteRequest {
     /// and not by `candidate_id`. Absent from a peer that predates configuration entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_url: Option<String>,
-    /// The leader that told this candidate to stand, on a transfer. A voter that is following that
-    /// leader votes despite fresh contact from it -- see `AppState::honours_transfer`, and Raft
-    /// §3.10, where the whole point is that a healthy cluster's leader can hand office over.
+    /// The leader that told this candidate to stand, on a transfer. A voter following that leader
+    /// votes despite fresh contact from it -- see `AppState::honours_transfer`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfer_from: Option<String>,
 }
@@ -57,8 +56,7 @@ pub struct VoteDecision {
 }
 
 // A promoted follower with no configured replicas would accept writes and replicate them nowhere.
-// Opens every collection on disk: one we have not opened yet still holds entries we could lose.
-// Takes the collections lock, so never call this while holding the replication lock.
+// Opens every collection on disk; takes the collections lock, so not under the replication lock.
 pub fn local_log_tails(state: &AppState) -> HashMap<String, LogTail> {
     try_local_log_tails(state).unwrap_or_default()
 }
@@ -77,9 +75,8 @@ pub fn try_local_log_tails(state: &AppState) -> std::io::Result<HashMap<String, 
     Ok(tails)
 }
 
-/// The database-wide `(term, lsn)` pair for peers that predate per-collection `logs`.
-/// Derived from `tails`, never from `durable_lsn`: fsync progress lags the log tail, and a
-/// candidate advertising a stale tail can be elected over a node holding more entries.
+/// The database-wide `(term, lsn)` pair for peers that predate per-collection `logs`. Derived from
+/// `tails`, never `durable_lsn`: fsync lags the tail, and a stale advertisement can win an election.
 pub fn log_summary(state: &AppState, tails: &HashMap<String, LogTail>) -> LogTail {
     if let Some(max) = tails.values().copied().max() {
         return max;
@@ -119,13 +116,8 @@ fn candidate_is_current(my_logs: &HashMap<String, LogTail>, my_summary: LogTail,
     my_logs.iter().all(|(name, mine)| req.logs.get(name).copied().unwrap_or_default() >= *mine)
 }
 
-/// Whether this voter's own configuration still counts the candidate. A demoted node that has not
-/// heard about its demotion goes on campaigning, and a voter that grants it a vote hands a leader
-/// to a set the cluster has left: its majorities are computed over the members it still thinks it
-/// has, and those are not majorities of the configuration in force.
-///
-/// `None` for either side is a grant: a peer that sends no url predates configuration entries, and
-/// a voter holding no configuration has nothing to judge the candidate against.
+/// Whether this voter's own configuration still counts the candidate: a demoted node goes on
+/// campaigning, and its majorities are over members it no longer has. `None` on either side grants.
 fn candidate_is_a_member(my_config: Option<&Configuration>, req: &VoteRequest) -> bool {
     match (my_config, req.candidate_url.as_deref()) {
         (Some(config), Some(url)) => config.contains(url),
@@ -134,8 +126,7 @@ fn candidate_is_a_member(my_config: Option<&Configuration>, req: &VoteRequest) -
 }
 
 /// The grant itself, given the vote this node would hold once `req`'s term is applied. Shared with
-/// the pre-vote, which asks exactly this and keeps the answer to itself. `must_withhold` is the
-/// lease's other half: a voter that owes a leader silence refuses whatever the candidate offers.
+/// the pre-vote. `must_withhold` is the lease's other half: silence owed refuses any offer.
 fn grants(
     voted_for: &Option<String>,
     my_logs: &HashMap<String, LogTail>,
@@ -154,9 +145,8 @@ fn grants(
         && !must_withhold
 }
 
-/// Raft §9.6. The question the real vote answers, decided against nothing and changing nothing: a
-/// candidate that could not win never raises anyone's term, so a node that has been removed or
-/// partitioned stops costing the group an election every cycle (bugs.md C20).
+/// The question the real vote answers, decided against nothing and changing nothing: a candidate
+/// that could not win never raises anyone's term, so a removed node stops costing an election.
 pub fn decide_pre_vote(
     cur_term: u64,
     my_logs: &HashMap<String, LogTail>,
@@ -221,12 +211,8 @@ fn vote_request(
     }
 }
 
-/// One round of asking every peer the same question, stopping as soon as the answers carry a quorum.
-/// Returns who granted -- this node included, since it answers for itself -- and the highest term
-/// any peer reported, or 0 if none did.
-///
-/// Who granted, not how many: while joint a tally cannot tell a majority of both halves from the
-/// same count spread across one of them.
+/// One round of asking every peer, stopping once the answers carry a quorum. Returns who granted --
+/// this node included -- and the highest peer term, or 0. Who granted, not how many: joint halves.
 async fn ask_peers(
     state: &AppState,
     req: &VoteRequest,
@@ -292,9 +278,8 @@ async fn ask_peers(
     (granted.lock().unwrap().clone(), highest_term.load(Ordering::Relaxed))
 }
 
-/// `forced_by` is the leader handing office over (Raft §3.10). Everything a timeout election does
-/// to avoid disturbing a live leader is exactly what a transfer must skip -- the jitter, adopting
-/// the leader that is standing aside, and the pre-vote round it would lose by asking.
+/// `forced_by` is the leader handing office over. Everything a timeout election does to avoid
+/// disturbing a live leader is what a transfer skips: jitter, adoption, and the pre-vote round.
 pub async fn run_election(state: &AppState, max_delay_ms: u64, forced_by: Option<String>) {
     let Ok(_campaign) = state.campaign.try_lock() else { return };
     let forced = forced_by.is_some();
@@ -342,10 +327,8 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64, forced_by: Option
     let lone_voter = quorum.has_quorum(std::slice::from_ref(&own));
     let round_deadline = Duration::from_millis(max_delay_ms.max(1000) + 2000);
 
-    // Raft §9.6: a term this node raises and then loses with deposes a leader that was serving
-    // fine, so ask whether it could win before standing costs the group anything (bugs.md C20).
-    // A transfer skips it: the leader is standing aside, so every voter still inside its refusal
-    // window would answer no, and the leader has already established this node holds its tail.
+    // A term raised and lost with deposes a leader that was serving fine, so ask whether it could win.
+    // A transfer skips it: every voter inside the standing leader's refusal window would answer no.
     if !forced && !lone_voter && !peers.is_empty() {
         let asking = state.current_term() + 1;
         let probe = vote_request(asking, &candidate_id, &my_logs, my_tail, &own, None);
@@ -397,6 +380,7 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64, forced_by: Option
     let (granted, seen_term) = ask_peers(
         state, &req, peers, &quorum, "/internal/vote", false, round_deadline).await;
 
+    // The vote round is async; another node may have moved our term while it ran.
     if seen_term > new_term {
         info!(target: "election", "Saw higher term {} during election; stepping down", seen_term);
         demote(state, seen_term).await;
@@ -410,7 +394,6 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64, forced_by: Option
     }
 }
 
-// The vote round is async; another node may have moved our term while it ran.
 /// Seeds every replica's send cursor from our own log, lowered by any persisted hint.
 /// Also used at boot by a node configured as primary, which never runs an election.
 pub fn seed_leader_progress(state: &AppState) {
@@ -435,17 +418,8 @@ pub fn seed_leader_progress(state: &AppState) {
     }
 }
 
-/// Raft's no-op, appended once per collection that needs one. A collection with a durable-but-
-/// uncommitted tail from a previous leader has no current-term entry, so `advance` has no floor and
-/// will not commit it however many replicas hold it; committing a barrier above it commits it
-/// indirectly. Collections already covered by a current-term append are skipped — the floor a write
-/// sets is enough for the write itself, and a barrier there would be a frame written for no reason
-/// on every election.
-///
-/// Called at promotion and then on every drive tick, because promotion is a moment and the state
-/// this fixes outlives it: a collection mid-resync is absent from the listing, and a term that
-/// moves under the spawned task takes the barrier with it. Missing it once stranded the tail for
-/// the life of the term (bugs.md C30).
+/// Raft's no-op, appended once per collection that needs one: a durable-but-uncommitted tail from a
+/// previous leader has no current-term entry, so `advance` has no floor. Re-run on every drive tick.
 pub fn publish_inherited_tails(state: &AppState) {
     let db = match state.db.as_ref() {
         Some(db) => db.clone(),
@@ -753,9 +727,8 @@ mod tests {
             "and a voter holding no configuration has nothing to judge the candidate against");
     }
 
-    /// The promise a leader's lease is built on. Withholding has to survive everything that would
-    /// otherwise win the vote -- a higher term, a longer log, an unspent vote -- or the leases
-    /// handed out on the strength of it are not leases.
+    /// The promise a leader's lease is built on: withholding survives a higher term, a longer log,
+    /// and an unspent vote, or the leases handed out on it are not leases.
     #[test]
     fn a_voter_with_fresh_leader_contact_withholds_its_vote_but_still_takes_the_term() {
         let req = vote_req(9, "n1", 4, 500);
@@ -848,9 +821,8 @@ mod tests {
         tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
     }
 
-    /// Pre-vote is an optimization, so a peer that has never heard of it is counted as willing:
-    /// a half-upgraded cluster elects exactly as it did before the round existed. The real vote
-    /// gets the opposite treatment, because there nobody answered.
+    /// Pre-vote is an optimization, so a peer that has never heard of it counts as willing. The real
+    /// vote gets the opposite treatment, because there nobody answered.
     #[tokio::test]
     async fn a_peer_that_does_not_know_the_pre_vote_endpoint_is_counted_as_willing() {
         let root = crate::test_support::temp_root();

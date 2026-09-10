@@ -1,17 +1,5 @@
-//! Long-running durability and recovery scenarios. Not part of the suite; each is `#[ignore]`d and
-//! run explicitly: `cargo test --release -- --ignored --nocapture soak`
-//!
-//! Each has a fixed seed so a failure replays. `DEWDB_SOAK_SEED=0x...` overrides it, which is how a
-//! run that found nothing is asked for a different schedule.
-//!
-//! All of them assert one thing: a write the cluster answered 200 or 201 is still readable, with a
-//! value no older than the one acknowledged, after whatever happened in between. A 202 is staged
-//! and promises nothing, so it is counted and never asserted on. Anything the client never saw an
-//! answer for is not evidence either way and is recorded as attempted only.
-//!
-//! `TestNode::kill` drops the process's state without flushing anything, so it is a process crash.
-//! It is not a machine crash: writes that reached the OS but were never fsynced still survive,
-//! because the page cache does. `truncated_tail` is what covers that half.
+//! Long-running durability and recovery scenarios: `cargo test --release -- --ignored --nocapture soak`.
+//! Each is seeded so a failure replays, and all assert that a write answered 200 or 201 stays readable.
 
 use crate::test_support::{cleanup, next_test_port, temp_root, three_node_cluster_with_timeout, TestNode};
 use std::collections::BTreeMap;
@@ -41,10 +29,8 @@ impl Rng {
     }
 }
 
-/// What the client was told, which is the only thing a durability claim can rest on. Per key: the
-/// highest value acknowledged, and the highest attempted. A later attempt that was never
-/// acknowledged is why the check is a range and not an equality -- it may or may not have landed,
-/// and both outcomes are correct.
+/// What the client was told, per key: the highest value acknowledged, and the highest attempted. An
+/// unacknowledged attempt may or may not have landed, which is why the check is a range.
 #[derive(Default)]
 struct Ledger {
     entries: BTreeMap<String, (Option<i64>, i64)>,
@@ -122,10 +108,8 @@ fn assert_durable(scenario: &str, ledger: &Ledger, actual: &BTreeMap<String, i64
         scenario, problems.len(), shown.len(), shown);
 }
 
-/// Where a node stands in the terms the replication path uses. A replica that never caught up and
-/// one that dropped a published entry read the same from the contents alone, and this is what
-/// separates them: `last_lsn` is what it holds, `applied_lsn` what it publishes, `pending_apply`
-/// what it holds and cannot yet show.
+/// Where a node stands in the replication path's own terms: `last_lsn` is what it holds, `applied_lsn`
+/// what it publishes, `pending_apply` what it holds and cannot yet show.
 async fn node_state(c: &reqwest::Client, base: &str) -> String {
     let body = match c.get(format!("{}/metrics", base)).send().await.ok() {
         Some(r) => r.json::<serde_json::Value>().await.ok(),
@@ -166,9 +150,8 @@ fn view_diff(mine: &BTreeMap<String, i64>, theirs: &BTreeMap<String, i64>) -> St
         stale.len(), stale.iter().take(6).collect::<Vec<_>>())
 }
 
-/// Whether keys missing from a view are late or gone: the same read, repeated. A durability
-/// failure and a replica that never caught up print the same complaint, and the only thing that
-/// separates them from outside the node is whether the entry ever arrives.
+/// Whether keys missing from a view are late or gone: the same read, repeated. Only whether the entry
+/// ever arrives separates a durability failure from a replica that never caught up.
 async fn linger_probe(
     c: &reqwest::Client,
     bases: &[String],
@@ -352,9 +335,8 @@ async fn soak_a_cluster_under_churn_loses_no_acknowledged_write() {
         };
         node.kill();
         if round % 5 == 4 {
-            // Compacted while it is down, so catching up from the WAL is no longer possible and
-            // the returning node has to take a snapshot instead. Short outages never reach that
-            // path, and it is the one recovery step with the most moving parts.
+            // Compacted while it is down, so the returning node has to take a snapshot rather than catch
+            // up from the WAL. Short outages never reach that path, the one with the most moving parts.
             for base in &bases {
                 let _ = c.post(format!("{}/collections/t/compact", base)).send().await;
             }
@@ -546,9 +528,8 @@ async fn soak_a_truncated_wal_tail_costs_only_the_frames_it_cuts() {
     cleanup(&root).await;
 }
 
-/// What a cut tail may cost: entries the WAL no longer ends with. Keys are written in value order
-/// here, so the ones a truncation can take are those with the highest values -- a surviving entry
-/// above a lost one means recovery kept a frame it should not have, or dropped one it should have.
+/// What a cut tail may cost: entries the WAL no longer ends with. Keys are written in value order, so a
+/// surviving entry above a lost one means recovery kept a frame it should not have.
 fn assert_lost_only_the_tail(
     cycle: usize,
     before: &BTreeMap<String, i64>,

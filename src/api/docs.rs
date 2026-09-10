@@ -53,9 +53,8 @@ fn wrong_owner(state: &AppState, collection: &str, key: &str) -> Option<axum::re
     }
 }
 
-/// A server-generated id only has to be unique, so when this shard does not own the first one it
-/// draws another. Expected draws equal the shard count; the bound is there for the pathological
-/// case where the ring says this node owns nothing at all.
+/// A server-generated id only has to be unique, so a shard that does not own the first draws again.
+/// Expected draws equal the shard count; the bound covers a ring that says this node owns nothing.
 fn own_id(state: &AppState, collection: &str, first: String) -> Option<String> {
     let mut candidate = first;
     for _ in 0..64 {
@@ -237,10 +236,8 @@ pub async fn bulk_create_docs(
                     })
                 }
             }).collect();
-            // `207` when the batch is not uniformly what `201` promises, the way the fan-outs
-            // already answer it. The status is the part a client acts on, and a per-item `warning`
-            // it has to go looking for is not one -- every single-document path answers `202` for
-            // exactly this (M19).
+            // `207` when the batch is not uniformly what `201` promises, the way the fan-outs answer
+            // it. A per-item `warning` a client has to go looking for is not a status (M19).
             let status = if met { StatusCode::CREATED } else { StatusCode::MULTI_STATUS };
             (status, Json(serde_json::json!({"results": results}))).into_response()
         }
@@ -248,11 +245,8 @@ pub async fn bulk_create_docs(
     }
 }
 
-/// `read=quorum` is the guarantee `read=primary` is not: the answer comes from a leader that has
-/// confirmed with a majority that it still leads, at an index it has already applied.
-///
-/// Every refusal is `503` with `Retry-After`, because none of them means the read was wrong -- an
-/// unconfirmed leader, a term too new to answer at, and an index not yet visible are all "not now".
+/// `read=quorum` is the guarantee `read=primary` is not: a leader that has confirmed with a majority,
+/// at an index it has applied. Every refusal is `503` with `Retry-After` -- all of them mean "not now".
 async fn unconfirmed_leader(
     state: &AppState,
     pref: &ReadPreference,
@@ -452,10 +446,8 @@ pub async fn query_docs(
     if let Err(e) = check_key_range(params.start.as_deref(), params.end.as_deref()) {
         return err_json(StatusCode::BAD_REQUEST, e);
     }
-    // A sorted cursor is a position in the sort order and an unsorted one is a position in one
-    // shard's keyspace, so a cursor carried over from a differently-shaped query cannot be honoured
-    // and must not be ignored. Both are checked: the unsorted one used to be a bare key, which any
-    // string is a valid one of, so the mix-up in that direction was answered rather than refused.
+    // A sorted cursor is a position in the sort order and an unsorted one a position in a shard's
+    // keyspace, so a cursor from a differently-shaped query is refused rather than ignored.
     let sort_cursor = match (&sort, params.cursor.as_deref()) {
         // The arity is part of belonging: a position taken under one set of sort keys says nothing
         // about where a different set resumes.
@@ -654,11 +646,8 @@ mod tests {
     use axum::http::StatusCode;
     use std::time::Duration;
 
-    /// IB-054: an unsorted filtered page had no read budget, so a selective filter read a shard's
-    /// whole owned range in one request. `max_docs` now bounds it, and because the page is
-    /// resumable the bound ends the page instead of refusing it the way a sorted one is refused.
-    /// The router already carries a short page with a position, so this is a shard-level change
-    /// only.
+    /// IB-054: an unsorted filtered page had no read budget, so a selective filter read a shard's whole
+    /// owned range. `max_docs` bounds it, and because the page resumes the bound ends it, not refuses it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_unsorted_filtered_query_pages_within_its_read_budget_across_shards() {
         let root = temp_root();
@@ -705,9 +694,8 @@ mod tests {
             pages);
     }
 
-    /// H8: with `?sort=`, `cursor` was ignored and `next_cursor` was always `None` — sorted
-    /// pagination was silently a no-op. The cursor is now a position in the sort order, which is one
-    /// position for the whole cluster rather than a per-shard map.
+    /// H8: with `?sort=`, `cursor` was ignored and `next_cursor` was always `None`. The cursor is now a
+    /// position in the sort order, which is one position for the whole cluster.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_sorted_query_pages_across_shards_in_one_global_order() {
         let root = temp_root();
@@ -818,9 +806,8 @@ mod tests {
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "an unsorted cursor is not a sort position");
     }
 
-    /// M3: `ceil(limit/n)` per shard, concatenated untrimmed, returned up to `n - 1` rows more than
-    /// asked for. Trimming afterwards is not the fix — a trimmed row sits behind the cursor its
-    /// shard already moved past — so the shares sum to the limit instead.
+    /// M3: `ceil(limit/n)` per shard, concatenated untrimmed, returned up to `n - 1` rows too many.
+    /// Trimming is not the fix -- a trimmed row sits behind a moved cursor -- so shares sum to the limit.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_cross_shard_page_never_exceeds_its_limit_or_loses_a_row() {
         let root = temp_root();
@@ -1010,9 +997,8 @@ mod tests {
         assert_eq!(q(n1.url(), "?read=nearest").await, StatusCode::BAD_REQUEST);
     }
 
-    /// The guarantee `read=primary` cannot give. It asks the node for its own opinion of who leads,
-    /// and a leader that has already been replaced still holds that opinion; `read=quorum` makes it
-    /// confirm with a majority before answering.
+    /// The guarantee `read=primary` cannot give: it asks the node for its own opinion of who leads, and
+    /// a replaced leader still holds that opinion. `read=quorum` confirms with a majority first.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_quorum_read_is_refused_by_a_leader_that_cannot_reach_its_voters() {
         let root = temp_root();
@@ -1485,10 +1471,8 @@ mod tests {
         assert_eq!(aggregate["groups"][0]["metrics"]["sum:amount"]["sum"].as_f64(), Some(100.0));
     }
 
-    /// IB-047: the ownership snapshot is per request, so a flip between two pages of one unsorted
-    /// scan leaves a moved key behind a position that never covered it -- the destination skipped
-    /// it while unowned without advancing, then returns it again as owner. The flip is applied to
-    /// the shards only, which is the half the router's own fingerprint check cannot see.
+    /// IB-047: the ownership snapshot is per request, so a flip between two pages of one unsorted scan
+    /// leaves a moved key behind a position that never covered it. Applied to the shards only.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ib047_a_ring_flip_between_two_pages_of_one_scan_is_refused() {
         let root = temp_root();
@@ -1687,11 +1671,8 @@ mod tests {
             "the node is still serving, which is the half of this that the status code cannot show");
     }
 
-    /// M18: anything that was not `1`, `majority`, `all` or a number became `w=1`, so a client that
-    /// asked for durability was told `200` and had no way to find out it got none. M19: the bulk
-    /// path answered `201` whatever the concern did, with the shortfall buried in each item.
-    /// L18: an unsorted `/query` took any string as a start key, so a cursor from a differently
-    /// shaped query was answered instead of refused.
+    /// M18: an unrecognised `w=` became `w=1`, so a client asking for durability got `200` and no way
+    /// to tell. M19: the bulk path answered `201` regardless. L18: `/query` took any string as a cursor.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_request_that_asks_for_something_unknown_is_refused_not_reinterpreted() {
         let root = temp_root();

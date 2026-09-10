@@ -111,9 +111,8 @@ pub struct Changefeed {
     /// Mirrors `Ring::subscribers` for `active()`, which the apply path calls per commit and must
     /// not have to take the ring lock for in the common case of nobody listening.
     live: AtomicUsize,
-    /// Consumers that keep the feed recording without holding a subscription: a webhook sender
-    /// between one subscription and the next, and the window after a restart before it attaches.
-    /// Without one, a change written in that window is never built, and no position recovers it.
+    /// Consumers that keep the feed recording without holding a subscription: a webhook sender between
+    /// two subscriptions, and the window after a restart. Without one, a change there is never built.
     pins: AtomicUsize,
     published: AtomicU64,
     overruns: AtomicU64,
@@ -527,9 +526,8 @@ mod tests {
         assert!(feed.subscribe(None, 0).is_ok());
     }
 
-    /// A webhook sender is not a connection, so nothing about it keeps the feed recording on its
-    /// own. Without the pin, a change written between a restart and the sender attaching is never
-    /// built, and there is no position that recovers it.
+    /// A webhook sender is not a connection, so nothing about it keeps the feed recording. Without the
+    /// pin, a change written between a restart and the sender attaching has no position that recovers it.
     #[tokio::test]
     async fn a_pin_keeps_the_feed_recording_for_a_consumer_that_has_not_attached() {
         let feed = Arc::new(Changefeed::new(

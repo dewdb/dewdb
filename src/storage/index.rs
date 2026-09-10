@@ -84,9 +84,8 @@ pub struct AppliedMeta {
     /// migration is cluster-wide, so a later plan replaces an earlier one rather than joining it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handover: Option<HandoverRecord>,
-    /// The committed secondary index definitions, here for the same reason the three above are:
-    /// an `Index` entry is never in the key index, so compaction retires its frame. Only the
-    /// definitions -- the postings are derived and rebuilt when the collection opens.
+    /// The committed secondary index definitions, here because an `Index` entry is never in the key
+    /// index and compaction retires its frame. Definitions only -- postings rebuild on open.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub indexes: Vec<IndexSpec>,
 }
@@ -94,9 +93,8 @@ pub struct AppliedMeta {
 pub const APPLIED_FILENAME: &str = "applied.meta";
 
 impl AppliedMeta {
-    /// `Ok(None)` is "this collection has no consensus history", which the caller replays in full.
-    /// A file that exists but does not parse is an error, never `None`: the two answers differ by
-    /// the whole log, and reading damage as absence publishes every entry above the watermark.
+    /// `Ok(None)` is "no consensus history", which the caller replays in full. A file that exists but
+    /// does not parse is an error, never `None`: reading damage as absence republishes the whole log.
     pub fn load(col_dir: &Path) -> io::Result<Option<Self>> {
         let path = col_dir.join(APPLIED_FILENAME);
         let content = match fs::read_to_string(&path) {
@@ -117,11 +115,8 @@ impl AppliedMeta {
     }
 }
 
-/// The commit position alone, updated in place, because rewriting `AppliedMeta` per commit costs a
-/// create plus an `fsync` on a *new* file -- a metadata transaction, not a data flush (bugs.md H17).
-///
-/// Two sector-sized slots written alternately, newest sequence wins: a torn write damages only the
-/// slot it was writing, which is what replaces the temp file and rename.
+/// The commit position alone, updated in place: rewriting `AppliedMeta` per commit costs a create plus
+/// an fsync. Two sector-sized slots written alternately, newest sequence wins, so a tear is local.
 pub struct AppliedPos {
     file: fs::File,
     seq: u64,

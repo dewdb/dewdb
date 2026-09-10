@@ -71,6 +71,7 @@ async fn local_write_inner(
     col: &Arc<Collection>,
     key: String,
     value: Option<serde_json::Value>,
+    migration: bool,
 ) -> Result<PendingWrite, axum::response::Response> {
     let col_clone = col.clone();
     let key_clone = key.clone();
@@ -80,6 +81,9 @@ async fn local_write_inner(
     let existed = col.exists_including_staged(&key);
 
     let write_res = tokio::task::spawn_blocking(move || {
+        if migration {
+            return col_clone.migration_write(key_clone, value, term);
+        }
         match value {
             Some(v) => col_clone.put(key_clone, v, term),
             None => col_clone.delete(key_clone, term),
@@ -206,6 +210,29 @@ pub async fn local_write(
     wc: WriteConcern,
     wtimeout: Duration,
 ) -> Result<WriteOutcome, axum::response::Response> {
+    local_write_with_origin(state, col_name, key, value, wc, wtimeout, false).await
+}
+
+pub async fn local_migration_write(
+    state: &AppState,
+    col_name: &str,
+    key: String,
+    value: Option<serde_json::Value>,
+    wc: WriteConcern,
+    wtimeout: Duration,
+) -> Result<WriteOutcome, axum::response::Response> {
+    local_write_with_origin(state, col_name, key, value, wc, wtimeout, true).await
+}
+
+async fn local_write_with_origin(
+    state: &AppState,
+    col_name: &str,
+    key: String,
+    value: Option<serde_json::Value>,
+    wc: WriteConcern,
+    wtimeout: Duration,
+    migration: bool,
+) -> Result<WriteOutcome, axum::response::Response> {
     let admitted = admit(state, col_name, 1)?;
 
     let db = state.db.as_ref().unwrap();
@@ -216,7 +243,7 @@ pub async fn local_write(
 
     let pending = {
         let _guard = col.key_lock(&key).lock().await;
-        local_write_inner(state, &col, key, value).await?
+        local_write_inner(state, &col, key, value, migration).await?
     };
     drop(admitted);
 
@@ -257,16 +284,15 @@ pub async fn local_patch(
 
         merge_patch(&mut doc, &patch);
 
-        local_write_inner(state, &col, key, Some(doc)).await?
+        local_write_inner(state, &col, key, Some(doc), false).await?
     };
     drop(admitted);
 
     Ok(Some(finish_write(state, col_name, pending, wc, wtimeout).await?))
 }
 
-/// The drop as a replicated log entry: it commits the way a write does, so a quorum holds it before
-/// the client hears success, a replica that was down for it picks it up from the log, and a leader
-/// elected afterwards replays it instead of having to be told.
+/// The drop as a replicated log entry: a quorum holds it before the client hears success, and both a
+/// replica that was down for it and a leader elected afterwards pick it up from the log.
 pub async fn local_drop(
     state: &AppState,
     col_name: &str,
@@ -307,10 +333,8 @@ pub async fn local_drop(
     finish_write(state, col_name, pending, wc, wtimeout).await
 }
 
-/// An index definition as a replicated log entry, the way `local_drop` carries a drop. No key
-/// locks: the entry orders against concurrent writes by LSN alone, and both readings are correct
-/// -- a write below it is picked up by the build, one above it stages the values the new index
-/// asks for.
+/// An index definition as a replicated log entry, the way `local_drop` carries a drop. No key locks:
+/// the entry orders by LSN alone, and a write either side of it is correct.
 pub async fn local_index_change(
     state: &AppState,
     col_name: &str,
@@ -343,12 +367,8 @@ pub async fn local_index_change(
     finish_write(state, col_name, pending, wc, wtimeout).await
 }
 
-/// One replication round for a run of frames appended together, rather than the per-document
-/// fan-out `finish_write` gives it (bugs.md H7). Sound because the log is a chain: a replica that
-/// acknowledges the last LSN holds every frame below it, so the run shares one holder set.
-///
-/// The fan-out was not just a cost: on a cold send cursor every document gapped at once and each
-/// rewound the replica on a `last_lsn` already stale, so the repairs undid each other's cursor.
+/// One replication round for a run of frames appended together, not the per-document fan-out (H7).
+/// Sound because the log is a chain: a replica acking the last LSN holds every frame below it.
 async fn finish_write_batch(
     state: &AppState,
     col_name: &str,
@@ -419,6 +439,7 @@ async fn local_write_batch_inner(
     col: &Arc<Collection>,
     items: Vec<(String, serde_json::Value)>,
     admitted: Option<FrameReservation>,
+    migration: bool,
 ) -> Result<Vec<PendingWrite>, axum::response::Response> {
     let term = append_term(state, &col.name)?;
     // A key repeated inside one batch is replaced by its second write, and the pre-batch state
@@ -432,7 +453,11 @@ async fn local_write_batch_inner(
     let write_res = tokio::task::spawn_blocking(move || {
         let mut out = Vec::with_capacity(items.len());
         for (key, value) in items {
-            let (frame, wal_id, offset, lsn) = col_clone.put(key.clone(), value, term)?;
+            let (frame, wal_id, offset, lsn) = if migration {
+                col_clone.migration_write(key.clone(), Some(value), term)?
+            } else {
+                col_clone.put(key.clone(), value, term)?
+            };
             out.push((key, frame, wal_id, offset, lsn));
         }
         Ok::<_, io::Error>(out)
@@ -469,6 +494,27 @@ pub async fn local_write_batch(
     wc: WriteConcern,
     wtimeout: Duration,
 ) -> Result<Vec<WriteOutcome>, axum::response::Response> {
+    local_write_batch_with_origin(state, col_name, items, wc, wtimeout, false).await
+}
+
+pub async fn local_migration_write_batch(
+    state: &AppState,
+    col_name: &str,
+    items: Vec<(String, serde_json::Value)>,
+    wc: WriteConcern,
+    wtimeout: Duration,
+) -> Result<Vec<WriteOutcome>, axum::response::Response> {
+    local_write_batch_with_origin(state, col_name, items, wc, wtimeout, true).await
+}
+
+async fn local_write_batch_with_origin(
+    state: &AppState,
+    col_name: &str,
+    items: Vec<(String, serde_json::Value)>,
+    wc: WriteConcern,
+    wtimeout: Duration,
+    migration: bool,
+) -> Result<Vec<WriteOutcome>, axum::response::Response> {
     let admitted = admit(state, col_name, items.len())?;
 
     let db = state.db.as_ref().unwrap();
@@ -487,7 +533,7 @@ pub async fn local_write_batch(
         _guards.push(col.key_locks[stripe].lock().await);
     }
 
-    let pending = local_write_batch_inner(state, &col, items, admitted).await?;
+    let pending = local_write_batch_inner(state, &col, items, admitted, migration).await?;
 
     finish_write_batch(state, col_name, pending, wc, wtimeout).await
 }
@@ -624,14 +670,8 @@ mod tests {
             &mut state.replication.as_ref().unwrap().write().unwrap());
     }
 
-    /// C26: `finish_write` opened with `!state.is_leader()`, meant as "there is nothing to
-    /// replicate to". It is equally true of a leader deposed between the handler's leadership check
-    /// and the fsync after it, and that node answered `201` with `required: 1` whatever was asked,
-    /// for an entry that is unreplicated at a stale term and that the next leader truncates.
-    ///
-    /// C26 routed that node onto the quorum path, where majority answered `202 acks: 1
-    /// required: 2`. IB-012 is why the append does not happen at all now: `w=1` needs one ack and
-    /// this node supplies it, so no arithmetic on the quorum path can catch it.
+    /// C26: `finish_write` opened with `!state.is_leader()`, which is equally true of a leader deposed
+    /// between the check and the fsync. IB-012 is why the append no longer happens at all.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_write_that_lost_leadership_mid_flight_does_not_report_its_concern_met() {
         let root = temp_root();
@@ -651,11 +691,8 @@ mod tests {
         assert_eq!(col.pending_len(), 0);
     }
 
-    /// IB-012, the reproduction: leadership is checked in the handler, and the write gate and key
-    /// locks are taken after it. A handler parked on one of those and deposed while it waited used
-    /// to append at the stale term it had captured, and at `w=1` `finish_write` counted the local
-    /// node and answered `201` for a value that is uncommitted, unreadable, and truncated by the
-    /// next leader.
+    /// IB-012: leadership is checked in the handler and the gate and key locks are taken after it, so a
+    /// handler deposed while parked appended at a stale term and `w=1` counted itself.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_write_deposed_while_parked_on_the_key_lock_is_refused() {
         let root = temp_root();
@@ -680,10 +717,8 @@ mod tests {
         assert_eq!(col.last_appended_lsn(), 0, "nothing was appended under the lost term");
     }
 
-    /// The other side of the same fence: the term was held at the append and gone by the
-    /// acknowledgement. Nothing keeps leadership still across an fsync and a round of replica
-    /// calls, so the captured term is rechecked there too -- `w=1` is met by this node alone and
-    /// the quorum arithmetic cannot notice.
+    /// The other side of the same fence: the term was held at the append and gone by the acknowledgement,
+    /// so it is rechecked there too -- `w=1` is met by this node alone and the arithmetic cannot notice.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_write_deposed_after_its_append_is_not_acknowledged() {
         let root = temp_root();
@@ -692,7 +727,7 @@ mod tests {
 
         let pending = {
             let _guard = col.key_lock("k").lock().await;
-            super::local_write_inner(&state, &col, "k".into(), Some(serde_json::json!({"v": 1})))
+            super::local_write_inner(&state, &col, "k".into(), Some(serde_json::json!({"v": 1})), false)
                 .await.unwrap()
         };
         depose(&state);
@@ -705,9 +740,8 @@ mod tests {
         assert!(col.get("k").unwrap().is_none(), "and the value stays unreadable");
     }
 
-    /// H7: the batch called `finish_write` per document, so a bulk of N paid N fan-outs for a run
-    /// one repair carries. A replica that refuses a frame it cannot chain is what makes the frames
-    /// below the last one observable: they arrive or the concern is not met.
+    /// H7: the batch called `finish_write` per document, so a bulk of N paid N fan-outs for a run one
+    /// repair carries. A replica refusing an unchainable frame is what makes the frames below observable.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_bulk_write_replicates_as_one_run() {
         use crate::replication::protocol::ReplicateRequest;
@@ -779,11 +813,8 @@ mod tests {
         leader.kill();
     }
 
-    /// The other half of H7, against real followers rather than a stub. The collection is
-    /// deliberately cold: with no send cursor for the replicas, the old per-document fan-out
-    /// gapped 23 of these 24 at once and burned the whole `wtimeout` reporting `acks: 1` for
-    /// documents both followers held. A `w=all` write first hides it, which is how the benchmark
-    /// missed it.
+    /// The other half of H7, against real followers. The collection is deliberately cold: with no send
+    /// cursor the old fan-out gapped 23 of 24 at once and burned the `wtimeout` reporting `acks: 1`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn every_document_in_a_batch_reaches_the_replicas() {
         const DOCS: usize = 24;

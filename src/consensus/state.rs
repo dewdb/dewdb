@@ -41,29 +41,25 @@ pub struct ReplicationState {
     pub progress: Progress,
     // Leader side: which voters have promised not to grant a vote, and until when.
     pub leases: Leases,
-    /// Leader side: this node has told a voter to stand for election, so its own leases are
-    /// promises it knows are about to be broken. Set for the length of a handover and no longer;
-    /// `leases` alone cannot say it, because the promises in it are still live and still honest.
+    /// Leader side: this node has told a voter to stand, so its own leases are promises about to
+    /// break. Set for the length of a handover only; `leases` cannot say it, those are still live.
     pub handing_over: bool,
     /// When this process came up. A restart forgets the promise it made a leader, so it is what
     /// tells `lease::withholds_vote` to keep the promise anyway until the window is out.
     pub booted_at: std::time::Instant,
-    /// Voter side: the deadline this node last granted a probing leader. Untouched by demotion and
-    /// step-down -- both clear the contact clock, and a leader on the other side of that probe is
-    /// still counting the deadline. It lapses within one refusal window instead.
+    /// Voter side: the deadline last granted a probing leader. Untouched by demotion and step-down,
+    /// which clear the contact clock while the probing leader still counts it; it lapses on its own.
     pub novote_until: Option<std::time::Instant>,
     // Matching evidence belongs to one leader term and is rebuilt after restart.
     pub leader_matched: HashMap<String, (u64, u64)>,
-    /// The newest configuration in the config log, once that log has one. `None` means no
-    /// configuration entry exists anywhere in this group and the view-derived voting set still
-    /// speaks; see `AppState::quorum_config`.
+    /// The newest configuration in the config log. `None` means no configuration entry exists in
+    /// this group and the view-derived voting set still speaks; see `AppState::quorum_config`.
     pub configuration: Option<Configuration>,
 }
 
 impl ReplicationState {
     /// The quorum to decide against, held under the same lock as the evidence. Falling back to
-    /// `replicas` keeps a cluster that has never reconfigured on exactly the set `become_leader`
-    /// counted, rather than reaching for the cluster view with this lock held.
+    /// `replicas` keeps a never-reconfigured cluster on exactly the set `become_leader` counted.
     pub fn quorum(&self, own_url: &str) -> Configuration {
         if let Some(config) = &self.configuration {
             return config.clone();

@@ -1,7 +1,5 @@
-//! Quorum arithmetic over a configuration, and the log the configuration travels in.
-//!
-//! The type is in `storage::frame`, next to the other log payloads. Everything that decides
-//! anything from it is here.
+//! Quorum arithmetic over a configuration, and the log it travels in. The type itself lives in
+//! `storage::frame`, next to the other log payloads.
 
 use crate::consensus::election::majority;
 use crate::storage::frame::Configuration;
@@ -39,9 +37,8 @@ pub fn valid_collection_name(name: &str) -> bool {
         && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'.'))
 }
 
-/// The physical nodes a voter slice names, first spelling of each kept. Every majority is taken
-/// over this rather than the slice: two entries naming one node would otherwise both count toward
-/// a threshold the second one raised, so one node alone could satisfy it (bugs.md C8).
+/// The physical nodes a voter slice names, first spelling of each kept. Two entries naming one node
+/// would both count toward a threshold the second raised, letting one node satisfy it alone.
 fn distinct(voters: &[String]) -> impl Iterator<Item = &String> + '_ {
     voters.iter().enumerate()
         .filter(move |(i, v)| !voters[..*i].iter().any(|w| same_endpoint(w, v.as_str())))

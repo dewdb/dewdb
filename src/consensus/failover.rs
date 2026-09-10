@@ -28,8 +28,7 @@ async fn discover_leader(state: &AppState) -> Option<String> {
         peers.extend(g.replicas.iter().cloned());
     }
     // A node admitted at runtime knows the cluster only through the view; its config names nobody.
-    // Scoped to this node's own shard group: `members` spans every group, and a follower that
-    // adopts another group's primary resyncs its whole database from a log it shares nothing with.
+    // Scoped to this node's shard group: adopting another group's primary resyncs a foreign log.
     {
         let own = state.own_url();
         let view = state.cluster.read().unwrap();
@@ -141,8 +140,7 @@ async fn resync_all_from(state: &AppState, leader: &str) {
 }
 
 /// Boot-time catch-up for a configured replica. `config.primary_addr` is a bootstrap seed, not a
-/// fact: it can name a leader deposed while this node was down, and installing that node's snapshot
-/// would adopt a superseded log over local state.
+/// fact: it can name a deposed leader, whose snapshot would then be adopted over local state.
 pub async fn boot_resync(state: &AppState) {
     if state.db.is_none() || state.replication.is_none() {
         return;
@@ -209,14 +207,8 @@ pub async fn demote(state: &AppState, new_term: u64) {
     });
 }
 
-/// Points a node that has just given up leadership at the node that took it.
-///
-/// The poll goes looking on its own once it holds no `primary_addr` (bugs.md L20), but it can only
-/// find a leader that has already won, and it adopts one by resyncing. On a handover the successor
-/// is known the moment office moves, so neither cost is paid.
-///
-/// No resync: this node was the leader, so its log is a prefix of the successor's by construction.
-/// What it lacks is the commit watermark, which the next heartbeat carries.
+/// Points a node that has just given up leadership at the node that took it: the poll would only
+/// find a leader that already won, and by resyncing. No resync here -- our log is a prefix of it.
 pub fn follow_handover(state: &AppState, leader: &str) {
     let Some(repl) = state.replication.as_ref() else { return };
     let mut g = repl.write().unwrap();
@@ -293,10 +285,8 @@ async fn follow_cluster_view(state: &AppState, from: &str) {
     }
 }
 
-/// Raft's CheckQuorum, which this architecture cannot get for free: a follower's poll proves the
-/// leader's *inbound* path, and so do the lease promises those polls carry, so an asymmetric
-/// partition leaves every inbound signal healthy while nothing the leader sends arrives. The probe
-/// is the only outbound evidence an idle leader has (bugs.md H10).
+/// Raft's CheckQuorum. A follower's poll and the lease promises it carries prove only the leader's
+/// inbound path, so the probe is the only outbound evidence an idle leader has.
 pub fn leader_contact_task(state: AppState) {
     tokio::spawn(async move {
         let timeout = Duration::from_secs(state.config.heartbeat_timeout_secs);
@@ -313,8 +303,7 @@ pub fn leader_contact_task(state: AppState) {
             }
 
             // Detached: awaiting a probe into a cut link would age every healthy replica's contact
-            // by its timeout before the check reads them, deposing a leader over someone else's
-            // partition.
+            // past its timeout before the check reads them, deposing a leader over a foreign partition.
             let term = state.current_term();
             for replica in state.replication_targets() {
                 probe_replica(state.clone(), replica, term, window);
@@ -328,10 +317,8 @@ pub fn leader_contact_task(state: AppState) {
     });
 }
 
-/// CheckQuorum's outbound probe, and the lease round with it: a voter answers with how long it
-/// will go on refusing votes, and the leader dates that from `sent` -- before the request left --
-/// so a slow link shortens the lease rather than overrunning it. Raft's shape, and why there is no
-/// margin between the two clocks to get wrong. See bugs.md M16.
+/// CheckQuorum's outbound probe, and the lease round with it: a voter answers with how long it will
+/// refuse votes, dated from `sent`, so a slow link shortens the lease instead of overrunning it.
 fn probe_replica(state: AppState, replica: String, term: u64, window: Duration) {
     tokio::spawn(async move {
         let url = format!("{}/internal/heartbeat", replica);
@@ -358,9 +345,8 @@ fn probe_replica(state: AppState, replica: String, term: u64, window: Duration) 
     });
 }
 
-/// Gives up leadership at the current term, so the voters this node can no longer reach are free to
-/// elect one that can. Writes were already failing at `w=majority`; what this ends is the leader
-/// going on answering reads and blocking a successor indefinitely.
+/// Gives up leadership at the current term, so voters this node cannot reach are free to elect one
+/// that can. Writes were already failing at `w=majority`; this ends the reads and the blocking.
 async fn step_down_without_quorum(state: &AppState, timeout: Duration) {
     let restart = {
         let repl = match state.replication.as_ref() {
@@ -473,9 +459,8 @@ pub fn heartbeat_poll_task(state: AppState) {
                                 }
                             }
 
-                            // Ordered by the tiebreak too, not by version alone: a leader whose
-                            // view wins at an equal version is one this follower must still fetch
-                            // (IB-023).
+                            // Ordered by the tiebreak too, not by version alone: a leader whose view
+                            // wins at an equal version is one this follower must still fetch (IB-023).
                             if parse_view_id(&hb).supersedes(&state.cluster_view_id()) {
                                 follow_cluster_view(&state, &primary_addr).await;
                             }
@@ -491,8 +476,7 @@ pub fn heartbeat_poll_task(state: AppState) {
                 }
             } else {
                 // Nothing to poll, and the contact clock can still be fresh: granting a vote at a
-                // higher term deposes a leader without naming one (bugs.md L20). Look for the
-                // successor rather than wait the timeout out; it may not have won yet.
+                // higher term deposes a leader without naming one. Look for the successor instead.
                 sought_leader = true;
                 if adopt_existing_leader(&state).await {
                     continue;
@@ -572,9 +556,8 @@ mod tests {
         node
     }
 
-    /// Every shard node sits in one flat member list, so "who might be my leader" read from it is
-    /// the whole cluster. A group that adopts a foreign primary never elects one of its own, and
-    /// resyncs its database from a log it shares nothing with.
+    /// Every shard node sits in one flat member list, so "who might be my leader" read from it is the
+    /// whole cluster. A group that adopts a foreign primary never elects its own, and resyncs from it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_leaderless_group_elects_its_own_rather_than_following_another_shard() {
         let root = temp_root();
@@ -782,14 +765,8 @@ mod tests {
         }
     }
 
-    /// C17: a promotion inherits frames a previous leader left durable but uncommitted. `advance`
-    /// refuses to commit below the current term's floor, and a collection nothing writes to never
-    /// gets a floor, so the tail stayed staged forever — invisible, pinning `pending`, and blocking
-    /// compaction. The barrier is the floor.
-    ///
-    /// The tail is staged straight onto the follower rather than raced through replication: the
-    /// state is the same durable-and-unpublished frame either way, and what is under test is what
-    /// promotion does about it.
+    /// C17: a promotion inherits frames left durable but uncommitted, and a collection nothing writes
+    /// to never gets a current-term floor, so the tail stayed staged forever. The barrier is the floor.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_promoted_leader_publishes_a_tail_no_one_writes_over() {
         let root = temp_root();
@@ -809,9 +786,8 @@ mod tests {
         assert!(!heir.exists("inherited"), "and unpublished, which is what makes it a tail");
 
         n1.kill();
-        // Not asserted to be n2: a winner must be at least as fresh as every voter, so n3 can only
-        // win after receiving these frames, and the tail is published either way. Which node wins
-        // is a timing question this test has no stake in.
+        // Not asserted to be n2: a winner is at least as fresh as every voter, so n3 can only win
+        // after receiving these frames. Which node wins is a timing question this test has no stake in.
         let winner = settle_leader(&[&n2, &n3], Duration::from_secs(20)).await
             .expect("no leader was elected");
 
@@ -1223,10 +1199,8 @@ mod tests {
             "the new term must clear the one n3 was stranded at");
     }
 
-    /// bugs.md L20. Granting a vote at a higher term deposes a leader without naming a successor,
-    /// and the grant itself stamps the contact clock, so `contact_lost` stays quiet for a whole
-    /// timeout. Nothing used to go looking in that window, and everything the node was shipped
-    /// last stayed below its applied watermark and invisible for the length of it.
+    /// Granting a vote at a higher term deposes a leader without naming a successor, and the grant
+    /// stamps the contact clock, so `contact_lost` stays quiet for a whole timeout.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_leader_deposed_by_granting_a_vote_goes_looking_for_the_winner() {
         let root = temp_root();

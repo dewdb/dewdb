@@ -297,9 +297,8 @@ pub async fn cluster_update_handler(
     }
 }
 
-/// Handover writes are the one place `w=1` is a data-loss bug rather than a latency choice: the
-/// source deletes what the destination acknowledged, so an ack only one node holds is a promise
-/// nothing can keep. A group with no replicas still needs one ack, so this costs nothing there.
+/// Handover writes are the one place `w=1` is a data-loss bug rather than a latency choice: the source
+/// deletes what the destination acknowledged. A group with no replicas still needs one ack.
 fn handover_write_concern() -> (crate::replication::WriteConcern, std::time::Duration) {
     (
         crate::replication::WriteConcern::Majority,
@@ -328,7 +327,7 @@ pub async fn migrate_handler(
     let (wc, wtimeout) = handover_write_concern();
     let written = batch.docs.len();
     let items = batch.docs.into_iter().map(|doc| (doc.key, doc.value)).collect();
-    let outcomes = match crate::api::write::local_write_batch(
+    let outcomes = match crate::api::write::local_migration_write_batch(
         &state, &batch.collection, items, wc, wtimeout,
     ).await {
         Ok(outcomes) => outcomes,
@@ -420,7 +419,7 @@ pub async fn migrate_reset_handler(
     let (wc, wtimeout) = handover_write_concern();
     let mut removed = 0usize;
     for (collection, key) in stale {
-        match crate::api::write::local_write(&state, &collection, key, None, wc, wtimeout).await {
+        match crate::api::write::local_migration_write(&state, &collection, key, None, wc, wtimeout).await {
             Ok(outcome) if outcome.met => removed += 1,
             // Marking the reset complete over a tombstone one node holds would let the copy it was
             // meant to clear come back with the next leader.
@@ -451,8 +450,7 @@ pub struct CleanupRequest {
 }
 
 /// Deletes the keys this node handed over, once the flip is visible here. Driven by the coordinator
-/// after the ring lands, never by the source on its own: a node whose view is behind would be
-/// deleting keys it still owns.
+/// after the ring lands, never by the source: a node whose view is behind would delete owned keys.
 pub async fn migrate_cleanup_handler(
     State(state): State<AppState>,
     Json(req): Json<CleanupRequest>,
@@ -481,15 +479,14 @@ pub async fn migrate_cleanup_handler(
         }
         // Through the write path, not a bare append: a tombstone has to be staged, committed and
         // applied to disappear from the index, and it has to reach this group's replicas too.
-        match crate::api::write::local_write(&state, &collection, key, None, wc, wtimeout).await {
+        match crate::api::write::local_migration_write(&state, &collection, key, None, wc, wtimeout).await {
             Ok(outcome) if outcome.met => removed += 1,
             _ => short += 1,
         }
     }
 
-    // The record survives a partial cleanup so a later call can finish it. Forgetting here leaves
-    // a tombstone this group's quorum does not hold, and a replica elected without it still has
-    // the key.
+    // The record survives a partial cleanup so a later call can finish it. Forgetting here leaves a
+    // tombstone this group's quorum does not hold, and a replica elected without it still has the key.
     if short == 0 {
         crate::cluster::migration::forget(&state, &req.migration_id);
         info!(target: "migration", id = %req.migration_id, removed, "Cleaned up handed-over keys");
@@ -519,9 +516,8 @@ pub async fn data_summary_handler(
     }))).into_response()
 }
 
-/// A leader's lease round rides on the probe it sends anyway: `lease_ms` is how long it asks this
-/// node to go on refusing votes, at `term`. Absent from a peer that predates leases, which costs
-/// nothing but a confirmation round on the reads that peer answers.
+/// A leader's lease round rides on the probe it sends anyway: `lease_ms` is how long it asks this node
+/// to refuse votes, at `term`. Absent from a peer that predates leases, which costs a round.
 #[derive(Deserialize)]
 pub struct HeartbeatQuery {
     pub term: Option<u64>,
@@ -569,12 +565,8 @@ pub async fn heartbeat_handler(
     }))).into_response()
 }
 
-/// Raft §3.10. The leader telling this node to stand for election now, without waiting out a
-/// contact timeout it would never see: the leader is still alive and is stepping aside.
-///
-/// Accepted only from the leader this node is following, which is the same authority the sender
-/// already spends on every heartbeat and replicate. Answered before the election runs, because the
-/// answer is "asked", not "won" -- the leader learns the rest from losing office.
+/// The leader telling this node to stand for election now, without waiting out a contact timeout it
+/// would never see. Accepted only from the leader this node follows, and answered "asked", not "won".
 pub async fn timeout_now_handler(
     State(state): State<AppState>,
     Json(req): Json<crate::consensus::transfer::TimeoutNowRequest>,
@@ -762,9 +754,8 @@ fn serve_snapshot(state: &AppState, collection: &str) -> axum::response::Respons
         None => return err_json(StatusCode::INTERNAL_SERVER_ERROR, "No database".to_string()),
     };
 
-    // Serving with `get_collection` created what it was asked for, so any name a caller sent cost
-    // a directory, a wal and a commit task here (bugs.md H18). Empty is also the wrong answer: the
-    // asker cannot tell it from a collection this node genuinely holds nothing of.
+    // Serving with `get_collection` created what it was asked for, so any name cost a directory, a wal
+    // and a commit task (H18). Empty is wrong too: the asker cannot tell it from a genuine miss.
     let col = match db.lookup_collection(collection) {
         Ok(Some(c)) => c,
         Ok(None) => return err_json(StatusCode::NOT_FOUND,
@@ -875,9 +866,8 @@ mod tests {
         follower.kill();
     }
 
-    /// The voter half of the leader-initiated round, M16's fix. What is granted is a duration on
-    /// this node's clock, bounded by the ask and by the contact this node already owes silence over,
-    /// and recorded -- so clearing the contact clock does not release it under the leader counting it.
+    /// The voter half of the leader-initiated round: what is granted is a duration on this node's clock,
+    /// bounded by the ask and by contact, and recorded -- so clearing the contact clock cannot release it.
     #[tokio::test]
     async fn a_voter_grants_no_more_silence_than_its_own_contact_already_commits_it_to() {
         let root = temp_root();
@@ -934,9 +924,8 @@ mod tests {
         follower.kill();
     }
 
-    /// The whole safety of the lease bypass: only the leader a voter is actually following can
-    /// spend its authority to stand something else up. Everything else stays refused, so the
-    /// bypass adds no way to force an election that commit 48 and commit 49 closed.
+    /// The whole safety of the lease bypass: only the leader a voter is actually following can spend its
+    /// authority to stand something else up. Everything else stays refused.
     #[tokio::test]
     async fn only_the_leader_a_voter_follows_can_get_a_vote_past_its_lease() {
         let root = temp_root();
@@ -1387,10 +1376,8 @@ mod tests {
         leader.kill();
     }
 
-    /// M9b: `/internal/drop` refused before it read the term, so a deposed leader kept the
-    /// collection the real leader had dropped, and a follower taking a drop from a higher term
-    /// applied it without adopting that term. The drop is a log entry now, so the term rules that
-    /// already govern every other entry govern it too.
+    /// M9b: `/internal/drop` refused before it read the term, so a deposed leader kept a dropped
+    /// collection and a follower applied a higher term's drop without adopting the term.
     #[tokio::test]
     async fn a_leader_steps_down_for_a_drop_from_a_higher_term() {
         let root = temp_root();
