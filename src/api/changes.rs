@@ -1,7 +1,7 @@
 //! The change-stream endpoint: one committed collection feed, delivered as SSE.
 
 use crate::api::docs::not_the_primary;
-use crate::api::middleware::{client_collection, CollectionPath};
+use crate::api::middleware::CollectionPath;
 use crate::auth::Credential;
 use crate::cdc::{CdcFilter, CdcFrame, CdcSession, CdcStream, ChangeSource, ChangeStream};
 use crate::changefeed::SubscribeError;
@@ -9,7 +9,6 @@ use crate::cluster::changestream::open_cluster_stream;
 use crate::cluster::router::{parse_read_pref, ReadPreference};
 use crate::model::err_json;
 use crate::state::AppState;
-use crate::storage::Collection;
 use axum::extract::{Extension, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -17,7 +16,6 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
 use std::convert::Infallible;
-use std::sync::Arc;
 use std::time::Duration;
 
 /// SSE's own reconnection hint. A client that reconnects sends `Last-Event-ID`, which is the LSN
@@ -70,7 +68,7 @@ pub(crate) fn parse_request(
     Ok((filter, pref, after))
 }
 
-fn refuse(err: SubscribeError, col: &Arc<Collection>) -> axum::response::Response {
+fn refuse(err: SubscribeError, col_name: &str) -> axum::response::Response {
     match err {
         // `410` rather than `400`: the position was valid and the server stopped being able to
         // honour it, which is the difference between "retry from here" and "fix your request".
@@ -85,7 +83,7 @@ fn refuse(err: SubscribeError, col: &Arc<Collection>) -> axum::response::Respons
             [(axum::http::header::RETRY_AFTER, "1")],
             Json(serde_json::json!({
                 "error": format!("collection '{}' is at its ceiling of {} change subscribers",
-                    col.name, max),
+                    col_name, max),
             })),
         ).into_response(),
         SubscribeError::Closed => (
@@ -117,11 +115,11 @@ pub(crate) fn open_shard_session(
         None => None,
     };
 
-    let col = client_collection(state, &col_name)?;
-    // Sampled before subscribing, so a feed that was quiet learns how far the log moved while it
-    // was not recording, and refuses a resume from under that rather than skipping it silently.
-    let applied = col.applied_lsn();
-    let sub = col.changefeed.subscribe(after, applied).map_err(|e| refuse(e, &col))?;
+    let db = state.db.as_ref().ok_or_else(|| err_json(
+        StatusCode::INTERNAL_SERVER_ERROR, "No database on this node".to_string()))?;
+    let sub = db.subscribe_changes(&col_name, after)
+        .map_err(|e| err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| refuse(e, &col_name))?;
     let leader_only = matches!(pref, ReadPreference::Primary).then(|| state.clone());
     Ok(CdcSession::new(col_name, CdcStream::new(sub, filter, leader_only)))
 }
@@ -203,8 +201,6 @@ mod tests {
         assert!(r.status().is_success(), "write failed: {}", r.status());
     }
 
-    /// Subscribing is a read, so it needs the collection to exist; only a write makes one. Every
-    /// test here seeds a key first for that reason, and the seed predates the stream.
     async fn watch(client: &reqwest::Client, base: &str, query: &str) -> SseTap {
         let r = changes(client, base, query).await;
         assert_eq!(r.status(), StatusCode::OK, "{}", r.text().await.unwrap());

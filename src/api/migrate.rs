@@ -592,7 +592,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn finalization_carries_updates_and_deletes_written_during_bulk_copy() {
+    async fn ib028_live_handover_preserves_client_changes_without_publishing_movement() {
         let root = temp_root();
         let cl = Cluster::start_with_movement(&root, 1, 25).await;
         let (a, b, c) = (cl.a.url(), cl.b.url(), cl.c.url());
@@ -626,6 +626,13 @@ mod tests {
         };
         assert!(moving.len() >= 2, "the test ring must move at least two keys from one source");
 
+        let collections: Vec<_> = [&cl.a, &cl.b, &cl.c].iter().map(|node| {
+            node.state.as_ref().unwrap().db.as_ref().unwrap().get_collection("t").unwrap()
+        }).collect();
+        let mut subscriptions: Vec<_> = collections.iter().map(|col| {
+            col.changefeed.subscribe(Some(col.applied_lsn()), col.applied_lsn()).unwrap()
+        }).collect();
+
         assert_eq!(cl.post(format!("{}/cluster/migrate", a), ring_body(&three)).await.0,
             StatusCode::ACCEPTED);
         assert!(wait_for(Duration::from_secs(10), || {
@@ -654,6 +661,26 @@ mod tests {
             .send().await.unwrap();
         assert_eq!(deleted.status(), StatusCode::NOT_FOUND,
             "a value deleted after the bulk copy must not reappear at cutover");
+
+        assert!(wait_for(Duration::from_secs(15), || {
+            keys.iter().filter(|key| owner_of(&three, key) == c).all(|key| {
+                let index = if owner_of(&two, key) == a { 0 } else { 1 };
+                !collections[index].exists(key)
+            })
+        }).await, "source cleanup did not finish");
+        let source_index = if *source == a { 0 } else { 1 };
+        for (index, col) in collections.iter().enumerate() {
+            assert_eq!(col.changefeed.stats().published, if index == source_index { 2 } else { 0 },
+                "copy, destination reset or source cleanup leaked into CDC on group {}", index);
+        }
+        let events = tokio::time::timeout(Duration::from_secs(2),
+            subscriptions[source_index].next_batch()).await.unwrap().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].key, moving[1]);
+        assert_eq!(events[0].op, crate::changefeed::ChangeOp::Update);
+        assert_eq!(events[0].value.as_ref().unwrap()["v"], 99);
+        assert_eq!(events[1].key, moving[0]);
+        assert_eq!(events[1].op, crate::changefeed::ChangeOp::Delete);
     }
 
     /// Finalization has to freeze the keys that are moving, not the node: the barrier drains writes that

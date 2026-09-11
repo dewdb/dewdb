@@ -683,7 +683,6 @@ mod tests {
         let c = reqwest::Client::new();
         let (first, second) = (key_on(&router, &s1.url()), key_on(&router, &s2.url()));
 
-        // Subscribing is a read, and a group holding none of the collection has nothing to read.
         put(&c, &router.url(), &first, 0).await;
         put(&c, &router.url(), &second, 0).await;
 
@@ -701,8 +700,49 @@ mod tests {
         assert_eq!(last.positions.len(), 2, "a position covers every group, not the one that moved");
     }
 
-    /// A reconnect resumes each group where that group stopped, which is the whole reason the
-    /// position is a map rather than a number.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ib029_stream_captures_first_writes_without_creating_collections() {
+        let root = temp_root();
+        let (s1, s2, router) = two_shard_cluster(&root).await;
+        let c = reqwest::Client::new();
+        let first = key_on(&router, &s1.url());
+        let second = key_on(&router, &s2.url());
+        let tap = watch(&c, &router.url(), "").await;
+        for node in [&s1, &s2] {
+            let db = node.state.as_ref().unwrap().db.as_ref().unwrap();
+            assert!(db.lookup_collection("c").unwrap().is_none());
+            assert!(!db.root_path.join("c").exists());
+            assert!(!db.list_collections().unwrap().contains(&"c".to_string()));
+        }
+        put(&c, &router.url(), &first, 1).await;
+        put(&c, &router.url(), &second, 1).await;
+        put(&c, &router.url(), &second, 2).await;
+        let seen = tap.wait_for_events("change", 3, SETTLE).await;
+        assert_eq!(seen.len(), 3, "first writes must reach the waiting feed: {:?}", seen);
+        assert_eq!(seen.iter().filter(|e| e.data["op"] == "insert").count(), 2);
+        assert_eq!(seen.iter().filter(|e| e.data["op"] == "update").count(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ib029_existing_stream_captures_a_groups_first_writes() {
+        let root = temp_root();
+        let (s1, s2, router) = two_shard_cluster(&root).await;
+        let c = reqwest::Client::new();
+        let first = key_on(&router, &s1.url());
+        let second = key_on(&router, &s2.url());
+        put(&c, &router.url(), &first, 0).await;
+        let tap = watch(&c, &router.url(), "").await;
+        let db = s2.state.as_ref().unwrap().db.as_ref().unwrap();
+        assert!(db.lookup_collection("c").unwrap().is_none());
+        put(&c, &router.url(), &second, 1).await;
+        put(&c, &router.url(), &second, 2).await;
+        let seen = tap.wait_for_events("change", 2, SETTLE).await;
+        assert_eq!(seen.iter().map(|e| e.data["op"].as_str().unwrap()).collect::<Vec<_>>(),
+            vec!["insert", "update"], "first changes on the previously empty group: {:?}", seen);
+        assert!(seen.iter().all(|e| e.data["key"] == second));
+    }
+
+    /// A reconnect resumes each group at its own position.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_reconnect_resumes_every_group_where_it_left_it() {
         let root = temp_root();
@@ -836,8 +876,8 @@ mod tests {
         put(&c, &router.url(), &key_on(&router, &s1.url()), 0).await;
 
         assert_eq!(c.get(format!("{}/collections/ghost/changes", router.url()))
-            .send().await.unwrap().status(), StatusCode::NOT_FOUND,
-            "a collection no group holds is the client's error, not an empty feed");
+            .send().await.unwrap().status(), StatusCode::OK,
+            "a subscription can precede the collection on every group");
         assert_eq!(changes(&c, &router.url(), "?filter=%7B%22%24nope%22%3A1%7D").await.status(),
             StatusCode::BAD_REQUEST, "a filter wrong for every shard is refused once, here");
         assert_eq!(changes(&c, &router.url(), "?ops=upsert").await.status(), StatusCode::BAD_REQUEST);

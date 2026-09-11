@@ -3,14 +3,14 @@
 use super::collection::Collection;
 use crate::consensus::config::{is_system_collection, valid_collection_name};
 use super::index::{AppliedMeta, INDEX_FILENAME, LsnMeta, ReadCacheConfig};
-use crate::changefeed::ChangefeedConfig;
+use crate::changefeed::{Changefeed, ChangefeedConfig, SubscribeError, Subscription};
 use crate::util::{remove_dir_with_retry, rename_with_retry, write_atomic};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use tracing::{error, info, warn};
 
 const INSTALL_MARKER: &str = ".install";
@@ -64,6 +64,7 @@ pub struct Database {
     pub root_path: PathBuf,
     pub cache: ReadCacheConfig,
     pub changefeed: ChangefeedConfig,
+    pending_feeds: Mutex<HashMap<String, Weak<Changefeed>>>,
     pub collections: RwLock<HashMap<String, Arc<Collection>>>,
     pub durable_lsn: Arc<AtomicU64>,
     pub next_lsn: Arc<AtomicU64>,
@@ -82,7 +83,7 @@ impl Database {
     }
 
     fn open_collection(&self, name: &str) -> io::Result<Arc<Collection>> {
-        let col = Arc::new(Collection::open(
+        let mut col = Arc::new(Collection::open(
             name.to_string(),
             self.collection_dir(name)?,
             self.durable_lsn.clone(),
@@ -91,6 +92,12 @@ impl Database {
             self.cache.clone(),
             self.changefeed.clone(),
         )?);
+        if let Some(feed) = self.pending_feeds.lock().unwrap().remove(name).and_then(|f| f.upgrade()) {
+            if col.applied_lsn() > 0 {
+                feed.note_gap(col.applied_lsn());
+            }
+            Arc::get_mut(&mut col).unwrap().changefeed = feed;
+        }
         Collection::start_commit_task(col.clone());
         Collection::start_index_task(col.clone());
         Ok(col)
@@ -116,6 +123,7 @@ impl Database {
             cache,
             changefeed,
             collections: RwLock::new(HashMap::new()),
+            pending_feeds: Mutex::new(HashMap::new()),
             durable_lsn: Arc::new(AtomicU64::new(boot_lsn)),
             next_lsn: Arc::new(AtomicU64::new(boot_lsn)),
             last_log_term: Arc::new(AtomicU64::new(0)),
@@ -273,6 +281,32 @@ impl Database {
             return Ok(None);
         }
         self.get_collection(name).map(Some)
+    }
+
+    // The map lock joins a waiting feed to collection creation before any writer sees the handle.
+    pub fn subscribe_changes(&self, name: &str, after: Option<u64>) -> io::Result<Result<Subscription, SubscribeError>> {
+        let live = self.collection_dir(name)?;
+        let mut collections = self.collections.write().unwrap();
+        if let Some(col) = collections.get(name) {
+            return Ok(col.changefeed.subscribe(after, col.applied_lsn()));
+        }
+        let (_, old, tmp) = install_paths(&self.root_path, name);
+        if live.is_dir() || old.is_dir() || staged_install_ready(&tmp) {
+            self.recover_collection_install(name, false)?;
+            let col = self.open_collection(name)?;
+            let result = col.changefeed.subscribe(after, col.applied_lsn());
+            collections.insert(name.to_string(), col);
+            self.drop_install_backup(name);
+            return Ok(result);
+        }
+        let mut pending = self.pending_feeds.lock().unwrap();
+        pending.retain(|_, feed| feed.strong_count() > 0);
+        let feed = pending.get(name).and_then(Weak::upgrade).unwrap_or_else(|| {
+            let feed = Arc::new(Changefeed::new(self.changefeed.clone(), 0));
+            pending.insert(name.to_string(), Arc::downgrade(&feed));
+            feed
+        });
+        Ok(feed.subscribe(Some(after.unwrap_or(0)), 0))
     }
 
     /// `lookup_collection` for callers with one fallback for absent and broken alike.
@@ -898,4 +932,42 @@ mod tests {
         assert!(db.get_collection("Orders").is_err());
         assert!(db.get_collection("users_A").is_err());
     }
+
+    #[tokio::test]
+    async fn ib029_pending_feeds_share_limits_and_attach_before_writes() {
+        let root = temp_root();
+        let db = Database::with_config(&root, ReadCacheConfig::default(),
+            ChangefeedConfig { max_subscribers: 1, ..ChangefeedConfig::default() }).unwrap();
+        assert!(db.subscribe_changes("../bad", None).is_err());
+        assert_eq!(db.subscribe_changes("c", Some(1)).unwrap().err(), Some(SubscribeError::Ahead(0)));
+        let sub = db.subscribe_changes("c", None).unwrap().unwrap();
+        assert_eq!(db.subscribe_changes("c", None).unwrap().err(), Some(SubscribeError::TooMany(1)));
+        let feed = db.pending_feeds.lock().unwrap().get("c").unwrap().upgrade().unwrap();
+        let col = db.get_collection("c").unwrap();
+        assert!(Arc::ptr_eq(&feed, &col.changefeed));
+        assert!(col.changefeed.active());
+        drop(sub);
+        assert!(db.subscribe_changes("c", Some(0)).unwrap().is_ok());
+        let abandoned = db.subscribe_changes("ghost", None).unwrap().unwrap();
+        drop(abandoned);
+        let _other = db.subscribe_changes("other", None).unwrap().unwrap();
+        assert!(!db.pending_feeds.lock().unwrap().contains_key("ghost"));
+        assert!(!root.join("ghost").exists());
+    }
+    #[tokio::test]
+    async fn ib029_snapshot_adoption_reports_a_gap_to_a_waiting_subscriber() {
+        let root = temp_root();
+        let donor = temp_root();
+        committed_collection(&donor, "c", "k", 1).await;
+        let db = Database::new(&root).unwrap();
+        let mut sub = db.subscribe_changes("c", None).unwrap().unwrap();
+        let staged = root.join("c.tmp");
+        crate::util::rename_with_retry(&donor.join("c"), &staged).unwrap();
+        db.install_staged_collection("c", &staged).unwrap();
+        let floor = db.get_collection("c").unwrap().applied_lsn();
+        assert!(floor > 0);
+        assert!(matches!(sub.next_batch().await,
+            Err(crate::changefeed::FeedEnd::Overrun(lsn)) if lsn == floor));
+    }
+
 }

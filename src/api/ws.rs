@@ -101,7 +101,6 @@ mod tests {
         let n = single_node(&root).await;
         let c = reqwest::Client::new();
 
-        put(&c, &n.url(), "seed", serde_json::json!({"v": 0})).await;
         let tap = open(&n.url(), "").await;
 
         put(&c, &n.url(), "k1", serde_json::json!({"v": 1})).await;
