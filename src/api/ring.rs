@@ -386,7 +386,9 @@ mod tests {
 
         let root = temp_root();
         let n = single_node(&root).await;
-        let c = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10))
+        // A backstop against a hang, not a bound on the answer: the ceiling ring below is a real
+        // ~300 ms build, and under load a 10 s cap read a starved machine as a broken bound (L8b).
+        let c = reqwest::Client::builder().timeout(std::time::Duration::from_secs(60))
             .build().unwrap();
 
         let ring = |shards: usize, vnodes: u32| serde_json::json!({
@@ -398,16 +400,24 @@ mod tests {
 
         // 20,000 shards is 769 KB of JSON, inside the 2 MB body limit, and used to be accepted.
         for (shards, vnodes) in [(20_000usize, 1u32), (MAX_RING_SHARDS + 1, 1), (MAX_RING_SHARDS, MAX_VNODES)] {
+            let because = if shards > MAX_RING_SHARDS {
+                format!("at most {} shards", MAX_RING_SHARDS)
+            } else {
+                "shards x vnodes".to_string()
+            };
             // Dry run first: it returns straight after `build` and `keyspace_movement` with no
             // network work, so a failure here is the layout cost and nothing else.
             for query in ["?dry_run=true", ""] {
-                let started = std::time::Instant::now();
                 let r = c.post(format!("{}/cluster/ring{}", n.url(), query))
                     .json(&ring(shards, vnodes)).send().await.unwrap();
-                assert_eq!(r.status(), StatusCode::UNPROCESSABLE_ENTITY,
-                    "{} shards x {} vnodes{}", shards, vnodes, query);
-                assert!(started.elapsed() < std::time::Duration::from_secs(5),
-                    "refused, but only after building it: {} shards x {} vnodes", shards, vnodes);
+                let status = r.status();
+                let body: serde_json::Value = r.json().await.unwrap();
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY,
+                    "{} shards x {} vnodes{}: {}", shards, vnodes, query, body);
+                // `validate`'s own words, which `build` is past and no refusal after it carries.
+                assert!(body["error"].as_str().is_some_and(|e| e.contains(&because)),
+                    "refused, but not by `validate` ahead of `build`: {} shards x {} vnodes{}: {}",
+                    shards, vnodes, query, body);
             }
         }
 

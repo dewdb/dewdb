@@ -298,6 +298,10 @@ mod tests {
 
     const SETTLE: Duration = Duration::from_secs(10);
 
+    /// Several `DEFAULT_WTIMEOUT_MS` windows, so a quorum that misses the first gets more than one
+    /// further try before a slow machine is reported as a broken contract.
+    const COMMIT: Duration = Duration::from_secs(30);
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn ib031_offline_replica_recovers_registration_and_removal() {
         let root = temp_root();
@@ -308,9 +312,9 @@ mod tests {
         assert!(put_value(&c, &n1.url(), "c", "seed", serde_json::json!({"v": 0}),
             "?w=all").await.is_success());
         n3.kill();
-        let response = register(&c, &n1.url(), serde_json::json!({
+        let response = committed(registration(&c, &n1.url(), serde_json::json!({
             "id": "offline", "url": sink.url, "secret": "kept",
-        })).await;
+        }))).await;
         assert_eq!(response.status(), StatusCode::CREATED);
         let key = ("c".to_string(), "offline".to_string());
         n3.start();
@@ -320,8 +324,8 @@ mod tests {
         n3.kill();
         let holder = settle_leader(&[&n1, &n2], SETTLE).await.unwrap();
         let leader = node_by_id(&[&n1, &n2], &holder);
-        assert_eq!(c.delete(format!("{}/collections/c/webhooks/offline", leader.url()))
-            .send().await.unwrap().status(), StatusCode::OK);
+        assert_eq!(committed(c.delete(format!("{}/collections/c/webhooks/offline", leader.url())))
+            .await.status(), StatusCode::OK);
         n3.start();
         assert!(wait_for(SETTLE, || {
             let state = n3.state.as_ref().unwrap();
@@ -338,12 +342,35 @@ mod tests {
             .is_success(), "write of {} failed", key);
     }
 
+    fn registration(
+        client: &reqwest::Client,
+        base: &str,
+        body: serde_json::Value,
+    ) -> reqwest::RequestBuilder {
+        client.post(format!("{}/collections/c/webhooks", base)).json(&body)
+    }
+
     async fn register(
         client: &reqwest::Client,
         base: &str,
         body: serde_json::Value,
     ) -> reqwest::Response {
-        client.post(format!("{}/collections/c/webhooks", base)).json(&body).send().await.unwrap()
+        registration(client, base, body).send().await.unwrap()
+    }
+
+    /// Every 503 these endpoints answer means "not yet": the `w=majority` catalogue write missed its
+    /// fixed `DEFAULT_WTIMEOUT_MS`, which suite load alone causes, so retry to a deadline (L8b).
+    async fn committed(request: reqwest::RequestBuilder) -> reqwest::Response {
+        let deadline = tokio::time::Instant::now() + COMMIT;
+        loop {
+            let response = request.try_clone().expect("a webhook body is in memory and clones")
+                .send().await.unwrap();
+            if response.status() != StatusCode::SERVICE_UNAVAILABLE
+                || tokio::time::Instant::now() >= deadline {
+                return response;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     async fn state_of(client: &reqwest::Client, base: &str, id: &str) -> serde_json::Value {
@@ -562,8 +589,8 @@ mod tests {
             "the test needs a settled leader to register against");
 
         put(&c, &n1.url(), "seed", 0).await;
-        let created = register(&c, &n1.url(), serde_json::json!({
-            "id": "orders", "url": sink.url, "secret": "s3cret"})).await;
+        let created = committed(registration(&c, &n1.url(), serde_json::json!({
+            "id": "orders", "url": sink.url, "secret": "s3cret"}))).await;
         assert_eq!(created.status(), StatusCode::CREATED);
         let body: serde_json::Value = created.json().await.unwrap();
         assert_eq!(body["replicated_to"].as_array().map(|r| r.len()), Some(2), "{}", body);
@@ -589,8 +616,8 @@ mod tests {
             .send().await.unwrap().status(), StatusCode::FORBIDDEN,
             "the group has one node that delivers, and this is not it");
 
-        assert_eq!(c.delete(format!("{}/collections/c/webhooks/orders", n1.url()))
-            .send().await.unwrap().status(), StatusCode::OK);
+        assert_eq!(committed(c.delete(format!("{}/collections/c/webhooks/orders", n1.url())))
+            .await.status(), StatusCode::OK);
         for follower in [&n2, &n3] {
             assert_eq!(c.get(format!("{}/collections/c/webhooks/orders", follower.url()))
                 .send().await.unwrap().status(), StatusCode::NOT_FOUND,
@@ -664,9 +691,9 @@ mod tests {
 
         assert!(put_value(&c, &n1.url(), "c", "seed", serde_json::json!({"v": 0}),
             "?w=majority").await.is_success());
-        assert_eq!(register(&c, &n1.url(), serde_json::json!({
+        assert_eq!(committed(registration(&c, &n1.url(), serde_json::json!({
             "id": "orders", "url": sink.url,
-        })).await.status(), StatusCode::CREATED);
+        }))).await.status(), StatusCode::CREATED);
         for follower in [&n2, &n3] {
             let feed_active = follower.state.as_ref().and_then(|state| state.db.as_ref())
                 .and_then(|db| db.existing_collection("c"))

@@ -193,14 +193,30 @@ async fn write_one(c: &reqwest::Client, base: &str, key: &str, value: i64, query
     c.put(&url).json(&body).send().await.ok().map(|r| r.status().as_u16())
 }
 
-/// The whole visible state in one request, which also catches a document that is present and was
-/// never written -- a per-key probe cannot.
+/// The whole visible state, which also catches a document that is present and was never written --
+/// a per-key probe cannot. Paged to the end, since one page stops at the limit and reads as loss.
 async fn contents(c: &reqwest::Client, base: &str) -> Option<BTreeMap<String, i64>> {
-    let url = format!("{}/collections/t/docs", base);
-    let docs = c.get(&url).send().await.ok()?.json::<Vec<serde_json::Value>>().await.ok()?;
-    Some(docs.iter()
-        .filter_map(|d| Some((d.get("k")?.as_str()?.to_string(), d.get("v")?.as_i64()?)))
-        .collect())
+    let mut out = BTreeMap::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut url = format!("{}/collections/t/docs?limit={}", base, crate::model::MAX_QUERY_LIMIT);
+        if let Some(next) = &cursor {
+            url.push_str(&format!("&cursor={}", next));
+        }
+        let page = c.get(&url).send().await.ok()?
+            .json::<crate::model::QueryPage>().await.ok()?;
+        for d in &page.items {
+            if let (Some(k), Some(v)) = (d.get("k").and_then(|x| x.as_str()),
+                                         d.get("v").and_then(|x| x.as_i64())) {
+                out.insert(k.to_string(), v);
+            }
+        }
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    Some(out)
 }
 
 /// Writes to whichever node answers, because the leader moves under every scenario here.
