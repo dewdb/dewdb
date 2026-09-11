@@ -1,0 +1,9 @@
+{
+  "node_id": "shard-1",
+  "role": "shard",
+  "shard_role": "primary",
+  "listen_addr": "127.0.0.1:8081",
+  "data_dir": "./data/examples/shard1",
+  "replicas": ["http://127.0.0.1:8083"],
+  "peers": ["http://127.0.0.1:8083"]
+}

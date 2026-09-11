@@ -19,33 +19,33 @@ no external coordinator, no separate metadata service, and no driver to install.
 cargo build --release
 ```
 
-Write `node.json`:
+```bash
+./target/release/dewdb --config examples/single-node.json
+```
+
+That is the whole setup. [`examples/single-node.json`](examples/single-node.json) is the whole file:
 
 ```json
 {
   "node_id": "n1",
   "role": "shard",
   "shard_role": "primary",
-  "listen_addr": "127.0.0.1:8081",
-  "data_dir": "./data"
+  "listen_addr": "127.0.0.1:8090",
+  "data_dir": "./data/examples/single-node"
 }
 ```
 
-```bash
-./target/release/dewdb --config node.json
-```
-
-That is the whole setup. The node leads itself, commits on its own fsync, and is ready immediately.
-Collections are created on first use — no schema, no create step.
+The node leads itself, commits on its own fsync, and is ready immediately. Collections are created
+on first use — no schema, no create step.
 
 ```bash
-curl -s -X PUT localhost:8081/collections/users/docs/u1 \
+curl -s -X PUT localhost:8090/collections/users/docs/u1 \
   -H 'content-type: application/json' \
   -d '{"value":{"name":"ada","age":36,"profile":{"city":"london"}}}'
 ```
 
 ```bash
-curl -s --get localhost:8081/collections/users/query \
+curl -s --get localhost:8090/collections/users/query \
   --data-urlencode 'filter={"age":{"$gte":30},"profile.city":"london"}' \
   --data-urlencode 'sort=age:desc' \
   --data-urlencode 'fields=name,profile.city'
@@ -67,9 +67,9 @@ change streams inside the database process, without requiring a separate coordin
 Consensus, ownership and routing run in the same process that stores the documents. What you deploy
 is the database.
 
-**One process, one file, one protocol.** A node is `dewdb --config node.json`. Storage is a
-directory. The wire format is HTTP and JSON, so curl, a browser, or any HTTP client is a first-class
-client, and there is nothing to install on the application side.
+**One process, one file, one protocol.** A node is `dewdb --config examples/single-node.json`.
+Storage is a directory. The wire format is HTTP and JSON, so curl, a browser, or any HTTP client is
+a first-class client, and there is nothing to install on the application side.
 
 **Strong consistency, stated precisely.** Writes commit by quorum and readers see committed state
 only. A single-document write is atomic — it becomes durable as one frame or not at all. `read=quorum`
@@ -154,7 +154,7 @@ combined through their counts rather than by averaging averages. Adding a shard 
 ## Change streams and CDC
 
 ```bash
-curl -N --get localhost:8081/collections/users/changes \
+curl -N --get localhost:8090/collections/users/changes \
   --data-urlencode 'filter={"profile.city":"london"}'
 ```
 

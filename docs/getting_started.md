@@ -1291,22 +1291,30 @@ vote and whose acknowledgement counts toward `w=majority`.
 A router holds no data: it hashes `collection:key`, finds the owning group, and forwards. Clients
 talk to routers and never need to know which shard owns what.
 
-`shard1.json` / `shard2.json` are ordinary primaries (ports 8081 and 8082, own data dirs, optionally
-with replicas as in [§12](#12-add-replicas-and-watch-a-failover)).
+`examples/cluster/shard1.json` / `examples/cluster/shard2.json` are ordinary primaries (ports 8081
+and 8082, own data dirs, optionally with replicas as in
+[§12](#12-add-replicas-and-watch-a-failover)).
 
-`router.json`:
+`examples/cluster/router.json`:
 
 ```json
 {
   "node_id": "router-1",
   "role": "router",
   "listen_addr": "127.0.0.1:8080",
-  "data_dir": "./nr",
+  "data_dir": "./data/examples/router",
   "shard_map": [
-    { "start_hash": 0, "end_hash": 9223372036854775808,
-      "node_url": "http://127.0.0.1:8081", "replica_urls": ["http://127.0.0.1:8083"] },
-    { "start_hash": 9223372036854775808, "end_hash": 0,
-      "node_url": "http://127.0.0.1:8082", "replica_urls": ["http://127.0.0.1:8084"] }
+    {
+      "start_hash": 0,
+      "end_hash": 9223372036854775808,
+      "node_url": "http://127.0.0.1:8081",
+      "replica_urls": ["http://127.0.0.1:8083"]
+    },
+    {
+      "start_hash": 9223372036854775808,
+      "end_hash": 0,
+      "node_url": "http://127.0.0.1:8082"
+    }
   ]
 }
 ```

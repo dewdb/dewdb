@@ -2,6 +2,8 @@
   "node_id": "shard-1-replica",
   "role": "shard",
   "shard_role": "replica",
+  "listen_addr": "127.0.0.1:8083",
+  "data_dir": "./data/examples/replica1",
   "primary_addr": "http://127.0.0.1:8081",
-  "listen_addr": "127.0.0.1:8083"
+  "peers": ["http://127.0.0.1:8081"]
 }
