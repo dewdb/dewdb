@@ -289,7 +289,9 @@ absence.
 
 `$gt`/`$gte`/`$lt`/`$lte` take a number *or* a string, and compare inside that type only:
 `{"age":{"$gt":1}}` will not return a document whose `age` is `"zebra"`, and the reverse holds too.
-Integer bounds keep their full signed or unsigned 64-bit precision, including values above 2^53.
+Numbers compare through `f64`: integers below 2^53 are exact, and two that differ only above that
+compare equal, so range filters cannot separate them. Store such a value as a zero-padded string if
+you need to range over it.
 `$ne`, `$in`, `$nin` and `$all` compare whole JSON values.
 
 Anything the engine cannot evaluate — an operator it does not know, `$in` without an array, range
@@ -500,9 +502,10 @@ Three ways forward:
   how far it got. Those totals cover the documents read, not the range, and one shard stopping short
   makes the whole merged answer partial — check the flag before you use the numbers.
 
-A node runs up to four aggregation scans at a time. A fifth waits a couple of seconds for a slot and
-is then `429`, which means retry: a scan holds a thread for as long as its budget lasts, and reads
-and writes share that pool.
+A node runs up to four scans at a time -- an aggregation, or a `/query` page that filters or sorts.
+A fifth waits a couple of seconds for a slot and is then `429`, which means retry: a scan holds a
+thread for as long as its budget lasts, and reads and writes share that pool. A plain listing with
+no filter reads exactly `limit` and never waits for a slot.
 
 ---
 
@@ -1700,7 +1703,7 @@ Write a client against these and it will behave well during elections and topolo
 | `410` | a change-stream position older than the buffer holds | resume from the `resume_floor` in the body |
 | `413` | the request body is over 2 MiB, or a bulk write has more documents than `max_uncommitted_frames` | split it — this one does not clear on retry |
 | `422` | a ring that fails validation, or a refused voting-set change | fix the layout or the set |
-| `429` | every aggregation or sorted-scan slot on the node is taken | back off and retry |
+| `429` | every scan slot on the node is taken: aggregation, or a filtered or sorted page | back off and retry |
 | `502` | no node in the group could be reached, including for `/collections` and `/query` | retry with backoff |
 | `503` + `Retry-After` | replication backlog, a key mid-handover, or a `primary`/`quorum` read this node cannot answer yet | back off and retry; it clears itself |
 | `503` *no longer leading* | the node lost the leadership term while the write was in flight; nothing was acknowledged | retry — the router already sends it to the rest of the group |

@@ -158,8 +158,9 @@ GET /collections/:name/query?filter={"age":{"$gte":30}}&sort=age:desc&fields=nam
   `$not` are the two ways to select for absence.
 - **Ordered comparison stays inside one JSON type.** `$gt: 1` never admits `"zebra"` and `$gt: "b"`
   never admits a number: they are different kinds of thing, not different points on one line.
-  Integer comparisons retain their full signed or unsigned 64-bit precision, including above 2^53. A
-  condition whose bounds name two types is refused rather than answered empty.
+  Numbers compare through `f64`, so integers below 2^53 are exact and two that differ only above it
+  compare equal (`bugs.md` M2). A condition whose bounds name two types is refused rather than
+  answered empty.
 - **Secondary indexes accelerate equality, range, prefix, type and existence filters.** Where a
   condition names an indexed field with `=`, `$in`, an ordered comparison, `$prefix`, a single
   `$type`, or `$exists: true`, the planner takes the candidate keys from the index instead of
@@ -310,9 +311,11 @@ GET /collections/:name/aggregate?filter={"tier":"gold"}&group=region&metrics=cou
   shard stopping short marks the merged answer — the merge cannot tell which groups the unread keys
   belonged to, so it knows no group to be complete.
 - **Admitted, four at a time per node.** A scan holds a blocking thread for as long as its budget
-  lasts, and document reads and group commits share that pool. A fifth request waits two seconds for
-  a slot and is then `429`; through a router that means every target in some group was busy, which
-  is neither `503`'s "no primary" nor a `502`.
+  lasts, and document reads and group commits share that pool. The same slots admit a `/query` page
+  that filters or sorts, which spends a budget the same way; an unfiltered listing reads exactly
+  `limit` and stays outside them. A fifth request waits two seconds for a slot and is then `429`;
+  through a router that means every target in some group was busy, which is neither `503`'s
+  "no primary" nor a `502`.
 
 **Scope.** The metric set is `count`, `sum`, `avg`, `min` and `max` over up to four grouping fields.
 An aggregation walks its range each time rather than reading a cached rollup, and, like a query, it
@@ -345,6 +348,11 @@ POST /collections/:name/webhooks                            # pushed to an endpo
   position is a `410` rather than a socket that opens and shuts.
 - **Every event is a resume position.** The event's `lsn` is also its SSE `id`, so `?after=<lsn>`
   and a browser's own `Last-Event-ID` reconnect both pick up exactly where the stream stopped.
+- **Recording costs the writer, and a registration makes that permanent.** A feed records only while
+  something is attached, plus a retention window -- but a webhook is a sender rather than a
+  connection, so a registration pins its collection's feed for as long as it exists. On a collection
+  of large documents, raise `read_cache.inline_max_value_bytes` past your document size: it decides
+  whether the feed resolves a change from the index or from the WAL.
 - **Bounded by one buffer per collection, not a queue per subscriber.** A subscriber that falls
   behind it is ended in-band and refused `410` with the `resume_floor` that still works — never
   served a feed with a hole in it and told nothing.

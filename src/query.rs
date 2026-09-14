@@ -422,6 +422,10 @@ fn parse_branches(op: &str, operand: &serde_json::Value, depth: usize) -> Result
 }
 
 fn parse_condition(field: &str, cond: &serde_json::Value, depth: usize) -> Result<Condition, String> {
+    // `$not` and `$elemMatch` recurse here without passing through `parse_expr`'s check (IB-048).
+    if depth > MAX_FILTER_DEPTH {
+        return Err(format!("filter nests deeper than the maximum of {}", MAX_FILTER_DEPTH));
+    }
     let Some(map) = cond.as_object() else {
         return Ok(Condition { ops: vec![Op::Eq(cond.clone())] });
     };
@@ -783,6 +787,24 @@ mod tests {
             deep = format!(r#"{{"$and": [{}]}}"#, deep);
         }
         assert!(parse_filter(&deep).is_err(), "recursion has to be bounded where it is parsed");
+    }
+
+    /// IB-048: both recurse through `parse_condition`, which the document-level check never reaches.
+    #[test]
+    fn field_operator_nesting_is_bounded() {
+        let wrap = |op: &str, n: usize| {
+            let mut inner = r#"{"$gt": 5}"#.to_string();
+            for _ in 0..n {
+                inner = format!(r#"{{"{}": {}}}"#, op, inner);
+            }
+            format!(r#"{{"a": {}}}"#, inner)
+        };
+        for op in ["$not", "$elemMatch"] {
+            assert!(parse_filter(&wrap(op, MAX_FILTER_DEPTH + 2)).is_err(),
+                "`{}` has to be bounded by the same ceiling as $and", op);
+            assert!(parse_filter(&wrap(op, 2)).is_ok(),
+                "`{}` within the ceiling still parses", op);
+        }
     }
 
     #[test]

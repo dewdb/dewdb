@@ -4,7 +4,7 @@
 use crate::test_support::{
     cleanup, get_raw, put_doc_at, put_value, sharded_cluster, single_node, temp_root,
     three_node_cluster_with_timeout,
-    voter_group, TestNode,
+    voter_group, TestNode, WebhookSink, WsTap,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -432,6 +432,89 @@ async fn bench_cross_shard_query() {
                 cleanup(&root).await;
             }
             report(&format!("{} shards, {}", shards, label), samples);
+        }
+    }
+}
+
+/// Writes a payload of a chosen size, so the inline threshold decides whether the feed's document
+/// resolution is a map lookup or a WAL seek.
+async fn sized_write_sample(node: &TestNode, client: Arc<reqwest::Client>, bytes: usize,
+                            concurrency: usize, per_worker: usize, tag: &'static str) -> Stats {
+    let url = node.url();
+    let started = Instant::now();
+    let (lat, fails) = drive(concurrency, per_worker, move |w, i| {
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            let value = serde_json::json!({"pad": "x".repeat(bytes)});
+            let status = put_value(&client, &url, "bench",
+                &format!("{}-{}-{}", tag, w, i), value, "?w=1").await;
+            status.is_success() && status != axum::http::StatusCode::ACCEPTED
+        }
+    }).await;
+    assert_eq!(fails, 0, "{}: {} writes failed", tag, fails);
+    summarize(lat, started.elapsed().as_secs_f64())
+}
+
+/// IB-027: a pinned feed resolves every committed `Put` through `read_entry`, which is a WAL seek
+/// above the inline ceiling. Measured, not fixed; the entry predicts the cost lands on large values.
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn bench_changefeed_write_cost() {
+    // More samples than the other benches take: the effect being measured is smaller than the
+    // run-to-run spread of a single sample, so the median needs more to sit on.
+    const RUNS: usize = 9;
+
+    for (conc, per) in [(1usize, 60usize), (16, 40)] {
+        println!("\n=== IB-027: pinned-feed cost on the write path, 1 node, w=1, {} concurrent ===", conc);
+        // 64 B is served from the index; 2 KiB is past the 512 B default and costs a seek per event.
+        for (size_label, bytes) in [("small 64B", 64usize), ("large 2KiB", 2048usize)] {
+            for pin in ["none", "ws subscriber", "webhook"] {
+                let mut samples = Vec::new();
+                for _ in 0..RUNS {
+                    let root = temp_root();
+                    let node = single_node(&root).await;
+                    let client = bench_client();
+                    let _ = put_value(&client, &node.url(), "bench", "warm",
+                        serde_json::json!({"pad": "x".repeat(bytes)}), "?w=1").await;
+
+                    // Held for the length of the sample; dropping either releases the pin.
+                    let mut tap: Option<WsTap> = None;
+                    let mut sink: Option<WebhookSink> = None;
+                    match pin {
+                        "ws subscriber" => {
+                            tap = Some(WsTap::open(&format!("{}/collections/bench/changes/ws", node.url()))
+                                .await.expect("the subscriber has to attach before the sample"));
+                        },
+                        "webhook" => {
+                            let s = WebhookSink::start().await;
+                            let created = client.post(format!("{}/collections/bench/webhooks", node.url()))
+                                .json(&serde_json::json!({"id": "bench", "url": s.url}))
+                                .send().await.unwrap();
+                            assert!(created.status().is_success(),
+                                "the registration is the pin: {}", created.status());
+                            sink = Some(s);
+                        },
+                        _ => {},
+                    }
+
+                    samples.push(sized_write_sample(&node, client, bytes, conc, per, "cdc").await);
+
+                    // Without this the sample measures an unpinned node under another name.
+                    if let Some(tap) = &tap {
+                        let seen = tap.wait_for("change", 1, Duration::from_secs(10)).await.len();
+                        assert!(seen > 0, "the subscriber received nothing, so nothing was pinned");
+                    }
+                    if let Some(sink) = &sink {
+                        let seen = sink.wait_for_events(1, Duration::from_secs(10)).await.len();
+                        assert!(seen > 0, "the endpoint received nothing, so nothing was pinned");
+                    }
+                    drop((tap, sink));
+                    drop(node);
+                    cleanup(&root).await;
+                }
+                report(&format!("{}, {}", size_label, pin), samples);
+            }
         }
     }
 }

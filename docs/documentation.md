@@ -283,7 +283,7 @@ config edit is logged as ignored rather than applied. Delete `cluster.meta` to r
 | `rebalance.*` | disabled | Automatic ring reconciliation after membership changes. |
 | `data_movement.batch_size` | 64 | Documents per handover batch (1–1024). |
 | `data_movement.batch_delay_ms` | 5 | Pause between handover batches during the bulk copy. |
-| `read_cache.inline_max_value_bytes` | 512 | Largest value cached inline in an index entry. |
+| `read_cache.inline_max_value_bytes` | 512 | Largest value cached inline in an index entry. Also decides whether a pinned change feed resolves a change from the index or with a WAL read. |
 | `read_cache.inline_budget_bytes` | 64 MiB | Total inline cache budget per collection. |
 | `changefeed.buffer_events` | 1024 | Change events kept per collection, and so how far a subscriber may fall behind or be away before its position is refused. Must be at least 1. |
 | `changefeed.idle_retention_ms` | 30000 | How long a feed keeps recording after its last subscriber leaves. `0` stops as soon as it goes. |
@@ -1145,10 +1145,11 @@ sixteen ticks. A write still triggers repair immediately regardless of backoff.
 A third case is neither: there is nothing to send, and yet nothing records that the replica holds
 the tail. That is the state a promotion leaves — evidence belongs to the term it was gathered in —
 and the state a snapshot install leaves, since installing a log is not acknowledging one. A missing
-cursor counts here too. The driver then re-sends the tail frame purely to be answered: the reply is
+cursor counts here too. The leader then re-sends the tail frame purely to be answered: the reply is
 either `duplicate`, which the receiver only gives after checking the term at that LSN, or a gap,
-which says where the replica really is. Without it a leader can hold a tail a majority already has
-and never be able to prove it.
+which says where the replica really is. The periodic driver and the catch-up a leadership handover
+runs both take this branch, so neither streams a collection from zero for want of a cursor. Without
+it a leader can hold a tail a majority already has and never be able to prove it.
 
 Before sending a frame the leader checks the cursor: if the replica is behind this frame's
 predecessor, the backlog is streamed from the cursor first. Both send paths route through that
@@ -1652,7 +1653,7 @@ Status codes worth knowing:
 | `410` | A change-stream position older than the buffer still holds; the body names the `resume_floor` that works. |
 | `413` | A request body over `MAX_PUBLIC_BODY`, or a bulk write of more documents than `flow_control.max_uncommitted_frames` allows in total. Not retriable. Through a router it stays `413`, and a per-item `code` says which slice it refused. |
 | `422` | A ring that fails validation: overlapping or duplicated members, or a layout over the shard, vnode or token ceiling. |
-| `429` | Every aggregation or sorted-scan slot on the node is taken. Retriable, and per node: through a router it means every target in some group said so. |
+| `429` | Every scan slot on the node is taken: aggregation, a sorted page, or a filtered one. Retriable, and per node: through a router it means every target in some group said so. |
 | `409` | This shard does not own the key; the body names the `owner`. A router follows that name and retries once, for reads, single writes and bulk slices alike. Also an unsorted cursor issued against a different shard layout, from the shard as well as the router — a router passes that one through rather than trying the next replica, which holds the same view. |
 | `503` | Replication backlog too large, the key is mid-handover, or a `primary`/`quorum` read this node cannot answer. `Retry-After` is set. Also a write whose [leadership term](#the-leadership-fence) went away while it was in flight — nothing was acknowledged, and the retry belongs on whichever node took the term. |
 
@@ -1786,13 +1787,19 @@ field is there; `$exists: false` and `$not` are the two exceptions.
 | `{"$and": [f,…]}` | every filter holds; also `$or` and `$nor` |
 
 Several conditions on one field, and several fields, are ANDed, and an `$and`/`$or`/`$nor` beside
-them is ANDed with them too. Filters nest 16 deep.
+them is ANDed with them too. Filters nest 16 deep, counting `$and`/`$or`/`$nor` and field-level
+`$not` and `$elemMatch` alike; past that the filter is `400`.
 
 `$gt`/`$gte`/`$lt`/`$lte` take a number or a string and compare inside that type only: `$gt: 1`
 never admits `"zebra"`, and `$gt: "b"` never admits a number. Values of different types are ordered
 against each other for *sorting*, where a total order is required, but a comparison operator asks a
-question only its own type can answer. Integer comparisons retain all signed or unsigned 64-bit
-precision, including above 2^53.
+question only its own type can answer.
+
+Numbers compare through `f64`, so two integers that differ only above 2^53 compare equal: a document
+holding `9007199254740993` does not satisfy `$gt: 9007199254740992`, and `u64::MAX` ties with
+`u64::MAX - 1`. Integers below 2^53 -- every ordinary count, price, timestamp in milliseconds or
+identifier under nine quadrillion -- are exact. Above it, store the value as a string if you need to
+range over it, since strings compare exactly and a zero-padded decimal sorts as its number does.
 
 `$in`, `$nin` and `$all` compare whole values. `$in` on an array-valued field asks whether that array
 is one of the listed values; `$all` and `$elemMatch` look inside it.
@@ -1880,20 +1887,22 @@ documents per shard per request, up to 1 000 000, refused rather than clamped ab
 after the ownership test and before the read. On an unsorted page, spending it ends the page and
 issues a cursor rather than refusing, because the cursor passes every candidate the page read: a
 rejected row is decided, so the next page cannot lose it. On a sorted page, which reads a whole range
-before it can order any of it, exhaustion returns `400` without a partial page or cursor. Sorted
-queries share four scan slots per node with aggregation and return `429` after a two-second
-admission wait; routers propagate these refusals rather than merging an incomplete answer.
+before it can order any of it, exhaustion returns `400` without a partial page or cursor. A page
+that carries a filter or a sort shares four scan slots per node with aggregation and returns `429`
+after a two-second admission wait; an unfiltered listing reads exactly `limit` and is not admitted
+through them. Routers propagate these refusals rather than merging an incomplete answer.
 
 ### Sorting and projection
 
 `sort=field[:asc|desc][,field[:asc|desc]]…` sorts on up to eight dotted paths. A later key decides
 where every earlier one ties, and the document key decides where they all do, so a sorted page
 resumes at exactly one position. Values are ordered by a total order across JSON types (null, bool,
-number, string, array, object); integers are compared exactly instead of being rounded through
-`f64`. That order is what lets a router merge pages from several shards. A shard scans the requested
-range, filters, sorts, then truncates to `limit`; a router asks each shard for the full limit and
-performs a k-way merge, because the top rows may all live on one shard. A router returns a cursor
-when any shard had more rows or when the merge cut some.
+number, string, array, object); numbers are compared through `f64`, so integers that differ only
+above 2^53 tie and the document key then separates them. That order is what lets a router merge
+pages from several shards. A shard scans the requested range, filters, sorts, then truncates to
+`limit`; a router asks each shard for the full limit and performs a k-way merge, because the top
+rows may all live on one shard. A router returns a cursor when any shard had more rows or when the
+merge cut some.
 
 A sort cursor carries one position per sort key, so changing the sort keys — including their number —
 invalidates it, and the mismatch is a `400`. A cursor issued by an earlier version, which carried a
@@ -1974,10 +1983,11 @@ to and so knows no group to be complete.
 
 ### Admission
 
-A node runs at most four aggregation scans concurrently. A request waits up to two seconds for a slot
-and is then `429`: a scan holds a `spawn_blocking` thread for the length of its budget, and document
-reads and group commits share that pool. Waiting holds no thread, so the wait is cheap and the
-refusal is for a queue that is not moving.
+A node runs at most four scans concurrently -- an aggregation, a sorted page or a filtered one, each
+of which spends a read budget on a blocking thread. A request waits up to two seconds for a slot and
+is then `429`: a scan holds a `spawn_blocking` thread for the length of its budget, and document
+reads and group commits share that pool. An unfiltered page reads exactly `limit` and takes no slot.
+Waiting holds no thread, so the wait is cheap and the refusal is for a queue that is not moving.
 
 Through a router a `429` is per node, so the fan-out tries the group's next replica and answers `429`
 only when every target it had refused. It is not a `503` — that is "no primary" — and not a `502`.
@@ -2126,6 +2136,20 @@ Resolving a document larger than `read_cache.inline_max_value_bytes` is a WAL re
 records only while it has a subscriber, plus `changefeed.idle_retention_ms` after the last one
 leaves, which is what lets a dropped connection reconnect and resume exactly. With no subscriber the
 cost is one atomic load per commit.
+
+A registration is the exception to "only while it has a subscriber". A webhook is a sender rather
+than a connection, so every node holding one pins that collection's feed for as long as the
+registration exists -- across restarts, on followers as well as the leader. Recording is then
+continuous rather than bounded by someone watching.
+
+If that collection holds documents above the inline ceiling, raise
+`read_cache.inline_max_value_bytes` past your typical document size: it is what decides whether the
+feed resolves a change from the index or from the WAL, so raising it removes the read instead of
+moving it, at the cost of `read_cache.inline_budget_bytes` of resident memory. Measured on one node
+with the feed pinned, the penalty is under 3 ms of p50 write latency and largest on *small*
+documents, where the per-event publish cost lands against a cheaper write; large documents moved
+less than the run-to-run spread. Those figures are with the frames still in page cache, which is the
+best case -- a working set past RAM turns each unresolved change into a real seek on the apply path.
 
 A feed that was quiet does not silently resume across the stretch it missed: `subscribe` compares the
 collection's applied watermark against the feed's own position and raises `resume_floor` to the log,

@@ -268,14 +268,14 @@ pub(crate) async fn catch_up_replica(state: &AppState, replica: &str) -> bool {
         if tail == 0 || state.matched_lsn(replica, &name) >= tail {
             continue;
         }
-        // With a backlog we stream it, with none and no ack on record the tail frame is re-sent to
-        // be answered (bugs.md C30). A missing cursor streams from 0 here, unlike the driver (IB-058).
         match state.sent_through(replica, &name) {
-            Some(cursor) if cursor >= tail => { confirm_tail(state, replica, &name).await; },
-            cursor => {
+            Some(cursor) if cursor < tail => {
                 repair_replica(state.clone(), replica.to_string(), name.clone(),
-                    cursor.unwrap_or(0), None, tail).await;
+                    cursor, None, tail).await;
             },
+            // Nothing to send, or no cursor to send from: the tail frame asks either way (C30).
+            // Streaming from 0 snapshots over a retired chain, under transfer.rs's gate (IB-058).
+            _ => { confirm_tail(state, replica, &name).await; },
         }
         if state.matched_lsn(replica, &name) < tail {
             caught_up = false;
@@ -940,6 +940,49 @@ mod tests {
     ) -> axum::http::StatusCode {
         stub.resyncs.fetch_add(1, Ordering::SeqCst);
         axum::http::StatusCode::OK
+    }
+
+    /// IB-058: a collection the leader held no cursor for streamed from 0, which over a compacted
+    /// chain is a whole-collection snapshot for a target that may be one frame behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_catch_up_with_no_cursor_probes_rather_than_snapshotting() {
+        let root = temp_root();
+        let stub = Arc::new(DivergentStub::default());
+        let stub_port = next_test_port();
+        let stub_url = format!("http://127.0.0.1:{}", stub_port);
+
+        let app = axum::Router::new()
+            .route("/internal/replicate", axum::routing::post(diverge_below_watermark))
+            .route("/internal/resync", axum::routing::post(count_resync))
+            .with_state(stub.clone());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", stub_port)).await.unwrap();
+        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+
+        let mut leader = TestNode::new("solo", next_test_port(), &root, "primary");
+        leader.start();
+        let state = leader.state.clone().unwrap();
+        let client = reqwest::Client::new();
+        // Overwrites of one key, so compaction retires every frame below the tail.
+        for v in 1..=7 {
+            assert!(put_doc_http(&client, &leader.url(), "hot", v).await.is_success());
+        }
+        let col = state.db.as_ref().unwrap().get_collection("t").unwrap();
+        assert!(wait_for(Duration::from_secs(10), || col.pending_len() == 0).await,
+            "compaction refuses while anything is still uncommitted");
+        col.compact(Retention::none()).expect("compaction");
+        let tail = col.last_appended_lsn();
+        assert!(chain_prefix(0, 0, col.read_frames_after(0, tail).unwrap()).is_empty(),
+            "the state this bug needs: nothing surviving compaction chains onto an empty log");
+
+        assert_eq!(state.sent_through(&stub_url, "t"), None, "no send cursor is the precondition");
+        catch_up_replica(&state, &stub_url).await;
+
+        assert_eq!(stub.resyncs.load(Ordering::SeqCst), 0,
+            "unfixed this streams from 0 over the retired chain and escalates a snapshot install");
+        assert_eq!(state.sent_through(&stub_url, "t"), Some(STUB_WATERMARK),
+            "the probe's refusal names where the target really is, so the next pass streams from there");
+
+        leader.kill();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

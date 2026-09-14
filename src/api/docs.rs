@@ -497,7 +497,9 @@ pub async fn query_docs(
         Err(resp) => return resp,
     };
 
-    let slot = if sort.is_some() {
+    // A filtered page spends `budget` reads whether or not it sorts; an unfiltered one reads
+    // exactly `limit` and stays outside the bound (IB-059).
+    let slot = if sort.is_some() || filter_obj.is_some() {
         match tokio::time::timeout(Duration::from_millis(SCAN_ADMISSION_WAIT_MS),
             state.scan_slots.clone().acquire_owned()).await {
             Ok(Ok(slot)) => Some(slot),
@@ -692,6 +694,38 @@ mod tests {
             "every match has to survive a budget that cannot reach it in one page");
         assert!(pages > 2, "a budget of two reads per shard cannot have covered 40 keys in {} pages",
             pages);
+    }
+
+    /// IB-059: after IB-054 gave it a budget, an unsorted filtered page is a walk of up to `max_docs`
+    /// reads, so it shares the slots with sorted queries and aggregation. An unfiltered page is not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_filtered_page_takes_a_scan_slot_and_an_unfiltered_one_does_not() {
+        let root = temp_root();
+        let node = single_node(&root).await;
+        let client = reqwest::Client::new();
+        for i in 0..4 {
+            assert_eq!(put_value(&client, &node.url(), "t", &format!("k{}", i),
+                serde_json::json!({"n": i}), "").await, StatusCode::CREATED);
+        }
+        let url = format!("{}/collections/t/query", node.url());
+        let page = |q: Vec<(&'static str, &'static str)>| {
+            let (c, url) = (client.clone(), url.clone());
+            async move { c.get(&url).query(&q).send().await.unwrap().status() }
+        };
+
+        let slots = node.state.as_ref().unwrap().scan_slots.clone();
+        let held = slots.clone().acquire_many_owned(MAX_CONCURRENT_SCANS as u32).await.unwrap();
+
+        assert_eq!(page(vec![("filter", r#"{"n": {"$gt": 0}}"#)]).await,
+            StatusCode::TOO_MANY_REQUESTS, "a filtered page is admitted through the slots");
+        // The listing path has never answered 429 and must not start: it reads exactly `limit`.
+        assert_eq!(page(vec![("limit", "2")]).await, StatusCode::OK,
+            "an unfiltered page reads `limit` and stays outside the bound");
+
+        drop(held);
+        assert_eq!(page(vec![("filter", r#"{"n": {"$gt": 0}}"#)]).await, StatusCode::OK);
+        assert_eq!(slots.available_permits(), MAX_CONCURRENT_SCANS,
+            "an answered filtered page releases its slot");
     }
 
     /// H8: with `?sort=`, `cursor` was ignored and `next_cursor` was always `None`. The cursor is now a
