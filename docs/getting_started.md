@@ -74,7 +74,7 @@ Set `DEWDB_SOAK_SEED=0x…` to run a different schedule than the fixed seed each
 
 ## 2. Your first node
 
-Create `node.json`:
+Create `dew.json`:
 
 ```json
 {
@@ -89,7 +89,7 @@ Create `node.json`:
 Start it:
 
 ```bash
-./target/release/dewdb --config node.json
+./target/release/dewdb --config dew.json
 ```
 
 That is the whole setup. This node leads itself, commits on its own fsync, and is ready
@@ -1566,7 +1566,7 @@ restart nothing, move your clients over, then remove the old one — within abou
 stops accepting it:
 
 ```bash
-# after editing node.json to drop "client-key-1"
+# after editing dew.json to drop "client-key-1"
 curl -s -o /dev/null -w '%{http_code}\n' localhost:8081/collections/users/docs/u1 \
   -H 'x-api-key: client-key-1'   # 401
 ```

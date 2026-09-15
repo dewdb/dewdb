@@ -20,10 +20,10 @@ cargo build --release
 ```
 
 ```bash
-./target/release/dewdb --config examples/single-node.json
+./target/release/dewdb --config examples/dew.json
 ```
 
-That is the whole setup. [`examples/single-node.json`](examples/single-node.json) is the whole file:
+That is the whole setup. [`examples/dew.json`](examples/dew.json) is the whole file:
 
 ```json
 {
@@ -31,7 +31,7 @@ That is the whole setup. [`examples/single-node.json`](examples/single-node.json
   "role": "shard",
   "shard_role": "primary",
   "listen_addr": "127.0.0.1:8090",
-  "data_dir": "./data/examples/single-node"
+  "data_dir": "./data/examples/dew"
 }
 ```
 
@@ -67,7 +67,7 @@ change streams inside the database process, without requiring a separate coordin
 Consensus, ownership and routing run in the same process that stores the documents. What you deploy
 is the database.
 
-**One process, one file, one protocol.** A node is `dewdb --config examples/single-node.json`.
+**One process, one file, one protocol.** A node is `dewdb --config examples/dew.json`.
 Storage is a directory. The wire format is HTTP and JSON, so curl, a browser, or any HTTP client is
 a first-class client, and there is nothing to install on the application side.
 

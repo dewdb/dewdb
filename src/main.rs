@@ -145,7 +145,7 @@ fn reload_auth(path: &str) -> Result<crate::auth::AuthConfig, String> {
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let mut config_path = "node.json".to_string();
+    let mut config_path = "dew.json".to_string();
 
     let mut i = 1;
     while i < args.len() {
@@ -370,7 +370,7 @@ mod tests {
     fn a_credential_reload_takes_the_client_tiers_and_refuses_a_file_it_cannot_trust() {
         let dir = std::env::temp_dir().join(format!("dew-auth-reload-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("node.json");
+        let path = dir.join("dew.json");
         let write = |body: &str| fs::write(&path, body).unwrap();
 
         write(r#"{"node_id":"n","role":"shard","listen_addr":"127.0.0.1:1",

@@ -134,10 +134,10 @@ Requires a Rust toolchain (edition 2024).
 cargo build --release
 ```
 
-Run a node by pointing it at a config file (the default is `node.json`):
+Run a node by pointing it at a config file (the default is `dew.json`):
 
 ```bash
-./target/release/dewdb --config node.json
+./target/release/dewdb --config dew.json
 ```
 
 `--config` is the only argument. Everything else is configuration.
