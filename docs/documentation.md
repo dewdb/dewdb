@@ -140,7 +140,13 @@ Run a node by pointing it at a config file (the default is `dew.json`):
 ./target/release/dewdb --config dew.json
 ```
 
-`--config` is the only argument. Everything else is configuration.
+`--config` is the only argument that affects a running node; everything else is configuration.
+`--version` (or `-V`) prints the build version and exits without reading a config file:
+
+```bash
+./target/release/dewdb --version
+# dewdb 1.0.0
+```
 
 `Ctrl-C` is handled: pending group-commit waiters are fsynced and the durable LSN is persisted
 before the process exits.

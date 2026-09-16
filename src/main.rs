@@ -149,11 +149,18 @@ async fn main() -> io::Result<()> {
 
     let mut i = 1;
     while i < args.len() {
-        if args[i] == "--config" && i + 1 < args.len() {
-            config_path = args[i + 1].clone();
-            i += 2;
-        } else {
-            i += 1;
+        match args[i].as_str() {
+            "--config" if i + 1 < args.len() => {
+                config_path = args[i + 1].clone();
+                i += 2;
+            },
+            // Answered before the config file is read: asking a binary what it is has to work on a
+            // host that has no dew.json yet.
+            "--version" | "-V" => {
+                println!("dewdb {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            },
+            _ => i += 1,
         }
     }
 

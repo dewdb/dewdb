@@ -49,7 +49,15 @@ You need a Rust toolchain (edition 2024).
 cargo build --release
 ```
 
-The binary is `./target/release/dewdb`. Run the tests in your environment:
+The binary is `./target/release/dewdb`. It will tell you what it is:
+
+```bash
+./target/release/dewdb --version
+# dewdb 1.0.0
+```
+
+`--version` (or `-V`) is answered before any config file is read, so it works before you have
+written one. Run the tests in your environment:
 
 ```bash
 cargo test

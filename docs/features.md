@@ -918,6 +918,8 @@ snapshot sit on the client tier.
 - **Cluster visibility.** The view version, which ownership model is actually deciding, member and
   shard counts, any migration with local progress, and — on a router — the effective primary per
   group with a failover flag and its load estimates.
+- **Identifiable binary.** `dewdb --version` (`-V`) prints the build version and exits before the
+  config file is read, so an operator can tell what a binary is on a host that has none.
 - **Restart-free administration.** Drop, compact and snapshot a collection; join and remove members;
   read and change the voting set; publish a ring; start, watch and abort a migration.
 - **Windows-aware file handling.** Deletes, renames and handle draining retry and park open handles
