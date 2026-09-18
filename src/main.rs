@@ -5,6 +5,7 @@ mod api;
 mod auth;
 mod cdc;
 mod changefeed;
+mod cli;
 mod cluster;
 mod config;
 mod consensus;
@@ -32,6 +33,7 @@ mod test_support;
 
 use crate::api::build_app;
 use crate::auth::build_client;
+use crate::cli::Cli;
 use crate::cluster::catalog::index_catalog_task;
 use crate::cluster::metadata::ClusterMetadata;
 use crate::cluster::migration::MigrationRuns;
@@ -145,28 +147,55 @@ fn reload_auth(path: &str) -> Result<crate::auth::AuthConfig, String> {
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let mut config_path = "dew.json".to_string();
 
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--config" if i + 1 < args.len() => {
-                config_path = args[i + 1].clone();
-                i += 2;
-            },
-            // Answered before the config file is read: asking a binary what it is has to work on a
-            // host that has no dew.json yet.
-            "--version" | "-V" => {
-                println!("dewdb {}", env!("CARGO_PKG_VERSION"));
+    // Answered before the config file is read: asking a binary what it is, how to run it, or to
+    // write a config has to work on a host that has no dew.json yet.
+    let config_path = match cli::parse(&args) {
+        Cli::Version => {
+            println!("dewdb {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        },
+        Cli::Help => {
+            print!("{}", cli::usage());
+            return Ok(());
+        },
+        Cli::Init(config) => match cli::init(&config) {
+            Ok(note) => {
+                println!("{}", note);
                 return Ok(());
             },
-            _ => i += 1,
-        }
-    }
+            Err(e) => {
+                eprintln!("{}", e);
+                std::process::exit(cli::EXIT_INIT_FAILED);
+            },
+        },
+        Cli::Start(config) => config,
+    };
 
-    let config_content = fs::read_to_string(&config_path).expect("Failed to read config file");
-    let config: NodeConfig = serde_json::from_str(&config_content).expect("Invalid config JSON format");
-    config.validate().expect("Invalid config map constraints");
+    // A config that is not there is the user's typo, not a bug in the node: say which path and stop.
+    let config_content = match cli::read_config(&config_path) {
+        Ok(body) => body,
+        Err(e) => {
+            eprintln!("{}", e.message());
+            std::process::exit(cli::EXIT_NO_CONFIG);
+        },
+    };
+    let config_path = config_path.path;
+
+    // Same for a config that is there and wrong. The reasons are the ones these two have always
+    // given -- serde's line and column, and the rule `validate` refused on -- without the panic
+    // frame and backtrace note wrapped around them, which never told the writer of the file anything.
+    let config: NodeConfig = match serde_json::from_str(&config_content) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("Invalid config JSON format: {}", e);
+            std::process::exit(cli::EXIT_BAD_CONFIG);
+        },
+    };
+    if let Err(e) = config.validate() {
+        eprintln!("Invalid config map constraints: {}", e);
+        std::process::exit(cli::EXIT_BAD_CONFIG);
+    }
 
     init_logging(&config.logging, &config.node_id);
 

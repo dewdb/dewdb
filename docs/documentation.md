@@ -140,12 +140,40 @@ Run a node by pointing it at a config file (the default is `dew.json`):
 ./target/release/dewdb --config dew.json
 ```
 
+With no `--config`, the node reads `./dew.json`; if that file does not exist it prints
+
+```
+No dew.json found.
+Run `dewdb init` to create one, or use `dewdb --config <path>`.
+```
+
+and exits 2 without starting. A `--config` path that is not there, or cannot be read, exits 2 the
+same way and names the path (`Config file not found: node.json`).
+
+A config that *is* there but that the node will not run — malformed JSON, an unknown field, or a
+rule `validate` refuses — exits 3 and prints the reason:
+
+```
+Invalid config JSON format: unknown field `dta_dir`, expected one of `node_id`, … at line 1 column 71
+Invalid config map constraints: role must be 'shard' or 'router', got 'banana'
+```
+
+None of these is a crash: the exit codes are `0` success, `2` no usable config, `3` a config the node
+refuses, and a panic (`101`) means a bug worth reporting.
+
+`dewdb init` writes that starter file (and refuses to replace one that is already there), so a fresh
+host needs no hand-written JSON to reach a running node. The file is compiled into the binary;
+nothing else has to be unpacked beside it.
+
 `--config` is the only argument that affects a running node; everything else is configuration.
-`--version` (or `-V`) prints the build version and exits without reading a config file:
+`--version` (or `-V`) and `--help` (or `-h`, or `dewdb help`) are answered before any config file is
+read, so both work on a host that has none:
 
 ```bash
 ./target/release/dewdb --version
 # dewdb 1.0.0
+./target/release/dewdb --help
+# usage, the default config path, and the five fields a single node needs
 ```
 
 `Ctrl-C` is handled: pending group-commit waiters are fsynced and the durable LSN is persisted

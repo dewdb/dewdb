@@ -57,7 +57,14 @@ The binary is `./target/release/dewdb`. It will tell you what it is:
 ```
 
 `--version` (or `-V`) is answered before any config file is read, so it works before you have
-written one. Run the tests in your environment:
+written one. So is `--help` (or `-h`, or `dewdb help`), which prints usage, the default config path
+and the five fields a single node needs:
+
+```bash
+./target/release/dewdb --help
+```
+
+Run the tests in your environment:
 
 ```bash
 cargo test
@@ -82,7 +89,14 @@ Set `DEWDB_SOAK_SEED=0x…` to run a different schedule than the fixed seed each
 
 ## 2. Your first node
 
-Create `dew.json`:
+Write `dew.json`:
+
+```bash
+./target/release/dewdb init
+# Wrote dew.json. Edit it if you like, then run `dewdb` to start the node.
+```
+
+That is the whole file — five fields:
 
 ```json
 {
@@ -94,10 +108,31 @@ Create `dew.json`:
 }
 ```
 
-Start it:
+`init` never overwrites an existing config; write one by hand if you prefer, or pass
+`--config <path>` to put it somewhere else. Start it:
+
+```bash
+./target/release/dewdb
+```
+
+With no `--config`, the node reads `./dew.json`. If there is no such file it says so and exits 2
+rather than starting:
+
+```
+No dew.json found.
+Run `dewdb init` to create one, or use `dewdb --config <path>`.
+```
+
+`--config <path>` reads a config anywhere:
 
 ```bash
 ./target/release/dewdb --config dew.json
+```
+
+A `--config` path that is not there exits 2 as well, and names the path you typed:
+
+```
+Config file not found: node.json
 ```
 
 That is the whole setup. This node leads itself, commits on its own fsync, and is ready
