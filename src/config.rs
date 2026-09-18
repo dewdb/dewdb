@@ -170,6 +170,23 @@ impl NodeConfig {
     pub fn is_learner(&self) -> bool {
         self.membership_mode == MEMBERSHIP_LEARNER
     }
+
+    /// Whether this node leads its shard at boot. This is the expression the boot path already
+    /// decided leadership with, named once so that nothing has to restate it: a learner never leads,
+    /// whatever the file says, and `validate` refuses that combination anyway.
+    pub fn runs_as_primary(&self) -> bool {
+        !self.is_learner() && self.shard_role.as_deref() == Some("primary")
+    }
+
+    /// The shard role this node runs as, as opposed to the one the file spells out. `shard_role` is
+    /// optional and leadership turns on `runs_as_primary`, so an omitted field runs as a replica --
+    /// which is already what the boot log calls it. `None` on a router, which has no shard role.
+    pub fn effective_shard_role(&self) -> Option<&'static str> {
+        if self.role != "shard" {
+            return None;
+        }
+        Some(if self.runs_as_primary() { "primary" } else { "replica" })
+    }
 }
 
 pub fn config_warnings(cfg: &NodeConfig) -> Vec<String> {

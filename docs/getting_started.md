@@ -136,7 +136,16 @@ Config file not found: node.json
 ```
 
 That is the whole setup. This node leads itself, commits on its own fsync, and is ready
-immediately. Confirm:
+immediately. The last line it logs on the way up says which node you started and where its state
+lives:
+
+```
+2026-09-18T12:23:14.744119Z  INFO node=n1 [boot] listening node_id=n1 role=shard shard_role=primary listen_addr=127.0.0.1:8081 data_dir=./data
+```
+
+Grep `listening node_id=` to see it. It is worth reading before you assume a port is yours: pointing
+a second app at a node another one is already running writes its collections into that node's
+`data_dir`, and nothing else in the log will say so. Confirm:
 
 ```bash
 curl -s localhost:8081/health
@@ -1685,6 +1694,13 @@ JSON gives one object per line, stamped with `node_id` and a subsystem `target` 
 `checkquorum`, `read_index`, `membership`, `replication`, `repair`, `migration`, `compaction`,
 `router_probe`, …). `RUST_LOG` overrides the configured level and takes per-target directives, so
 `RUST_LOG=info,repair=debug,election=debug` turns up the subsystem you are chasing.
+
+The `listening` event from `boot` is the node's identity, and keeps its fields in either format:
+
+```json
+{"ts_ms":1789734201780,"level":"INFO","node_id":"n1","target":"boot","message":"listening",
+ "role":"shard","shard_role":"primary","listen_addr":"127.0.0.1:8081","data_dir":"./data"}
+```
 
 ---
 

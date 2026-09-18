@@ -129,6 +129,38 @@ where
     }
 }
 
+/// Renders whatever `f` logs through the real `NodeFormat`, and hands back the bytes it wrote.
+///
+/// `init_logging` installs a process-global subscriber and can only be called once, so a test that
+/// wanted to read a boot line would otherwise have to spawn a node and scrape its stdout. This
+/// scopes the same formatter to the calling thread instead: no process, no ports, no waiting.
+#[cfg(test)]
+pub fn render_events(cfg: &LoggingConfig, node_id: &str, f: impl FnOnce()) -> String {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Clone)]
+    struct Buffer(Arc<Mutex<Vec<u8>>>);
+    impl Write for Buffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    let buffer = Buffer(Arc::new(Mutex::new(Vec::new())));
+    let writer = buffer.clone();
+    let layer = tracing_subscriber::fmt::layer()
+        .event_format(NodeFormat { node_id: node_id.to_string(), json: cfg.format == "json" })
+        .with_writer(move || writer.clone());
+
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), f);
+    let bytes = buffer.0.lock().unwrap().clone();
+    String::from_utf8(bytes).expect("the formatter writes UTF-8")
+}
+
 pub fn init_logging(cfg: &LoggingConfig, node_id: &str) {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
