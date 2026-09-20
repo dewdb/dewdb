@@ -40,6 +40,21 @@ pub struct Member {
     pub follows: Option<String>,
 }
 
+impl Member {
+    /// `NodeConfig::effective_shard_role`'s rule, applied to a member of the view: a shard that is
+    /// not the primary is a replica. A member's `shard_role` can be absent because the node that
+    /// published this entry knew it only as a peer, as well as because that node's own file left the
+    /// field out -- neither is a reason to treat a shard as having no role at all.
+    ///
+    /// `None` only for a router, which has no shard role to run as.
+    pub fn effective_shard_role(&self) -> Option<&'static str> {
+        if self.role != "shard" {
+            return None;
+        }
+        Some(if self.shard_role.as_deref() == Some("primary") { "primary" } else { "replica" })
+    }
+}
+
 /// The whole topology as one versioned value. Replacing it wholesale rather than patching fields
 /// keeps the ring validatable as a unit: a half-applied update is a routing hole.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -222,7 +237,10 @@ impl ClusterMetadata {
             });
         };
 
-        push(&normalize_self_url(&cfg.listen_addr), &cfg.role, cfg.shard_role.as_deref(), Some(&cfg.node_id));
+        // What this node runs as, not what its file spells: a shard that named no shard_role is a
+        // replica, and it has to reach the member list as one or nothing downstream can see it.
+        push(&normalize_self_url(&cfg.listen_addr), &cfg.role, cfg.effective_shard_role(),
+            Some(&cfg.node_id));
         if let Some(primary) = &cfg.primary_addr {
             push(primary, "shard", Some("primary"), None);
         }
@@ -764,6 +782,55 @@ mod tests {
 
     fn cfg(json: serde_json::Value) -> NodeConfig {
         serde_json::from_value(json).unwrap()
+    }
+
+    /// What a node publishes about itself is what it runs as, not what its file spells. A shard that
+    /// left `shard_role` out used to enter the member list with no role, where every consumer that
+    /// asks "is this a replica?" answered no -- `cluster::rebalance` most visibly.
+    ///
+    /// The runtime-join path at `apply_add_member` has always defaulted a shard to `"replica"`; this
+    /// is the same contract applied to the node's own entry.
+    #[test]
+    fn a_node_publishes_the_shard_role_it_runs_as_not_the_one_its_file_spells() {
+        let seeded = |shard_role: Option<&str>| -> Member {
+            let mut json = serde_json::json!({
+                "node_id": "n1", "role": "shard",
+                "listen_addr": "127.0.0.1:9601", "data_dir": "./data",
+            });
+            if let Some(role) = shard_role {
+                json["shard_role"] = serde_json::json!(role);
+            }
+            let config = cfg(json);
+            config.validate().expect("both spellings are configurations a node can hold");
+            let view = ClusterMetadata::seed_from_config(&config);
+            view.members.iter()
+                .find(|m| m.node_id.as_deref() == Some("n1"))
+                .expect("a node seeds itself into its own view")
+                .clone()
+        };
+
+        let omitted = seeded(None);
+        let explicit = seeded(Some("replica"));
+        assert_eq!(omitted.shard_role.as_deref(), Some("replica"),
+            "an omitted shard_role has to reach the member list as the replica it runs as");
+        assert_eq!(omitted, explicit,
+            "and the published entry must be indistinguishable from the explicit spelling");
+        assert_eq!(omitted.effective_shard_role(), Some("replica"));
+
+        assert_eq!(seeded(Some("primary")).shard_role.as_deref(), Some("primary"),
+            "a primary still publishes itself as one");
+
+        // A router has no shard role, and must not acquire one on the way into the view.
+        let router = cfg(serde_json::json!({
+            "node_id": "r1", "role": "router", "listen_addr": "127.0.0.1:9600", "data_dir": "./data",
+            "shard_map": [{"start_hash": 0, "end_hash": 0, "node_url": "http://127.0.0.1:9601"}],
+        }));
+        router.validate().unwrap();
+        let published = ClusterMetadata::seed_from_config(&router);
+        let self_entry = published.members.iter()
+            .find(|m| m.node_id.as_deref() == Some("r1")).expect("the router seeds itself");
+        assert_eq!(self_entry.shard_role, None, "a router publishes no shard role");
+        assert_eq!(self_entry.effective_shard_role(), None);
     }
 
     #[test]

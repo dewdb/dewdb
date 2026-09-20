@@ -178,9 +178,15 @@ impl NodeConfig {
         !self.is_learner() && self.shard_role.as_deref() == Some("primary")
     }
 
-    /// The shard role this node runs as, as opposed to the one the file spells out. `shard_role` is
-    /// optional and leadership turns on `runs_as_primary`, so an omitted field runs as a replica --
-    /// which is already what the boot log calls it. `None` on a router, which has no shard role.
+    /// The shard role this node runs as, as opposed to the one the file spells out, and the one
+    /// contract every consumer reads: **for `role: "shard"`, an omitted `shard_role` is `"replica"`.**
+    /// `shard_role` is optional and leadership turns on `runs_as_primary`, so a node that names no
+    /// role does not lead, and a node that does not lead is a replica. `None` on a router, which has
+    /// no shard role to run as.
+    ///
+    /// Read this rather than `self.shard_role`. The field is what an operator typed; this is what
+    /// the node is. Boot sync, the boot log, the member list this node publishes and the warnings it
+    /// prints all go through here, so a file that leaves the field out cannot mean four things.
     pub fn effective_shard_role(&self) -> Option<&'static str> {
         if self.role != "shard" {
             return None;
@@ -242,7 +248,7 @@ pub fn config_warnings(cfg: &NodeConfig) -> Vec<String> {
         if !cfg.is_learner()
             && cfg.peers.is_empty()
             && cfg.primary_addr.is_none()
-            && cfg.shard_role.as_deref() == Some("replica")
+            && cfg.effective_shard_role() == Some("replica")
         {
             out.push("replica has no primary_addr and no peers, and membership_mode is 'voter'; \
                       it will elect itself once its heartbeat timeout expires. Set membership_mode \
@@ -302,6 +308,81 @@ mod tests {
 
     fn parse(json: &str) -> Result<NodeConfig, String> {
         serde_json::from_str::<NodeConfig>(json).map_err(|e| e.to_string())
+    }
+
+    /// The contract, stated once: for `role: "shard"`, leaving `shard_role` out means `"replica"`.
+    ///
+    /// `validate` accepts a shard that omits the field, so both spellings are configurations an
+    /// operator can hold. Everything downstream reads `effective_shard_role`, so this is the only
+    /// place the default is decided, and the equivalence regressions in `cluster::metadata`,
+    /// `cluster::rebalance` and `consensus::failover` all rest on it.
+    #[test]
+    fn an_omitted_shard_role_is_the_same_as_an_explicit_replica() {
+        let cfg = |shard_role: &str| -> NodeConfig {
+            let field = if shard_role.is_empty() {
+                String::new()
+            } else {
+                format!(r#""shard_role":"{}","#, shard_role)
+            };
+            let cfg: NodeConfig = serde_json::from_str(&format!(
+                r#"{{"node_id":"n1","role":"shard",{}"listen_addr":"127.0.0.1:9601",
+                   "data_dir":"./data"}}"#, field)).expect("both spellings parse");
+            cfg.validate().expect("both spellings are accepted; validate does not require the field");
+            cfg
+        };
+
+        let (omitted, replica, primary) = (cfg(""), cfg("replica"), cfg("primary"));
+        assert_eq!(omitted.shard_role, None, "the premise: the field is absent");
+        assert_eq!(replica.shard_role.as_deref(), Some("replica"));
+
+        assert_eq!(omitted.effective_shard_role(), Some("replica"));
+        assert_eq!(omitted.effective_shard_role(), replica.effective_shard_role(),
+            "omitted and explicit replica must be indistinguishable to every consumer");
+        assert_eq!(omitted.runs_as_primary(), replica.runs_as_primary());
+        assert!(!omitted.runs_as_primary(), "a node that names no role does not lead");
+
+        assert_eq!(primary.effective_shard_role(), Some("primary"),
+            "and an explicit primary is still a primary");
+        assert!(primary.runs_as_primary());
+
+        // A learner cannot be a primary whatever the file says, so it is a replica either way.
+        let learner: NodeConfig = serde_json::from_str(
+            r#"{"node_id":"n1","role":"shard","membership_mode":"learner",
+               "listen_addr":"127.0.0.1:9601","data_dir":"./data"}"#).unwrap();
+        learner.validate().unwrap();
+        assert_eq!(learner.effective_shard_role(), Some("replica"));
+
+        // A router has no shard role at all; the contract is about shards.
+        let router: NodeConfig = serde_json::from_str(
+            r#"{"node_id":"r1","role":"router","listen_addr":"127.0.0.1:9600","data_dir":"./data",
+               "shard_map":[{"start_hash":0,"end_hash":0,"node_url":"http://127.0.0.1:9601"}]}"#).unwrap();
+        router.validate().unwrap();
+        assert_eq!(router.effective_shard_role(), None);
+    }
+
+    /// The warning that tells an operator their replica will elect itself over an empty log is the
+    /// one an omitted-role node most needs, and used to be the one it never saw.
+    #[test]
+    fn the_self_election_warning_does_not_depend_on_the_field_being_written() {
+        let body = |shard_role: &str| {
+            let field = if shard_role.is_empty() {
+                String::new()
+            } else {
+                format!(r#""shard_role":"{}","#, shard_role)
+            };
+            format!(r#"{{"node_id":"n1","role":"shard",{}"listen_addr":"127.0.0.1:9601",
+                       "data_dir":"./data"}}"#, field)
+        };
+
+        let omitted = warn_cfg(&body(""));
+        let explicit = warn_cfg(&body("replica"));
+        assert_eq!(omitted, explicit,
+            "omitted and explicit replica must produce the same warnings, not different ones");
+        assert!(omitted.iter().any(|w| w.contains("will elect itself")),
+            "the warning has to be one of them: {:?}", omitted);
+
+        // The warning is about a replica with nobody to follow, so a primary still does not get it.
+        assert!(!warn_cfg(&body("primary")).iter().any(|w| w.contains("will elect itself")));
     }
 
     /// L1: a key nobody reads is a setting that did not take, and defaulting silently is how a

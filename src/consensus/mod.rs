@@ -15,7 +15,9 @@ pub use election::{
     decide_pre_vote, decide_vote, log_summary, publish_inherited_tails,
     seed_leader_progress, VoteRequest, VoteResponse,
 };
-pub use failover::{boot_resync, demote, heartbeat_poll_task, leader_contact_task, progress_flush_task};
+pub use failover::{
+    boot_resync_if_replica, demote, heartbeat_poll_task, leader_contact_task, progress_flush_task,
+};
 pub use progress::Progress;
 pub use state::{ReplicationMeta, ReplicationState};
 pub use transfer::{transfer_leadership, TransferError};

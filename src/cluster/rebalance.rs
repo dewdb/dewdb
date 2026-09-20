@@ -67,9 +67,10 @@ fn replica_placements(
     let replicas: BTreeMap<String, _> = view
         .members
         .iter()
-        .filter(|member| {
-            member.role == "shard" && member.shard_role.as_deref() == Some("replica")
-        })
+        // Effective, not configured. This only ever looks up nodes the ring already names in
+        // `replica_urls`, so a member whose entry carries no shard_role is a replica the ring has
+        // already placed -- dropping it here leaves its group a replica short in the plan.
+        .filter(|member| member.effective_shard_role() == Some("replica"))
         .map(|member| (node_key(&member.url), member))
         .collect();
     let mut placements: BTreeMap<String, Vec<String>> = primaries
@@ -373,6 +374,38 @@ mod tests {
             migration: None,
             index_catalog: Default::default(),
         }
+    }
+
+    /// A replica the ring already places, whose member entry carries no `shard_role`. That happens
+    /// whenever the node that published the view knew this one only as a peer, and it used to drop
+    /// the node out of the plan: `desired_ring` kept the shard but lost its replica.
+    ///
+    /// `Member::effective_shard_role` is the same contract `NodeConfig` states -- a shard that is
+    /// not the primary is a replica -- so the plan is now identical either way.
+    #[test]
+    fn a_replica_with_no_shard_role_written_is_placed_like_an_explicit_one() {
+        let planned = |shard_role: Option<&str>| {
+            let mut v = view();
+            v.members.iter_mut()
+                .find(|m| m.url == "http://a2")
+                .expect("a2 is the replica in the fixture")
+                .shard_role = shard_role.map(str::to_string);
+            desired_ring(&v).unwrap().unwrap()
+        };
+
+        let explicit = planned(Some("replica"));
+        let absent = planned(None);
+        assert_eq!(absent.shards, explicit.shards,
+            "an absent shard_role must produce the same placement as an explicit replica");
+        assert_eq!(absent.shards[0].replica_urls, vec!["http://a2"],
+            "and that placement has to keep the replica the ring already named");
+
+        // The contract is one-directional: absent still does not mean primary.
+        let mut v = view();
+        v.members.iter_mut().find(|m| m.url == "http://c").unwrap().shard_role = None;
+        let demoted = desired_ring(&v).unwrap().unwrap();
+        assert!(!demoted.shards.iter().any(|s| s.node_url == "http://c"),
+            "a member with no shard_role must not be treated as a primary: {:?}", demoted.shards);
     }
 
     #[test]

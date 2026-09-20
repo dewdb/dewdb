@@ -41,7 +41,7 @@ use crate::cluster::probe::{router_probe_task, ROUTER_PROBE_INTERVAL_SECS};
 use crate::cluster::rebalance::rebalance_task;
 use crate::config::{config_warnings, NodeConfig};
 use crate::consensus::{
-    boot_resync, heartbeat_poll_task, leader_contact_task, progress_flush_task, publish_inherited_tails,
+    boot_resync_if_replica, heartbeat_poll_task, leader_contact_task, progress_flush_task, publish_inherited_tails,
     seed_leader_progress, Progress, ReplicationMeta, ReplicationState,
 };
 use crate::logging::init_logging;
@@ -354,9 +354,7 @@ async fn main() -> io::Result<()> {
         membership_changes: Arc::new(Default::default()),
     };
 
-    if config.shard_role.as_deref() == Some("replica") {
-        boot_resync(&state).await;
-    }
+    boot_resync_if_replica(&state).await;
 
     let app = build_app(&state);
 

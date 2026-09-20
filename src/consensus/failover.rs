@@ -139,6 +139,18 @@ async fn resync_all_from(state: &AppState, leader: &str) {
     state.refresh_configuration();
 }
 
+/// The boot-time gate: a node that *runs as* a replica catches up before it serves. The effective
+/// role, not the written field -- a shard whose file names no `shard_role` runs as a replica, and
+/// one that skipped this came back serving whatever its `data_dir` held.
+///
+/// Named here rather than written out at the call site so the gate and the test that covers it
+/// cannot disagree about what a replica is.
+pub async fn boot_resync_if_replica(state: &AppState) {
+    if state.config.effective_shard_role() == Some("replica") {
+        boot_resync(state).await;
+    }
+}
+
 /// Boot-time catch-up for a configured replica. `config.primary_addr` is a bootstrap seed, not a
 /// fact: it can name a deposed leader, whose snapshot would then be adopted over local state.
 pub async fn boot_resync(state: &AppState) {
@@ -536,7 +548,15 @@ mod tests {
     async fn stale_replica(root: &std::path::Path, id: &str, col: &str, peers: Vec<String>,
         configured_primary: String) -> TestNode
     {
-        let mut node = TestNode::new(id, next_test_port(), root, "replica");
+        stale_shard(root, id, col, peers, configured_primary, "replica").await
+    }
+
+    /// As `stale_replica`, but the caller picks the `shard_role`. `""` writes no `shard_role` field
+    /// at all, which is what an operator who never set one has on disk.
+    async fn stale_shard(root: &std::path::Path, id: &str, col: &str, peers: Vec<String>,
+        configured_primary: String, shard_role: &str) -> TestNode
+    {
+        let mut node = TestNode::new(id, next_test_port(), root, shard_role);
         node.peers = peers;
         node.primary_addr = Some(configured_primary);
         // Long enough that the heartbeat watchdog cannot repair what boot sync is being tested on.
@@ -676,6 +696,97 @@ mod tests {
             "boot sync must follow the leader it discovered, not the address config seeded");
         assert!(wait_for_doc(&client, &n4.url(), "t", "k1", 1, Duration::from_secs(3)).await,
             "the stale local copy must be replaced by the current leader's snapshot");
+    }
+
+    /// Boot sync is the same for a shard that wrote `shard_role: "replica"` and one that wrote no
+    /// `shard_role` at all, which is the contract `NodeConfig::effective_shard_role` states.
+    ///
+    /// Both nodes here come back holding a superseded copy -- the only state boot sync can repair --
+    /// and both are given the boot sequence `main` gives them. Before the gate read the effective
+    /// role, the node that omitted the field skipped boot sync and went on serving the superseded
+    /// value indefinitely, while its `/health` reported `ok`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn boot_sync_treats_an_omitted_shard_role_as_the_replica_it_runs_as() {
+        let root = temp_root();
+        let (n1, n2, n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(2)).build().unwrap();
+
+        assert_eq!(leaders(&[&n1, &n2, &n3]), vec!["n1".to_string()], "n1 starts as the only leader");
+        assert_eq!(put_doc_at(&client, &n1.url(), "t", "k1", 1, "?w=majority&wtimeout=4000").await,
+            StatusCode::CREATED);
+
+        let peers = vec![n1.url(), n2.url(), n3.url()];
+        // Same superseded copy, same peers, same configured primary, same timeout. The only
+        // difference between the two is whether `shard_role` appears in the file.
+        let mut explicit = stale_shard(&root, "explicit", "t", peers.clone(), n1.url(), "replica").await;
+        let mut omitted = stale_shard(&root, "omitted", "t", peers, n1.url(), "").await;
+        explicit.start();
+        omitted.start();
+
+        assert_eq!(explicit.state.as_ref().unwrap().config.shard_role.as_deref(), Some("replica"));
+        assert_eq!(omitted.state.as_ref().unwrap().config.shard_role, None,
+            "the premise: this node's file names no shard_role");
+        for node in [&explicit, &omitted] {
+            assert_eq!(node.state.as_ref().unwrap().config.effective_shard_role(), Some("replica"),
+                "{}: both run as replicas", node.node_id);
+        }
+
+        // The gate itself, the one `main` calls -- not a copy of its condition. Reverting the gate
+        // to read the written field is what makes the assertion below fail for the omitted node.
+        for node in [&explicit, &omitted] {
+            boot_resync_if_replica(&node.state.clone().unwrap()).await;
+        }
+
+        for node in [&explicit, &omitted] {
+            assert!(wait_for_doc(&client, &node.url(), "t", "k1", 1, Duration::from_secs(3)).await,
+                "{}: a replica's superseded copy must be replaced at boot, however its file spells \
+                 shard_role; it still serves {:?}",
+                node.node_id, read_doc_at_col(&client, &node.url(), "t", "k1").await);
+        }
+
+        drop((explicit, omitted, n1, n2, n3));
+    }
+
+    /// The invariant that keeps a follower's applied watermark from ever running ahead of what the
+    /// group committed: a leader cut off from its followers does not apply its own write either.
+    ///
+    /// It is what makes `validate_staged_snapshot`'s refusal -- a snapshot stopping below what this
+    /// node has applied -- unreachable through cluster operation, so an install is refused only over
+    /// a `data_dir` that was written from outside the cluster. If this test ever fails, that refusal
+    /// becomes reachable and needs a repair path rather than a warning.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_isolated_leader_does_not_publish_a_write_its_group_never_committed() {
+        let root = temp_root();
+        let (mut n1, mut n2, mut n3) = three_node_cluster(&root).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(3)).build().unwrap();
+        assert_eq!(leaders(&[&n1, &n2, &n3]), vec!["n1".to_string()]);
+        assert_eq!(put_doc_at(&client, &n1.url(), "t", "k1", 1, "?w=majority&wtimeout=4000").await,
+            StatusCode::CREATED);
+        assert!(wait_for_doc(&client, &n2.url(), "t", "k1", 1, Duration::from_secs(5)).await,
+            "premise: the group committed k1=1");
+
+        n2.kill();
+        n3.kill();
+        // The write is accepted and fsynced locally, and the leader still has nobody to commit it
+        // with. `w=1` is a local durability promise, not a visibility one.
+        put_doc_at(&client, &n1.url(), "t", "k1", 99, "?w=1").await;
+        assert_eq!(read_doc_at_col(&client, &n1.url(), "t", "k1").await, Some(1),
+            "a leader without a quorum must not serve a write the quorum never committed");
+
+        // And it is still not there after its own restart, so the tail cannot outlive the term that
+        // failed to commit it and reappear as a published watermark.
+        let port: u16 = n1.addr.rsplit(':').next().unwrap().parse().unwrap();
+        let (peers, replicas) = (n1.peers.clone(), n1.replicas.clone());
+        n1.kill();
+        let mut again = TestNode::new("n1", port, &root, "primary");
+        again.peers = peers;
+        again.replicas = replicas;
+        again.start();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(read_doc_at_col(&client, &again.url(), "t", "k1").await, Some(1),
+            "the uncommitted tail must not survive the restart as published state");
+
+        drop(again);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

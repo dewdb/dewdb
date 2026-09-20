@@ -231,7 +231,13 @@ fn node_config(n: &TestNode) -> NodeConfig {
         "node_id": n.node_id,
         "role": n.role,
         "shard_map": shard_map,
-        "shard_role": if n.role == "router" { serde_json::Value::Null } else { serde_json::json!(n.shard_role) },
+        // An empty `shard_role` writes no field at all, which is a shape the config permits and a
+        // real deployment can hold; `role: "router"` has never written one.
+        "shard_role": if n.role == "router" || n.shard_role.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(n.shard_role)
+        },
         "membership_mode": n.membership_mode,
         "allow_unsafe_ring_changes": n.allow_unsafe_ring_changes,
         "listen_addr": n.addr,
