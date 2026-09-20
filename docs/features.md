@@ -350,7 +350,10 @@ POST /collections/:name/webhooks                            # pushed to an endpo
   resume position inside each object; its refusals are answered on the handshake, so an unusable
   position is a `410` rather than a socket that opens and shuts.
 - **Every event is a resume position.** The event's `lsn` is also its SSE `id`, so `?after=<lsn>`
-  and a browser's own `Last-Event-ID` reconnect both pick up exactly where the stream stopped.
+  and a browser's own `Last-Event-ID` reconnect both pick up exactly where the stream stopped. A
+  browser normally reaches the feed through the application's own backend, which relays the stream
+  same-origin and forwards that header — see
+  [Your first application](getting_started.md#browser-realtime-through-your-backend).
 - **Recording costs the writer, and a registration makes that permanent.** A feed records only while
   something is attached, plus a retention window -- but a webhook is a sender rather than a
   connection, so a registration pins its collection's feed for as long as it exists. On a collection

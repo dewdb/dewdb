@@ -1816,6 +1816,22 @@ what was stored, so `GET /collections/:name/docs/:id` is unaffected, an array or
 readily as an object, and a document with an `id` field of its own keeps it untouched inside `value`.
 `fields=` projects within `value` and leaves the row's `id` alone.
 
+### A collection that does not exist
+
+`/query`, `/docs`, `/docs/:id` and `/aggregate` all answer `404 {"error":"collection 'x' does not
+exist"}` for a name no collection answers to. Reading never creates one, and an empty page is not
+substituted for the refusal: an empty page would make a mistyped collection name indistinguishable
+from a collection that is genuinely empty, and the engine cannot tell which one the caller meant.
+
+Collections are created by their first write, so an application's own collection is absent until
+then. Translating that `404` into an empty result is an application decision, made at the call site
+that knows the collection is the one it creates on first use — see
+[Your first application](getting_started.md#a-missing-collection-is-not-an-empty-list). It is not a
+rule about `404` in general: the same status from `/docs/:id` ordinarily means the document is gone.
+
+Subscribing is the exception, and deliberately so: `/changes` opens on a collection that does not
+exist yet and waits at position `0`. See [Change streams](#17b-change-streams).
+
 ### Filters
 
 `filter` is a JSON object mapping field paths to conditions. Paths are dotted (`profile.city`). A
@@ -2140,6 +2156,10 @@ ends.
 `Last-Event-ID` is read as `after` when `after` is absent, so a browser's `EventSource` resumes on
 its own reconnect. An explicit `after` wins.
 
+A collection that does not exist is not a refusal here, unlike every other read: the stream opens at
+position `0` against a pending feed and delivers the collection's first write when it commits. A
+subscription still never creates a collection — only a write does.
+
 A node keeps the last `changefeed.buffer_events` events per collection and no more. The log cannot
 stand behind them: compaction retires superseded frames, so it holds each key's latest value rather
 than the sequence of values it held. `resume_floor` is that horizon as a number — the lowest `after`
@@ -2152,7 +2172,6 @@ the feed did not record.
 | Code | When |
 |---|---|
 | `400` | A filter, `ops` value or position that cannot be parsed, an `after` above this node's committed log, or `read=replica` on a router. |
-| `404` | No such collection, on any group. Subscribing is a read, and reads never create one. |
 | `409` | On a router: the position was issued against a different shard layout. |
 | `410` | `after` is below `resume_floor`. The body carries `resume_floor`, and on a router the `shard` whose log it belongs to. |
 | `502` | On a router: a shard group could not be reached at all. |
@@ -2218,6 +2237,39 @@ every stream on that handle with an `error`.
 
 `/metrics` reports `subscribers`, `buffered`, `position`, `resume_floor`, `published` and `overruns`
 per collection under `changefeed`, and the same as `dewdb_changefeed_*` in the Prometheus exposition.
+
+### Relaying a stream to a browser
+
+A browser normally reaches this feed through the application's own backend rather than directly: a
+`WebSocket` cannot carry a credential header at all, `EventSource` cannot carry one either, and an
+API key is per client rather than per end user. The backend holds the DewDB stream and re-serves it
+same-origin. A worked example is in
+[Your first application](getting_started.md#a-minimal-sse-proxy); the contract a relay has to keep
+is four points.
+
+- **Forward `Last-Event-ID` upstream.** The browser resends it on its own reconnect, and this
+  endpoint reads it as `after`. A relay that drops it resubscribes from *now*, and the events
+  committed during the gap are never delivered — silently, because nothing about the new stream says
+  it skipped anything.
+- **Forward the id downstream unparsed.** It is an LSN on a shard and an opaque cluster token on a
+  router, and only the issuer's format is guaranteed.
+- **Release the subscription when the browser disconnects.** Nothing upstream notices a reader that
+  went away; a relay that keeps the upstream request open holds a subscriber against
+  `changefeed.max_subscribers` (64 per collection) for the life of the relay process, and the ceiling
+  answers `503` once it is reached. `subscribers` under `changefeed` in `/metrics` is where a leak
+  shows.
+- **Relay the bytes, not a re-rendering of them.** The stream is already well-formed SSE. Parsing it
+  into objects and re-emitting them drops the `retry:` hint, the ids that make a resume work, and
+  the keep-alive comments that hold idle connections open.
+
+Two `EventSource` behaviours on the browser side follow from the standard rather than from DewDB,
+and both fail quietly. `onmessage` handles only events with no name, and every event here is named,
+so it never fires; and `open` and `error` are `EventSource`'s own event names as well as this feed's,
+so a listener on either sees the browser's connection events too. Those carry no `data`, which is
+what tells them apart.
+
+A refusal is an ordinary JSON response, not a stream — a relay should pass the status through rather
+than opening an SSE response and reporting the failure inside it.
 
 ### Cluster-wide streams
 

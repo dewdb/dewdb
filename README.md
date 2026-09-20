@@ -207,6 +207,7 @@ Stated up front, so nothing here is a surprise later:
 | | |
 |---|---|
 | [Getting started](docs/getting_started.md) | A walkthrough from one node to a sharded, authenticated cluster, with client snippets and troubleshooting. |
+| [Your first application](docs/getting_started.md#10-your-first-application) | How a web application wires itself to DewDB: backend CRUD over `fetch`, queries that carry their ids, and browser realtime proxied through your own backend. |
 | [Features](docs/features.md) | Capability by capability, each with the guarantee it gives and the bound that goes with it. |
 | [Documentation](docs/documentation.md) | The reference manual: every config field, endpoint, status code, on-disk format and internal protocol. |
 

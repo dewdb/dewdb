@@ -26,18 +26,19 @@ as written.
 7. [Secondary indexes](#7-secondary-indexes)
 8. [Watching for changes](#8-watching-for-changes)
 9. [Getting changes pushed to you](#9-getting-changes-pushed-to-you)
-10. [Write concerns and durability](#10-write-concerns-and-durability)
-11. [Collection administration](#11-collection-administration)
-12. [Add replicas and watch a failover](#12-add-replicas-and-watch-a-failover)
-13. [Add a node at runtime](#13-add-a-node-at-runtime)
-14. [Shard with a router](#14-shard-with-a-router)
-15. [Add a shard without downtime](#15-add-a-shard-without-downtime)
-16. [Turn on authentication](#16-turn-on-authentication)
-17. [Monitoring](#17-monitoring)
-18. [Backups and restarts](#18-backups-and-restarts)
-19. [Handling responses in a client](#19-handling-responses-in-a-client)
-20. [Client snippets](#20-client-snippets)
-21. [Troubleshooting](#21-troubleshooting)
+10. [Your first application](#10-your-first-application)
+11. [Write concerns and durability](#11-write-concerns-and-durability)
+12. [Collection administration](#12-collection-administration)
+13. [Add replicas and watch a failover](#13-add-replicas-and-watch-a-failover)
+14. [Add a node at runtime](#14-add-a-node-at-runtime)
+15. [Shard with a router](#15-shard-with-a-router)
+16. [Add a shard without downtime](#16-add-a-shard-without-downtime)
+17. [Turn on authentication](#17-turn-on-authentication)
+18. [Monitoring](#18-monitoring)
+19. [Backups and restarts](#19-backups-and-restarts)
+20. [Handling responses in a client](#20-handling-responses-in-a-client)
+21. [Client snippets](#21-client-snippets)
+22. [Troubleshooting](#22-troubleshooting)
 
 ---
 
@@ -685,7 +686,7 @@ $ curl -s localhost:8080/collections/users/indexes    # through the router
 - Index name: 1–64 bytes of `A-Za-z0-9_-`. Field path: up to 256 bytes and 16 dot-separated
   segments.
 - Defining and dropping sit behind `auth.admin_keys` when you set that tier — see
-  [section 16](#16-turn-on-authentication). Listing does not.
+  [section 17](#17-turn-on-authentication). Listing does not.
 
 ---
 
@@ -1005,7 +1006,278 @@ Three more things to know:
 
 ---
 
-## 10. Write concerns and durability
+## 10. Your first application
+
+The sections above drive DewDB from a terminal; this one is the shape of a web application whose
+backend keeps its documents here. DewDB is a backend database service, and browser code does not
+normally talk to it directly — it calls your own backend, and your backend calls DewDB:
+
+```
+Browser
+   │
+   │ HTTPS / same origin
+   ▼
+Your application backend
+   │
+   │ HTTP
+   ▼
+DewDB
+```
+
+An API key is per client, not per end user ([section 17](#17-turn-on-authentication)), so anything
+holding one can read and write every collection — which is why the key stays on the backend, along
+with the users, sessions and per-row permissions DewDB does not model. Nothing enforces this shape;
+a trusted internal tool on a closed network can call DewDB from the page, and the trade is the key.
+
+Everything here runs against the single node from [section 2](#2-your-first-node) — the one
+`dewdb init && dewdb` gives you, on `127.0.0.1:8081`. No cluster needed.
+
+### Reading and writing from the backend
+
+There is no driver to install. DewDB speaks HTTP and JSON, so the built-in `fetch` is the whole
+client:
+
+```js
+const DEWDB = "http://127.0.0.1:8081";
+
+// 201 the first time, 200 when it replaced an existing document.
+await fetch(`${DEWDB}/collections/messages/docs/m1`, {
+  method: "PUT",
+  headers: { "content-type": "application/json" },
+  body: JSON.stringify({ value: { room: "general", text: "hello" } }),
+});
+```
+
+**The document goes inside `value`.** `PUT`, `POST` and `PATCH` all take `{"value": …}`, and a body
+without it is a `422`. Responses have no envelope: `GET .../docs/m1` returns
+`{"room":"general","text":"hello"}` — what you `PUT` is what you `GET`. `POST .../docs` stores under
+a server-generated id, `PATCH` merge-patches an existing document, `DELETE` reports whether one
+existed, and collections are created by their first write; the details are in
+[section 3](#3-documents-create-read-update-delete).
+
+### Listing documents with their ids
+
+Everything below is a transcript against two documents — `m1` as above, plus:
+
+```bash
+curl -s -X PUT localhost:8081/collections/messages/docs/m2 \
+  -H 'content-type: application/json' \
+  -d '{"value":{"room":"random","text":"anyone there?"}}'
+```
+
+The natural application query is "give me the rows, each with the id I would use to address it".
+That is `keys=embed`:
+
+```js
+const page = await (await fetch(
+  `${DEWDB}/collections/messages/query?limit=50&keys=embed`)).json();
+```
+
+```json
+{
+  "items": [
+    {"id": "m1", "value": {"room": "general", "text": "hello"}},
+    {"id": "m2", "value": {"room": "random", "text": "anyone there?"}}
+  ],
+  "next_cursor": null
+}
+```
+
+Each row is addressable as it stands — `page.items.map(({ id, value }) => ({ id, ...value }))` is
+the whole adaptation to most application APIs.
+
+`keys=true` returns the 1.0 shape instead — a `keys` array parallel to `items` — and is not
+deprecated. `embed` only saves you that pairing: `value` is exactly what you stored, so the id is
+never written into your document. Both shapes are in
+[documentation.md § Querying](documentation.md#17-querying); paging (`next_cursor` until it is
+`null`), filters and sorting are in [section 5](#5-querying).
+
+### A missing collection is not an empty list
+
+Before your first write, `messages` does not exist, and DewDB says so rather than pretending:
+
+```
+GET /collections/messages/query   →  404  {"error":"collection 'messages' does not exist"}
+```
+
+That is what lets a typo (`mesages`) be told apart from a collection that is really there and really
+empty. An application that treats "no collection yet" as its own empty state translates it at the
+edge, where it knows that is what it means:
+
+```js
+async function listMessages(room) {
+  const q = new URLSearchParams({
+    limit: "50", keys: "embed", filter: JSON.stringify({ room }),
+  });
+  const r = await fetch(`${DEWDB}/collections/messages/query?${q}`);
+
+  // This collection is created by the first message, so "not there yet" is its empty
+  // state. Scoped on purpose — not a rule about 404 in general, and the same status
+  // from .../docs/:id means the document is gone.
+  if (r.status === 404) return [];
+
+  if (!r.ok) throw new Error((await r.json()).error);
+  const page = await r.json();
+  return page.items.map(({ id, value }) => ({ id, ...value }));
+}
+```
+
+Reference:
+[documentation.md § A collection that does not exist](documentation.md#a-collection-that-does-not-exist).
+The codes worth handling are in [section 20](#20-handling-responses-in-a-client).
+
+### One indexed query
+
+Filtering by `room` works immediately, by reading every document. An index turns that into reading
+only the documents that can match. Define it once — it is a replicated log entry, like a write:
+
+```bash
+curl -s -X POST localhost:8081/collections/messages/indexes \
+  -H 'content-type: application/json' \
+  -d '{"name":"by_room","field":"room"}'
+```
+
+`201` means the definition is agreed, not that the index is answering queries yet;
+`GET .../indexes` reports `"state":"ready"` once it is. The query itself does not change — there is
+no index name to pass and no hint syntax, so the `filter=` you were already sending starts using it:
+
+```bash
+curl -s --get localhost:8081/collections/messages/query \
+  --data-urlencode 'filter={"room":"general"}' \
+  --data-urlencode 'keys=embed' --data-urlencode 'limit=50'
+# {"items":[{"id":"m1","value":{"room":"general","text":"hello"}}],"next_cursor":null}
+```
+
+Same rows, fewer documents read. What an index accelerates and what it costs is
+[section 7](#7-secondary-indexes).
+
+### Browser realtime through your backend
+
+A browser can hold a live view without polling. The stream it subscribes to is your backend's, and
+your backend's stream is DewDB's:
+
+```
+Browser EventSource
+        │
+        ▼
+GET /api/messages/events            ← your application
+        │
+        ▼
+GET /collections/messages/changes   ← DewDB
+```
+
+`EventSource` cannot set request headers, so with `auth.api_keys` configured a browser cannot
+authenticate to the change route at all — your backend can, and it can filter by session before
+events reach the user. Staying same-origin keeps cookies, reconnection and your session middleware
+working.
+
+### A minimal SSE proxy
+
+Node's standard library is enough. No framework and no SSE library: forwarding the stream byte for
+byte preserves its framing for free.
+
+```js
+import { createServer } from "node:http";
+
+const DEWDB = "http://127.0.0.1:8081";
+
+createServer(async (req, res) => {
+  if (req.url !== "/api/messages/events") return void res.writeHead(404).end();
+
+  // DewDB reads `Last-Event-ID` exactly as it reads `?after=`. Forward it, or every
+  // reconnect silently resubscribes from now and skips the gap.
+  const headers = { accept: "text/event-stream" };
+  const resume = req.headers["last-event-id"];
+  if (resume) headers["last-event-id"] = resume;
+
+  // Nothing upstream notices a browser that navigated away; without this abort the
+  // subscription is held for the life of this process, against a ceiling of 64 per
+  // collection (`changefeed.max_subscribers`).
+  const abort = new AbortController();
+  res.on("close", () => abort.abort());
+
+  let upstream;
+  try {
+    upstream = await fetch(`${DEWDB}/collections/messages/changes`,
+                           { headers, signal: abort.signal });
+  } catch {
+    return void res.writeHead(502).end();
+  }
+
+  // A refusal is JSON, not a stream — pass it through before committing to SSE headers.
+  if (!upstream.ok) {
+    return void res
+      .writeHead(upstream.status, { "content-type": "application/json" })
+      .end(await upstream.text());
+  }
+
+  res.writeHead(200, {
+    "content-type": "text/event-stream", "cache-control": "no-cache",
+  });
+  res.flushHeaders();
+
+  try {
+    for await (const chunk of upstream.body) res.write(chunk);
+  } catch { /* client gone; the abort above released the subscription */ }
+  res.end();
+}).listen(3000);
+```
+
+Forward the event `id` downstream unparsed, too — it is an LSN on a single node and an opaque
+cluster token through a router — and watch `subscribers` under `changefeed` in `/metrics`, which is
+where a leaked subscription shows up. The rest of the relay contract is in
+[documentation.md § Relaying a stream to a browser](documentation.md#relaying-a-stream-to-a-browser),
+and the stream's guarantees in [section 8](#8-watching-for-changes). You can open the stream before
+the collection exists: it waits at position `0` and catches the first write.
+
+### The browser side
+
+```js
+const events = new EventSource("/api/messages/events");
+
+events.addEventListener("change", () => refreshMessages());
+```
+
+Two `EventSource` behaviours catch people out, both from the standard rather than from DewDB, and
+both silent when you get them wrong:
+
+- **`onmessage` never fires.** It handles only events with no name, and every DewDB event is named
+  (`open`, `change`, `error`). Listen by name.
+- **`open` and `error` are `EventSource`'s own event names too.** The browser fires them on connect
+  and on a dropped connection, with no `data`, so a listener on either name sees DewDB's frames and
+  the browser's; `e.data === undefined` tells them apart. A browser `error` is not fatal —
+  `EventSource` reconnects itself, and because your proxy forwards `Last-Event-ID` it resumes where
+  it stopped. `change` has no such collision.
+
+Re-fetching on every change is the simplest thing that works. To skip the round trip, apply the
+payload instead:
+
+```js
+events.addEventListener("change", (e) => {
+  const { op, key, value } = JSON.parse(e.data);
+  // insert and update carry the whole document; a delete carries only the key it
+  // removed; a drop is the collection itself going away and carries neither.
+  if (op === "drop") clearMessages();
+  else if (op === "delete") removeMessage(key);
+  else upsertMessage(key, value);
+});
+```
+
+### What belongs where
+
+| Tier | Owns |
+|---|---|
+| Browser | UI and local state; an `EventSource` against your own origin; calls to your application's API |
+| Application backend | user and session authorization; the DewDB URL and API key; application semantics, such as a `404` for a not-yet-created collection → `[]`; relaying the change stream |
+| DewDB | durable documents; queries, indexes and aggregation; replication, sharding and change streams |
+
+DewDB gives you documents and the guarantees around them, and deliberately not users, sessions,
+per-row permissions, or an application's idea of "empty". Those live in the tier that knows what
+they mean.
+
+---
+
+## 11. Write concerns and durability
 
 Every mutating request takes `?w=` and `?wtimeout=`.
 
@@ -1074,7 +1346,7 @@ one does.
 
 ---
 
-## 11. Collection administration
+## 12. Collection administration
 
 All of these work at runtime; nothing needs a restart.
 
@@ -1137,7 +1409,7 @@ forwards, so a key containing `/`, `?` or `#` is stored under the name you wrote
 
 ---
 
-## 12. Add replicas and watch a failover
+## 13. Add replicas and watch a failover
 
 Three nodes, each with its own data directory and port.
 
@@ -1239,7 +1511,7 @@ itself and steps down inside its own term. Look for `checkquorum` in its logs:
 
 ---
 
-## 13. Add a node at runtime
+## 14. Add a node at runtime
 
 A node admitted while the cluster is running joins as a **learner**: it replicates immediately and
 can serve reads, and is counted in no quorum. That is the first half of adding a voter — a node
@@ -1358,14 +1630,14 @@ vote and whose acknowledgement counts toward `w=majority`.
 
 ---
 
-## 14. Shard with a router
+## 15. Shard with a router
 
 A router holds no data: it hashes `collection:key`, finds the owning group, and forwards. Clients
 talk to routers and never need to know which shard owns what.
 
 `examples/cluster/shard1.json` / `examples/cluster/shard2.json` are ordinary primaries (ports 8081
 and 8082, own data dirs, optionally with replicas as in
-[§12](#12-add-replicas-and-watch-a-failover)).
+[§12](#13-add-replicas-and-watch-a-failover)).
 
 `examples/cluster/router.json`:
 
@@ -1456,7 +1728,7 @@ Things to know:
 
 - **`/cluster/ring` moves ownership without moving data.** It is refused when any current owner
   holds data, and the refusal names which one. Use it to establish the *initial* ring, and use
-  `/cluster/migrate` ([§15](#15-add-a-shard-without-downtime)) for every change after that.
+  `/cluster/migrate` ([§15](#16-add-a-shard-without-downtime)) for every change after that.
 - **Establish the ring before loading data.** In development `allow_unsafe_ring_changes` forces a
   publish through.
 - **Once a ring is in force, shards enforce ownership themselves.** A shard asked for a key it does
@@ -1491,7 +1763,7 @@ after that, the durable view is what decides.
 
 ---
 
-## 15. Add a shard without downtime
+## 16. Add a shard without downtime
 
 `POST /cluster/migrate` takes the same target ring but **copies the data before ownership moves**.
 Send it to a shard leader that already holds a ring.
@@ -1581,7 +1853,7 @@ curl -s localhost:8081/cluster/rebalance
 
 ---
 
-## 16. Turn on authentication
+## 17. Turn on authentication
 
 All credentials are optional, and the node warns at boot while any is unset.
 
@@ -1652,7 +1924,7 @@ TLS is terminated in front of the node; keep `/internal/*` off untrusted network
 
 ---
 
-## 17. Monitoring
+## 18. Monitoring
 
 ### Health, for load balancers
 
@@ -1721,7 +1993,7 @@ The `listening` event from `boot` is the node's identity, and keeps its fields i
 
 ---
 
-## 18. Backups and restarts
+## 19. Backups and restarts
 
 **Restarts** need nothing from you. A node replays its log from the last index snapshot, truncates a
 torn tail, and re-stages any uncommitted entries instead of publishing them.
@@ -1764,7 +2036,7 @@ boot rather than defaulting quietly, so a typo shows up immediately.
 
 ---
 
-## 19. Handling responses in a client
+## 20. Handling responses in a client
 
 Write a client against these and it will behave well during elections and topology changes:
 
@@ -1790,7 +2062,7 @@ idempotent), and a `202` is not a failure — it is a durability report.
 
 ---
 
-## 20. Client snippets
+## 21. Client snippets
 
 ### JavaScript
 
@@ -1867,7 +2139,7 @@ def bulk_load(collection, docs, chunk=500):
 
 ---
 
-## 21. Troubleshooting
+## 22. Troubleshooting
 
 | Symptom | What to check |
 |---|---|
