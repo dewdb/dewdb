@@ -1658,7 +1658,7 @@ All bodies are JSON. Errors are `{"error":"…"}`.
 | `GET` | `/collections/:name/docs/:id` | The stored value, or `404` — for the document or for the collection. Accepts `?read=`. |
 | `DELETE` | `/collections/:name/docs/:id` | `200 {"status":"deleted","existed":bool}`. |
 | `POST` | `/collections/:name/docs/bulk` | Body `[{"id"?,"value"},…]`. One group commit and one replication round, per-document results. `201` when every item met its write concern, `207` when some did not, and the shard's own status when a refusal answered for the whole batch. |
-| `GET` | `/collections/:name/docs` | An ownership-filtered query page (`items`, `next_cursor`, optional `keys`), or `404` if there is no such collection. Default limit 100, maximum 10 000. Shard-only; a router answers `501` and points at `/query`. |
+| `GET` | `/collections/:name/docs` | An ownership-filtered query page (`items`, `next_cursor`), or `404` if there is no such collection. Takes the same `keys=true`/`keys=embed` shapes as `/query`. Default limit 100, maximum 10 000. Shard-only; a router answers `501` and points at `/query`. |
 | `GET` | `/collections/:name/query` | See [Querying](#17-querying). |
 | `GET` | `/collections/:name/aggregate` | Totals over the same filter, grouped on dotted fields, within a per-shard read budget. See [Aggregation](#17a-aggregation). |
 | `GET` | `/collections/:name/changes` | A server-sent-events stream of committed changes, from one shard group or, on a router, from all of them. See [Change streams](#17b-change-streams). |
@@ -1795,9 +1795,26 @@ GET /collections/:name/query
       &read=replica
 ```
 
-The response is `{"items":[…],"next_cursor":"…"|null}`, plus `keys` — parallel to `items` — when
-`keys=true` was asked for. The cross-shard merge needs the keys to break ties and to build the next
-cursor, so a router always asks the shards for them; a client may.
+The response is `{"items":[…],"next_cursor":"…"|null}`. The cross-shard merge needs each row's key
+to break ties and to build the next cursor, so a router always asks the shards for them; a client
+may, in either of two shapes.
+
+`keys` takes `true`, `false` or `embed`, and anything else is a `400`. Omitted is `false`.
+
+| `keys` | Response |
+|---|---|
+| omitted, `false` | `{"items":[{"title":"one"}], "next_cursor":null}` |
+| `true` | the same, plus `"keys":["a"]` — one entry per item, in the same order |
+| `embed` | `{"items":[{"id":"a","value":{"title":"one"}}], "next_cursor":null}`, and no `keys` array |
+
+`keys=true` is the compatibility form and is not deprecated: it is what a client that already pairs
+the two arrays itself asks for, and what one node asks another for. `keys=embed` is the ergonomic
+form, for a client that would only have written that pairing out by hand.
+
+An embedded row is a projection over the response, not a change to the document: `value` is exactly
+what was stored, so `GET /collections/:name/docs/:id` is unaffected, an array or a scalar embeds as
+readily as an object, and a document with an `id` field of its own keeps it untouched inside `value`.
+`fields=` projects within `value` and leaves the row's `id` alone.
 
 ### Filters
 

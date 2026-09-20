@@ -204,8 +204,11 @@ GET /collections/:name/query?filter={"age":{"$gte":30}}&sort=age:desc&fields=nam
   unless the answering node believes it leads; `read=quorum` establishes a read index first, so the
   answer cannot come from a replaced leader; `read=replica` spreads reads across replicas and
   tolerates staleness. An unknown value is an error, not a silent fallback.
-- **Keys on request.** `keys=true` returns each row's key alongside it — the cross-shard merge needs
-  them, and a client that pages by key can have them too.
+- **Keys on request, in two shapes.** `keys=true` returns a `keys` array parallel to `items` — the
+  cross-shard merge needs them, and a client that pages by key can have them too. `keys=embed`
+  returns each row as `{id, value}` instead, which is the same pairing without the client-side
+  `zip`. It wraps the stored value rather than adding a field to it, so an array, a scalar, or an
+  object with its own `id` all survive intact, and reading a document by id is unchanged.
 - **Owner-only scans.** During migration, a destination's committed copy stays invisible until the
   ring gives it ownership. Query limits, cursors, sorting and aggregation all skip that copy, so a
   router sees exactly one row and one metric contribution while both groups hold the key.

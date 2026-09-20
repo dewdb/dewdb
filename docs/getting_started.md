@@ -405,7 +405,24 @@ curl -s --get localhost:8080/collections/users/query \
 ```
 
 `limit` defaults to 100 and is capped at 10 000; ask for more and you get a `400` telling you to
-page. Add `keys=true` if you want each row's key alongside it.
+page.
+
+Add `keys=` if you want each row's key alongside it, in whichever of the two shapes suits you:
+
+```bash
+# keys=true — a `keys` array parallel to `items`
+curl -s 'localhost:8081/collections/users/query?limit=1&keys=true'
+# {"items":[{"name":"ada","age":36}],"next_cursor":"…","keys":["u1"]}
+
+# keys=embed — each item carries its own id
+curl -s 'localhost:8081/collections/users/query?limit=1&keys=embed'
+# {"items":[{"id":"u1","value":{"name":"ada","age":36}}],"next_cursor":"…"}
+```
+
+`embed` saves you the `zip(items, keys)` on the client. It wraps the value rather than adding an
+`id` field to it, so what you stored is still exactly what comes back — under `value` here, and
+unchanged from `GET /collections/users/docs/u1`. `keys` takes `true`, `false` or `embed`; anything
+else is a `400`.
 
 `max_docs` bounds the other cost: documents *read* per shard per request, 100 000 by default and
 1 000 000 at most. A filter is what makes the two differ, since a page that matches nothing still

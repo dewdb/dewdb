@@ -36,7 +36,48 @@ pub struct QueryParams {
     pub fields: Option<String>,
     /// Return each row's key alongside it. The cross-shard merge needs them to order ties and to
     /// build the next cursor, so the router always asks; a client may.
-    pub keys: Option<bool>,
+    pub keys: Option<KeyMode>,
+}
+
+impl QueryParams {
+    /// Absent is the same as `keys=false`: no key anywhere in the answer.
+    pub fn key_mode(&self) -> KeyMode {
+        self.keys.unwrap_or(KeyMode::None)
+    }
+}
+
+/// Which of the two shapes a page reports its keys in, parsed once at the edge so the paths that
+/// build a page match on a mode rather than re-reading a query string.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeyMode {
+    /// `keys=false`, or omitted: the keys stay out of the response.
+    #[default]
+    None,
+    /// `keys=true`, 1.0's shape: a `keys` array parallel to `items`.
+    Parallel,
+    /// `keys=embed`: each item becomes `{"id": …, "value": <stored value>}` and there is no array.
+    Embedded,
+}
+
+impl<'de> Deserialize<'de> for KeyMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // 1.0 parsed this as a `bool`, which accepted `true` and `false` and nothing else. `embed`
+        // joins that set rather than widening it: every spelling that was a `400` still is.
+        match String::deserialize(deserializer)?.as_str() {
+            "true" => Ok(KeyMode::Parallel),
+            "false" => Ok(KeyMode::None),
+            "embed" => Ok(KeyMode::Embedded),
+            other => Err(serde::de::Error::custom(format!(
+                "keys must be `true`, `false` or `embed`, not `{}`", other))),
+        }
+    }
+}
+
+/// Projects a row's key into the response without touching the document it belongs to. `{id,value}`
+/// rather than `{id, ...fields}` because a stored value is arbitrary JSON: it may be an array or a
+/// scalar with nowhere to put an id, and an object may already have an `id` of its own.
+pub fn embed_key(key: &str, value: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"id": key, "value": value})
 }
 
 #[derive(Serialize, Deserialize, Default)]

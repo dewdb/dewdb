@@ -12,8 +12,8 @@ use crate::cluster::router::{
 use crate::consensus::read_index::read_index;
 use crate::json::{parse_fields, project};
 use crate::model::{
-    err_json, AggregateParams, BulkDoc, CreateDoc, QueryPage, QueryParams, ReadParams,
-    DEFAULT_QUERY_LIMIT, MAX_QUERY_LIMIT,
+    embed_key, err_json, AggregateParams, BulkDoc, CreateDoc, KeyMode, QueryPage, QueryParams,
+    ReadParams, DEFAULT_QUERY_LIMIT, MAX_QUERY_LIMIT,
 };
 use crate::query::{
     check_key_range, decode_cursor, encode_cursor, parse_filter, parse_sort, sort_position,
@@ -511,7 +511,7 @@ pub async fn query_docs(
     let after = key_cursor.map(|c| c.key);
     let start = params.start.clone();
     let end = params.end.clone();
-    let want_keys = params.keys.unwrap_or(false);
+    let key_mode = params.key_mode();
     let ring = ownership.fingerprint();
 
     let result = tokio::task::spawn_blocking(move || -> io::Result<(Vec<SortedRow>, Option<String>)> {
@@ -540,8 +540,15 @@ pub async fn query_docs(
 
     match result {
         Ok(Ok((rows, next_cursor))) => {
-            let keys = if want_keys { rows.iter().map(|r| r.key.clone()).collect() } else { Vec::new() };
-            let items = rows.iter().map(|r| project(&r.value, &fields)).collect();
+            // An embedded page pairs each row with its own key here, where the two are still one
+            // `SortedRow`, so nothing downstream has to keep two lists in step.
+            let (items, keys) = match key_mode {
+                KeyMode::Embedded => (rows.iter()
+                    .map(|r| embed_key(&r.key, project(&r.value, &fields))).collect(), Vec::new()),
+                KeyMode::Parallel => (rows.iter().map(|r| project(&r.value, &fields)).collect(),
+                    rows.iter().map(|r| r.key.clone()).collect()),
+                KeyMode::None => (rows.iter().map(|r| project(&r.value, &fields)).collect(), Vec::new()),
+            };
             (StatusCode::OK, Json(QueryPage { items, next_cursor, keys })).into_response()
         },
         Ok(Err(e)) if e.kind() == io::ErrorKind::InvalidInput =>
@@ -1807,5 +1814,196 @@ mod tests {
             "a full buffer refuses the next write, and this one is retriable unlike the wide batch");
 
         node.kill();
+    }
+
+    /// `keys=embed` is an added mode, not a change to an existing one: the three forms 1.0 accepted
+    /// have to answer exactly as they did, and the new one has to carry the key without ever
+    /// reaching the stored document.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_keys_modes_answer_side_by_side_and_none_of_them_touch_the_document() {
+        let root = temp_root();
+        let mut node = single_node(&root).await;
+        let client = reqwest::Client::new();
+
+        // Arbitrary JSON, not only objects: an array, a scalar, and an object with its own `id`.
+        let stored = [
+            ("a", serde_json::json!({"title": "one"})),
+            ("b", serde_json::json!(["a", "b"])),
+            ("c", serde_json::json!(42)),
+            ("d", serde_json::json!({"id": "not-the-key", "title": "four"})),
+        ];
+        for (key, value) in &stored {
+            assert_eq!(put_value(&client, &node.url(), "users", key, value.clone(), "").await,
+                StatusCode::CREATED);
+        }
+
+        let ask = |q: Vec<(&'static str, &'static str)>| {
+            let client = client.clone();
+            let url = format!("{}/collections/users/query", node.url());
+            async move { client.get(&url).query(&q).send().await.unwrap() }
+        };
+        let page = |q: Vec<(&'static str, &'static str)>| {
+            let ask = ask.clone();
+            async move {
+                let r = ask(q).await;
+                assert_eq!(r.status(), StatusCode::OK, "{}", r.text().await.unwrap());
+                r.json::<serde_json::Value>().await.unwrap()
+            }
+        };
+
+        // Omitted and `false` are one answer, and neither says anything about keys.
+        let omitted = page(vec![("limit", "10")]).await;
+        let off = page(vec![("limit", "10"), ("keys", "false")]).await;
+        assert_eq!(omitted, off, "`keys=false` is the omitted form spelled out");
+        assert!(omitted.get("keys").is_none(), "no keys unless asked: {}", omitted);
+        assert_eq!(omitted["items"], serde_json::json!([
+            {"title": "one"}, ["a", "b"], 42, {"id": "not-the-key", "title": "four"}]),
+            "items are the stored values, in key order");
+
+        // The compatibility form still answers with a parallel array beside untouched items.
+        let parallel = page(vec![("limit", "10"), ("keys", "true")]).await;
+        assert_eq!(parallel["keys"], serde_json::json!(["a", "b", "c", "d"]));
+        assert_eq!(parallel["items"], omitted["items"],
+            "`keys=true` adds an array; it does not reshape the items");
+
+        // The ergonomic form pairs each id with its value, whatever shape that value has.
+        let embedded = page(vec![("limit", "10"), ("keys", "embed")]).await;
+        assert!(embedded.get("keys").is_none(),
+            "an embedded page carries no parallel array: {}", embedded);
+        assert_eq!(embedded["items"], serde_json::json!([
+            {"id": "a", "value": {"title": "one"}},
+            {"id": "b", "value": ["a", "b"]},
+            {"id": "c", "value": 42},
+            {"id": "d", "value": {"id": "not-the-key", "title": "four"}},
+        ]), "an id beside the value, never merged into it");
+        assert_eq!(embedded["next_cursor"], parallel["next_cursor"],
+            "the same page, shaped differently");
+
+        // What was PUT is what GET-by-id returns: the id is a projection, not a field.
+        for (key, value) in &stored {
+            let got = client.get(format!("{}/collections/users/docs/{}", node.url(), key))
+                .send().await.unwrap().json::<serde_json::Value>().await.unwrap();
+            assert_eq!(&got, value, "an embedded id reached the stored document");
+        }
+
+        // `/docs` is the other door on to this page and answers through the same modes.
+        let listed = client.get(format!("{}/collections/users/docs", node.url()))
+            .query(&[("keys", "embed")]).send().await.unwrap()
+            .json::<serde_json::Value>().await.unwrap();
+        assert_eq!(listed["items"], embedded["items"], "`/docs` answers the page `/query` does");
+
+        // An unknown mode is refused rather than quietly read as one of the three. `embed` joins
+        // the set 1.0 accepted; it does not widen it, so what used to be a `400` still is.
+        for bad in ["banana", "1", "0", "yes", "TRUE", "embedded", ""] {
+            assert_eq!(ask(vec![("keys", bad)]).await.status(), StatusCode::BAD_REQUEST,
+                "`keys={}` parsed as a mode", bad);
+        }
+
+        // Projection applies inside `value` and leaves the row's own id alone.
+        let projected = page(vec![("limit", "10"), ("keys", "embed"), ("fields", "title")]).await;
+        assert_eq!(projected["items"][0], serde_json::json!({"id": "a", "value": {"title": "one"}}));
+        assert_eq!(projected["items"][3], serde_json::json!({"id": "d", "value": {"title": "four"}}),
+            "projecting away a document's own `id` must not disturb the row's");
+
+        node.kill();
+    }
+
+    /// An embedded id has to survive every operation that moves a row: a filter, the k-way merge
+    /// that orders a sorted fan-out, and the cursor that resumes either path through the router.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn embedded_ids_stay_attached_to_their_values_through_sort_paging_and_the_router_merge() {
+        let root = temp_root();
+        let (_s1, _s2, router) = two_shard_cluster(&root).await;
+        let client = reqwest::Client::new();
+
+        // `rank` descends as the key ascends, so a pairing the merge got wrong cannot pass unseen;
+        // and each document echoes its own key, which makes every row self-checking.
+        let rows = 14i64;
+        for i in 1..=rows {
+            let key = format!("k{:02}", i);
+            let value = serde_json::json!({"rank": rows + 1 - i, "key_echo": key, "even": i % 2 == 0});
+            assert_eq!(put_value(&client, &router.url(), "t", &key, value, "").await,
+                StatusCode::CREATED);
+        }
+
+        let page = |q: Vec<(String, String)>| {
+            let client = client.clone();
+            let url = format!("{}/collections/t/query", router.url());
+            async move {
+                let r = client.get(&url).query(&q).send().await.unwrap();
+                assert_eq!(r.status(), StatusCode::OK, "{}", r.text().await.unwrap());
+                r.json::<serde_json::Value>().await.unwrap()
+            }
+        };
+        fn paired(items: &[serde_json::Value]) {
+            for row in items {
+                let id = row["id"].as_str().expect("an embedded row carries an id");
+                assert_eq!(row["value"]["key_echo"].as_str(), Some(id),
+                    "an id travelled away from its value: {}", row);
+            }
+        }
+
+        // A sorted fan-out is merged across shards; the id has to move with the row it belongs to.
+        for (dir, first) in [("asc", rows), ("desc", 1)] {
+            let mut ids: Vec<String> = Vec::new();
+            let mut ranks: Vec<i64> = Vec::new();
+            let mut cursor: Option<String> = None;
+            for _ in 0..20 {
+                let mut q = vec![("sort".to_string(), format!("rank:{}", dir)),
+                                 ("limit".to_string(), "3".to_string()),
+                                 ("keys".to_string(), "embed".to_string())];
+                if let Some(c) = cursor.clone() { q.push(("cursor".to_string(), c)); }
+                let body = page(q).await;
+                let items = body["items"].as_array().unwrap().clone();
+                paired(&items);
+                assert!(body.get("keys").is_none(), "an embedded page carries no parallel array");
+                ids.extend(items.iter().map(|r| r["id"].as_str().unwrap().to_string()));
+                ranks.extend(items.iter().map(|r| r["value"]["rank"].as_i64().unwrap()));
+                cursor = body["next_cursor"].as_str().map(str::to_string);
+                if cursor.is_none() { break; }
+            }
+            let mut expected: Vec<i64> = (1..=rows).collect();
+            if dir == "desc" { expected.reverse(); }
+            assert_eq!(ranks, expected, "{}: one global order, every row exactly once", dir);
+            assert_eq!(ids[0], format!("k{:02}", first), "{}: the first row's id", dir);
+        }
+
+        // A filter selects rows before the merge orders them.
+        let filtered = page(vec![("sort".to_string(), "rank:asc".to_string()),
+                                 ("filter".to_string(), r#"{"even": true}"#.to_string()),
+                                 ("limit".to_string(), "50".to_string()),
+                                 ("keys".to_string(), "embed".to_string())]).await;
+        let items = filtered["items"].as_array().unwrap().clone();
+        paired(&items);
+        assert_eq!(items.len(), 7, "seven even keys: {:?}", items);
+        assert!(items.iter().all(|r| r["value"]["even"] == serde_json::json!(true)));
+
+        // The unsorted router path concatenates shard replies instead of merging them, one page at
+        // a time; the pairing has to hold there too.
+        let mut seen: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..40 {
+            let mut q = vec![("limit".to_string(), "1".to_string()),
+                             ("keys".to_string(), "embed".to_string())];
+            if let Some(c) = cursor.clone() { q.push(("cursor".to_string(), c)); }
+            let body = page(q).await;
+            let items = body["items"].as_array().unwrap().clone();
+            paired(&items);
+            seen.extend(items.iter().map(|r| r["id"].as_str().unwrap().to_string()));
+            cursor = body["next_cursor"].as_str().map(str::to_string);
+            if cursor.is_none() { break; }
+        }
+        seen.sort();
+        assert_eq!(seen, (1..=rows).map(|i| format!("k{:02}", i)).collect::<Vec<_>>(),
+            "an embedded page returns every row exactly once as it pages");
+
+        // And 1.0's shape still comes back through the same router, on the same data.
+        let parallel = page(vec![("sort".to_string(), "rank:asc".to_string()),
+                                 ("limit".to_string(), "3".to_string()),
+                                 ("keys".to_string(), "true".to_string())]).await;
+        assert_eq!(parallel["keys"], serde_json::json!(["k14", "k13", "k12"]));
+        assert_eq!(parallel["items"][0],
+            serde_json::json!({"rank": 1, "key_echo": "k14", "even": true}),
+            "`keys=true` leaves the item exactly as it is stored");
     }
 }

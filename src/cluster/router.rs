@@ -1,7 +1,9 @@
 //! Request forwarding, shard failover, and cross-shard fan-out.
 
 use crate::aggregate::{merge as merge_aggregates, AggregateResult};
-use crate::model::{err_json, AggregateParams, BulkDoc, CreateDoc, QueryPage, QueryParams};
+use crate::model::{
+    embed_key, err_json, AggregateParams, BulkDoc, CreateDoc, KeyMode, QueryPage, QueryParams,
+};
 use crate::query::{
     decode_cursor, encode_cursor, kway_merge, sort_position, ShardCursor, SortCursor, SortOrder,
     SortedRow,
@@ -909,7 +911,7 @@ pub async fn router_query(
 
         let sorted = sort.is_some();
         // The merge needs keys for a sorted page whether or not the client wanted them back.
-        let want_keys = params.keys.unwrap_or(false);
+        let key_mode = params.key_mode();
         let shares = if sorted {
             // The top rows may all live on one shard, so a share of limit/n would misorder the merge.
             vec![limit; active.len()]
@@ -942,7 +944,9 @@ pub async fn router_query(
             if let Some(s) = &params.sort { q.push(("sort".to_string(), s.clone())); }
             if let Some(a) = &after { q.push(("cursor".to_string(), a.clone())); }
             if let Some(v) = forwarded_read_pref(&pref) { q.push(("read".to_string(), v.to_string())); }
-            if sorted || want_keys {
+            // Always the parallel form on the wire, whichever shape the client asked for: the
+            // router pairs and embeds here, so a shard is never asked for a mode it may predate.
+            if sorted || key_mode != KeyMode::None {
                 q.push(("keys".to_string(), "true".to_string()));
             }
             if sorted {
@@ -1032,8 +1036,15 @@ pub async fn router_query(
                     &SortCursor::at(sort_position(&last.value, sort), last.key.clone()))),
                 _ => None,
             };
-            let keys = if want_keys { merged.iter().map(|r| r.key.clone()).collect() } else { Vec::new() };
-            let items: Vec<serde_json::Value> = merged.iter().map(|r| project(&r.value, fields)).collect();
+            // `merged` is rows, not two lists: the k-way merge carried each key with its value, so
+            // embedding after the ordering pairs what the ordering itself kept together.
+            let (items, keys): (Vec<serde_json::Value>, Vec<String>) = match key_mode {
+                KeyMode::Embedded => (merged.iter()
+                    .map(|r| embed_key(&r.key, project(&r.value, fields))).collect(), Vec::new()),
+                KeyMode::Parallel => (merged.iter().map(|r| project(&r.value, fields)).collect(),
+                    merged.iter().map(|r| r.key.clone()).collect()),
+                KeyMode::None => (merged.iter().map(|r| project(&r.value, fields)).collect(), Vec::new()),
+            };
             return (StatusCode::OK, Json(QueryPage { items, next_cursor, keys })).into_response();
         }
 
@@ -1048,10 +1059,21 @@ pub async fn router_query(
             match outcome {
                 ShardQueryOutcome::Page(p) => {
                     present += 1;
-                    for item in p.items {
-                        merged.push(project(&item, fields));
+                    if key_mode == KeyMode::Embedded {
+                        // Paired inside the reply it arrived in, before any concatenation: an id
+                        // never ends up beside a value from a different shard's page.
+                        if p.keys.len() != p.items.len() {
+                            return (StatusCode::BAD_GATEWAY,
+                                "Shard returned a page without keys").into_response();
+                        }
+                        merged.extend(p.keys.iter().zip(&p.items)
+                            .map(|(key, item)| embed_key(key, project(item, fields))));
+                    } else {
+                        for item in p.items {
+                            merged.push(project(&item, fields));
+                        }
+                        keys.extend(p.keys);
                     }
-                    keys.extend(p.keys);
 
                     if let Some(k) = p.next_cursor {
                         positions.insert(original, Some(k));
