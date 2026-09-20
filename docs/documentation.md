@@ -171,7 +171,7 @@ read, so both work on a host that has none:
 
 ```bash
 ./target/release/dewdb --version
-# dewdb 1.0.0
+# dewdb 1.1.0
 ./target/release/dewdb --help
 # usage, the default config path, and the five fields a single node needs
 ```

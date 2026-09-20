@@ -54,7 +54,7 @@ The binary is `./target/release/dewdb`. It will tell you what it is:
 
 ```bash
 ./target/release/dewdb --version
-# dewdb 1.0.0
+# dewdb 1.1.0
 ```
 
 `--version` (or `-V`) is answered before any config file is read, so it works before you have
