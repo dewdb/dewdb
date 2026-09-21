@@ -13,7 +13,42 @@ no external coordinator, no separate metadata service, and no driver to install.
 
 ---
 
-## Quickstart
+## Install
+
+### Windows, PowerShell
+
+```powershell
+iwr https://windows.dewdb.com -useb | iex
+```
+
+```powershell
+dewdb --version
+dewdb init
+dewdb
+```
+
+This installs DewDB for the current user under `%LOCALAPPDATA%\DewDB` and adds it to your user
+`PATH`, so it does not need Administrator privileges. Open a new terminal after installing to pick
+up the `PATH` change.
+
+### Windows, GitHub Releases
+
+Releases are published at
+[github.com/dewdb/dewdb/releases/latest](https://github.com/dewdb/dewdb/releases/latest).
+
+1. Download the Windows x86_64 ZIP from the latest release.
+2. Extract it.
+3. Run:
+
+```powershell
+.\dewdb.exe --version
+.\dewdb.exe init
+.\dewdb.exe
+```
+
+Each release page carries a `SHA256SUMS.txt` if you want to verify the download before extracting.
+
+### Build from source
 
 ```bash
 cargo build --release
@@ -23,29 +58,36 @@ cargo build --release
 ./target/release/dewdb --config examples/dew.json
 ```
 
-That is the whole setup. [`examples/dew.json`](examples/dew.json) is the whole file:
+[`examples/dew.json`](examples/dew.json) is a ready-made single-node config on port 8090. With no
+`--config`, the binary reads `dew.json` in the working directory.
+
+---
+
+## Quickstart
+
+`dewdb init` writes a starter `dew.json`:
 
 ```json
 {
   "node_id": "n1",
   "role": "shard",
   "shard_role": "primary",
-  "listen_addr": "127.0.0.1:8090",
-  "data_dir": "./data/examples/dew"
+  "listen_addr": "127.0.0.1:8081",
+  "data_dir": "./data"
 }
 ```
 
-The node leads itself, commits on its own fsync, and is ready immediately. Collections are created
-on first use — no schema, no create step.
+That is all a single node needs. It leads itself, commits on its own fsync, and is ready
+immediately. Collections are created on first use, with no schema and no create step.
 
 ```bash
-curl -s -X PUT localhost:8090/collections/users/docs/u1 \
+curl -s -X PUT localhost:8081/collections/users/docs/u1 \
   -H 'content-type: application/json' \
   -d '{"value":{"name":"ada","age":36,"profile":{"city":"london"}}}'
 ```
 
 ```bash
-curl -s --get localhost:8090/collections/users/query \
+curl -s --get localhost:8081/collections/users/query \
   --data-urlencode 'filter={"age":{"$gte":30},"profile.city":"london"}' \
   --data-urlencode 'sort=age:desc' \
   --data-urlencode 'fields=name,profile.city'
@@ -55,32 +97,30 @@ curl -s --get localhost:8090/collections/users/query \
 {"items":[{"name":"ada","profile":{"city":"london"}}],"next_cursor":null}
 ```
 
-The full walkthrough — from this node to a replicated, sharded, authenticated cluster — is in
+The full walkthrough, from this node to a replicated, sharded, authenticated cluster, is in
 [docs/getting_started.md](docs/getting_started.md). Every command in it runs as written.
 
 ---
 
 ## Why DewDB
 
-**Distribution lives in the database.** DewDB keeps replication, failover, sharding, routing, and
-change streams inside the database process, without requiring a separate coordinator service.
-Consensus, ownership and routing run in the same process that stores the documents. What you deploy
-is the database.
+**Distribution lives in the database.** DewDB keeps replication, failover, sharding, routing and
+change streams inside the database process, without a separate coordinator service. Consensus,
+ownership and routing run in the same process that stores the documents.
 
-**One process, one file, one protocol.** A node is `dewdb --config examples/dew.json`.
-Storage is a directory. The wire format is HTTP and JSON, so curl, a browser, or any HTTP client is
-a first-class client, and there is nothing to install on the application side.
+**One process, one file, one protocol.** A node is `dewdb --config dew.json`. Storage is a
+directory. The wire format is HTTP and JSON, so curl, a browser, or any HTTP client is a first-class
+client, and there is nothing to install on the application side.
 
-**Strong consistency, stated precisely.** Writes commit by quorum and readers see committed state
-only. A single-document write is atomic — it becomes durable as one frame or not at all. `read=quorum`
-is linearizable at the page's starting point, established through a read index rather than assumed
+**Strong consistency.** Writes commit by quorum and readers see committed state only. A
+single-document write is atomic: it becomes durable as one frame or not at all. `read=quorum` is
+linearizable at the page's starting point, established through a read index rather than assumed
 from a lease.
 
 **The API tells you what actually happened.** A write that is durable but did not meet its write
 concern answers `202` with `acks` and `required` in the body, not `200`. A shard that does not own a
 key answers `409` naming the real owner. An unknown `?w=`, an unparseable sort, or a cursor that
-does not belong to its query is a `400`, never a silent default. A query answered `200` is the query
-you asked for.
+does not belong to its query is a `400` rather than a silent default.
 
 **Permissive licence.** Apache 2.0, including for redistribution inside software you ship to
 someone else's infrastructure.
@@ -93,7 +133,7 @@ someone else's infrastructure.
 |---|---|
 | Data model | Schemaless JSON documents in auto-created collections, string keys |
 | API | REST over HTTP: CRUD, merge patch, bulk writes, query, aggregation, collection and index admin, cluster control |
-| Query | 17 field operators — equality, comparison, `$exists`, `$type`, `$prefix`/`$suffix`/`$contains`, `$all`/`$size`/`$elemMatch`, `$not` — composed with `$and`/`$or`/`$nor`, over dotted paths, with multi-key sort, projection and cursor paging |
+| Query | 17 field operators (equality, comparison, `$exists`, `$type`, `$prefix`/`$suffix`/`$contains`, `$all`/`$size`/`$elemMatch`, `$not`) composed with `$and`/`$or`/`$nor`, over dotted paths, with multi-key sort, projection and cursor paging |
 | Indexes | Per-collection secondary indexes on dotted fields, replicated as log entries and carried across shard groups by a cluster-wide catalogue |
 | Aggregation | `count`, `sum`, `avg`, `min`, `max`, grouped on dotted fields, merged across shards through the totals rather than the answers |
 | Change streams | A resumable per-collection feed of committed inserts, updates, deletes and drops, filtered like a query, cluster-wide through a router |
@@ -133,8 +173,8 @@ curl -s -X PUT 'localhost:9501/collections/users/docs/u1?w=majority' \
 ```
 
 Stop the leader. Within the heartbeat timeout plus election jitter, a survivor takes the term and
-accepts writes — no operator step, no external arbiter. A replica that fell behind repairs from WAL
-frames, or takes a full collection snapshot if it fell behind further than retention.
+accepts writes, with no operator step and no external arbiter. A replica that fell behind repairs
+from WAL frames, or takes a full collection snapshot if it fell behind further than retention.
 
 ## Sharding
 
@@ -147,23 +187,23 @@ client ──► router ──┤
                     └─► group B (leader + replicas)
 ```
 
-Queries and aggregations fan out and merge — sorted pages are merged in order, aggregate totals are
-combined through their counts rather than by averaging averages. Adding a shard is
+Queries and aggregations fan out and merge: sorted pages are merged in order, and aggregate totals
+are combined through their counts rather than by averaging averages. Adding a shard is
 `POST /cluster/migrate`: keys move in paced batches while both sides keep serving.
 
 ## Change streams and CDC
 
 ```bash
-curl -N --get localhost:8090/collections/users/changes \
+curl -N --get localhost:8081/collections/users/changes \
   --data-urlencode 'filter={"profile.city":"london"}'
 ```
 
 Events are published from the commit path and nowhere else, so a subscriber never sees a write a
-leader change can take back. Each event carries its own position; `?after=` resumes from it, and a
-position older than the buffer is refused with `410` and the floor that still works — it is never
+leader change can take back. Each event carries its own position, and `?after=` resumes from it. A
+position older than the buffer is refused with `410` and the floor that still works, rather than
 silently skipped. The same feed is available as a WebSocket, or pushed to your endpoint as signed,
-batched webhook deliveries whose acknowledged position is majority-committed, so it survives a
-failover.
+batched webhook deliveries. Their acknowledged position is majority-committed, so delivery survives
+a failover.
 
 ---
 
@@ -180,12 +220,12 @@ failover.
 
 ## Scope
 
-Stated up front, so nothing here is a surprise later:
+Current limitations:
 
 | | |
 |---|---|
 | Transactions | Per document. Bulk writes are one group commit, accepted or refused whole; there are no multi-document transactions. |
-| Conditional writes | Not yet — see Planned below. |
+| Conditional writes | Not yet. See Planned below. |
 | Indexes | Single-field, by value, non-unique, up to eight per collection. A filter with no eligible index scans a key range. |
 | Aggregation | `count`, `sum`, `avg`, `min`, `max` over up to four grouping fields, bounded at 10 000 groups, computed per request. |
 | Joins | Done in the client. Cross-shard work is per-key or fan-out. |
@@ -195,9 +235,9 @@ Stated up front, so nothing here is a surprise later:
 
 ## Planned
 
-- **TLS in the process** — public and internal listeners terminating from a certificate named in the
+- **TLS in the process.** Public and internal listeners terminating from a certificate named in the
   config, so replication does not need a proxy in front of it to be safe.
-- **Conditional writes** — `If-Match` on `PUT`, `PATCH` and `DELETE` against the version a read
+- **Conditional writes.** `If-Match` on `PUT`, `PATCH` and `DELETE` against the version a read
   returned, answered `412` when the document moved underneath it.
 
 ---
@@ -211,17 +251,16 @@ Stated up front, so nothing here is a surprise later:
 | [Features](docs/features.md) | Capability by capability, each with the guarantee it gives and the bound that goes with it. |
 | [Documentation](docs/documentation.md) | The reference manual: every config field, endpoint, status code, on-disk format and internal protocol. |
 
-## Building and testing
+## Testing
 
 ```bash
-cargo build --release
 cargo test
 ```
 
 The suite is in-crate and runs against real nodes over real sockets: consensus and failover,
 ownership handover, query and aggregation correctness against unindexed twins, change-stream resume
-and webhook delivery. Benchmarks and the long-running durability scenarios — repeated crashes,
-cluster churn under load, compaction interleaved with crashes, a WAL cut off mid-record — are held
+and webhook delivery. Benchmarks and the long-running durability scenarios (repeated crashes,
+cluster churn under load, compaction interleaved with crashes, a WAL cut off mid-record) are held
 back from the default run:
 
 ```bash
