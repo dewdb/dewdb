@@ -6,7 +6,8 @@ use crate::replication::WriteConcern;
 use crate::replication::write_concern::write_quorum;
 use crate::json::merge_patch;
 use crate::state::{AppState, FrameReservation, Refusal};
-use crate::storage::{Collection, FrameHeader};
+use crate::api::precondition::{precondition_failed, Preconditions};
+use crate::storage::{Collection, FrameHeader, Version};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use std::collections::HashSet;
@@ -19,6 +20,8 @@ pub struct WriteOutcome {
     pub acks: usize,
     pub required: usize,
     pub existed: bool,
+    /// The appended frame's; returned as the write's `ETag`.
+    pub version: Version,
 }
 
 struct PendingWrite {
@@ -119,7 +122,7 @@ async fn finish_write(
         }
         state.apply_committed(col_name, lsn)
             .map_err(|e| err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        return Ok(WriteOutcome { met: true, acks: 1, required: 1, existed });
+        return Ok(WriteOutcome { met: true, acks: 1, required: 1, existed, version: Version { term, lsn } });
     }
 
     // Resolved against the configuration in force, not a replica count: while a change is in
@@ -170,7 +173,7 @@ async fn finish_write(
     state.advance_own_commit(col_name, own_durable)
         .map_err(|e| err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Ok(WriteOutcome { met: quorum.met(&holders), acks: holders.len(), required, existed })
+    Ok(WriteOutcome { met: quorum.met(&holders), acks: holders.len(), required, existed, version: Version { term, lsn } })
 }
 
 /// 503 rather than 500: the write is not wrong, the leader is too far ahead of its quorum, and the
@@ -210,7 +213,19 @@ pub async fn local_write(
     wc: WriteConcern,
     wtimeout: Duration,
 ) -> Result<WriteOutcome, axum::response::Response> {
-    local_write_with_origin(state, col_name, key, value, wc, wtimeout, false).await
+    local_write_with_origin(state, col_name, key, value, wc, wtimeout, false, &Preconditions::none()).await
+}
+
+pub async fn local_write_if(
+    state: &AppState,
+    col_name: &str,
+    key: String,
+    value: Option<serde_json::Value>,
+    wc: WriteConcern,
+    wtimeout: Duration,
+    pre: &Preconditions,
+) -> Result<WriteOutcome, axum::response::Response> {
+    local_write_with_origin(state, col_name, key, value, wc, wtimeout, false, pre).await
 }
 
 pub async fn local_migration_write(
@@ -221,7 +236,7 @@ pub async fn local_migration_write(
     wc: WriteConcern,
     wtimeout: Duration,
 ) -> Result<WriteOutcome, axum::response::Response> {
-    local_write_with_origin(state, col_name, key, value, wc, wtimeout, true).await
+    local_write_with_origin(state, col_name, key, value, wc, wtimeout, true, &Preconditions::none()).await
 }
 
 async fn local_write_with_origin(
@@ -232,6 +247,7 @@ async fn local_write_with_origin(
     wc: WriteConcern,
     wtimeout: Duration,
     migration: bool,
+    pre: &Preconditions,
 ) -> Result<WriteOutcome, axum::response::Response> {
     let admitted = admit(state, col_name, 1)?;
 
@@ -243,6 +259,13 @@ async fn local_write_with_origin(
 
     let pending = {
         let _guard = col.key_lock(&key).lock().await;
+        // Under the key lock the append takes, so no write can land between the check and it.
+        if !pre.is_empty() {
+            let current = col.version_including_staged(&key);
+            if !pre.holds(current) {
+                return Err(precondition_failed(current));
+            }
+        }
         local_write_inner(state, &col, key, value, migration).await?
     };
     drop(admitted);
@@ -257,6 +280,7 @@ pub async fn local_patch(
     patch: serde_json::Value,
     wc: WriteConcern,
     wtimeout: Duration,
+    pre: &Preconditions,
 ) -> Result<Option<WriteOutcome>, axum::response::Response> {
     let admitted = admit(state, col_name, 1)?;
 
@@ -271,14 +295,20 @@ pub async fn local_patch(
 
         let col_read = col.clone();
         let key_read = key.clone();
-        let current = match tokio::task::spawn_blocking(move || col_read.get_including_staged(&key_read)).await {
+        let current = match tokio::task::spawn_blocking(move || col_read.get_including_staged_versioned(&key_read)).await {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
             Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
         };
 
+        // Judged on the version of the document the patch merges into, read as one with it.
+        let version = current.as_ref().map(|(_, v)| *v);
+        if !pre.is_empty() && !pre.holds(version) {
+            return Err(precondition_failed(version));
+        }
+
         let mut doc = match current {
-            Some(d) => d,
+            Some((d, _)) => d,
             None => return Ok(None),
         };
 
@@ -383,13 +413,15 @@ async fn finish_write_batch(
         }
     }
 
-    let existed: Vec<bool> = pending.iter().map(|p| p.existed).collect();
+    let written: Vec<(bool, Version)> = pending.iter()
+        .map(|p| (p.existed, Version { term: p.term, lsn: p.lsn }))
+        .collect();
     let last = match pending.pop() {
         Some(p) => p,
         None => return Ok(Vec::new()),
     };
     let spread = |met: bool, acks: usize, required: usize| -> Vec<WriteOutcome> {
-        existed.iter().map(|&existed| WriteOutcome { met, acks, required, existed }).collect()
+        written.iter().map(|&(existed, version)| WriteOutcome { met, acks, required, existed, version }).collect()
     };
 
     if state.replication.is_none() {

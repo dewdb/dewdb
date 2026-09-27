@@ -9,6 +9,7 @@ pub mod members;
 pub mod migrate;
 pub mod middleware;
 pub mod observe;
+pub mod precondition;
 pub mod ring;
 pub mod webhooks;
 pub mod write;

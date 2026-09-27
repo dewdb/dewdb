@@ -812,6 +812,7 @@ mod tests {
             migration_id: "m1".into(), phase: MigrationPhase::Finalizing,
             collection: "t".into(),
             docs: vec![MigrateDoc { key: key.clone(), value: serde_json::json!({"v": 7}) }],
+            lsn_floor: 0,
         };
         assert_eq!(client.post(format!("{}/internal/migrate", c)).json(&batch)
             .send().await.unwrap().status(), StatusCode::OK);
@@ -872,6 +873,7 @@ mod tests {
                 migration_id: "m1".into(), phase: MigrationPhase::Finalizing,
                 collection: "t".into(),
                 docs: vec![MigrateDoc { key: self.key.clone(), value: serde_json::json!({"v": v}) }],
+                lsn_floor: 0,
             }
         }
 
@@ -886,6 +888,25 @@ mod tests {
             self.node.state.as_ref().unwrap().db.as_ref().unwrap()
                 .get_collection("t").unwrap().get(&self.key).unwrap()
         }
+    }
+
+    /// A moved key's versions come from two independent logs; only the floor orders them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handed_over_key_is_versioned_above_every_lsn_its_source_issued() {
+        let root = temp_root();
+        let mut h = Handover::stage(&root, vec![]).await;
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap();
+
+        let floor = 1_000_000;
+        let batch = MigrateBatch { lsn_floor: floor, ..h.batch(7) };
+        assert_eq!(client.post(format!("{}/internal/migrate", h.node.url()))
+            .json(&batch).send().await.unwrap().status(), StatusCode::OK);
+
+        let col = h.node.state.as_ref().unwrap().db.as_ref().unwrap().get_collection("t").unwrap();
+        let (_, version) = col.get_versioned(&h.key).unwrap().expect("the copy must be published");
+        assert!(version.lsn > floor, "copied at {}, below the source's floor {}", version.lsn, floor);
+
+        h.node.kill();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

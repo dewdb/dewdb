@@ -53,6 +53,10 @@ pub struct MigrateBatch {
     pub phase: MigrationPhase,
     pub collection: String,
     pub docs: Vec<MigrateDoc>,
+    /// The source node's highest issued LSN. The destination issues above it, so a moved key never
+    /// takes a version a reader of the source could still hold as an `If-Match`.
+    #[serde(default)]
+    pub lsn_floor: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -497,12 +501,15 @@ async fn push_all(
                 }
 
                 let sent = docs.len();
+                // Sampled after the reads, so it covers the version of every document in the batch.
+                let lsn_floor = db.next_lsn.load(std::sync::atomic::Ordering::SeqCst);
                 for group in size_bounded_docs(docs) {
                     let batch = MigrateBatch {
                         migration_id: migration.id.clone(),
                         phase: migration.phase,
                         collection: collection.clone(),
                         docs: group,
+                        lsn_floor,
                     };
                     let url = format!("{}/internal/migrate", destination);
                     let response = state.client.post(&url).json(&batch).send().await

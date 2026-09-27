@@ -324,6 +324,10 @@ pub async fn migrate_handler(
             "no migration {} is in progress here", batch.migration_id)),
     }
 
+    if let Some(db) = state.db.as_ref() {
+        db.next_lsn.fetch_max(batch.lsn_floor, std::sync::atomic::Ordering::SeqCst);
+    }
+
     let (wc, wtimeout) = handover_write_concern();
     let written = batch.docs.len();
     let items = batch.docs.into_iter().map(|doc| (doc.key, doc.value)).collect();

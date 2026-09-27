@@ -1,6 +1,7 @@
 //! Document endpoints.
 
-use super::write::{local_patch, local_write, local_write_batch};
+use super::precondition::{parse_or_refuse, with_etag, CONDITIONAL_HEADERS};
+use super::write::{local_patch, local_write_if, local_write_batch};
 use crate::aggregate::{
     budget_spent, parse_group, parse_metrics, AggregateSpec, DEFAULT_AGGREGATE_SCAN,
     MAX_AGGREGATE_SCAN, SCAN_ADMISSION_WAIT_MS,
@@ -24,7 +25,7 @@ use crate::cluster::ownership::Ownership;
 use crate::api::middleware::{client_collection, CollectionPath};
 use crate::state::AppState;
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use std::io;
@@ -86,17 +87,23 @@ pub async fn create_doc(
     State(state): State<AppState>,
     CollectionPath(col_name): CollectionPath<String>,
     Query(wcp): Query<WriteConcernParams>,
+    headers: HeaderMap,
     Json(payload): Json<CreateDoc>,
 ) -> impl axum::response::IntoResponse {
     if state.is_shard() && !state.is_leader() {
         return (StatusCode::FORBIDDEN, "Replica nodes reject direct writes").into_response();
     }
 
+    let pre = match parse_or_refuse(&headers) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+
     let id = Uuid::new_v4().to_string();
 
     if state.config.role == "router" {
         let wc_query = wc_query_string(&wcp);
-        return match router_forward_write(&state, &col_name, &id, ForwardMethod::Put, Some(&payload), &wc_query).await {
+        return match router_forward_write(&state, &col_name, &id, ForwardMethod::Put, Some(&payload), &wc_query, &headers).await {
             Ok(reply) => passthrough(reply),
             Err(resp) => resp,
         };
@@ -117,15 +124,15 @@ pub async fn create_doc(
     };
     let wtimeout = Duration::from_millis(wcp.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
 
-    match local_write(&state, &col_name, id.clone(), Some(payload.value), wc, wtimeout).await {
-        Ok(o) if o.met => (StatusCode::CREATED, Json(serde_json::json!({"id": id, "status": "created"}))).into_response(),
-        Ok(o) => (StatusCode::ACCEPTED, Json(serde_json::json!({
+    match local_write_if(&state, &col_name, id.clone(), Some(payload.value), wc, wtimeout, &pre).await {
+        Ok(o) if o.met => with_etag((StatusCode::CREATED, Json(serde_json::json!({"id": id, "status": "created"}))).into_response(), o.version),
+        Ok(o) => with_etag((StatusCode::ACCEPTED, Json(serde_json::json!({
             "id": id,
             "status": "created",
             "warning": "write concern not met",
             "acks": o.acks,
             "required": o.required,
-        }))).into_response(),
+        }))).into_response(), o.version),
         Err(resp) => resp,
     }
 }
@@ -134,15 +141,21 @@ pub async fn put_doc(
     State(state): State<AppState>,
     CollectionPath((col_name, id)): CollectionPath<(String, String)>,
     Query(wcp): Query<WriteConcernParams>,
+    headers: HeaderMap,
     Json(payload): Json<CreateDoc>,
 ) -> impl axum::response::IntoResponse {
     if state.is_shard() && !state.is_leader() {
         return (StatusCode::FORBIDDEN, "Replica nodes reject direct writes").into_response();
     }
 
+    let pre = match parse_or_refuse(&headers) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+
     if state.config.role == "router" {
         let wc_query = wc_query_string(&wcp);
-        return match router_forward_write(&state, &col_name, &id, ForwardMethod::Put, Some(&payload), &wc_query).await {
+        return match router_forward_write(&state, &col_name, &id, ForwardMethod::Put, Some(&payload), &wc_query, &headers).await {
             Ok(reply) => passthrough(reply),
             Err(resp) => resp,
         };
@@ -160,19 +173,19 @@ pub async fn put_doc(
     };
     let wtimeout = Duration::from_millis(wcp.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
 
-    match local_write(&state, &col_name, id.clone(), Some(payload.value), wc, wtimeout).await {
+    match local_write_if(&state, &col_name, id.clone(), Some(payload.value), wc, wtimeout, &pre).await {
         Ok(o) if o.met => {
             let status = if o.existed { StatusCode::OK } else { StatusCode::CREATED };
             let label = if o.existed { "replaced" } else { "created" };
-            (status, Json(serde_json::json!({"id": id, "status": label}))).into_response()
+            with_etag((status, Json(serde_json::json!({"id": id, "status": label}))).into_response(), o.version)
         },
-        Ok(o) => (StatusCode::ACCEPTED, Json(serde_json::json!({
+        Ok(o) => with_etag((StatusCode::ACCEPTED, Json(serde_json::json!({
             "id": id,
             "status": if o.existed { "replaced" } else { "created" },
             "warning": "write concern not met",
             "acks": o.acks,
             "required": o.required,
-        }))).into_response(),
+        }))).into_response(), o.version),
         Err(resp) => resp,
     }
 }
@@ -181,6 +194,7 @@ pub async fn bulk_create_docs(
     State(state): State<AppState>,
     CollectionPath(col_name): CollectionPath<String>,
     Query(wcp): Query<WriteConcernParams>,
+    headers: HeaderMap,
     Json(payload): Json<Vec<BulkDoc>>,
 ) -> impl axum::response::IntoResponse {
     if state.is_shard() && !state.is_leader() {
@@ -189,6 +203,12 @@ pub async fn bulk_create_docs(
 
     if payload.is_empty() {
         return err_json(StatusCode::BAD_REQUEST, "bulk request must contain at least one document".to_string());
+    }
+
+    // One header cannot name a version per document, and applying it to all of them is not a guard.
+    if CONDITIONAL_HEADERS.iter().any(|name| headers.contains_key(name)) {
+        return err_json(StatusCode::BAD_REQUEST,
+            "If-Match and If-None-Match apply to single-document writes, not to a bulk batch".to_string());
     }
 
     let wc_query = wc_query_string(&wcp);
@@ -302,8 +322,8 @@ pub async fn get_doc(
     let key = id.clone();
     let col_clone = col.clone();
 
-    match tokio::task::spawn_blocking(move || col_clone.get(&key)).await {
-        Ok(Ok(Some(val))) => (StatusCode::OK, Json(val)).into_response(),
+    match tokio::task::spawn_blocking(move || col_clone.get_versioned(&key)).await {
+        Ok(Ok(Some((val, version)))) => with_etag((StatusCode::OK, Json(val)).into_response(), version),
         Ok(Ok(None)) => err_json(StatusCode::NOT_FOUND, "not found".to_string()),
         Ok(Err(e)) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -314,6 +334,7 @@ pub async fn update_doc(
     State(state): State<AppState>,
     CollectionPath((col_name, id)): CollectionPath<(String, String)>,
     Query(wcp): Query<WriteConcernParams>,
+    headers: HeaderMap,
     Json(payload): Json<CreateDoc>,
 ) -> impl axum::response::IntoResponse {
     if state.is_shard() && !state.is_leader() {
@@ -324,9 +345,14 @@ pub async fn update_doc(
         return err_json(StatusCode::BAD_REQUEST, "PATCH body must not be null; use DELETE to remove a document".to_string());
     }
 
+    let pre = match parse_or_refuse(&headers) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+
     if state.config.role == "router" {
         let wc_query = wc_query_string(&wcp);
-        return match router_forward_write(&state, &col_name, &id, ForwardMethod::Patch, Some(&payload), &wc_query).await {
+        return match router_forward_write(&state, &col_name, &id, ForwardMethod::Patch, Some(&payload), &wc_query, &headers).await {
             Ok(reply) => passthrough(reply),
             Err(resp) => resp,
         };
@@ -344,16 +370,16 @@ pub async fn update_doc(
     };
     let wtimeout = Duration::from_millis(wcp.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
 
-    match local_patch(&state, &col_name, id.clone(), payload.value, wc, wtimeout).await {
+    match local_patch(&state, &col_name, id.clone(), payload.value, wc, wtimeout, &pre).await {
         Ok(None) => err_json(StatusCode::NOT_FOUND, "not found".to_string()),
-        Ok(Some(o)) if o.met => (StatusCode::OK, Json(serde_json::json!({"id": id, "status": "updated"}))).into_response(),
-        Ok(Some(o)) => (StatusCode::ACCEPTED, Json(serde_json::json!({
+        Ok(Some(o)) if o.met => with_etag((StatusCode::OK, Json(serde_json::json!({"id": id, "status": "updated"}))).into_response(), o.version),
+        Ok(Some(o)) => with_etag((StatusCode::ACCEPTED, Json(serde_json::json!({
             "id": id,
             "status": "updated",
             "warning": "write concern not met",
             "acks": o.acks,
             "required": o.required,
-        }))).into_response(),
+        }))).into_response(), o.version),
         Err(resp) => resp,
     }
 }
@@ -362,14 +388,20 @@ pub async fn delete_doc(
     State(state): State<AppState>,
     CollectionPath((col_name, id)): CollectionPath<(String, String)>,
     Query(wcp): Query<WriteConcernParams>,
+    headers: HeaderMap,
 ) -> impl axum::response::IntoResponse {
     if state.is_shard() && !state.is_leader() {
         return (StatusCode::FORBIDDEN, "Replica nodes reject direct writes").into_response();
     }
 
+    let pre = match parse_or_refuse(&headers) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
+
     if state.config.role == "router" {
         let wc_query = wc_query_string(&wcp);
-        return match router_forward_write(&state, &col_name, &id, ForwardMethod::Delete, None, &wc_query).await {
+        return match router_forward_write(&state, &col_name, &id, ForwardMethod::Delete, None, &wc_query, &headers).await {
             Ok(reply) => passthrough(reply),
             Err(resp) => resp,
         };
@@ -387,7 +419,7 @@ pub async fn delete_doc(
     };
     let wtimeout = Duration::from_millis(wcp.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
 
-    match local_write(&state, &col_name, id.clone(), None, wc, wtimeout).await {
+    match local_write_if(&state, &col_name, id.clone(), None, wc, wtimeout, &pre).await {
         Ok(o) if o.met => (StatusCode::OK, Json(serde_json::json!({"status": "deleted", "existed": o.existed}))).into_response(),
         Ok(o) => (StatusCode::ACCEPTED, Json(serde_json::json!({
             "status": "deleted",
@@ -2005,5 +2037,150 @@ mod tests {
         assert_eq!(parallel["items"][0],
             serde_json::json!({"rank": 1, "key_echo": "k14", "even": true}),
             "`keys=true` leaves the item exactly as it is stored");
+    }
+
+    fn etag_of(r: &reqwest::Response) -> String {
+        r.headers().get(reqwest::header::ETAG).expect("an ETag").to_str().unwrap().to_string()
+    }
+
+    async fn conditional(
+        c: &reqwest::Client,
+        method: reqwest::Method,
+        url: &str,
+        header: (&str, &str),
+        body: Option<serde_json::Value>,
+    ) -> reqwest::Response {
+        let mut rb = c.request(method, url).header(header.0, header.1);
+        if let Some(b) = body {
+            rb = rb.json(&serde_json::json!({"value": b}));
+        }
+        rb.send().await.unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_based_on_a_stale_read_is_refused_rather_than_silently_lost() {
+        let root = temp_root();
+        let mut node = single_node(&root).await;
+        let c = reqwest::Client::new();
+        let url = format!("{}/collections/t/docs/k", node.url());
+        use reqwest::Method;
+
+        let created = c.put(&url).json(&serde_json::json!({"value": {"n": 1}})).send().await.unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let first = etag_of(&created);
+        let read = c.get(&url).send().await.unwrap();
+        assert_eq!(etag_of(&read), first, "a read names the version the write returned");
+
+        let second = conditional(&c, Method::PUT, &url, ("If-Match", &first), Some(serde_json::json!({"n": 2}))).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let second = etag_of(&second);
+        assert_ne!(second, first);
+
+        let stale = conditional(&c, Method::PUT, &url, ("If-Match", &first), Some(serde_json::json!({"n": 3}))).await;
+        assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(stale.json::<serde_json::Value>().await.unwrap()["etag"], second.as_str(),
+            "a refusal names what the document is now, so the client can re-read");
+        assert_eq!(c.get(&url).send().await.unwrap().json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!({"n": 2}), "a refused write writes nothing");
+
+        let stale = conditional(&c, Method::PATCH, &url, ("If-Match", &first), Some(serde_json::json!({"m": 1}))).await;
+        assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+        let patched = conditional(&c, Method::PATCH, &url, ("If-Match", &second), Some(serde_json::json!({"m": 1}))).await;
+        assert_eq!(patched.status(), StatusCode::OK);
+        let third = etag_of(&patched);
+
+        let stale = conditional(&c, Method::DELETE, &url, ("If-Match", &second), None).await;
+        assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+        let deleted = conditional(&c, Method::DELETE, &url, ("If-Match", &third), None).await;
+        assert_eq!(deleted.status(), StatusCode::OK);
+
+        let absent = conditional(&c, Method::PUT, &url, ("If-Match", "*"), Some(serde_json::json!({"n": 4}))).await;
+        assert_eq!(absent.status(), StatusCode::PRECONDITION_FAILED, "`*` requires a document to exist");
+        assert!(absent.json::<serde_json::Value>().await.unwrap()["etag"].is_null());
+
+        let only = conditional(&c, Method::PUT, &url, ("If-None-Match", "*"), Some(serde_json::json!({"n": 5}))).await;
+        assert_eq!(only.status(), StatusCode::CREATED, "If-None-Match: * is create-only");
+        let again = conditional(&c, Method::PUT, &url, ("If-None-Match", "*"), Some(serde_json::json!({"n": 6}))).await;
+        assert_eq!(again.status(), StatusCode::PRECONDITION_FAILED);
+
+        let malformed = conditional(&c, Method::PUT, &url, ("If-Match", "no-quotes"), Some(serde_json::json!({"n": 7}))).await;
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST, "an unreadable guard is not an absent one");
+
+        let bulk = c.post(format!("{}/collections/t/docs/bulk", node.url()))
+            .header("If-Match", "*").json(&serde_json::json!([{"id": "b", "value": {}}])).send().await.unwrap();
+        assert_eq!(bulk.status(), StatusCode::BAD_REQUEST);
+
+        node.kill();
+    }
+
+    /// The check and the append share the key lock, so writers racing on one version cannot both win.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn writers_racing_on_one_version_land_exactly_one_write() {
+        let root = temp_root();
+        let mut node = single_node(&root).await;
+        let c = reqwest::Client::new();
+        let url = format!("{}/collections/t/docs/k", node.url());
+        let created = c.put(&url).json(&serde_json::json!({"value": {"n": 0}})).send().await.unwrap();
+        let base = etag_of(&created);
+
+        let racers = (1..=16).map(|n| {
+            let (c, url, base) = (c.clone(), url.clone(), base.clone());
+            tokio::spawn(async move {
+                c.put(&url).header("If-Match", base).json(&serde_json::json!({"value": {"n": n}}))
+                    .send().await.unwrap().status()
+            })
+        });
+        let statuses: Vec<StatusCode> = futures::future::join_all(racers).await
+            .into_iter().map(|r| r.unwrap()).collect();
+        assert_eq!(statuses.iter().filter(|s| **s == StatusCode::OK).count(), 1, "{:?}", statuses);
+        assert_eq!(statuses.iter().filter(|s| **s == StatusCode::PRECONDITION_FAILED).count(), 15);
+
+        node.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_router_carries_the_precondition_in_and_the_etag_out() {
+        let root = temp_root();
+        let (mut s1, mut s2, mut router) = two_shard_cluster(&root).await;
+        let c = reqwest::Client::new();
+        let url = format!("{}/collections/t/docs/k", router.url());
+
+        let created = c.put(&url).json(&serde_json::json!({"value": {"n": 1}})).send().await.unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let first = etag_of(&created);
+        assert_eq!(etag_of(&c.get(&url).send().await.unwrap()), first);
+
+        let moved = c.put(&url).header("If-Match", &first)
+            .json(&serde_json::json!({"value": {"n": 2}})).send().await.unwrap();
+        assert_eq!(moved.status(), StatusCode::OK);
+        let stale = c.put(&url).header("If-Match", &first)
+            .json(&serde_json::json!({"value": {"n": 3}})).send().await.unwrap();
+        assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED,
+            "a 412 is the shard's answer, not a failure to route around");
+
+        router.kill();
+        s1.kill();
+        s2.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn every_member_of_a_group_names_a_document_by_the_same_version() {
+        let root = temp_root();
+        let (mut n1, mut n2, mut n3) = three_node_cluster(&root).await;
+        let c = reqwest::Client::new();
+        let written = c.put(format!("{}/collections/t/docs/k?w=all", n1.url()))
+            .json(&serde_json::json!({"value": {"v": 9}})).send().await.unwrap();
+        assert_eq!(written.status(), StatusCode::CREATED);
+        let etag = etag_of(&written);
+
+        for replica in [&n2, &n3] {
+            assert!(crate::test_support::wait_for_doc(&c, &replica.url(), "t", "k", 9, Duration::from_secs(10)).await);
+            let read = c.get(format!("{}/collections/t/docs/k", replica.url())).send().await.unwrap();
+            assert_eq!(etag_of(&read), etag, "a failover must not change the version a client holds");
+        }
+
+        n1.kill();
+        n2.kill();
+        n3.kill();
     }
 }

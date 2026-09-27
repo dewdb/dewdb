@@ -541,7 +541,9 @@ impl Collection {
 
             let mut header = [0u8; HEADER_LEN];
             file.read_exact(&mut header)?;
-            let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+            let parsed = FrameHeader::parse(&header)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "short frame header"))?;
+            let len = parsed.len as usize;
 
             if len == 0 || len as u64 > MAX_RECORD_SIZE {
                 return Err(io::Error::new(io::ErrorKind::InvalidData,
@@ -564,7 +566,7 @@ impl Collection {
                 key.clone(),
                 *old_wal_id,
                 *old_offset,
-                self.build_entry(compact_id, current_offset, &payload),
+                self.build_entry(compact_id, current_offset, parsed.lsn, parsed.term, &payload),
             ));
             current_offset += (HEADER_LEN + len) as u64;
         }

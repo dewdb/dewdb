@@ -24,7 +24,8 @@ use std::time::Duration;
 use uuid::Uuid;
 
 pub fn idx(frame: &[u8], wal_id: u64, offset: u64) -> IndexEntry {
-    IndexEntry { wal_id, offset, len: (frame.len() - HEADER_LEN) as u32, inline: None }
+    let header = FrameHeader::parse(frame).expect("a test frame carries a header");
+    IndexEntry { wal_id, offset, len: (frame.len() - HEADER_LEN) as u32, inline: None, lsn: header.lsn, term: header.term }
 }
 
 /// The existence check is the verdict, not the removal's result: a background task still holding an

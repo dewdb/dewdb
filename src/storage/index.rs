@@ -9,7 +9,24 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-pub const INDEX_FILENAME: &str = "index-current.bin";
+// Compatibility: bincode carries no tag, so the name is the format. v2 added the version per entry.
+pub const INDEX_FILENAME: &str = "index-v2.bin";
+/// Removed on open: a downgraded binary would resume from it over WALs compaction has since rewritten.
+pub const LEGACY_INDEX_FILENAME: &str = "index-current.bin";
+
+/// The frame that last wrote a key. `(term, lsn)` names one entry of a group's log, on every member
+/// of it, and compaction and snapshot installs copy frame headers verbatim, so it survives both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Version {
+    pub term: u64,
+    pub lsn: u64,
+}
+
+impl Version {
+    pub fn etag(&self) -> String {
+        format!("\"{}.{}\"", self.term, self.lsn)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexEntry {
@@ -18,9 +35,15 @@ pub struct IndexEntry {
     pub len: u32,
     #[serde(default)]
     pub inline: Option<Box<[u8]>>,
+    pub lsn: u64,
+    pub term: u64,
 }
 
 impl IndexEntry {
+    pub fn version(&self) -> Version {
+        Version { term: self.term, lsn: self.lsn }
+    }
+
     pub fn frame_bytes(&self) -> u64 {
         HEADER_LEN as u64 + self.len as u64
     }

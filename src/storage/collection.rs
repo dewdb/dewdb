@@ -1,7 +1,10 @@
 //! A collection's index, key locks, group commit, and read path.
 
 use super::frame::{Configuration, HandoverRecord, LogEntry};
-use super::index::{AppliedMeta, AppliedPos, IndexEntry, IndexSnapshot, LsnMeta, ReadCacheConfig, INDEX_FILENAME};
+use super::index::{
+    AppliedMeta, AppliedPos, IndexEntry, IndexSnapshot, LsnMeta, ReadCacheConfig, Version,
+    INDEX_FILENAME, LEGACY_INDEX_FILENAME,
+};
 use super::secondary::{index_values, IndexChange, IndexKey, IndexSpec, IndexStatus, Indexes, Selection, BUILD_CHUNK};
 use super::wal::{WalCut, WalsState};
 use crate::model::MAX_QUERY_LIMIT;
@@ -188,6 +191,12 @@ impl Collection {
         let mut staged_inline: u64 = 0;
         let mut wal_files = Vec::new();
 
+        match fs::remove_file(root_path.join(LEGACY_INDEX_FILENAME)) {
+            Ok(()) => info!(target: "storage", collection = %name, "Retired the pre-v2 index snapshot; replaying"),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {},
+            Err(e) => return Err(e),
+        }
+
         let index_path = root_path.join(INDEX_FILENAME);
         let mut snapshot_loaded = false;
         let mut snapshot_wal_id = 0;
@@ -361,7 +370,7 @@ impl Collection {
         self.truncation_fence.lock().unwrap().is_some()
     }
 
-    pub fn build_entry(&self, wal_id: u64, offset: u64, payload: &[u8]) -> IndexEntry {
+    pub fn build_entry(&self, wal_id: u64, offset: u64, lsn: u64, term: u64, payload: &[u8]) -> IndexEntry {
         let len = payload.len() as u32;
         let inline = if len <= self.cache.inline_max_value_bytes
             && self.inline_resident() + len as u64 <= self.cache.inline_budget_bytes
@@ -370,7 +379,7 @@ impl Collection {
         } else {
             None
         };
-        IndexEntry { wal_id, offset, len, inline }
+        IndexEntry { wal_id, offset, len, inline, lsn, term }
     }
 
     /// Committed plus staged inline bytes -- the budget bounds resident memory, and a staged frame's
@@ -381,8 +390,8 @@ impl Collection {
 
     /// `build_entry` plus the reservation the frame holds until it commits or is truncated. Without
     /// it a burst of uncommitted writes each sizes itself against the same unused budget (M11).
-    fn reserve_staged_entry(&self, wal_id: u64, offset: u64, payload: &[u8]) -> IndexEntry {
-        let entry = self.build_entry(wal_id, offset, payload);
+    fn reserve_staged_entry(&self, wal_id: u64, offset: u64, lsn: u64, term: u64, payload: &[u8]) -> IndexEntry {
+        let entry = self.build_entry(wal_id, offset, lsn, term, payload);
         self.staged_inline.fetch_add(entry.inline_bytes(), Ordering::Relaxed);
         entry
     }
@@ -1072,22 +1081,23 @@ impl Collection {
         }
     }
 
-    /// Compaction remaps the index before it retires a WAL, so a location that fails validation or
-    /// lost its file is stale by definition: re-resolve and retry. An unmoved location is a real error.
-    fn read_located(&self, key: &str, at: Located) -> io::Result<Option<serde_json::Value>> {
-        let mut at = at;
+    /// A location that fails validation or lost its file was retired by compaction: re-resolve, and
+    /// return the version of the frame actually read, which a re-resolve can change.
+    fn read_located(&self, key: &str, at: Located, version: Version) -> io::Result<Option<(serde_json::Value, Version)>> {
+        let (mut at, mut version) = (at, version);
         for _ in 0..READ_RESOLVE_ATTEMPTS {
             let err = match self.read_frame_payload(at.0, at.1, at.2) {
-                Ok(payload) => return Ok(Self::value_from_payload(&payload)),
+                Ok(payload) => return Ok(Self::value_from_payload(&payload).map(|v| (v, version))),
                 Err(e) => e,
             };
             let index = self.index.read().unwrap();
             match index.get(key) {
                 None => return Ok(None),
                 Some(entry) => match &entry.inline {
-                    Some(payload) => return Ok(Self::value_from_payload(payload)),
+                    Some(payload) => return Ok(Self::value_from_payload(payload).map(|v| (v, entry.version()))),
                     None if (entry.wal_id, entry.offset, entry.len) != at => {
                         at = (entry.wal_id, entry.offset, entry.len);
+                        version = entry.version();
                     },
                     None => return Err(err),
                 },
@@ -1108,19 +1118,24 @@ impl Collection {
     }
 
     pub fn get(&self, key: &str) -> io::Result<Option<serde_json::Value>> {
+        Ok(self.get_versioned(key)?.map(|(value, _)| value))
+    }
+
+    /// The committed value and the version of the frame it came from, read as one.
+    pub fn get_versioned(&self, key: &str) -> io::Result<Option<(serde_json::Value, Version)>> {
         self.check_live()?;
-        let at = {
+        let (at, version) = {
             let index = self.index.read().unwrap();
             match index.get(key) {
                 None => return Ok(None),
                 Some(entry) => match &entry.inline {
-                    Some(payload) => return Ok(Self::value_from_payload(payload)),
-                    None => (entry.wal_id, entry.offset, entry.len),
+                    Some(payload) => return Ok(Self::value_from_payload(payload).map(|v| (v, entry.version()))),
+                    None => ((entry.wal_id, entry.offset, entry.len), entry.version()),
                 },
             }
         };
 
-        self.read_located(key, at)
+        self.read_located(key, at, version)
     }
 
     pub fn list_all(&self) -> io::Result<Vec<serde_json::Value>> {
@@ -1137,13 +1152,13 @@ impl Collection {
                             resolved.push(v);
                         }
                     },
-                    None => pending.push((key.clone(), (entry.wal_id, entry.offset, entry.len))),
+                    None => pending.push((key.clone(), (entry.wal_id, entry.offset, entry.len), entry.version())),
                 }
             }
         }
 
-        for (key, at) in pending {
-            if let Some(v) = self.read_located(&key, at)? {
+        for (key, at, version) in pending {
+            if let Some((v, _)) = self.read_located(&key, at, version)? {
                 resolved.push(v);
             }
         }
@@ -1173,7 +1188,7 @@ impl Collection {
             // `wal_writer`: a definition just below this frame is already in force for it.
             LogEntry::Put { key, value, .. } => StagedEffect::Put {
                 key: key.clone(),
-                entry: self.reserve_staged_entry(wal_id, offset, payload),
+                entry: self.reserve_staged_entry(wal_id, offset, lsn, term, payload),
                 indexed: index_values(&Self::overlay_index_specs(&committed_specs, &pending), value),
             },
             LogEntry::Del { key, .. } => StagedEffect::Remove { key: key.clone() },
@@ -1436,6 +1451,10 @@ impl Collection {
 
     /// Read-modify-write must read the newest durable value; the committed one drops a racing write.
     pub fn get_including_staged(&self, key: &str) -> io::Result<Option<serde_json::Value>> {
+        Ok(self.get_including_staged_versioned(key)?.map(|(value, _)| value))
+    }
+
+    pub fn get_including_staged_versioned(&self, key: &str) -> io::Result<Option<(serde_json::Value, Version)>> {
         self.check_live()?;
         let staged = {
             let pending = self.pending.lock().unwrap();
@@ -1447,9 +1466,19 @@ impl Collection {
         };
         match staged {
             Some(None) => Ok(None),
-            Some(Some(entry)) => self.read_entry(&entry),
-            None => self.get(key),
+            Some(Some(entry)) => Ok(self.read_entry(&entry)?.map(|v| (v, entry.version()))),
+            None => self.get_versioned(key),
         }
+    }
+
+    /// What a precondition is judged against: the newest durable write, committed or not. A staged
+    /// write commits before anything appended above it, so a check that ignored it would be stale.
+    pub fn version_including_staged(&self, key: &str) -> Option<Version> {
+        let staged = {
+            let pending = self.pending.lock().unwrap();
+            pending.values().rev().find_map(|s| s.effect.resolve(key)).map(|e| e.map(IndexEntry::version))
+        };
+        staged.unwrap_or_else(|| self.index.read().unwrap().get(key).map(IndexEntry::version))
     }
 
     pub fn last_appended_lsn(&self) -> u64 {
@@ -1480,7 +1509,7 @@ impl Collection {
             map: index.clone(),
         };
 
-        let temp_path = self.root_path.join("index-current.tmp");
+        let temp_path = self.root_path.join("index-v2.tmp");
         let path = self.root_path.join(INDEX_FILENAME);
 
         let file = File::create(&temp_path)?;
@@ -1867,14 +1896,63 @@ mod tests {
         let stale = disk_put(&col, "a", "a");
         disk_put(&col, "b", "b");
         col.enqueue_commit().await.unwrap().unwrap();
+        let written = col.get_versioned("a").unwrap().unwrap().1;
 
         col.compact(Retention::none()).unwrap();
         assert!(col.retired_through.load(Ordering::SeqCst) >= stale.0,
             "compaction must retire the WAL the location names");
 
-        let value = col.read_located("a", stale).unwrap()
+        let (value, version) = col.read_located("a", stale, written).unwrap()
             .expect("a location retired mid-read must be re-resolved, not dropped");
         assert_eq!(value["v"], "a".repeat(600));
+        assert_eq!(version, written, "relocating a frame is not a new write");
+    }
+
+    #[tokio::test]
+    async fn a_version_survives_compaction_and_restart_and_moves_only_on_a_write() {
+        let root = temp_root();
+        let first = {
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("c").unwrap();
+            live_put(&col, "a", 1);
+            live_put(&col, "b", 1);
+            live_put(&col, "b", 2);
+            let first = col.get_versioned("a").unwrap().unwrap().1;
+            assert_eq!(col.version_including_staged("a"), Some(first));
+
+            col.compact(Retention::none()).unwrap();
+            assert_eq!(col.get_versioned("a").unwrap().unwrap().1, first);
+            col.save_index().unwrap();
+            first
+        };
+
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+        assert_eq!(col.get_versioned("a").unwrap().unwrap().1, first,
+            "the snapshot and the replay above it must agree on which frame wrote the key");
+
+        let staged = stage_put(&col, "a", 2);
+        let moved = col.version_including_staged("a").unwrap();
+        assert_eq!(moved.lsn, staged);
+        assert_ne!(moved, first);
+        assert_eq!(col.get_versioned("a").unwrap().unwrap().1, first,
+            "a read sees the committed version while the write above it is staged");
+        col.apply_committed(staged).unwrap();
+        assert_eq!(col.get_versioned("a").unwrap().unwrap().1, moved);
+
+        stage_delete(&col, "a");
+        assert_eq!(col.version_including_staged("a"), None);
+    }
+
+    #[tokio::test]
+    async fn opening_retires_the_pre_v2_snapshot_so_a_downgrade_replays() {
+        let root = temp_root();
+        let dir = root.join("c");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(LEGACY_INDEX_FILENAME), b"not a v2 snapshot").unwrap();
+        let db = Database::new(&root).unwrap();
+        db.get_collection("c").unwrap();
+        assert!(!dir.join(LEGACY_INDEX_FILENAME).exists());
     }
 
     fn inline_count(col: &Arc<Collection>) -> usize {
@@ -2638,12 +2716,12 @@ mod tests {
         let db = Database::with_config(&root, cache_cfg(64, 1 << 20), Default::default()).unwrap();
         let col = db.get_collection("c").unwrap();
 
-        let (f, w, o, _) = col.put("small".into(), serde_json::json!({"v": 1}), 1).unwrap();
-        col.index.write().unwrap().insert("small".into(), col.build_entry(w, o, &f[HEADER_LEN..]));
+        let (f, w, o, lsn) = col.put("small".into(), serde_json::json!({"v": 1}), 1).unwrap();
+        col.index.write().unwrap().insert("small".into(), col.build_entry(w, o, lsn, 1, &f[HEADER_LEN..]));
 
         let big = "x".repeat(500);
-        let (f2, w2, o2, _) = col.put("big".into(), serde_json::json!({"v": big.clone()}), 1).unwrap();
-        col.index.write().unwrap().insert("big".into(), col.build_entry(w2, o2, &f2[HEADER_LEN..]));
+        let (f2, w2, o2, lsn2) = col.put("big".into(), serde_json::json!({"v": big.clone()}), 1).unwrap();
+        col.index.write().unwrap().insert("big".into(), col.build_entry(w2, o2, lsn2, 1, &f2[HEADER_LEN..]));
 
         let index = col.index.read().unwrap();
         assert!(index.get("small").unwrap().inline.is_some(), "a value under the threshold is cached");

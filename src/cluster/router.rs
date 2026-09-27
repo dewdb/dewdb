@@ -30,12 +30,24 @@ pub enum ForwardMethod {
     Delete,
 }
 
-fn build_forward(client: &reqwest::Client, method: &ForwardMethod, url: &str, body: Option<&CreateDoc>) -> reqwest::RequestBuilder {
-    let rb = match method {
+fn build_forward(
+    client: &reqwest::Client,
+    method: &ForwardMethod,
+    url: &str,
+    body: Option<&CreateDoc>,
+    conditions: &axum::http::HeaderMap,
+) -> reqwest::RequestBuilder {
+    let mut rb = match method {
         ForwardMethod::Put => client.put(url),
         ForwardMethod::Patch => client.patch(url),
         ForwardMethod::Delete => client.delete(url),
     };
+    // Judged by the shard, under the key lock; a router has no version to compare against.
+    for name in &crate::api::precondition::CONDITIONAL_HEADERS {
+        for value in conditions.get_all(name) {
+            rb = rb.header(name.as_str(), value.as_bytes());
+        }
+    }
     match body {
         Some(b) => rb.json(b),
         None => rb,
@@ -47,11 +59,14 @@ fn build_forward(client: &reqwest::Client, method: &ForwardMethod, url: &str, bo
 pub struct ShardReply {
     pub status: StatusCode,
     pub body: String,
+    pub etag: Option<axum::http::HeaderValue>,
 }
 
 impl ShardReply {
     pub(crate) async fn of(r: reqwest::Response) -> Self {
-        Self { status: r.status(), body: r.text().await.unwrap_or_default() }
+        let etag = r.headers().get(reqwest::header::ETAG)
+            .and_then(|v| axum::http::HeaderValue::from_bytes(v.as_bytes()).ok());
+        Self { status: r.status(), etag, body: r.text().await.unwrap_or_default() }
     }
 
     /// `Some(owner)` when the shard is telling us our view is stale rather than answering.
@@ -67,7 +82,11 @@ impl ShardReply {
 pub fn passthrough(reply: ShardReply) -> axum::response::Response {
     let json: serde_json::Value = serde_json::from_str(&reply.body)
         .unwrap_or(serde_json::Value::String(reply.body));
-    (reply.status, Json(json)).into_response()
+    let mut response = (reply.status, Json(json)).into_response();
+    if let Some(etag) = reply.etag {
+        response.headers_mut().insert(axum::http::header::ETAG, etag);
+    }
+    response
 }
 
 // A shard's 4xx is an answer, not a failure: a PATCH 404 means no document, not a dead node.
@@ -78,6 +97,7 @@ fn authoritative_write_status(s: StatusCode) -> bool {
         || s == StatusCode::CONFLICT
         || s == StatusCode::PAYLOAD_TOO_LARGE
         || s == StatusCode::UNPROCESSABLE_ENTITY
+        || s == StatusCode::PRECONDITION_FAILED
 }
 
 /// One attempt at `base`, graded, following a `409` naming an owner once. The `bool` marks an
@@ -110,6 +130,7 @@ pub async fn router_forward_write(
     method: ForwardMethod,
     body: Option<&CreateDoc>,
     wc_query: &str,
+    conditions: &axum::http::HeaderMap,
 ) -> Result<ShardReply, axum::response::Response> {
     let hash = hash_key(col_name, key);
 
@@ -125,7 +146,7 @@ pub async fn router_forward_write(
 
     // Every attempt below follows a redirect, because one write can meet a stale ring and a dead
     // primary at once; none of them caches an override off a reply that only disowned the key.
-    let send = |url: &str| build_forward(&state.client, &method, url, body);
+    let send = |url: &str| build_forward(&state.client, &method, url, body, conditions);
 
     if let Some((reply, redirected)) = attempt_write(&send, &effective_url, &path).await {
         if !redirected && effective_url != original_url {
@@ -1707,6 +1728,7 @@ mod tests {
     #[test]
     fn a_refusal_body_keeps_its_fields_and_a_plain_text_one_becomes_a_message() {
         let structured = ShardReply {
+            etag: None,
             status: StatusCode::PAYLOAD_TOO_LARGE,
             body: r#"{"error":"batch of 10 documents exceeds max_uncommitted_frames (2)","bound":2}"#.to_string(),
         };
@@ -1715,12 +1737,13 @@ mod tests {
         assert!(body["error"].as_str().unwrap().contains("exceeds"));
 
         let text = ShardReply {
+            etag: None,
             status: StatusCode::BAD_REQUEST,
             body: "Key not owned by any shard".to_string(),
         };
         assert_eq!(refusal_body(&text)["error"], "Key not owned by any shard");
 
-        let empty = ShardReply { status: StatusCode::CONFLICT, body: String::new() };
+        let empty = ShardReply { status: StatusCode::CONFLICT, body: String::new(), etag: None };
         assert_eq!(refusal_body(&empty)["error"], "Conflict", "an empty body still names the status");
     }
 

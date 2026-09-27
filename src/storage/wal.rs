@@ -213,7 +213,7 @@ impl Collection {
                             };
                             StagedEffect::Put {
                                 key,
-                                entry: IndexEntry { wal_id, offset, len, inline },
+                                entry: IndexEntry { wal_id, offset, len, inline, lsn, term },
                                 indexed: index_values(indexes, &value),
                             }
                         },
@@ -251,7 +251,7 @@ impl Collection {
                         } else {
                             None
                         };
-                        if let Some(old) = index.insert(key, IndexEntry { wal_id, offset, len: len as u32, inline }) {
+                        if let Some(old) = index.insert(key, IndexEntry { wal_id, offset, len: len as u32, inline, lsn, term }) {
                             *inline_used -= old.inline_bytes();
                         }
                         *dropped = false;

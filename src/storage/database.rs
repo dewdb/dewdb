@@ -2,7 +2,7 @@
 
 use super::collection::Collection;
 use crate::consensus::config::{is_system_collection, valid_collection_name};
-use super::index::{AppliedMeta, INDEX_FILENAME, LsnMeta, ReadCacheConfig};
+use super::index::{AppliedMeta, INDEX_FILENAME, LEGACY_INDEX_FILENAME, LsnMeta, ReadCacheConfig};
 use crate::changefeed::{Changefeed, ChangefeedConfig, SubscribeError, Subscription};
 use crate::util::{remove_dir_with_retry, rename_with_retry, write_atomic};
 use std::collections::{HashMap, HashSet};
@@ -49,6 +49,7 @@ fn staged_install_ready(dir: &Path) -> bool {
 fn holds_collection_data(dir: &Path) -> bool {
     dir.join("applied.meta").is_file()
         || dir.join(INDEX_FILENAME).is_file()
+        || dir.join(LEGACY_INDEX_FILENAME).is_file()
         || fs::read_dir(dir).ok().is_some_and(|entries| {
             entries.flatten().any(|entry| {
                 entry.file_name().to_str().is_some_and(|n| {

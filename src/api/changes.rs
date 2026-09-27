@@ -190,14 +190,23 @@ mod tests {
     use crate::test_support::{next_test_port, single_node, temp_root, SseTap, TestNode};
 
     const SETTLE: Duration = Duration::from_secs(5);
+    const RESPONSE_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// Bounds the wait for response headers only; a reqwest timeout would also end the SSE body (IB-061).
+    async fn bounded(request: reqwest::RequestBuilder, what: &str) -> reqwest::Response {
+        tokio::time::timeout(RESPONSE_DEADLINE, request.send()).await
+            .unwrap_or_else(|_| panic!("{} got no response within {:?}", what, RESPONSE_DEADLINE))
+            .unwrap()
+    }
 
     async fn changes(client: &reqwest::Client, base: &str, query: &str) -> reqwest::Response {
-        client.get(format!("{}/collections/c/changes{}", base, query)).send().await.unwrap()
+        bounded(client.get(format!("{}/collections/c/changes{}", base, query)),
+            &format!("GET /changes{}", query)).await
     }
 
     async fn put(client: &reqwest::Client, base: &str, key: &str, body: serde_json::Value) {
-        let r = client.put(format!("{}/collections/c/docs/{}", base, key))
-            .json(&serde_json::json!({"value": body})).send().await.unwrap();
+        let r = bounded(client.put(format!("{}/collections/c/docs/{}", base, key))
+            .json(&serde_json::json!({"value": body})), &format!("PUT {}", key)).await;
         assert!(r.status().is_success(), "write failed: {}", r.status());
     }
 
