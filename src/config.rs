@@ -8,6 +8,7 @@ use crate::logging::LoggingConfig;
 use crate::maintenance::MaintenanceConfig;
 use crate::ring::{validate_shard_ring, HashRing, ShardInfo};
 use crate::storage::ReadCacheConfig;
+use crate::tls::{plaintext_urls, TlsConfig};
 use crate::webhook::WebhookConfig;
 use crate::util::{node_key, same_endpoint};
 use serde::Deserialize;
@@ -61,6 +62,8 @@ pub struct NodeConfig {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub tls: TlsConfig,
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
     /// Development only: lets a ring change reassign ownership on a cluster that already holds data,
@@ -109,6 +112,8 @@ impl NodeConfig {
     pub fn own_url(&self) -> String {
         if self.listen_addr.contains("://") {
             self.listen_addr.clone()
+        } else if self.tls.serves() {
+            format!("https://{}", self.listen_addr)
         } else {
             format!("http://{}", self.listen_addr)
         }
@@ -162,9 +167,27 @@ impl NodeConfig {
         }
         self.logging.validate()?;
         self.auth.validate()?;
+        self.tls.validate()?;
+        if self.tls.serves() {
+            let plaintext = plaintext_urls(self.peer_urls());
+            if !plaintext.is_empty() {
+                return Err(format!(
+                    "tls is served, so peers are dialed over https only; these are http:// and unreachable: {}",
+                    plaintext.join(", ")));
+            }
+        }
         self.changefeed.validate()?;
         self.webhooks.validate()?;
         Ok(())
+    }
+
+    /// Every node URL this file names.
+    pub fn peer_urls(&self) -> impl Iterator<Item = &str> {
+        let shards = self.shard_map.iter().flat_map(|s| std::iter::once(&s.node_url).chain(&s.replica_urls));
+        let ring = self.ring.iter().flat_map(|r| &r.shards)
+            .flat_map(|s| std::iter::once(&s.node_url).chain(&s.replica_urls));
+        self.peers.iter().chain(&self.replicas).chain(&self.primary_addr).chain(shards).chain(ring)
+            .map(String::as_str)
     }
 
     pub fn is_learner(&self) -> bool {

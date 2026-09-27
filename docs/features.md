@@ -18,7 +18,7 @@ and no separate metadata service.
 | Area | What you get |
 |---|---|
 | Data model | Schemaless JSON documents in auto-created collections, string keys |
-| API | REST over HTTP: CRUD, bulk writes, query, aggregation, collection admin, cluster control |
+| API | REST over HTTP: CRUD with `ETag` and `If-Match`, bulk writes, query, aggregation, collection admin, cluster control |
 | Query | Equality, comparison, string, existence, type and array predicates with `$and`/`$or`/`$nor`, dotted paths, multi-field sort, projection, cursor paging sorted or not |
 | Aggregation | Shard-side `count`, `sum`, `avg`, `min`, `max`, grouped on dotted fields, merged across shards through the totals rather than the answers |
 | Indexes | Per-collection secondary indexes on dotted fields, replicated as log entries and carried across shard groups by a cluster-wide catalogue, used for equality and range filters |
@@ -80,10 +80,20 @@ and no separate metadata service.
   them stays an operator constraint.
 - **Keys survive routing.** The router percent-encodes each path segment it forwards, so a key
   containing `/`, `?` or `#` reaches the shard as the key the ring hashed.
+- **Conditional writes.** Every read and write of a document returns an `ETag`, and `PUT`, `POST`,
+  `PATCH` and `DELETE` take `If-Match` and `If-None-Match` per RFC 9110, answering `412` with the
+  current `ETag` when the condition fails. `If-None-Match: *` makes a `PUT` create-only.
+- **A version every node agrees on.** The `ETag` is the same on every member of the shard group, so
+  neither a failover, a compaction nor a snapshot transfer changes it. A key moved to another group
+  by a migration gets a new one.
+- **Judged where the write is decided.** The condition is checked on the leader as the write is
+  applied, against the newest write of the document including one still replicating, so two
+  conditional writers cannot both pass. A `PATCH` is judged on the version it merges into.
 
-**Guarantee.** A single document write is atomic: it becomes durable as one frame or not at all.
-**Scope.** Writes are per document — there are no multi-document transactions, and no per-document
-version or compare-and-set token.
+**Guarantee.** A single document write is atomic: it becomes durable as one frame or not at all, and
+a conditional one is applied only if the document is still at the version it names.
+**Scope.** Writes are per document — there are no multi-document transactions, and a bulk write
+cannot be conditional.
 
 ---
 
@@ -120,7 +130,8 @@ version or compare-and-set token.
 - **Cluster control** for membership, the voting set, ring publication, migration and rebalancing
   status.
 - **Status codes that say what happened.** `202` when a write is durable but its write concern was
-  not met, with `acks` and `required` in the body. `403` for a direct write to a follower. `409`
+  not met, with `acks` and `required` in the body. `412` when a conditional write's precondition
+  does not hold, naming the document's current `etag`. `403` for a direct write to a follower. `409`
   naming the real owner when a shard does not own the key. `503` with `Retry-After` for a
   replication backlog, a key mid-handover, a guaranteed read this node cannot answer right now, or a
   write whose leadership term went away underneath it. `207` when a fan-out partially failed, or
@@ -895,9 +906,19 @@ are right, and a direct request to the shard gives the precise message.
 - **Fail-loud credential validation.** A credential that could not go in an HTTP header fails the
   boot instead of silently disabling a check, and an unset credential is warned about at startup.
 - **Probe-friendly.** `/health` stays open; `/metrics` does not, because it exposes topology.
+- **TLS in the process.** One certificate and key in the config put the public API, `/internal/*`,
+  SSE and WebSocket behind TLS on the node's one port, with no proxy in front. A node that serves TLS
+  connects to its peers over `https://` only and verifies their certificates, against a configured
+  CA or the system roots, so replication never carries the shared secret in the clear. Plaintext
+  stays the default, because a single-node trial should not need a certificate.
+- **Certificate renewal without a restart.** A replaced certificate and key are served from the next
+  connection; a pair that does not match is refused and the old one kept. The node warns weeks before
+  its own certificate expires.
 
-**Scope.** TLS is terminated in front of the node, and the credential tiers are client, admin and
-internal. At-rest encryption and audit logging live in the surrounding infrastructure. Compact and
+**Scope.** The credential tiers are client, admin and internal, and TLS does not add client
+certificates — the shared secret stays the internal identity. Changing the CA bundle needs a restart,
+and an existing plaintext cluster cannot yet be switched to TLS in place. At-rest encryption and
+audit logging live in the surrounding infrastructure. Compact and
 snapshot sit on the client tier.
 
 ---
@@ -992,23 +1013,6 @@ The shape of what DewDB does today, in one place:
 | Change history | As far back as `changefeed.buffer_events` per collection. A cluster-wide stream can miss up to a second of a collection's first changes on a shard group that held none of it when the stream opened. |
 | Webhooks | Registered per shard group. Registrations, removals and acknowledged positions are majority-committed; administration needs a reachable quorum. |
 | WebSocket auth | The handshake carries a credential header, so a browser reaches an authenticated feed through SSE and a same-origin proxy. |
-| TLS and audit | Terminated and collected in front of the node. |
+| TLS | In the process, for clusters started with it; an existing plaintext cluster cannot be switched in place, and a CA change needs a restart. |
+| Audit | Collected in front of the node. |
 | Cross-shard work | Per-key or fan-out; joins are done in the client. |
-
----
-
-## 16. Planned
-
-Two capabilities are designed and not yet shipped. They are listed here so the scope above is read
-as it stands today, not as a permanent boundary.
-
-- **TLS in the process.** The public and internal listeners terminate TLS from a certificate and key
-  named in the config, and a node dials its peers the same way, so replication does not carry its
-  shared secret in the clear and a deployment needs no proxy in front of it to be reachable safely.
-  Plaintext stays available, because a single-node trial should not need a certificate.
-
-- **Conditional writes.** `If-Match` on `PUT`, `PATCH` and `DELETE`, carrying the version a read
-  returned and answered `412` when the document moved underneath it. Single-document writes are
-  already atomic, but atomicity settles one write against another and never a write against the read
-  it was based on; the precondition is what lets two clients that read, decide and write notice that
-  one of them lost.

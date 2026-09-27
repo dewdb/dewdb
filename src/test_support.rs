@@ -183,6 +183,7 @@ pub struct TestNode {
     pub webhooks: serde_json::Value,
     /// An `AuthConfig` body; `{}` is the default open configuration.
     pub auth: serde_json::Value,
+    pub tls: serde_json::Value,
     /// A `FlowControlConfig` body; `{}` is the default 4096-frame bound.
     pub flow_control: serde_json::Value,
     pub state: Option<AppState>,
@@ -249,6 +250,7 @@ fn node_config(n: &TestNode) -> NodeConfig {
         "heartbeat_timeout_secs": n.heartbeat_timeout_secs,
         "election_delay_ms": 200,
         "auth": n.auth,
+        "tls": n.tls,
         "changefeed": n.changefeed,
         "webhooks": n.webhooks,
         "flow_control": n.flow_control,
@@ -281,6 +283,7 @@ impl TestNode {
             data_movement_batch_size: 64,
             data_movement_batch_delay_ms: 5,
             auth: serde_json::json!({}),
+            tls: serde_json::json!({}),
             flow_control: serde_json::json!({}),
             changefeed: serde_json::json!({}),
             webhooks: serde_json::json!({}),
@@ -291,7 +294,8 @@ impl TestNode {
     }
 
     pub fn url(&self) -> String {
-        format!("http://{}", self.addr)
+        let scheme = if self.tls.get("cert_file").is_some() { "https" } else { "http" };
+        format!("{}://{}", scheme, self.addr)
     }
 
     pub fn start(&mut self) {
@@ -311,6 +315,8 @@ impl TestNode {
                 .unwrap();
 
             rt.block_on(async move {
+                let peer_trust = crate::tls::PeerTrust::load(&config.tls).unwrap();
+                let server_tls = crate::tls::ServerTls::load(&config.tls).unwrap();
                 let is_router = config.role == "router";
                 let db = (!is_router).then(|| Arc::new(
                     Database::with_config(&config.data_dir, ReadCacheConfig::default(),
@@ -355,8 +361,8 @@ impl TestNode {
                     db,
                     auth: Arc::new(RwLock::new(config.auth.clone())),
                     config: Arc::new(config.clone()),
-                    client: build_client(&config.auth, &config.own_url()),
-                    stream_client: crate::auth::build_stream_client(&config.auth, &config.own_url()),
+                    client: build_client(&config.auth, &peer_trust, &config.own_url()),
+                    stream_client: crate::auth::build_stream_client(&config.auth, &peer_trust, &config.own_url()),
                     replication: (!is_router).then_some(replication),
                     primary_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),
                     shard_failover_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -410,7 +416,7 @@ impl TestNode {
 
                 let listener = bind_with_retry(&addr).await;
                 tokio::spawn(async move {
-                    let _ = axum::serve(listener, app).await;
+                    let _ = crate::tls::serve(listener, app, server_tls).await;
                 });
 
                 tx.send(state).unwrap();

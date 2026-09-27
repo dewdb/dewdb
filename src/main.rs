@@ -19,6 +19,7 @@ mod replication;
 mod ring;
 mod state;
 mod storage;
+mod tls;
 mod util;
 mod webhook;
 
@@ -111,10 +112,10 @@ fn log_listening(config: &NodeConfig) {
     match config.effective_shard_role() {
         Some(shard_role) => info!(target: "boot",
             node_id = %config.node_id, role = %config.role, shard_role = %shard_role,
-            listen_addr = %config.listen_addr, data_dir = %config.data_dir, "listening"),
+            listen_addr = %config.listen_addr, tls = config.tls.serves(), data_dir = %config.data_dir, "listening"),
         None => info!(target: "boot",
             node_id = %config.node_id, role = %config.role,
-            listen_addr = %config.listen_addr, data_dir = %config.data_dir, "listening"),
+            listen_addr = %config.listen_addr, tls = config.tls.serves(), data_dir = %config.data_dir, "listening"),
     }
 }
 
@@ -220,6 +221,13 @@ async fn main() -> io::Result<()> {
         eprintln!("Invalid config map constraints: {}", e);
         std::process::exit(cli::EXIT_BAD_CONFIG);
     }
+    let (server_tls, peer_trust) = match (tls::ServerTls::load(&config.tls), tls::PeerTrust::load(&config.tls)) {
+        (Ok(server), Ok(trust)) => (server, trust),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("Invalid TLS files: {}", e);
+            std::process::exit(cli::EXIT_BAD_CONFIG);
+        },
+    };
 
     init_logging(&config.logging, &config.node_id);
 
@@ -241,6 +249,16 @@ async fn main() -> io::Result<()> {
     }
 
     let cluster = Arc::new(RwLock::new(load_cluster_view(&config)));
+    if config.tls.serves() {
+        let view = cluster.read().unwrap();
+        let urls = view.members.iter().map(|m| m.url.as_str())
+            .chain(view.shards.iter().flat_map(|s| std::iter::once(&s.node_url).chain(&s.replica_urls)).map(String::as_str));
+        let plaintext = tls::plaintext_urls(urls);
+        if !plaintext.is_empty() {
+            warn!(target: "boot", urls = %plaintext.join(", "),
+                "The cluster view on disk names http:// nodes and this node dials https only; they are unreachable (IB-062)");
+        }
+    }
 
     let db = if config.role == "shard" {
         Some(Arc::new(Database::with_config(
@@ -307,10 +325,13 @@ async fn main() -> io::Result<()> {
         None
     };
 
-    let client = build_client(&config.auth, &config.own_url());
+    let client = build_client(&config.auth, &peer_trust, &config.own_url());
 
     if config.auth.internal_secret.is_none() && config.role == "shard" {
         warn!(target: "boot", "auth.internal_secret is not set; /internal/* endpoints accept unauthenticated requests");
+    }
+    if config.auth.internal_secret.is_some() && !config.tls.serves() {
+        warn!(target: "boot", "tls is not configured; auth.internal_secret crosses the network in the clear");
     }
     if !config.auth.public_locked() {
         warn!(target: "boot", "auth.api_keys is empty; the public API accepts unauthenticated requests");
@@ -330,7 +351,7 @@ async fn main() -> io::Result<()> {
         auth: Arc::new(RwLock::new(config.auth.clone())),
         config: Arc::new(config.clone()),
         client: client.clone(),
-        stream_client: crate::auth::build_stream_client(&config.auth, &config.own_url()),
+        stream_client: crate::auth::build_stream_client(&config.auth, &peer_trust, &config.own_url()),
         replication,
         primary_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),
         shard_failover_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -408,9 +429,13 @@ async fn main() -> io::Result<()> {
         }
     }
 
+    if let Some(server_tls) = &server_tls {
+        tls::reload_task(server_tls.clone());
+    }
+
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     log_listening(&config);
-    axum::serve(listener, app).await?;
+    tls::serve(listener, app, server_tls).await?;
 
     Ok(())
 }

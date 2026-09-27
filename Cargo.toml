@@ -15,7 +15,13 @@ hmac = "0.12"
 axum = { version = "0.7", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 bincode = "1"
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls-manual-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = { version = "1.9", features = ["std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"] }
+tower = "0.5"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 futures = "0.3"
 tokio-util = { version = "0.7", features = ["io"] }
@@ -25,3 +31,4 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 [dev-dependencies]
 # The test suite is in-crate, so a WebSocket client for it is a dev dependency of the binary.
 tokio-tungstenite = "0.24"
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }

@@ -233,6 +233,37 @@ curl -s -X DELETE localhost:8081/collections/users/docs/u1
 {"status":"deleted","existed":true}
 ```
 
+### Read, decide, write: conditional writes
+
+Two clients that read a document, decide something, and write it back will lose one of the two
+decisions unless the write says which version it was based on. Every read and write returns an
+`ETag` naming the version of the document:
+
+```bash
+curl -si localhost:8081/collections/accounts/docs/a1 | grep -i etag
+```
+
+```
+etag: "1.42"
+```
+
+Send it back as `If-Match`. If anyone wrote the document in between, the write is refused with
+`412` and nothing changes:
+
+```bash
+curl -s -X PUT localhost:8081/collections/accounts/docs/a1 -H 'content-type: application/json' -H 'If-Match: "1.42"' -d '{"value":{"balance":90}}'
+```
+
+```json
+{"error":"precondition failed: the document is not at the version the request names","etag":"1.43"}
+```
+
+The `412` names the version the document is at now: re-read it, decide again, and retry with that.
+`PATCH` and `DELETE` take `If-Match` too. `If-None-Match: *` on a `PUT` makes it create-only — it is
+refused if the key already holds a document. Treat the tag as opaque; it survives a failover, since
+every node in the group holds the same version, and it changes when a migration moves the key to
+another shard group. Bulk writes do not take either header.
+
 ### List a collection
 
 ```bash
@@ -1920,7 +1951,52 @@ collection on a credential you took away.
 `internal_secret` and `upstream_api_key` are wired into the node's outbound clients at boot, so
 changing either takes a restart. The node logs a warning when it sees one change under it.
 
-TLS is terminated in front of the node; keep `/internal/*` off untrusted networks.
+### Turn on TLS
+
+Without TLS the internal secret crosses the network in the clear, and the node warns about it at
+boot. Make a CA and a certificate for the node — the certificate has to name every host or IP the
+node is reached by:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 -subj "/CN=dew-ca" -keyout ca.key -out ca.pem
+openssl req -newkey rsa:2048 -nodes -subj "/CN=shard-1" -keyout node.key -out node.csr
+printf "subjectAltName=IP:127.0.0.1,DNS:localhost\n" > san.ext
+openssl x509 -req -in node.csr -CA ca.pem -CAkey ca.key -CAcreateserial -days 90 -extfile san.ext -out node.pem
+```
+
+In Git Bash on Windows, prefix the two `openssl req` lines with `MSYS_NO_PATHCONV=1` so `/CN=` is not
+read as a path. Then point the config at the files:
+
+```json
+"tls": { "cert_file": "node.pem", "key_file": "node.key", "ca_file": "ca.pem" }
+```
+
+The port now speaks TLS only:
+
+```bash
+curl -s --cacert ca.pem https://127.0.0.1:8081/health
+```
+
+Windows `curl` checks revocation and a private CA publishes none; add `--ssl-no-revoke` there.
+
+In a cluster, give every node its own certificate from the same CA and write every peer URL as
+`https://` — `peers`, `replicas`, `primary_addr`, `shard_map`, `ring`. A node that serves TLS refuses
+to boot with an `http://` peer in its file and never connects to one, so the secret cannot leak
+through a forgotten URL. `ca_file` is what it verifies peers against; leave it out to use the
+operating system's trusted roots.
+
+To renew, overwrite `node.pem` and `node.key`. The node picks the pair up within about five seconds
+and presents it from the next connection; if the key is written after the certificate, the first
+attempt is refused with a warning and the node keeps serving the old pair until the two match. It
+warns daily from three weeks before its certificate expires (`tls.expiry_warning_days`).
+
+Two current limits:
+
+- **Changing `ca_file` needs a restart.** To move to a new CA, add it to the bundle on every node and
+  restart each one, reissue certificates from it, then remove the old CA and restart again.
+- **An existing plaintext cluster cannot be switched to TLS in place yet.** The cluster remembers
+  its members by the `http://` addresses they joined with, and a node serving TLS cannot reach them.
+  Start a cluster with TLS if you want it.
 
 ---
 
@@ -2049,6 +2125,7 @@ Write a client against these and it will behave well during elections and topolo
 | `404` | no such document, or no such collection | expected for reads and patches; check the collection name before assuming the document is gone |
 | `409` | wrong owner (`owner` in body), a stale-view conflict, or a cursor issued against an older shard layout | retry via the router; restart the scan for a stale cursor |
 | `410` | a change-stream position older than the buffer holds | resume from the `resume_floor` in the body |
+| `412` | an `If-Match` or `If-None-Match` did not hold; the body's `etag` is the document's current version | re-read, decide again, and retry with the new tag |
 | `413` | the request body is over 2 MiB, or a bulk write has more documents than `max_uncommitted_frames` | split it — this one does not clear on retry |
 | `422` | a ring that fails validation, or a refused voting-set change | fix the layout or the set |
 | `429` | every scan slot on the node is taken: aggregation, or a filtered or sorted page | back off and retry |
@@ -2058,7 +2135,9 @@ Write a client against these and it will behave well during elections and topolo
 | `207` | fan-out partially failed, or a bulk write whose items did not all meet their concern | inspect the per-node or per-item results |
 
 Two rules of thumb: retries are safe for `PUT`, `PATCH` and `DELETE` on a known key (they are
-idempotent), and a `202` is not a failure — it is a durability report.
+idempotent), and a `202` is not a failure — it is a durability report. A conditional write is the
+exception to the first: if the attempt you are retrying was applied, the retry is `412`, so read the
+document before concluding the write was lost.
 
 ---
 

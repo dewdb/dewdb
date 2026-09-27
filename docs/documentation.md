@@ -107,8 +107,10 @@ ownership are the same data structure everywhere.
 - A **document** is any JSON value stored under a string **key**. Objects are the usual case;
   arrays, numbers and strings are stored as given.
 - `POST` generates a UUIDv4 key; `PUT` uses the key you supply.
-- A write is per document: there is no cross-document transaction and no per-document version or
-  compare-and-set token.
+- A write is per document: there is no cross-document transaction. A single-document write can be
+  made conditional on the version a read returned: every read and write returns an `ETag`, and
+  `If-Match` refuses the write with `412` if the document moved. See
+  [Conditional writes](#conditional-writes).
 - A single document write is atomic. A bulk write is one group commit and one replication round,
   reported per document, and its write concern is decided for the whole run — a replica that
   acknowledges the last frame holds every frame below it.
@@ -264,7 +266,8 @@ that should serve as primary.
     "max_backoff_ms": 30000
   },
   "logging": { "level": "info", "format": "text" },
-  "auth": { "internal_secret": null, "api_keys": [], "admin_keys": [], "upstream_api_key": null }
+  "auth": { "internal_secret": null, "api_keys": [], "admin_keys": [], "upstream_api_key": null },
+  "tls": { "cert_file": null, "key_file": null, "ca_file": null, "expiry_warning_days": 21 }
 }
 ```
 
@@ -274,7 +277,7 @@ that should serve as primary.
 |---|---|---|
 | `node_id` | — | Name used in logs, metrics, and as the author of view changes. |
 | `role` | — | `shard` or `router`. |
-| `listen_addr` | — | Bind address, and this node's identity in the cluster (`host:port`). |
+| `listen_addr` | — | Bind address, and this node's identity in the cluster (`host:port`). Advertised as `https://` when the node serves TLS. |
 | `shard_role` | none | `primary` or `replica`. A `primary` with no peers bootstraps as leader. |
 | `membership_mode` | `voter` | A `learner` never campaigns and is counted in no quorum. |
 | `data_dir` | `./data` | Where WALs, indexes and metadata live. Must not be blank. |
@@ -331,6 +334,7 @@ config edit is logged as ignored rather than applied. Delete `cluster.meta` to r
 | `webhooks.max_backoff_ms` | 30000 | Ceiling on that doubling. Must be at least `initial_backoff_ms`. |
 | `logging.level` / `.format` | `info` / `text` | `text` or `json`; `RUST_LOG` overrides the level. |
 | `auth.*` | open | Credentials — see [Security](#18-security). |
+| `tls.*` | off | TLS on the node's port and toward peers — see [TLS](#tls). |
 
 ### Boot validation and warnings
 
@@ -338,8 +342,10 @@ Fatal at boot: a key no field matches — the whole config tree is `deny_unknown
 fails the boot instead of silently taking a default — an unknown `role` or `shard_role`, an invalid
 ring or shard map, both ownership models set, a blank `data_dir`, an unknown `membership_mode`, a
 learner declared `primary`, an out-of-range maintenance ratio, rebalancing enabled on a router, an
-unusable log level or format, non-printable credentials, and an unreadable `cluster.meta` or
-`replication.meta`.
+unusable log level or format, non-printable credentials, `tls.cert_file` without `tls.key_file` or
+the reverse, a TLS file that cannot be read or a key that does not belong to its certificate, an
+`http://` peer, replica, primary or shard URL on a node that serves TLS, and an unreadable
+`cluster.meta` or `replication.meta`.
 
 `ShardInfo` and `HashRing` are deliberately exempt from the unknown-key check: they are also the
 wire format of the cluster view, which has to survive version skew between nodes.
@@ -356,6 +362,9 @@ Logged as warnings, because they are legal but usually mistakes:
   expires, and the warning names `membership_mode: "learner"` as the fix.
 - A router whose `data_dir` contains collection directories.
 - A missing `auth.internal_secret`, or an empty `auth.api_keys`.
+- An `auth.internal_secret` on a node that does not serve TLS, since the secret then crosses the
+  network in the clear.
+- On a node that serves TLS, `http://` nodes in the stored cluster view, which it cannot reach.
 - An empty `auth.admin_keys` while `auth.api_keys` is set, and the reverse.
 
 ### Example: three-node replicated group
@@ -1664,8 +1673,9 @@ All bodies are JSON. Errors are `{"error":"…"}`.
 | `GET` | `/collections/:name/changes` | A server-sent-events stream of committed changes, from one shard group or, on a router, from all of them. See [Change streams](#17b-change-streams). |
 | `GET` | `/collections/:name/changes/ws` | The same stream as a WebSocket, with the same parameters and the same refusals. |
 
-Mutating requests accept `?w=` and `?wtimeout=`. Merge-patch semantics are the standard ones: a
-`null` value removes a field, nested objects merge, anything else replaces.
+Mutating requests accept `?w=` and `?wtimeout=`, and single-document writes accept `If-Match` and
+`If-None-Match` — see [Conditional writes](#conditional-writes). Merge-patch semantics are the
+standard ones: a `null` value removes a field, nested objects merge, anything else replaces.
 
 `?read=` on `GET /collections/:name/docs/:id`, `/query` and `/aggregate`:
 
@@ -1681,15 +1691,37 @@ Status codes worth knowing:
 | Code | Meaning |
 |---|---|
 | `202` | Durable, but the write concern was not met; the body carries `acks` and `required`. |
-| `400` | An unknown `read` preference, a filter, sort or metric the engine cannot evaluate, a cursor that does not belong to this query, an aggregation over more groups than the ceiling or past its read budget without `partial=true`, a `max_docs` above the ceiling, or a non-canonical collection name outside `a-z0-9._-`. |
+| `400` | A malformed `If-Match` or `If-None-Match`, or either one on a bulk write. An unknown `read` preference, a filter, sort or metric the engine cannot evaluate, a cursor that does not belong to this query, an aggregation over more groups than the ceiling or past its read budget without `partial=true`, a `max_docs` above the ceiling, or a non-canonical collection name outside `a-z0-9._-`. |
 | `403` | A direct write sent to a node that is not the leader, or a collection name beginning with `_`. |
 | `404` | No such document, or no such collection. Reads never create one. On a router it means no shard holds it; a shard that holds none of a collection other shards do is not an error and does not reach the client. |
 | `410` | A change-stream position older than the buffer still holds; the body names the `resume_floor` that works. |
+| `412` | An `If-Match` or `If-None-Match` that does not hold. The body's `etag` is the document's current version, or `null` if it is absent. Nothing was written. |
 | `413` | A request body over `MAX_PUBLIC_BODY`, or a bulk write of more documents than `flow_control.max_uncommitted_frames` allows in total. Not retriable. Through a router it stays `413`, and a per-item `code` says which slice it refused. |
 | `422` | A ring that fails validation: overlapping or duplicated members, or a layout over the shard, vnode or token ceiling. |
 | `429` | Every scan slot on the node is taken: aggregation, a sorted page, or a filtered one. Retriable, and per node: through a router it means every target in some group said so. |
 | `409` | This shard does not own the key; the body names the `owner`. A router follows that name and retries once, for reads, single writes and bulk slices alike. Also an unsorted cursor issued against a different shard layout, from the shard as well as the router — a router passes that one through rather than trying the next replica, which holds the same view. |
 | `503` | Replication backlog too large, the key is mid-handover, or a `primary`/`quorum` read this node cannot answer. `Retry-After` is set. Also a write whose [leadership term](#the-leadership-fence) went away while it was in flight — nothing was acknowledged, and the retry belongs on whichever node took the term. |
+
+### Conditional writes
+
+Every `GET` of a document and every `POST`, `PUT` and `PATCH` returns an `ETag` naming the version of
+the document. Treat it as opaque. It is the same on every member of the shard group, so a failover
+does not change it, and neither do compaction and snapshot transfer. A key moved to another group by
+a migration gets a new one.
+
+`PUT`, `POST`, `PATCH` and `DELETE` take `If-Match` and `If-None-Match`, evaluated per RFC 9110:
+`If-Match` compares strongly and `*` requires the document to exist; `If-None-Match` compares weakly
+and `*` requires it to be absent, which makes `PUT` create-only. Both present must both hold. A
+failed condition is `412`, writes nothing, and carries the document's current `etag` in the body
+(`null` if it is absent).
+
+The condition is checked on the leader at the moment the write is applied, against the newest write
+of the document — including one that is still replicating — so two conditional writers cannot both
+pass against the same version. A `PATCH` is judged on the version of the document it merges into.
+Through a router, both headers are forwarded and the `ETag` and a `412` come back unchanged.
+
+A header that does not parse is `400`, never a write without its guard. A bulk write carrying either
+header is `400`: one header cannot name a version per document.
 
 A bulk write checks ownership for every key before writing anything: the batch is accepted whole or
 refused whole. [Admission](#11-flow-control) is whole-batch for the same reason.
@@ -2577,10 +2609,65 @@ Note also that a browser's `EventSource` cannot set headers, so a locked public 
 `fetch` and from ordinary clients but not from `EventSource`; the key deliberately has no
 query-parameter form, which would put it in every access log along the way.
 
-Handled outside the process: TLS, per-key authorization scopes finer than the three tiers above,
-at-rest encryption, and audit logging. Terminate TLS in front of the node and restrict network
-reachability of `/internal/*`; internal traffic authenticates with a shared secret sent in the clear,
-so `/internal/*` reachability is the control that matters.
+### TLS
+
+Off unless configured. With `tls.cert_file` and `tls.key_file` set, the node's port speaks TLS only —
+the public API, `/internal/*`, SSE and WebSocket — and the node advertises itself as
+`https://<listen_addr>`. That port serves no plaintext. TLS 1.2 and 1.3 are supported, over HTTP/1.1.
+
+```json
+"tls": {
+  "cert_file": "/etc/dewdb/node.pem",
+  "key_file": "/etc/dewdb/node.key",
+  "ca_file": "/etc/dewdb/cluster-ca.pem",
+  "expiry_warning_days": 21
+}
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `tls.cert_file` | none | PEM chain, leaf first. The leaf must name every host or IP that peers and clients reach this node by. |
+| `tls.key_file` | none | PEM private key for that leaf (PKCS#8, PKCS#1 or SEC1). Set together with `cert_file`. |
+| `tls.ca_file` | none | PEM bundle this node trusts when it connects to a peer. When set it *replaces* the operating system's roots; when unset, peers are verified against them. |
+| `tls.expiry_warning_days` | 21 | How long before the served certificate expires the node starts warning. |
+
+**Connecting to peers.** A node that serves TLS connects to peers over `https://` only. It refuses an
+`http://` URL outright, so the shared secret is never sent in the clear by accident, and it fails to
+boot if its config names an `http://` peer, replica, primary or shard. Peer URLs carry their scheme:
+write `https://` in `peers`, `replicas`, `primary_addr`, `shard_map` and `ring`. Every peer
+certificate is verified — the chain to `ca_file` or the system roots, the validity dates, and the
+host or IP being connected to. `ca_file` without a certificate and key is a client-only setup, such
+as a router serving plaintext beside its application while it connects to TLS shards; that node may
+still connect over `http://`.
+
+**The shared secret is still the identity.** TLS keeps internal traffic private and proves which
+node answered; it does not decide who may call. `/internal/*` is authorized by
+`auth.internal_secret` as before, now inside the TLS session. Client certificates are not used, so
+holding a certificate from the cluster CA does not by itself admit a caller.
+
+**Rotation and expiry.** The served certificate and key are re-read when either file changes,
+checked every five seconds. The next connection gets the new pair; established connections keep the
+one they started with. A pair that does not load — a key that is not the certificate's, a
+half-written file — is refused with a warning and the previous pair stays in force; the node tries
+again until the pair matches, so writing the certificate before the key is safe. From
+`expiry_warning_days` before the served certificate expires the node warns once a day, and it logs an
+error once it has expired. A peer whose certificate has expired is refused like any other that fails
+verification, so renew certificates ahead of time — replacing the files is enough, no restart needed.
+
+**Current limits.**
+
+- `tls.ca_file` is read at startup, like `auth.internal_secret`, so changing it needs a restart. A CA
+  rotates by adding the new CA to the bundle on every node, restarting each one, reissuing
+  certificates from it, then removing the old CA with another restart.
+- An existing plaintext cluster cannot be switched to TLS in place yet. The cluster view keeps the
+  `http://` addresses its members were recorded under, and a node serving TLS logs a warning for each
+  at boot and cannot reach them. Start a cluster with TLS if you want it.
+
+### Not handled in-process
+
+Per-key authorization scopes finer than the three tiers above, at-rest encryption, and audit
+logging. On a node without TLS, internal traffic authenticates with a shared secret sent in the
+clear, so restrict network reachability of `/internal/*` there.
 
 ---
 

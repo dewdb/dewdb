@@ -239,7 +239,7 @@ impl ClusterMetadata {
 
         // What this node runs as, not what its file spells: a shard that named no shard_role is a
         // replica, and it has to reach the member list as one or nothing downstream can see it.
-        push(&normalize_self_url(&cfg.listen_addr), &cfg.role, cfg.effective_shard_role(),
+        push(&cfg.own_url(), &cfg.role, cfg.effective_shard_role(),
             Some(&cfg.node_id));
         if let Some(primary) = &cfg.primary_addr {
             push(primary, "shard", Some("primary"), None);
@@ -585,15 +585,6 @@ impl ClusterMetadata {
 
 fn same_url(a: &str, b: &str) -> bool {
     crate::util::same_endpoint(a, b)
-}
-
-// listen_addr is a bind address, not a URL; peers and shard maps always carry a scheme.
-fn normalize_self_url(listen_addr: &str) -> String {
-    if listen_addr.contains("://") {
-        listen_addr.to_string()
-    } else {
-        format!("http://{}", listen_addr)
-    }
 }
 
 /// Outcome of offering a view to a node, kept distinct so callers can tell "already current" from

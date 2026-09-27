@@ -1,5 +1,6 @@
 //! Credential config and the authorization decision for a request path.
 
+use crate::tls::PeerTrust;
 use axum::http::HeaderMap;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -275,8 +276,8 @@ fn node_headers(auth: &AuthConfig, from: &str) -> reqwest::header::HeaderMap {
     headers
 }
 
-pub fn build_client(auth: &AuthConfig, from: &str) -> reqwest::Client {
-    reqwest::Client::builder()
+pub fn build_client(auth: &AuthConfig, trust: &PeerTrust, from: &str) -> reqwest::Client {
+    trust.apply(reqwest::Client::builder())
         .timeout(Duration::from_secs(5))
         .default_headers(node_headers(auth, from))
         .build()
@@ -285,8 +286,8 @@ pub fn build_client(auth: &AuthConfig, from: &str) -> reqwest::Client {
 
 /// The same credentials with no whole-request deadline, for the change streams a router holds open
 /// for as long as its own subscriber does. `STREAM_READ_TIMEOUT` is the liveness check in its place.
-pub fn build_stream_client(auth: &AuthConfig, from: &str) -> reqwest::Client {
-    reqwest::Client::builder()
+pub fn build_stream_client(auth: &AuthConfig, trust: &PeerTrust, from: &str) -> reqwest::Client {
+    trust.apply(reqwest::Client::builder())
         .connect_timeout(Duration::from_secs(5))
         .read_timeout(STREAM_READ_TIMEOUT)
         .default_headers(node_headers(auth, from))
