@@ -478,6 +478,11 @@ pub struct SseEvent {
     pub data: serde_json::Value,
 }
 
+/// For opening an `SseTap`: a pooled client whose connection holds a stream can stall its next request (IB-061).
+pub fn stream_client() -> reqwest::Client {
+    reqwest::Client::builder().pool_max_idle_per_host(0).build().unwrap()
+}
+
 /// Reads an SSE response in the background and collects what arrives. Dropping it aborts the read
 /// and closes the connection, which is how a test plays a subscriber going away.
 pub struct SseTap {

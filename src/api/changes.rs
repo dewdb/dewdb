@@ -187,7 +187,7 @@ pub async fn stream_changes(
 mod tests {
     use super::*;
     use crate::auth::API_KEY_HEADER;
-    use crate::test_support::{next_test_port, single_node, temp_root, SseTap, TestNode};
+    use crate::test_support::{next_test_port, single_node, stream_client, temp_root, SseTap, TestNode};
 
     const SETTLE: Duration = Duration::from_secs(5);
     const RESPONSE_DEADLINE: Duration = Duration::from_secs(10);
@@ -210,8 +210,8 @@ mod tests {
         assert!(r.status().is_success(), "write failed: {}", r.status());
     }
 
-    async fn watch(client: &reqwest::Client, base: &str, query: &str) -> SseTap {
-        let r = changes(client, base, query).await;
+    async fn watch(base: &str, query: &str) -> SseTap {
+        let r = changes(&stream_client(), base, query).await;
         assert_eq!(r.status(), StatusCode::OK, "{}", r.text().await.unwrap());
         let tap = SseTap::open(r);
         assert_eq!(tap.wait_for_events("open", 1, SETTLE).await.len(), 1,
@@ -232,13 +232,13 @@ mod tests {
         let c = reqwest::Client::new();
 
         put(&c, &n.url(), "seed", serde_json::json!({"v": 0})).await;
-        let tap = watch(&c, &n.url(), "").await;
+        let tap = watch(&n.url(), "").await;
 
         put(&c, &n.url(), "k1", serde_json::json!({"v": 1})).await;
         put(&c, &n.url(), "k1", serde_json::json!({"v": 2})).await;
-        c.delete(format!("{}/collections/c/docs/k1", n.url())).send().await.unwrap();
+        bounded(c.delete(format!("{}/collections/c/docs/k1", n.url())), "DELETE k1").await;
         // Nothing was there, so nothing changed, so nothing is published.
-        c.delete(format!("{}/collections/c/docs/absent", n.url())).send().await.unwrap();
+        bounded(c.delete(format!("{}/collections/c/docs/absent", n.url())), "DELETE absent").await;
         put(&c, &n.url(), "k2", serde_json::json!({"v": 3})).await;
 
         let seen = tap.wait_for_events("change", 4, SETTLE).await;
@@ -259,7 +259,7 @@ mod tests {
         let c = reqwest::Client::new();
 
         put(&c, &n.url(), "seed", serde_json::json!({"v": 0})).await;
-        let tap = watch(&c, &n.url(), "").await;
+        let tap = watch(&n.url(), "").await;
         put(&c, &n.url(), "k1", serde_json::json!({"v": 1})).await;
         let first = tap.wait_for_events("change", 1, SETTLE).await;
         let resume: u64 = first[0].id.as_ref().unwrap().parse().unwrap();
@@ -268,7 +268,7 @@ mod tests {
         put(&c, &n.url(), "k2", serde_json::json!({"v": 2})).await;
         put(&c, &n.url(), "k3", serde_json::json!({"v": 3})).await;
 
-        let resumed = watch(&c, &n.url(), &format!("?after={}", resume)).await;
+        let resumed = watch(&n.url(), &format!("?after={}", resume)).await;
         let seen = resumed.wait_for_events("change", 2, SETTLE).await;
         assert_eq!(seen.iter().map(|e| e.data["key"].as_str().unwrap()).collect::<Vec<_>>(),
             vec!["k2", "k3"], "a resume must not repeat what it had, nor skip what it missed");
@@ -286,7 +286,7 @@ mod tests {
         let c = reqwest::Client::new();
 
         put(&c, &n.url(), "seed", serde_json::json!({"v": 0})).await;
-        let tap = watch(&c, &n.url(), "").await;
+        let tap = watch(&n.url(), "").await;
         put(&c, &n.url(), "k1", serde_json::json!({"v": 1})).await;
         let first = tap.wait_for_events("change", 1, SETTLE).await;
         let stale: u64 = first[0].id.as_ref().unwrap().parse().unwrap();
@@ -313,11 +313,11 @@ mod tests {
         let c = reqwest::Client::new();
 
         put(&c, &n.url(), "seed", serde_json::json!({"status": "seed"})).await;
-        let tap = watch(&c, &n.url(), "?filter=%7B%22status%22%3A%22active%22%7D").await;
+        let tap = watch(&n.url(), "?filter=%7B%22status%22%3A%22active%22%7D").await;
 
         put(&c, &n.url(), "k1", serde_json::json!({"status": "active"})).await;
         put(&c, &n.url(), "k2", serde_json::json!({"status": "archived"})).await;
-        c.delete(format!("{}/collections/c/docs/k2", n.url())).send().await.unwrap();
+        bounded(c.delete(format!("{}/collections/c/docs/k2", n.url())), "DELETE k2").await;
 
         let seen = tap.wait_for_events("change", 2, SETTLE).await;
         assert_eq!(ops(&seen), vec!["insert", "delete"]);
@@ -345,8 +345,9 @@ mod tests {
         put(&c, &n.url(), "k1", serde_json::json!({"v": 1})).await;
         put(&c, &n.url(), "k2", serde_json::json!({"v": 2})).await;
 
-        let tap = watch(&c, &n.url(), "").await;
-        assert!(c.delete(format!("{}/collections/c", n.url())).send().await.unwrap().status().is_success());
+        let tap = watch(&n.url(), "").await;
+        assert!(bounded(c.delete(format!("{}/collections/c", n.url())), "DELETE c").await
+            .status().is_success());
 
         let seen = tap.wait_for_events("change", 1, SETTLE).await;
         assert_eq!(ops(&seen), vec!["drop"], "{:?}", seen);
@@ -383,11 +384,12 @@ mod tests {
 
         let c = reqwest::Client::new();
         let subscribe = format!("{}/collections/c/changes", n.url());
-        assert!(c.put(format!("{}/collections/c/docs/seed", n.url()))
-            .header(API_KEY_HEADER, "old").json(&serde_json::json!({"value": {"v": 0}}))
-            .send().await.unwrap().status().is_success());
+        assert!(bounded(c.put(format!("{}/collections/c/docs/seed", n.url()))
+            .header(API_KEY_HEADER, "old").json(&serde_json::json!({"value": {"v": 0}})), "PUT seed")
+            .await.status().is_success());
 
-        let opened = c.get(&subscribe).header(API_KEY_HEADER, "old").send().await.unwrap();
+        let opened = bounded(stream_client().get(&subscribe).header(API_KEY_HEADER, "old"),
+            "GET /changes").await;
         assert_eq!(opened.status(), StatusCode::OK);
         let tap = SseTap::open(opened);
         assert_eq!(tap.wait_for_events("open", 1, SETTLE).await.len(), 1);
@@ -400,9 +402,9 @@ mod tests {
         assert_eq!(ended[0].data["error"].as_str(), Some(crate::cdc::REVOKED),
             "the end has to say why, the way an overrun does: {:?}", ended[0]);
 
-        assert_eq!(c.get(&subscribe).header(API_KEY_HEADER, "old").send().await.unwrap().status(),
+        assert_eq!(bounded(c.get(&subscribe).header(API_KEY_HEADER, "old"), "GET /changes").await.status(),
             StatusCode::UNAUTHORIZED, "the rotated key must not open a new stream either");
-        assert_eq!(c.get(&subscribe).header(API_KEY_HEADER, "new").send().await.unwrap().status(),
+        assert_eq!(bounded(c.get(&subscribe).header(API_KEY_HEADER, "new"), "GET /changes").await.status(),
             StatusCode::OK, "a key that is still held is untouched");
     }
 
@@ -419,7 +421,7 @@ mod tests {
             "the test needs a settled leader to take office away from");
 
         put(&c, &n1.url(), "seed", serde_json::json!({"v": 0})).await;
-        let tap = watch(&c, &n1.url(), "?read=primary").await;
+        let tap = watch(&n1.url(), "?read=primary").await;
         let opened = tap.named("open")[0].data["position"].as_u64().unwrap();
 
         if let Err(why) = hand_over_leadership(&c, &n1, &n2, Duration::from_secs(60)).await {

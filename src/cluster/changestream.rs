@@ -620,7 +620,7 @@ mod tests {
     }
 
     use crate::ring::hash_key;
-    use crate::test_support::{put_value, temp_root, two_shard_cluster, SseTap, TestNode};
+    use crate::test_support::{put_value, stream_client, temp_root, two_shard_cluster, SseTap, TestNode};
     use std::collections::HashSet;
 
     const SETTLE: Duration = Duration::from_secs(10);
@@ -630,8 +630,8 @@ mod tests {
             .timeout(Duration::from_secs(10)).send().await.unwrap()
     }
 
-    async fn watch(client: &reqwest::Client, base: &str, query: &str) -> SseTap {
-        let r = changes(client, base, query).await;
+    async fn watch(base: &str, query: &str) -> SseTap {
+        let r = changes(&stream_client(), base, query).await;
         assert_eq!(r.status(), StatusCode::OK, "{}", r.text().await.unwrap());
         let tap = SseTap::open(r);
         assert_eq!(tap.wait_for_events("open", 1, SETTLE).await.len(), 1,
@@ -686,7 +686,7 @@ mod tests {
         put(&c, &router.url(), &first, 0).await;
         put(&c, &router.url(), &second, 0).await;
 
-        let tap = watch(&c, &router.url(), "").await;
+        let tap = watch(&router.url(), "").await;
         put(&c, &router.url(), &first, 1).await;
         put(&c, &router.url(), &second, 1).await;
 
@@ -707,7 +707,7 @@ mod tests {
         let c = reqwest::Client::new();
         let first = key_on(&router, &s1.url());
         let second = key_on(&router, &s2.url());
-        let tap = watch(&c, &router.url(), "").await;
+        let tap = watch(&router.url(), "").await;
         for node in [&s1, &s2] {
             let db = node.state.as_ref().unwrap().db.as_ref().unwrap();
             assert!(db.lookup_collection("c").unwrap().is_none());
@@ -731,7 +731,7 @@ mod tests {
         let first = key_on(&router, &s1.url());
         let second = key_on(&router, &s2.url());
         put(&c, &router.url(), &first, 0).await;
-        let tap = watch(&c, &router.url(), "").await;
+        let tap = watch(&router.url(), "").await;
         let db = s2.state.as_ref().unwrap().db.as_ref().unwrap();
         assert!(db.lookup_collection("c").unwrap().is_none());
         put(&c, &router.url(), &second, 1).await;
@@ -752,7 +752,7 @@ mod tests {
 
         put(&c, &router.url(), &first, 0).await;
         put(&c, &router.url(), &second, 0).await;
-        let tap = watch(&c, &router.url(), "").await;
+        let tap = watch(&router.url(), "").await;
 
         put(&c, &router.url(), &first, 1).await;
         put(&c, &router.url(), &second, 1).await;
@@ -763,7 +763,7 @@ mod tests {
         put(&c, &router.url(), &first, 2).await;
         put(&c, &router.url(), &second, 2).await;
 
-        let resumed = watch(&c, &router.url(), &format!("?after={}", resume)).await;
+        let resumed = watch(&router.url(), &format!("?after={}", resume)).await;
         let after = resumed.wait_for_events("change", 2, SETTLE).await;
         assert_eq!(after.len(), 2, "a resume must not repeat what it had: {:?}", after);
         assert!(after.iter().all(|e| e.data["value"]["v"] == 2),
@@ -781,7 +781,7 @@ mod tests {
 
         put(&c, &router.url(), &first, 0).await;
         put(&c, &router.url(), &second, 0).await;
-        let tap = watch(&c, &router.url(), "").await;
+        let tap = watch(&router.url(), "").await;
         put(&c, &router.url(), &first, 1).await;
         let stale = tap.wait_for_events("change", 1, SETTLE).await[0].id.clone().unwrap();
         drop(tap);
@@ -807,7 +807,7 @@ mod tests {
 
         put(&c, &router.url(), &first, 0).await;
         put(&c, &router.url(), &second, 0).await;
-        let tap = watch(&c, &router.url(), "").await;
+        let tap = watch(&router.url(), "").await;
         let opened: ClusterChangeCursor = decode_cursor(
             tap.named("open")[0].data["position"].as_str().unwrap()).unwrap();
 
@@ -846,7 +846,7 @@ mod tests {
 
         put(&c, &router.url(), &first, 0).await;
         put(&c, &router.url(), &second, 0).await;
-        let tap = watch(&c, &router.url(), "").await;
+        let tap = watch(&router.url(), "").await;
         put(&c, &router.url(), &first, 1).await;
         let stale = tap.wait_for_events("change", 1, SETTLE).await[0].id.clone().unwrap();
         drop(tap);

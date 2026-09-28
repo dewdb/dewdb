@@ -290,6 +290,8 @@ pub fn build_stream_client(auth: &AuthConfig, trust: &PeerTrust, from: &str) -> 
     trust.apply(reqwest::Client::builder())
         .connect_timeout(Duration::from_secs(5))
         .read_timeout(STREAM_READ_TIMEOUT)
+        // Unpooled: a request needing a new connection past an open stream can stall undialed (IB-061).
+        .pool_max_idle_per_host(0)
         .default_headers(node_headers(auth, from))
         .build()
         .unwrap()
