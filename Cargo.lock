@@ -244,7 +244,7 @@ checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 
 [[package]]
 name = "dewdb"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "axum",
  "bincode",
