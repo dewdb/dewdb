@@ -108,10 +108,12 @@ pub struct AppState {
     /// The credential set in force, seeded from config and re-read while the node runs. Read through
     /// `auth()`, never `config.auth`, so a key removed from the file stops working without a restart.
     pub(crate) auth: Arc<RwLock<crate::auth::AuthConfig>>,
-    pub client: reqwest::Client,
+    pub client: crate::tls::PeerClient,
     /// The same credentials without a request deadline. Only the router-coordinated change stream
     /// uses it: every other call to a peer is one request that must not outlive its own timeout.
-    pub stream_client: reqwest::Client,
+    pub stream_client: crate::tls::PeerClient,
+    /// The roots both clients were last built on. Its lock also serializes their rebuilds.
+    pub(crate) peer_trust: Arc<std::sync::Mutex<crate::tls::PeerTrust>>,
     pub replication: Option<Arc<RwLock<ReplicationState>>>,
     pub primary_overrides: Arc<std::sync::Mutex<HashMap<String, PrimaryOverride>>>,
     pub shard_failover_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
@@ -147,6 +149,7 @@ pub struct AppState {
     pub campaign: Arc<tokio::sync::Mutex<()>>,
     pub election_history: Arc<tokio::sync::RwLock<()>>,
     pub membership_changes: Arc<crate::consensus::reconfigure::MembershipChanges>,
+    pub append_order: Arc<crate::consensus::election::AppendOrder>,
 }
 
 /// Whether `incoming` carries a catalogue entry `current` does not already hold. Cheaper than the
@@ -185,8 +188,7 @@ impl AppState {
         self.auth.read().unwrap()
     }
 
-    /// Replaces the two client tiers, returning whether they moved. `internal_secret` and
-    /// `upstream_api_key` are baked into this node's outbound clients at boot and are not rotatable.
+    /// Replaces the two client tiers, returning whether they moved.
     pub fn rotate_client_keys(&self, api_keys: Vec<String>, admin_keys: Vec<String>) -> bool {
         let mut held = self.auth.write().unwrap();
         if held.api_keys == api_keys && held.admin_keys == admin_keys {
@@ -195,6 +197,46 @@ impl AppState {
         held.api_keys = api_keys;
         held.admin_keys = admin_keys;
         true
+    }
+
+    /// Replaces the credentials this node checks and presents on peer calls, returning whether they
+    /// moved. Refuses to unlock `/internal/*`; that takes a restart (IB-042).
+    pub fn rotate_peer_credentials(&self, internal_secret: Vec<String>, upstream_api_key: Option<String>)
+        -> Result<bool, &'static str>
+    {
+        let trust = self.peer_trust.lock().unwrap();
+        let (presented_moved, auth) = {
+            let mut held = self.auth.write().unwrap();
+            if held.internal_locked() && internal_secret.is_empty() {
+                return Err("auth.internal_secret cannot be removed from a running node");
+            }
+            if held.internal_secret == internal_secret && held.upstream_api_key == upstream_api_key {
+                return Ok(false);
+            }
+            let moved = held.internal_secret.first() != internal_secret.first()
+                || held.upstream_api_key != upstream_api_key;
+            held.internal_secret = internal_secret;
+            held.upstream_api_key = upstream_api_key;
+            (moved, held.clone())
+        };
+        if presented_moved {
+            self.rebuild_peer_clients(&auth, &trust);
+        }
+        Ok(true)
+    }
+
+    /// Rebuilds both outbound clients on `next`, for a rewritten `tls.ca_file` (IB-063).
+    pub fn rotate_peer_trust(&self, next: crate::tls::PeerTrust) {
+        let mut trust = self.peer_trust.lock().unwrap();
+        *trust = next;
+        let auth = self.auth().clone();
+        self.rebuild_peer_clients(&auth, &trust);
+    }
+
+    fn rebuild_peer_clients(&self, auth: &crate::auth::AuthConfig, trust: &crate::tls::PeerTrust) {
+        let from = self.config.own_url();
+        self.client.replace(crate::auth::build_client(auth, trust, &from));
+        self.stream_client.replace(crate::auth::build_stream_client(auth, trust, &from));
     }
 
     pub fn is_leader(&self) -> bool {
@@ -556,8 +598,9 @@ impl AppState {
             replication: None,
             replication_slots: Arc::new(tokio::sync::Semaphore::new(1)),
             scan_slots: Arc::new(tokio::sync::Semaphore::new(crate::aggregate::MAX_CONCURRENT_SCANS)),
-            client: reqwest::Client::new(),
-            stream_client: reqwest::Client::new(),
+            client: reqwest::Client::new().into(),
+            stream_client: reqwest::Client::new().into(),
+            peer_trust: Default::default(),
             auth: Arc::new(RwLock::new(config.auth.clone())),
             config: Arc::new(config),
             primary_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -577,6 +620,7 @@ impl AppState {
             campaign: Arc::new(tokio::sync::Mutex::new(())),
             election_history: Arc::new(tokio::sync::RwLock::new(())),
             membership_changes: Arc::new(Default::default()),
+            append_order: Arc::new(Default::default()),
         }
     }
 
@@ -613,8 +657,9 @@ impl AppState {
             replication_slots: Arc::new(tokio::sync::Semaphore::new(
                 config.flow_control.max_inflight_requests.max(1))),
             scan_slots: Arc::new(tokio::sync::Semaphore::new(crate::aggregate::MAX_CONCURRENT_SCANS)),
-            client: reqwest::Client::new(),
-            stream_client: reqwest::Client::new(),
+            client: reqwest::Client::new().into(),
+            stream_client: reqwest::Client::new().into(),
+            peer_trust: Default::default(),
             auth: Arc::new(RwLock::new(config.auth.clone())),
             config: Arc::new(config),
             primary_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -634,6 +679,7 @@ impl AppState {
             campaign: Arc::new(tokio::sync::Mutex::new(())),
             election_history: Arc::new(tokio::sync::RwLock::new(())),
             membership_changes: Arc::new(Default::default()),
+            append_order: Arc::new(Default::default()),
         }
     }
 

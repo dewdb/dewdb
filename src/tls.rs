@@ -55,7 +55,7 @@ impl TlsConfig {
     }
 }
 
-/// `http://` URLs among `urls`. A node that serves TLS dials only `https://`, so each is a peer it cannot reach.
+/// `http://` URLs among `urls`; a TLS node refuses these in its config, unlike cluster-view ones it upgrades.
 pub fn plaintext_urls<'a>(urls: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
     urls.into_iter()
         .filter(|u| u.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://")))
@@ -234,7 +234,8 @@ pub async fn serve(listener: TcpListener, app: Router, tls: Option<Arc<ServerTls
     }
 }
 
-/// What this node's outbound clients trust and whether they may dial plaintext. Fixed at boot.
+/// What this node's outbound clients trust and whether they may dial plaintext. The roots re-read
+/// with `tls.ca_file`; `https_only` follows `tls.cert_file` and is fixed at boot.
 #[derive(Clone, Default)]
 pub struct PeerTrust {
     roots: Vec<reqwest::Certificate>,
@@ -267,6 +268,82 @@ impl PeerTrust {
             }
         }
         builder
+    }
+}
+
+#[derive(Clone)]
+struct Dialer {
+    inner: reqwest::Client,
+    upgrade: bool,
+}
+
+/// Every peer call goes through this. Clones share one slot, so `replace` reaches every holder (IB-042).
+/// A serving node dials `https://` whatever the URL records, since an old view says `http://` (IB-062).
+#[derive(Clone)]
+pub struct PeerClient {
+    current: Arc<RwLock<Dialer>>,
+}
+
+impl From<reqwest::Client> for PeerClient {
+    fn from(inner: reqwest::Client) -> Self {
+        Self::with(Dialer { inner, upgrade: false })
+    }
+}
+
+impl PeerClient {
+    pub fn new(inner: reqwest::Client, trust: &PeerTrust) -> Self {
+        Self::with(Dialer { inner, upgrade: trust.https_only })
+    }
+
+    fn with(dialer: Dialer) -> Self {
+        Self { current: Arc::new(RwLock::new(dialer)) }
+    }
+
+    /// Requests already sent finish on the client they started on; the next one takes `next`'s.
+    pub fn replace(&self, next: PeerClient) {
+        let dialer = next.dialer();
+        *self.current.write().unwrap() = dialer;
+    }
+
+    fn dialer(&self) -> Dialer {
+        self.current.read().unwrap().clone()
+    }
+
+    pub fn dial_url<'a>(&self, url: &'a str) -> std::borrow::Cow<'a, str> {
+        upgraded(self.dialer().upgrade, url)
+    }
+
+    pub fn request(&self, method: reqwest::Method, url: impl AsRef<str>) -> reqwest::RequestBuilder {
+        let dialer = self.dialer();
+        dialer.inner.request(method, upgraded(dialer.upgrade, url.as_ref()).as_ref())
+    }
+
+    pub fn get(&self, url: impl AsRef<str>) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::GET, url)
+    }
+
+    pub fn post(&self, url: impl AsRef<str>) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::POST, url)
+    }
+
+    pub fn put(&self, url: impl AsRef<str>) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::PUT, url)
+    }
+
+    pub fn patch(&self, url: impl AsRef<str>) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::PATCH, url)
+    }
+
+    pub fn delete(&self, url: impl AsRef<str>) -> reqwest::RequestBuilder {
+        self.request(reqwest::Method::DELETE, url)
+    }
+}
+
+fn upgraded(upgrade: bool, url: &str) -> std::borrow::Cow<'_, str> {
+    match url.get(..7) {
+        Some(scheme) if upgrade && scheme.eq_ignore_ascii_case("http://") =>
+            format!("https://{}", &url[7..]).into(),
+        _ => url.into(),
     }
 }
 
@@ -544,6 +621,176 @@ mod tests {
         let left = tls.expires_in().unwrap();
         assert!(left > 2 * 86_400 && left <= 3 * 86_400, "{}", left);
         assert!(tls.check_expiry(), "three days out is inside the warning window");
+    }
+
+    #[test]
+    fn a_serving_node_dials_recorded_http_urls_as_https() {
+        let plain = reqwest::Client::new();
+        let serving = PeerClient::with(Dialer { inner: plain.clone(), upgrade: true });
+        assert_eq!(serving.dial_url("http://a:1/internal/x"), "https://a:1/internal/x");
+        assert_eq!(serving.dial_url("HTTP://a:1"), "https://a:1");
+        assert_eq!(serving.dial_url("https://a:1"), "https://a:1");
+        let client_only = PeerClient::from(plain);
+        assert_eq!(client_only.dial_url("http://a:1"), "http://a:1");
+        assert_eq!(client_only.dial_url("https://a:1"), "https://a:1", "a plaintext node never downgrades");
+    }
+
+    /// IB-063: a CA rotation is a bundle rewrite. A client taken before the swap trusts the new bundle
+    /// from its next request, because every holder of a `PeerClient` shares one slot.
+    #[tokio::test]
+    async fn a_replaced_client_trusts_the_new_bundle_in_every_clone() {
+        let dir = temp_root();
+        let (old_ca, new_ca) = (Ca::new(), Ca::new());
+        let old_path = old_ca.write(&dir, "old-ca.pem");
+        let new_path = new_ca.write(&dir, "new-ca.pem");
+        let (cert, key) = new_ca.issue(&dir, "node", &["127.0.0.1"], None);
+        let addr = serve_hello(ServerTls::load(&tls_cfg(&cert, &key, &new_path)).unwrap().unwrap()).await;
+        let url = format!("https://{}/hello", addr);
+
+        let auth = crate::auth::AuthConfig::default();
+        let peer = crate::auth::build_client(&auth, &PeerTrust::load(&tls_cfg(&cert, &key, &old_path)).unwrap(), "n");
+        let held = peer.clone();
+        assert!(held.get(&url).send().await.is_err(), "a leaf from a CA not in the bundle must be refused");
+
+        let bundle = dir.join("bundle.pem");
+        std::fs::write(&bundle, [std::fs::read(&old_path).unwrap(), std::fs::read(&new_path).unwrap()].concat()).unwrap();
+        let rotated = PeerTrust::load(&tls_cfg(&cert, &key, &bundle)).unwrap();
+        peer.replace(crate::auth::build_client(&auth, &rotated, "n"));
+        assert_eq!(held.get(&url).send().await.unwrap().text().await.unwrap(), "hi");
+    }
+
+    /// IB-061: a rotation rebuilds `stream_client` through `build_stream_client`, so it stays unpooled.
+    /// The request client is the control that shows the counter would see a reused connection.
+    #[tokio::test]
+    async fn a_rebuilt_stream_client_still_opens_a_connection_per_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let url = format!("http://{}/x", listener.local_addr().unwrap());
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    while matches!(conn.read(&mut buf).await, Ok(n) if n > 0) {
+                        let reply = b"HTTP/1.1 200 OK
+content-length: 2
+
+hi";
+                        if conn.write_all(reply).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let config: crate::config::NodeConfig = serde_json::from_value(serde_json::json!({
+            "node_id": "n", "role": "shard", "listen_addr": "127.0.0.1:1",
+            "data_dir": temp_root().to_string_lossy()})).unwrap();
+        let state = crate::state::AppState::for_routing_test(config);
+        state.rotate_peer_trust(PeerTrust::default());
+        assert_eq!(state.rotate_peer_credentials(vec!["s".to_string()], Some("k".to_string())), Ok(true));
+
+        let twice = |client: PeerClient| {
+            let (accepted, url) = (accepted.clone(), url.clone());
+            async move {
+                let before = accepted.load(Ordering::SeqCst);
+                for _ in 0..2 {
+                    client.get(&url).send().await.unwrap().text().await.unwrap();
+                }
+                accepted.load(Ordering::SeqCst) - before
+            }
+        };
+        assert_eq!(twice(state.stream_client.clone()).await, 2, "the rebuilt stream client must not pool");
+        assert_eq!(twice(state.client.clone()).await, 1, "the request client pools, so the counter can tell");
+    }
+
+    /// The stop-all conversion keeps `cluster.meta`, which still records the shard as `http://`; a router
+    /// routes from that view, not from its config.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_plaintext_cluster_converts_to_tls_keeping_its_view() {
+        let root = temp_root();
+        let ca = Ca::new();
+        let ca_path = ca.write(&root, "ca.pem");
+        let mut shard = TestNode::new("s1", next_test_port(), &root, "primary");
+        let mut router = TestNode::new("router", next_test_port(), &root, "primary");
+        router.role = "router".to_string();
+        shard.start();
+        router.shard_map = vec![(shard.url(), Vec::new())];
+        router.start();
+        let plain = reqwest::Client::new();
+        assert!(wait_for_doc_written(&plain, &router.url(), "a", 1).await);
+        shard.kill();
+        router.kill();
+
+        for node in [&mut shard, &mut router] {
+            let (cert, key) = ca.issue(&root, &node.node_id, &["127.0.0.1"], None);
+            node.tls = tls_json(&cert, &key, &ca_path);
+        }
+        router.shard_map = vec![(shard.url(), Vec::new())];
+        shard.start();
+        router.start();
+        let view = crate::cluster::metadata::ClusterMetadata::load(router.data_dir.to_str().unwrap()).unwrap().unwrap();
+        assert!(view.shards.iter().all(|s| s.node_url.starts_with("http://")), "{:?}", view.shards);
+
+        let trust = PeerTrust::load(&serde_json::from_value(serde_json::json!({"ca_file": ca_path})).unwrap()).unwrap();
+        let c = client(&trust);
+        assert!(wait_for_doc(&c, &router.url(), "t", "a", 1, Duration::from_secs(10)).await,
+            "the router must reach the shard at the https:// spelling of its recorded url");
+        assert!(wait_for_doc_written(&c, &router.url(), "b", 2).await);
+        drop((shard, router));
+    }
+
+    /// IB-042: append, promote, remove, one step at a time on a running pair. Replication survives
+    /// every step, and the removed secret stops opening `/internal/*`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pair_rotates_its_internal_secret_without_a_restart() {
+        let root = temp_root();
+        let mut primary = TestNode::new("p", next_test_port(), &root, "primary");
+        let mut replica = TestNode::new("r", next_test_port(), &root, "replica");
+        for node in [&mut primary, &mut replica] {
+            node.auth = serde_json::json!({"internal_secret": "old"});
+        }
+        primary.peers = vec![replica.url()];
+        primary.replicas = vec![replica.url()];
+        replica.peers = vec![primary.url()];
+        replica.primary_addr = Some(primary.url());
+        primary.start();
+        replica.start();
+
+        let c = reqwest::Client::new();
+        assert!(put_doc_http(&c, &primary.url(), "k", 0).await.is_success());
+        assert!(wait_for_doc(&c, &replica.url(), "t", "k", 0, Duration::from_secs(10)).await);
+
+        let steps: [&[&str]; 3] = [&["old", "new"], &["new", "old"], &["new"]];
+        for (v, secrets) in (1..).zip(steps) {
+            for node in [&primary, &replica] {
+                let secrets = secrets.iter().map(|s| s.to_string()).collect();
+                assert_eq!(node.state.as_ref().unwrap().rotate_peer_credentials(secrets, None), Ok(true));
+            }
+            assert!(put_doc_http(&c, &primary.url(), "k", v).await.is_success(), "{:?}", secrets);
+            assert!(wait_for_doc(&c, &replica.url(), "t", "k", v, Duration::from_secs(10)).await,
+                "replication must survive the step to {:?}", secrets);
+        }
+
+        let heartbeat = |secret: &'static str| c.get(format!("{}/internal/heartbeat", replica.url()))
+            .header(crate::auth::INTERNAL_SECRET_HEADER, secret).send();
+        assert_eq!(heartbeat("old").await.unwrap().status(), reqwest::StatusCode::UNAUTHORIZED);
+        assert!(heartbeat("new").await.unwrap().status().is_success());
+        drop((primary, replica));
+    }
+
+    async fn wait_for_doc_written(c: &reqwest::Client, base: &str, key: &str, v: i64) -> bool {
+        for _ in 0..100 {
+            if put_doc_http(c, base, key, v).await.is_success() {
+                return wait_for_doc(c, base, "t", key, v, Duration::from_secs(10)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
     }
 
     /// Replication, the internal secret and a public read all over TLS, end to end.

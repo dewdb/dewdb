@@ -363,6 +363,7 @@ impl TestNode {
                     config: Arc::new(config.clone()),
                     client: build_client(&config.auth, &peer_trust, &config.own_url()),
                     stream_client: crate::auth::build_stream_client(&config.auth, &peer_trust, &config.own_url()),
+                    peer_trust: Arc::new(std::sync::Mutex::new(peer_trust.clone())),
                     replication: (!is_router).then_some(replication),
                     primary_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),
                     shard_failover_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -391,6 +392,7 @@ impl TestNode {
                     campaign: Arc::new(tokio::sync::Mutex::new(())),
                     election_history: Arc::new(tokio::sync::RwLock::new(())),
                     membership_changes: Arc::new(Default::default()),
+                    append_order: Arc::new(Default::default()),
                 };
 
                 let app = build_app(&state);

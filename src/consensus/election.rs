@@ -24,6 +24,44 @@ pub struct LogTail {
     pub last_lsn: u64,
 }
 
+/// A replica's term check and append hold `gate` shared; a vote's tail sample and term change hold it
+/// exclusive, so no voter acknowledges an entry and elects a candidate without it (IB-065).
+#[derive(Default)]
+pub struct AppendOrder {
+    pub gate: tokio::sync::RwLock<()>,
+    #[cfg(test)]
+    pub(crate) after_term_check: PauseSlot,
+    #[cfg(test)]
+    pub(crate) after_tail_sample: PauseSlot,
+}
+
+#[cfg(test)]
+pub(crate) type PauseSlot = std::sync::Mutex<Option<Arc<Pause>>>;
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct Pause {
+    pub entered: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl Pause {
+    pub(crate) fn arm(slot: &PauseSlot) -> Arc<Pause> {
+        let pause = Arc::new(Pause::default());
+        *slot.lock().unwrap() = Some(pause.clone());
+        pause
+    }
+
+    pub(crate) async fn hold(slot: &PauseSlot) {
+        let pause = slot.lock().unwrap().take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
+}
+
 // last_lsn/last_term are the database-wide summary, kept for peers that predate `logs`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct VoteRequest {
@@ -350,20 +388,21 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64, forced_by: Option
         }
     }
 
+    // Standing is a self-vote: saved before memory holds it (IB-049), or a restart forgets it and
+    // this node can grant the same term twice.
     let new_term = {
         let mut repl = state.replication.as_ref().unwrap().write().unwrap();
-        repl.term += 1;
+        let new_term = repl.term + 1;
+        let meta = ReplicationMeta { term: new_term, is_leader: false, voted_for: Some(candidate_id.clone()) };
+        if let Err(e) = meta.save(&state.config.data_dir) {
+            warn!(target: "election", error = %e,
+                "Could not persist candidacy for term {}; abandoning this election", new_term);
+            return;
+        }
+        repl.term = new_term;
         repl.voted_for = Some(candidate_id.clone());
-        repl.term
+        new_term
     };
-    // Standing is a self-vote: forget it across a restart and this node can grant the same term twice.
-    if let Err(e) = (ReplicationMeta { term: new_term, is_leader: false, voted_for: Some(candidate_id.clone()) })
-        .save(&state.config.data_dir)
-    {
-        warn!(target: "election", error = %e,
-            "Could not persist candidacy for term {}; abandoning this election", new_term);
-        return;
-    }
     info!(target: "election", "Node {} standing for term {} (voters {:?}, outgoing {:?}, handover {:?})",
         candidate_id, new_term, quorum.voters, quorum.outgoing, forced_by);
 

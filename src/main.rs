@@ -123,8 +123,8 @@ fn log_listening(config: &NodeConfig) {
 /// this is a bound on noticing one rather than something a request waits on.
 const AUTH_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Re-reads `auth.api_keys` and `auth.admin_keys` when the config file changes, ending the streams and
-/// subscriptions opened under a removed key (IB-026). Nothing else in the file is re-read.
+/// Re-reads `auth` when the config file changes, ending the streams and subscriptions opened under a
+/// removed key (IB-026) and rebuilding the outbound clients on a new presented credential (IB-042).
 fn auth_reload_task(state: AppState, path: String) {
     tokio::spawn(async move {
         let mut seen = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
@@ -135,24 +135,56 @@ fn auth_reload_task(state: AppState, path: String) {
                 continue;
             }
             seen = stamp;
-            match reload_auth(&path) {
-                Ok(next) => {
-                    if next.internal_secret != state.config.auth.internal_secret
-                        || next.upstream_api_key != state.config.auth.upstream_api_key {
-                        warn!(target: "auth",
-                            "auth.internal_secret and auth.upstream_api_key are wired into this \
-                             node's outbound clients at boot and were not reloaded; restart the \
-                             node to change either");
-                    }
-                    if state.rotate_client_keys(next.api_keys.clone(), next.admin_keys.clone()) {
-                        info!(target: "auth", api_keys = next.api_keys.len(),
-                            admin_keys = next.admin_keys.len(),
-                            "Reloaded the credential set from the config file");
-                    }
+            // The set in force is left alone: a half-written file must not unlock the API.
+            if let Err(e) = reload_auth(&path).and_then(|next| apply_auth_reload(&state, next)) {
+                warn!(target: "auth", path = %path, error = %e,
+                    "Refused the credential reload; keeping the set in force");
+            }
+        }
+    });
+}
+
+/// All of `next` or none of it: a refused peer rotation keeps the client tiers in force as well.
+fn apply_auth_reload(state: &AppState, next: crate::auth::AuthConfig) -> Result<(), String> {
+    if state.rotate_peer_credentials(next.internal_secret.clone(), next.upstream_api_key.clone())? {
+        info!(target: "auth", internal_secrets = next.internal_secret.len(),
+            upstream_api_key = next.upstream_api_key.is_some(),
+            "Reloaded the peer credentials from the config file");
+    }
+    if state.rotate_client_keys(next.api_keys.clone(), next.admin_keys.clone()) {
+        info!(target: "auth", api_keys = next.api_keys.len(), admin_keys = next.admin_keys.len(),
+            "Reloaded the credential set from the config file");
+    }
+    Ok(())
+}
+
+/// Re-reads `tls.ca_file` when it changes. A bundle that does not parse keeps the roots in force
+/// and is retried until it does (IB-063).
+fn trust_reload_task(state: AppState) {
+    let Some(path) = state.config.tls.ca_file.clone() else { return };
+    tokio::spawn(async move {
+        let modified = || std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        let mut loaded = modified();
+        let mut refused = None;
+        loop {
+            tokio::time::sleep(AUTH_RELOAD_INTERVAL).await;
+            let stamp = modified();
+            if stamp.is_none() || stamp == loaded {
+                continue;
+            }
+            match tls::PeerTrust::load(&state.config.tls) {
+                Ok(trust) => {
+                    state.rotate_peer_trust(trust);
+                    loaded = stamp;
+                    refused = None;
+                    info!(target: "tls", ca_file = %path, "Reloaded the peer CA bundle");
                 },
-                // The set in force is left alone: a half-written file must not unlock the API.
-                Err(e) => warn!(target: "auth", path = %path, error = %e,
-                    "Could not re-read the credential set; keeping the one in force"),
+                Err(e) if refused != stamp => {
+                    refused = stamp;
+                    warn!(target: "tls", error = %e,
+                        "Could not reload the peer CA bundle; still trusting the previous one");
+                },
+                Err(_) => {},
             }
         }
     });
@@ -249,16 +281,6 @@ async fn main() -> io::Result<()> {
     }
 
     let cluster = Arc::new(RwLock::new(load_cluster_view(&config)));
-    if config.tls.serves() {
-        let view = cluster.read().unwrap();
-        let urls = view.members.iter().map(|m| m.url.as_str())
-            .chain(view.shards.iter().flat_map(|s| std::iter::once(&s.node_url).chain(&s.replica_urls)).map(String::as_str));
-        let plaintext = tls::plaintext_urls(urls);
-        if !plaintext.is_empty() {
-            warn!(target: "boot", urls = %plaintext.join(", "),
-                "The cluster view on disk names http:// nodes and this node dials https only; they are unreachable (IB-062)");
-        }
-    }
 
     let db = if config.role == "shard" {
         Some(Arc::new(Database::with_config(
@@ -327,10 +349,10 @@ async fn main() -> io::Result<()> {
 
     let client = build_client(&config.auth, &peer_trust, &config.own_url());
 
-    if config.auth.internal_secret.is_none() && config.role == "shard" {
+    if !config.auth.internal_locked() && config.role == "shard" {
         warn!(target: "boot", "auth.internal_secret is not set; /internal/* endpoints accept unauthenticated requests");
     }
-    if config.auth.internal_secret.is_some() && !config.tls.serves() {
+    if config.auth.internal_locked() && !config.tls.serves() {
         warn!(target: "boot", "tls is not configured; auth.internal_secret crosses the network in the clear");
     }
     if !config.auth.public_locked() {
@@ -352,6 +374,7 @@ async fn main() -> io::Result<()> {
         config: Arc::new(config.clone()),
         client: client.clone(),
         stream_client: crate::auth::build_stream_client(&config.auth, &peer_trust, &config.own_url()),
+        peer_trust: Arc::new(std::sync::Mutex::new(peer_trust.clone())),
         replication,
         primary_overrides: Arc::new(std::sync::Mutex::new(HashMap::new())),
         shard_failover_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -373,6 +396,7 @@ async fn main() -> io::Result<()> {
         campaign: Arc::new(tokio::sync::Mutex::new(())),
         election_history: Arc::new(tokio::sync::RwLock::new(())),
         membership_changes: Arc::new(Default::default()),
+        append_order: Arc::new(Default::default()),
     };
 
     boot_resync_if_replica(&state).await;
@@ -420,6 +444,7 @@ async fn main() -> io::Result<()> {
     index_catalog_task(state.clone());
     webhook_task(state.clone());
     auth_reload_task(state.clone(), config_path.clone());
+    trust_reload_task(state.clone());
 
     if state.db.is_some() {
         if config.maintenance.enabled {
@@ -442,7 +467,7 @@ async fn main() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{log_listening, reload_auth};
+    use super::{apply_auth_reload, log_listening, reload_auth};
     use crate::logging::{render_events, LoggingConfig};
     use std::fs;
 
@@ -560,22 +585,46 @@ mod tests {
         }
     }
 
-    /// The reload is the only live half of `auth` and has to be exact about which fields it takes: a new
-    /// `internal_secret` must not be read as one, and an unparseable file must not read as no keys.
+    /// A running node never unlocks `/internal/*` from a file edit, and the rest of that file is not
+    /// taken either.
     #[test]
-    fn a_credential_reload_takes_the_client_tiers_and_refuses_a_file_it_cannot_trust() {
+    fn a_reload_that_removes_the_internal_secret_is_refused_whole() {
+        use crate::auth::{authorize, AuthConfig, AuthOutcome};
+        let config: crate::config::NodeConfig = serde_json::from_value(serde_json::json!({
+            "node_id": "n", "role": "shard", "listen_addr": "127.0.0.1:1",
+            "data_dir": crate::test_support::temp_root().to_string_lossy(),
+            "auth": {"internal_secret": "s", "api_keys": ["alpha"]}})).unwrap();
+        let state = crate::state::AppState::for_routing_test(config);
+
+        let removed = AuthConfig { api_keys: vec!["beta".to_string()], ..Default::default() };
+        assert!(apply_auth_reload(&state, removed).is_err());
+        let held = state.auth().clone();
+        assert_eq!(held.internal_secret, vec!["s"]);
+        assert_eq!(held.api_keys, vec!["alpha"], "a refused reload must not take its client tiers either");
+        assert_eq!(authorize("/internal/replicate", "POST", &held, None, None, None),
+            AuthOutcome::Deny("missing internal secret header"));
+
+        let rotated = AuthConfig { internal_secret: vec!["s".into(), "t".into()], api_keys: vec!["beta".into()],
+            ..Default::default() };
+        apply_auth_reload(&state, rotated).unwrap();
+        assert_eq!(state.auth().internal_secret, vec!["s", "t"]);
+        assert_eq!(state.auth().api_keys, vec!["beta"]);
+    }
+
+    /// An unparseable file must not read as no keys.
+    #[test]
+    fn a_credential_reload_reads_every_tier_and_refuses_a_file_it_cannot_trust() {
         let dir = std::env::temp_dir().join(format!("dew-auth-reload-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("dew.json");
         let write = |body: &str| fs::write(&path, body).unwrap();
 
         write(r#"{"node_id":"n","role":"shard","listen_addr":"127.0.0.1:1",
-            "auth":{"api_keys":["alpha"],"admin_keys":["root"],"internal_secret":"s"}}"#);
+            "auth":{"api_keys":["alpha"],"admin_keys":["root"],"internal_secret":["s","t"]}}"#);
         let loaded = reload_auth(path.to_str().unwrap()).expect("a valid file has to load");
         assert_eq!(loaded.api_keys, vec!["alpha".to_string()]);
         assert_eq!(loaded.admin_keys, vec!["root".to_string()]);
-        assert_eq!(loaded.internal_secret.as_deref(), Some("s"),
-            "the reader still reports it; whether it is applied is the caller's rule");
+        assert_eq!(loaded.internal_secret, vec!["s", "t"]);
 
         write(r#"{"node_id":"n","role":"shard","listen_addr":"127.0.0.1:1"}"#);
         assert!(reload_auth(path.to_str().unwrap()).unwrap().api_keys.is_empty(),

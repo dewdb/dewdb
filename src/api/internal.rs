@@ -52,6 +52,8 @@ pub async fn replicate_handler(
         return (StatusCode::SERVICE_UNAVAILABLE, "Snapshot resync in progress").into_response();
     }
 
+    // Held from the term check through the append: a vote between them would elect past this entry.
+    let append_order = state.append_order.gate.read().await;
     let our_term = state.current_term();
     if req.term < our_term {
         return (StatusCode::CONFLICT, Json(serde_json::json!({
@@ -82,6 +84,9 @@ pub async fn replicate_handler(
             }
         }
     }
+
+    #[cfg(test)]
+    crate::consensus::election::Pause::hold(&state.append_order.after_term_check).await;
 
     let db = match state.db.as_ref() {
         Some(db) => db.clone(),
@@ -144,6 +149,7 @@ pub async fn replicate_handler(
         }
         (highest_applied, matched, refusal)
     }).await;
+    drop(append_order);
 
     let (highest, matched, refusal) = match appended {
         Ok(v) => v,
@@ -652,12 +658,16 @@ pub async fn vote_handler(
         None => return (StatusCode::FORBIDDEN, "No replication state").into_response(),
     };
 
+    // Exclusive from the tail sample until the new term is in memory, so no append lands between.
+    let append_order = state.append_order.gate.write().await;
     // Collected before the replication lock: local_log_tails reaches the collections lock.
     let my_logs = match crate::consensus::election::try_local_log_tails(&state) {
         Ok(logs) => logs,
         Err(e) => return err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
     let my_summary = log_summary(&state, &my_logs);
+    #[cfg(test)]
+    crate::consensus::election::Pause::hold(&state.append_order.after_tail_sample).await;
     let (my_config, contact, granted_until, since_boot) = {
         let g = repl.read().unwrap();
         (g.configuration.clone(),
@@ -671,19 +681,33 @@ pub async fn vote_handler(
         Duration::from_secs(state.config.heartbeat_timeout_secs), std::time::Instant::now())
         && !state.honours_transfer(req.transfer_from.as_deref());
 
-    let (granted, resp_term, restart_poll, persist) = {
+    let (granted, resp_term, restart_poll) = {
         let mut g = repl.write().unwrap();
         let was_leader = g.is_leader;
         let old_term = g.term;
 
         let d = decide_vote(g.term, &g.voted_for, &my_logs, my_summary, my_config.as_ref(),
             &req, must_withhold);
+        let stands_down = d.term > old_term && was_leader;
+
+        // Saved under the lock and before memory changes (IB-049): a vote forgotten on restart can be
+        // cast twice in one term, and a failed save must leave no term or vote behind.
+        if d.term != old_term || d.voted_for != g.voted_for {
+            let meta = ReplicationMeta {
+                term: d.term, is_leader: was_leader && !stands_down, voted_for: d.voted_for.clone() };
+            if let Err(e) = meta.save(&state.config.data_dir) {
+                warn!(target: "vote", error = %e,
+                    "Could not persist term/vote; denying the vote rather than promising one we may forget");
+                return (StatusCode::OK, Json(VoteResponse { term: old_term, vote_granted: false }))
+                    .into_response();
+            }
+        }
 
         let mut restart = false;
         g.term = d.term;
         g.voted_for = d.voted_for.clone();
 
-        if d.term > old_term && was_leader {
+        if stands_down {
             g.is_leader = false;
             // Standing down by granting a vote is still standing down; same rule as apply_demotion.
             g.progress.reset();
@@ -696,19 +720,12 @@ pub async fn vote_handler(
             g.last_heartbeat = Some(std::time::Instant::now());
         }
 
-        let persist = ReplicationMeta { term: g.term, is_leader: g.is_leader, voted_for: g.voted_for.clone() };
-        (d.granted, d.term, restart, persist)
+        (d.granted, d.term, restart)
     };
+    drop(append_order);
 
     if restart_poll {
         heartbeat_poll_task(state.clone());
-    }
-
-    // Election safety: a vote promised before it is durable can be cast twice in one term after a restart.
-    if let Err(e) = persist.save(&state.config.data_dir) {
-        warn!(target: "vote", error = %e,
-            "Could not persist term/vote; denying the vote rather than promising one we may forget");
-        return (StatusCode::OK, Json(VoteResponse { term: resp_term, vote_granted: false })).into_response();
     }
 
     if granted {
@@ -1103,6 +1120,17 @@ mod tests {
         commit_index: u64,
         frame: Vec<u8>,
     ) -> (StatusCode, serde_json::Value) {
+        replicate_to(&node.url(), term, lsn, prev_lsn, commit_index, frame).await
+    }
+
+    async fn replicate_to(
+        base: &str,
+        term: u64,
+        lsn: u64,
+        prev_lsn: u64,
+        commit_index: u64,
+        frame: Vec<u8>,
+    ) -> (StatusCode, serde_json::Value) {
         let request = ReplicateRequest {
             collection: "t".to_string(),
             term,
@@ -1113,7 +1141,7 @@ mod tests {
             frames: Vec::new(),
         };
         let response = reqwest::Client::new()
-            .post(format!("{}/internal/replicate", node.url()))
+            .post(format!("{}/internal/replicate", base))
             .json(&request)
             .send()
             .await
@@ -1465,5 +1493,229 @@ mod tests {
         assert_no_watermark(&heartbeat(&leader).await);
 
         leader.kill();
+    }
+
+    /// A voter holding `lsn 1` at term 1, quiet long enough that nothing withholds its vote.
+    async fn quiet_voter_at_lsn_one(root: &std::path::Path) -> TestNode {
+        let mut voter = TestNode::new("voter", next_test_port(), root, "replica");
+        voter.heartbeat_timeout_secs = 30;
+        voter.primary_addr = Some(VOTERS_LEADER.to_string());
+        voter.start();
+        let (status, _) = replicate(&voter, 1, 1, 0, 0, make_frame(1, 1, 0, 0, "k1", 1)).await;
+        assert_eq!(status, StatusCode::OK);
+        let state = voter.state.as_ref().unwrap();
+        let mut g = state.replication.as_ref().unwrap().write().unwrap();
+        let long_ago = std::time::Instant::now() - Duration::from_secs(60);
+        g.last_heartbeat = Some(long_ago);
+        g.last_replication = Some(long_ago);
+        g.booted_at = long_ago;
+        drop(g);
+        voter
+    }
+
+    /// The leader `quiet_voter_at_lsn_one` follows, which is the one name a transfer vote honours.
+    const VOTERS_LEADER: &str = "http://127.0.0.1:1";
+
+    /// A candidate at term 2 whose log ends at `lsn 1`, one entry short of what the leader sends next.
+    async fn ask_for_vote_without_lsn_two(voter: &str, transfer_from: Option<&str>) -> VoteResponse {
+        let tail = crate::consensus::election::LogTail { last_term: 1, last_lsn: 1 };
+        let vote = VoteRequest {
+            term: 2,
+            candidate_id: "behind".to_string(),
+            last_lsn: 1,
+            last_term: 1,
+            logs: HashMap::from([("t".to_string(), tail)]),
+            candidate_url: None,
+            transfer_from: transfer_from.map(str::to_string),
+        };
+        reqwest::Client::new().post(format!("{}/internal/vote", voter))
+            .json(&vote).send().await.unwrap()
+            .json::<VoteResponse>().await.unwrap()
+    }
+
+    /// IB-065: the replicate path checked its term and appended with nothing between them, so a
+    /// vote there elected a candidate without the entry this node then acknowledged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_vote_cannot_land_between_a_replicates_term_check_and_its_append() {
+        use crate::consensus::election::Pause;
+        let root = temp_root();
+        let mut voter = quiet_voter_at_lsn_one(&root).await;
+        let state = voter.state.clone().unwrap();
+
+        let pause = Pause::arm(&state.append_order.after_term_check);
+        let sending = voter.url();
+        let replicating = tokio::spawn(async move {
+            replicate_to(&sending, 1, 2, 1, 1, make_frame(1, 2, 1, 1, "k2", 2)).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), pause.entered.notified()).await
+            .expect("the replicate never reached its term check");
+
+        let voter_url = voter.url();
+        let mut voting = tokio::spawn(async move {
+            ask_for_vote_without_lsn_two(&voter_url, None).await
+        });
+        let early = tokio::time::timeout(Duration::from_millis(500), &mut voting).await;
+        let decided_early = early.is_ok();
+        pause.release.notify_one();
+
+        let (status, body) = replicating.await.unwrap();
+        let vote = match early { Ok(done) => done.unwrap(), Err(_) => voting.await.unwrap() };
+        let acknowledged = status == StatusCode::OK && body["status"] == "applied";
+        assert!(!(acknowledged && vote.vote_granted),
+            "acknowledged lsn 2 and voted for a candidate without it: {} {:?}", status, body);
+        assert!(!decided_early, "the vote was decided while an admitted append was still in flight");
+        assert!(acknowledged, "an append admitted before the vote finishes: {} {:?}", status, body);
+        assert!(!vote.vote_granted, "the vote then sees lsn 2 and refuses the candidate without it");
+
+        drop(state);
+        voter.kill();
+    }
+
+    /// IB-065, from the vote's side: the tails were sampled before anything excluded an append. Asked
+    /// as a transfer, because otherwise the append's contact makes the lease refuse the vote anyway.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_append_cannot_land_between_a_votes_tail_sample_and_its_decision() {
+        use crate::consensus::election::Pause;
+        let root = temp_root();
+        let mut voter = quiet_voter_at_lsn_one(&root).await;
+        let state = voter.state.clone().unwrap();
+
+        let pause = Pause::arm(&state.append_order.after_tail_sample);
+        let voter_url = voter.url();
+        let voting = tokio::spawn(async move {
+            ask_for_vote_without_lsn_two(&voter_url, Some(VOTERS_LEADER)).await
+        });
+        tokio::time::timeout(Duration::from_secs(5), pause.entered.notified()).await
+            .expect("the vote never sampled its tails");
+
+        let sending = voter.url();
+        let mut replicating = tokio::spawn(async move {
+            replicate_to(&sending, 1, 2, 1, 1, make_frame(1, 2, 1, 1, "k2", 2)).await
+        });
+        let early = tokio::time::timeout(Duration::from_millis(500), &mut replicating).await;
+        let appended_early = early.is_ok();
+        pause.release.notify_one();
+
+        let vote = voting.await.unwrap();
+        let (status, body) = match early { Ok(done) => done.unwrap(), Err(_) => replicating.await.unwrap() };
+        let acknowledged = status == StatusCode::OK && body["status"] == "applied";
+        assert!(!(acknowledged && vote.vote_granted),
+            "voted on a tail that no longer held, for a candidate without lsn 2: {} {:?}", status, body);
+        assert!(!appended_early, "an append landed while a vote was deciding on the tail before it");
+        assert!(vote.vote_granted, "the candidate matched the tail the vote sampled");
+        assert_eq!(status, StatusCode::CONFLICT, "and the term the vote raised refuses the append: {:?}", body);
+        assert_eq!(body["status"], "stale_term");
+
+        drop(state);
+        voter.kill();
+    }
+
+    /// IB-051's vote reading: a voter that took a frame for a collection it had never held must
+    /// advertise that collection's tail, or it cannot refuse a candidate without it.
+    #[tokio::test]
+    async fn the_first_frame_of_a_new_collection_is_in_the_voters_tails() {
+        let root = temp_root();
+        let mut voter = TestNode::new("voter", next_test_port(), &root, "replica");
+        voter.heartbeat_timeout_secs = 30;
+        voter.primary_addr = Some("http://127.0.0.1:1".to_string());
+        voter.start();
+        let state = voter.state.clone().unwrap();
+        assert!(!crate::consensus::election::try_local_log_tails(&state).unwrap().contains_key("t"));
+
+        let (status, _) = replicate(&voter, 3, 1, 0, 0, make_frame(3, 1, 0, 0, "k1", 1)).await;
+        assert_eq!(status, StatusCode::OK);
+        let tails = crate::consensus::election::try_local_log_tails(&state).unwrap();
+        assert_eq!(tails.get("t"), Some(&crate::consensus::election::LogTail { last_term: 3, last_lsn: 1 }),
+            "a staged, uncommitted first frame still has to count against a candidate: {:?}", tails);
+
+        drop(state);
+        voter.kill();
+    }
+
+    /// A directory where the atomic write stages its file, so the next `ReplicationMeta::save` fails.
+    fn break_meta_saves(node: &TestNode) -> std::path::PathBuf {
+        let staging = std::path::Path::new(&node.data_dir).join("replication.meta.tmp");
+        std::fs::create_dir(&staging).unwrap();
+        staging
+    }
+
+    fn term_and_vote(state: &AppState) -> (u64, Option<String>) {
+        let g = state.replication.as_ref().unwrap().read().unwrap();
+        (g.term, g.voted_for.clone())
+    }
+
+    /// IB-049: a vote raised the in-memory term and recorded the vote before saving them, so a failed
+    /// save refused the vote and still left a term and vote behind that no restart would remember.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_vote_that_cannot_be_saved_leaves_no_term_or_vote_in_memory() {
+        let root = temp_root();
+        let mut voter = quiet_voter_at_lsn_one(&root).await;
+        let state = voter.state.clone().unwrap();
+        let before = term_and_vote(&state);
+        let durable_before = crate::consensus::state::ReplicationMeta::load(voter.data_dir.to_str().unwrap()).unwrap().unwrap();
+
+        let staging = break_meta_saves(&voter);
+        let tail = crate::consensus::election::LogTail { last_term: 1, last_lsn: 1 };
+        let ask = || VoteRequest {
+            term: 2,
+            candidate_id: "fresh".to_string(),
+            last_lsn: 1,
+            last_term: 1,
+            logs: HashMap::from([("t".to_string(), tail)]),
+            candidate_url: None,
+            transfer_from: None,
+        };
+        let post = |vote: VoteRequest| {
+            let url = format!("{}/internal/vote", voter.url());
+            async move {
+                reqwest::Client::new().post(url).json(&vote).send().await.unwrap()
+                    .json::<VoteResponse>().await.unwrap()
+            }
+        };
+
+        let refused = post(ask()).await;
+        assert!(!refused.vote_granted, "a vote that could not be made durable must not be promised");
+        assert_eq!(refused.term, before.0, "and the answer names the term this node still holds");
+        assert_eq!(term_and_vote(&state), before,
+            "memory is ahead of disk: the term and vote a restart would forget are still in force");
+        assert_eq!(crate::consensus::state::ReplicationMeta::load(voter.data_dir.to_str().unwrap()).unwrap().unwrap().term,
+            durable_before.term);
+
+        std::fs::remove_dir(&staging).unwrap();
+        let granted = post(ask()).await;
+        assert!(granted.vote_granted, "the same vote goes through once it can be saved");
+        assert_eq!(term_and_vote(&state), (2, Some("fresh".to_string())));
+        let durable = crate::consensus::state::ReplicationMeta::load(voter.data_dir.to_str().unwrap()).unwrap().unwrap();
+        assert_eq!((durable.term, durable.voted_for), (2, Some("fresh".to_string())),
+            "what memory holds, the disk holds");
+
+        drop(state);
+        voter.kill();
+    }
+
+    /// IB-049's other copy: standing raised the term and cast the self-vote in memory before saving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_candidacy_that_cannot_be_saved_leaves_no_term_or_self_vote_in_memory() {
+        let root = temp_root();
+        let mut voter = quiet_voter_at_lsn_one(&root).await;
+        let state = voter.state.clone().unwrap();
+        let before = term_and_vote(&state);
+
+        let staging = break_meta_saves(&voter);
+        crate::consensus::election::run_election(&state, 0, Some("test".to_string())).await;
+        assert_eq!(term_and_vote(&state), before,
+            "an abandoned candidacy left a self-vote in memory that the disk never recorded");
+        assert!(!state.is_leader());
+
+        std::fs::remove_dir(&staging).unwrap();
+        crate::consensus::election::run_election(&state, 0, Some("test".to_string())).await;
+        let (term, voted) = term_and_vote(&state);
+        assert_eq!((term, voted.as_deref()), (before.0 + 1, Some("voter")),
+            "the same candidacy stands once it can be saved");
+        let durable = crate::consensus::state::ReplicationMeta::load(voter.data_dir.to_str().unwrap()).unwrap().unwrap();
+        assert_eq!(durable.term, before.0 + 1);
+
+        drop(state);
+        voter.kill();
     }
 }

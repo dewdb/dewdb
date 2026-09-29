@@ -17,7 +17,7 @@ pub struct Probe {
     pub load: Option<NodeLoad>,
 }
 
-pub(crate) async fn probe_node(client: &reqwest::Client, url: &str) -> Option<Probe> {
+pub(crate) async fn probe_node(client: &crate::tls::PeerClient, url: &str) -> Option<Probe> {
     let hb = format!("{}/internal/heartbeat", url);
     let r = client.get(&hb).send().await.ok()?;
     if !r.status().is_success() {
@@ -42,7 +42,7 @@ fn parse_probe(v: &serde_json::Value) -> Option<Probe> {
 
 /// Pulls the view a peer advertised. Gated on the advertised identity by the caller, so a peer
 /// that lies about being ahead costs one request; the adopt path still validates what comes back.
-pub async fn fetch_cluster_view(client: &reqwest::Client, url: &str) -> Option<ClusterMetadata> {
+pub async fn fetch_cluster_view(client: &crate::tls::PeerClient, url: &str) -> Option<ClusterMetadata> {
     let r = client.get(&format!("{}/internal/cluster", url)).send().await.ok()?;
     if !r.status().is_success() {
         return None;

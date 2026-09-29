@@ -31,7 +31,7 @@ pub enum ForwardMethod {
 }
 
 fn build_forward(
-    client: &reqwest::Client,
+    client: &crate::tls::PeerClient,
     method: &ForwardMethod,
     url: &str,
     body: Option<&CreateDoc>,
@@ -527,7 +527,7 @@ pub async fn router_read_doc(state: &AppState, col_name: &str, id: &str, pref: R
     (StatusCode::BAD_GATEWAY, "No shard node could serve the read").into_response()
 }
 
-async fn admin_call(client: &reqwest::Client, post: bool, url: &str) -> Option<(StatusCode, serde_json::Value)> {
+async fn admin_call(client: &crate::tls::PeerClient, post: bool, url: &str) -> Option<(StatusCode, serde_json::Value)> {
     admin_call_with(client, if post { AdminMethod::Post } else { AdminMethod::Delete }, url, None).await
 }
 
@@ -539,7 +539,7 @@ enum AdminMethod {
 }
 
 async fn admin_call_with(
-    client: &reqwest::Client,
+    client: &crate::tls::PeerClient,
     method: AdminMethod,
     url: &str,
     body: Option<&serde_json::Value>,

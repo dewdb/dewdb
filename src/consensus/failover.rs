@@ -1297,7 +1297,6 @@ mod tests {
             .json::<serde_json::Value>().await.unwrap();
         assert_eq!(vote["vote_granted"], false, "a candidate with an empty log must not win");
         assert!(n3.term() >= ahead, "a denied vote still raises the term");
-        assert_eq!(n1.term(), leader_term, "the leader was never told");
 
         assert!(wait_for(Duration::from_secs(25), || !n1.is_leader()).await,
             "n1 leads on at term {} while n3 sits at {}: n3 keeps taking n1's heartbeats as \

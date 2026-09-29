@@ -230,7 +230,7 @@ Current limitations:
 | Aggregation | `count`, `sum`, `avg`, `min`, `max` over up to four grouping fields, bounded at 10 000 groups, computed per request. |
 | Joins | Done in the client. Cross-shard work is per-key or fan-out. |
 | Sizes | 10 MiB per stored record, 2 MiB per request body, 10 000 documents per query page. |
-| TLS | In the process, for clusters started with it. An existing plaintext cluster cannot be switched in place yet, and changing the CA file needs a restart. |
+| TLS | In the process. An existing plaintext cluster switches with a full stop of every node, not a rolling one, and keeps its cluster view. The CA file reloads without a restart. |
 | Audit | Collected in front of the node. |
 | Change history | As far back as the per-collection change buffer holds. |
 

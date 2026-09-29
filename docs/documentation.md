@@ -364,7 +364,6 @@ Logged as warnings, because they are legal but usually mistakes:
 - A missing `auth.internal_secret`, or an empty `auth.api_keys`.
 - An `auth.internal_secret` on a node that does not serve TLS, since the secret then crosses the
   network in the clear.
-- On a node that serves TLS, `http://` nodes in the stored cluster view, which it cannot reach.
 - An empty `auth.admin_keys` while `auth.api_keys` is set, and the reverse.
 
 ### Example: three-node replicated group
@@ -2553,7 +2552,8 @@ Three independent credentials, all optional and all off by default:
   to, and its registration carries a secret, so reads are gated there too. While it is empty those
   routes fall back to `api_keys`, which is what they did before the tier existed. Same headers as
   `api_keys`, and the same rotation.
-- **`auth.internal_secret`** guards `/internal/*` through `x-dew-internal-secret`. While it is unset
+- **`auth.internal_secret`** guards `/internal/*` through `x-dew-internal-secret`. One string or a
+  list; any listed secret is accepted and the first is the one this node sends. While it is unset
   those routes are open, and a warning says so at boot.
 
 An admin key also opens the public API — the tier is a superset, so an operator does not need a
@@ -2584,9 +2584,17 @@ file and remove a key; within about five seconds the node stops accepting it, an
 accepted by the subjects that were *already* admitted under it. A file that cannot be parsed, or that
 carries a credential no header could hold, is refused and the set in force is kept.
 
-`auth.internal_secret` and `auth.upstream_api_key` are baked into this node's outbound clients at
-boot, so taking a new one live would leave the node presenting a credential its peers no longer
-expect; changing either needs a restart, and the node warns when it sees one change under it.
+`auth.internal_secret` and `auth.upstream_api_key` reload the same way. `internal_secret` takes
+one string or a list: a node accepts any listed secret on `/internal/*` and presents the first. To
+rotate it, make three passes over the cluster, each reaching every node before the next starts:
+add the new secret (`["old", "new"]`), move it first (`["new", "old"]`), then remove the old one
+(`["new"]`). At every point, whatever one node presents, every other node accepts, so replication
+keeps running. An empty list is refused rather than read as no secret. A reload that removes the
+secret from a running node is refused whole, and the set in force is kept; removing it takes a
+restart. `upstream_api_key` stays a single value because the list is on the receiving side: add the
+new key to the shards' `api_keys` or `admin_keys`, change `upstream_api_key`, then remove the old
+key from the shards. A change to either rebuilds the node's outbound clients, and requests already
+in flight finish on the old ones.
 
 Authorization is per request, and every other endpoint is a request. Three subjects outlive the
 request that created them, and all three are judged again rather than only at the start:
@@ -2631,9 +2639,10 @@ the public API, `/internal/*`, SSE and WebSocket — and the node advertises its
 | `tls.ca_file` | none | PEM bundle this node trusts when it connects to a peer. When set it *replaces* the operating system's roots; when unset, peers are verified against them. |
 | `tls.expiry_warning_days` | 21 | How long before the served certificate expires the node starts warning. |
 
-**Connecting to peers.** A node that serves TLS connects to peers over `https://` only. It refuses an
-`http://` URL outright, so the shared secret is never sent in the clear by accident, and it fails to
-boot if its config names an `http://` peer, replica, primary or shard. Peer URLs carry their scheme:
+**Connecting to peers.** A node that serves TLS connects to peers over `https://` only, so the
+shared secret is never sent in the clear by accident. An `http://` address it learned from the
+cluster view is connected to as `https://` on the same port, and it fails to boot if its config
+names an `http://` peer, replica, primary or shard. Peer URLs carry their scheme:
 write `https://` in `peers`, `replicas`, `primary_addr`, `shard_map` and `ring`. Every peer
 certificate is verified — the chain to `ca_file` or the system roots, the validity dates, and the
 host or IP being connected to. `ca_file` without a certificate and key is a client-only setup, such
@@ -2654,14 +2663,19 @@ again until the pair matches, so writing the certificate before the key is safe.
 error once it has expired. A peer whose certificate has expired is refused like any other that fails
 verification, so renew certificates ahead of time — replacing the files is enough, no restart needed.
 
+`tls.ca_file` is re-read when the file changes, and the next connection to a peer is checked
+against the new bundle. Rotating a CA needs no restart: add the new CA to the bundle on every node,
+reissue each node's certificate from it and replace the files, then remove the old CA from the
+bundles. A bundle that does not parse is refused with a warning, and the one in force is kept.
+
 **Current limits.**
 
-- `tls.ca_file` is read at startup, like `auth.internal_secret`, so changing it needs a restart. A CA
-  rotates by adding the new CA to the bundle on every node, restarting each one, reissuing
-  certificates from it, then removing the old CA with another restart.
-- An existing plaintext cluster cannot be switched to TLS in place yet. The cluster view keeps the
-  `http://` addresses its members were recorded under, and a node serving TLS logs a warning for each
-  at boot and cannot reach them. Start a cluster with TLS if you want it.
+- An existing plaintext cluster switches to TLS with a full stop, not one node at a time: stop
+  every node, add `tls` and rewrite every URL in every config file to `https://`, then start them
+  all. Keep `cluster.meta`. It still records the `http://` addresses, and a node serving TLS
+  connects to those as `https://`, so runtime joins and ring changes survive. A rolling conversion
+  does not work, because a plaintext node cannot reach one that has switched. Cluster status
+  responses keep showing the recorded `http://` addresses.
 
 ### Not handled in-process
 

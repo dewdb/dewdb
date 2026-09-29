@@ -1,8 +1,8 @@
 //! Credential config and the authorization decision for a request path.
 
-use crate::tls::PeerTrust;
+use crate::tls::{PeerClient, PeerTrust};
 use axum::http::HeaderMap;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
@@ -13,8 +13,9 @@ pub const NODE_HEADER: &str = "x-dew-node";
 #[derive(Deserialize, Clone, Debug, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AuthConfig {
-    #[serde(default)]
-    pub internal_secret: Option<String>,
+    /// Any entry is accepted on `/internal/*` and the first is presented, so a rotation is append-then-remove.
+    #[serde(default, deserialize_with = "one_or_more")]
+    pub internal_secret: Vec<String>,
     #[serde(default)]
     pub api_keys: Vec<String>,
     /// Empty means the admin surface shares `api_keys`, as it did before this tier existed.
@@ -24,15 +25,32 @@ pub struct AuthConfig {
     pub upstream_api_key: Option<String>,
 }
 
+fn one_or_more<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMore {
+        One(String),
+        More(Vec<String>),
+    }
+    match Option::<OneOrMore>::deserialize(d)? {
+        None => Ok(Vec::new()),
+        Some(OneOrMore::One(secret)) => Ok(vec![secret]),
+        // An empty list would open `/internal/*` from a file that looks like it sets a secret.
+        Some(OneOrMore::More(list)) if list.is_empty() => Err(serde::de::Error::custom(
+            "auth.internal_secret must name at least one secret; leave it out to run without one")),
+        Some(OneOrMore::More(list)) => Ok(list),
+    }
+}
+
 fn valid_header_value(v: &str) -> bool {
     !v.is_empty() && v.bytes().all(|b| (0x20..=0x7e).contains(&b))
 }
 
 impl AuthConfig {
     pub fn validate(&self) -> Result<(), String> {
-        if let Some(secret) = &self.internal_secret {
+        for secret in &self.internal_secret {
             if !valid_header_value(secret) {
-                return Err("auth.internal_secret must be non-empty printable ASCII".to_string());
+                return Err("auth.internal_secret entries must be non-empty printable ASCII".to_string());
             }
         }
         for key in &self.api_keys {
@@ -51,6 +69,10 @@ impl AuthConfig {
             }
         }
         Ok(())
+    }
+
+    pub fn internal_locked(&self) -> bool {
+        !self.internal_secret.is_empty()
     }
 
     pub fn public_locked(&self) -> bool {
@@ -143,13 +165,13 @@ pub fn authorize(
     authorization: Option<&str>,
 ) -> AuthOutcome {
     if path.starts_with("/internal/") {
-        return match &cfg.internal_secret {
-            None => AuthOutcome::Allow,
-            Some(expected) => match secret_header {
-                Some(got) if constant_time_eq(got, expected) => AuthOutcome::Allow,
-                Some(_) => AuthOutcome::Deny("invalid internal secret"),
-                None => AuthOutcome::Deny("missing internal secret header"),
-            },
+        if !cfg.internal_locked() {
+            return AuthOutcome::Allow;
+        }
+        return match secret_header {
+            Some(got) if cfg.internal_secret.iter().any(|s| constant_time_eq(got, s)) => AuthOutcome::Allow,
+            Some(_) => AuthOutcome::Deny("invalid internal secret"),
+            None => AuthOutcome::Deny("missing internal secret header"),
         };
     }
 
@@ -263,7 +285,7 @@ fn node_headers(auth: &AuthConfig, from: &str) -> reqwest::header::HeaderMap {
         headers.insert(NODE_HEADER, v);
     }
 
-    if let Some(secret) = &auth.internal_secret {
+    if let Some(secret) = auth.internal_secret.first() {
         if let Ok(v) = reqwest::header::HeaderValue::from_str(secret) {
             headers.insert(INTERNAL_SECRET_HEADER, v);
         }
@@ -276,25 +298,27 @@ fn node_headers(auth: &AuthConfig, from: &str) -> reqwest::header::HeaderMap {
     headers
 }
 
-pub fn build_client(auth: &AuthConfig, trust: &PeerTrust, from: &str) -> reqwest::Client {
-    trust.apply(reqwest::Client::builder())
+pub fn build_client(auth: &AuthConfig, trust: &PeerTrust, from: &str) -> PeerClient {
+    let client = trust.apply(reqwest::Client::builder())
         .timeout(Duration::from_secs(5))
         .default_headers(node_headers(auth, from))
         .build()
-        .unwrap()
+        .unwrap();
+    PeerClient::new(client, trust)
 }
 
 /// The same credentials with no whole-request deadline, for the change streams a router holds open
 /// for as long as its own subscriber does. `STREAM_READ_TIMEOUT` is the liveness check in its place.
-pub fn build_stream_client(auth: &AuthConfig, trust: &PeerTrust, from: &str) -> reqwest::Client {
-    trust.apply(reqwest::Client::builder())
+pub fn build_stream_client(auth: &AuthConfig, trust: &PeerTrust, from: &str) -> PeerClient {
+    let client = trust.apply(reqwest::Client::builder())
         .connect_timeout(Duration::from_secs(5))
         .read_timeout(STREAM_READ_TIMEOUT)
         // Unpooled: a request needing a new connection past an open stream can stall undialed (IB-061).
         .pool_max_idle_per_host(0)
         .default_headers(node_headers(auth, from))
         .build()
-        .unwrap()
+        .unwrap();
+    PeerClient::new(client, trust)
 }
 
 #[cfg(test)]
@@ -308,7 +332,7 @@ mod tests {
 
     fn with_admin(secret: Option<&str>, keys: &[&str], admin: &[&str]) -> AuthConfig {
         AuthConfig {
-            internal_secret: secret.map(|s| s.to_string()),
+            internal_secret: secret.into_iter().map(str::to_string).collect(),
             api_keys: keys.iter().map(|k| k.to_string()).collect(),
             admin_keys: admin.iter().map(|k| k.to_string()).collect(),
             upstream_api_key: None,
@@ -331,6 +355,28 @@ mod tests {
         let open = auth_cfg(None, &[]);
         assert_eq!(authorize("/internal/replicate", "GET", &open, None, None, None), AuthOutcome::Allow,
             "an unset secret leaves internal routes open for backward compatibility");
+    }
+
+    /// IB-042: a secret rotation is append-then-remove, so every listed secret opens `/internal/*`
+    /// and only the first is presented.
+    #[test]
+    fn any_listed_internal_secret_is_accepted_and_the_first_is_presented() {
+        let parse = |json: &str| serde_json::from_str::<AuthConfig>(json);
+        let listed = parse(r#"{"internal_secret":["new","old"]}"#).unwrap();
+        for secret in ["new", "old"] {
+            assert_eq!(authorize("/internal/replicate", "POST", &listed, Some(secret), None, None),
+                AuthOutcome::Allow, "{}", secret);
+        }
+        assert_eq!(authorize("/internal/replicate", "POST", &listed, Some("gone"), None, None),
+            AuthOutcome::Deny("invalid internal secret"));
+        let presented = node_headers(&listed, "http://n:1");
+        assert_eq!(presented.get(INTERNAL_SECRET_HEADER).unwrap(), "new");
+
+        assert_eq!(parse(r#"{"internal_secret":"one"}"#).unwrap().internal_secret, vec!["one"],
+            "the single-string form is the one every existing config file holds");
+        assert!(!parse(r#"{"internal_secret":null}"#).unwrap().internal_locked());
+        assert!(parse(r#"{"internal_secret":[]}"#).is_err(), "an empty list must not read as no secret");
+        assert!(parse(r#"{"internal_secret":["ok",""]}"#).unwrap().validate().is_err());
     }
 
     #[test]
@@ -400,7 +446,7 @@ mod tests {
 
         let parsed: NodeConfig = serde_json::from_str(
             r#"{"node_id":"n","role":"shard","listen_addr":"127.0.0.1:1"}"#).unwrap();
-        assert!(parsed.auth.internal_secret.is_none());
+        assert!(!parsed.auth.internal_locked());
         assert!(!parsed.auth.public_locked(), "auth is off by default");
         assert!(!parsed.auth.admin_locked(), "the admin tier is off by default");
     }

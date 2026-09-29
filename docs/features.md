@@ -885,8 +885,8 @@ are right, and a direct request to the shard gives the precise message.
 - **Rotation without a restart.** `api_keys` and `admin_keys` are re-read from the config file while
   the node runs, so removing a compromised key takes effect within about five seconds. A file that
   will not parse or that names an unusable credential is refused and the set in force is kept.
-  `internal_secret` and `upstream_api_key` are wired into the node's outbound clients at boot, so
-  changing either takes a restart.
+  `internal_secret` and `upstream_api_key` reload too: `internal_secret` can be a list, so a node
+  accepts the old and new secret while a rotation rolls through the cluster.
 - **An admin tier over topology, destruction and schema.** `admin_keys` guards every `/cluster/*`
   route, `DELETE /collections/:name`, index definitions and every webhook route; leaving it empty
   falls back to `api_keys`, so an existing deployment is unchanged. An admin key opens the public API
@@ -916,9 +916,9 @@ are right, and a direct request to the shard gives the precise message.
   its own certificate expires.
 
 **Scope.** The credential tiers are client, admin and internal, and TLS does not add client
-certificates — the shared secret stays the internal identity. Changing the CA bundle needs a restart,
-and an existing plaintext cluster cannot yet be switched to TLS in place. At-rest encryption and
-audit logging live in the surrounding infrastructure. Compact and
+certificates — the shared secret stays the internal identity. The CA bundle reloads without a
+restart, and an existing plaintext cluster switches to TLS with every node stopped at once, not
+rolling. At-rest encryption and audit logging live in the surrounding infrastructure. Compact and
 snapshot sit on the client tier.
 
 ---
@@ -1013,6 +1013,6 @@ The shape of what DewDB does today, in one place:
 | Change history | As far back as `changefeed.buffer_events` per collection. A cluster-wide stream can miss up to a second of a collection's first changes on a shard group that held none of it when the stream opened. |
 | Webhooks | Registered per shard group. Registrations, removals and acknowledged positions are majority-committed; administration needs a reachable quorum. |
 | WebSocket auth | The handshake carries a credential header, so a browser reaches an authenticated feed through SSE and a same-origin proxy. |
-| TLS | In the process, for clusters started with it; an existing plaintext cluster cannot be switched in place, and a CA change needs a restart. |
+| TLS | In the process; an existing plaintext cluster switches with a full stop, keeping its cluster view; the CA bundle reloads live. |
 | Audit | Collected in front of the node. |
 | Cross-shard work | Per-key or fan-out; joins are done in the client. |

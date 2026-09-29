@@ -1948,8 +1948,11 @@ last `error` frame saying the credential is no longer accepted, and a webhook su
 registered disables itself with the reason in `delivery.disabled`. Nothing keeps reading the
 collection on a credential you took away.
 
-`internal_secret` and `upstream_api_key` are wired into the node's outbound clients at boot, so
-changing either takes a restart. The node logs a warning when it sees one change under it.
+`internal_secret` and `upstream_api_key` reload too. `internal_secret` can be a list: a node
+accepts any secret in it and sends the first. Rotate it in three edits, each made on every node
+before the next: `["old", "new"]`, then `["new", "old"]`, then `["new"]`. Nodes keep replicating
+throughout. Removing `internal_secret` altogether is refused while the node runs; that takes a
+restart.
 
 ### Turn on TLS
 
@@ -1990,13 +1993,18 @@ and presents it from the next connection; if the key is written after the certif
 attempt is refused with a warning and the node keeps serving the old pair until the two match. It
 warns daily from three weeks before its certificate expires (`tls.expiry_warning_days`).
 
-Two current limits:
+To move to a new CA, add it to `ca_file` on every node, reissue each node's certificate from it,
+then remove the old CA. The node re-reads `ca_file` when it changes, so none of this needs a restart.
 
-- **Changing `ca_file` needs a restart.** To move to a new CA, add it to the bundle on every node and
-  restart each one, reissue certificates from it, then remove the old CA and restart again.
-- **An existing plaintext cluster cannot be switched to TLS in place yet.** The cluster remembers
-  its members by the `http://` addresses they joined with, and a node serving TLS cannot reach them.
-  Start a cluster with TLS if you want it.
+To switch an existing plaintext cluster to TLS, stop every node, add `tls` and rewrite every URL in
+every config file to `https://`, then start them all. Keep `cluster.meta`: it still records the
+`http://` addresses, and a node serving TLS connects to those as `https://` on the same port.
+
+One current limit:
+
+- **The switch is a full stop, not a rolling one.** Converting one node at a time does not work,
+  because a plaintext node cannot reach one that has switched, so the cluster cannot run with a
+  mix of plaintext and TLS nodes.
 
 ---
 

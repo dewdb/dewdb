@@ -478,7 +478,7 @@ fn validate_staged_snapshot(target: &Path, local_applied: u64) -> io::Result<()>
 }
 
 pub async fn replica_sync_from_primary(
-    client: &reqwest::Client,
+    client: &crate::tls::PeerClient,
     primary_addr: &str,
     db: &Database,
     collection_name: &str,
@@ -921,7 +921,7 @@ mod tests {
         let local = replica_db.get_collection("ghost").unwrap();
         live_put(&local, "mine", 1);
 
-        let error = replica_sync_from_primary(&client, &leader.url(), &replica_db, "ghost")
+        let error = replica_sync_from_primary(&client.clone().into(), &leader.url(), &replica_db, "ghost")
             .await.expect_err("there is nothing there to install");
         assert!(error.contains("holds no collection 'ghost'"), "unexpected refusal: {}", error);
         assert_eq!(replica_db.get_collection("ghost").unwrap().get("mine").unwrap(),
@@ -961,7 +961,7 @@ mod tests {
         old.enqueue_commit().await.unwrap().unwrap();
 
         let result = replica_sync_from_primary(
-            &reqwest::Client::new(),
+            &reqwest::Client::new().into(),
             &format!("http://{}", address),
             &replica_db,
             "events",
@@ -1020,7 +1020,7 @@ mod tests {
         assert!(published > 1, "the fixture must put this node ahead of the snapshot");
 
         let error = replica_sync_from_primary(
-            &reqwest::Client::new(),
+            &reqwest::Client::new().into(),
             &format!("http://{}", address),
             &replica_db,
             "events",
@@ -1252,7 +1252,7 @@ mod tests {
         assert!(!replica_db.root_path.join("events").exists(), "the replica starts without it");
 
         replica_sync_from_primary(
-            &reqwest::Client::new(),
+            &reqwest::Client::new().into(),
             &format!("http://{}", address),
             &replica_db,
             "events",
