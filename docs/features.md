@@ -512,8 +512,8 @@ SSE stream through a same-origin proxy, since it cannot set headers on a WebSock
 - **Background maintenance.** Compaction fires when a collection's dead-byte ratio and total size
   both cross their thresholds; index snapshots are written on an interval and skipped when nothing
   was appended. Both are configurable, and the whole scheduler can be turned off.
-- **Clean shutdown.** `Ctrl-C` fsyncs pending group-commit waiters and persists the durable LSN
-  before exit.
+- **Clean shutdown.** `Ctrl-C`, and `SIGTERM` on Unix (what `docker stop` sends), fsync pending
+  group-commit waiters and persist the durable LSN before exit.
 - **Concurrent reads.** Reads and scans run on a blocking pool, and every WAL file is opened four
   times so readers do not serialise on one file handle.
 

@@ -201,6 +201,24 @@ fn reload_auth(path: &str) -> Result<crate::auth::AuthConfig, String> {
     Ok(auth)
 }
 
+/// Resolves on the first stop request, naming it. SIGTERM is what `docker stop`, systemd and
+/// Kubernetes send, so on Unix it has to take the same clean path as Ctrl-C.
+#[cfg(unix)]
+async fn shutdown_signal() -> &'static str {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut terminate = signal(SignalKind::terminate()).expect("Cannot install the SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => "SIGINT",
+        _ = terminate.recv() => "SIGTERM",
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> &'static str {
+    let _ = tokio::signal::ctrl_c().await;
+    "Ctrl-C"
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -292,8 +310,8 @@ async fn main() -> io::Result<()> {
     let db_clone = db.clone();
     tokio::spawn(async move {
         // Pending group-commit waiters are not yet durable.
-        let _ = tokio::signal::ctrl_c().await;
-        info!(target: "boot", "Received Ctrl-C; shutting down and forcing WAL commits");
+        let received = shutdown_signal().await;
+        info!(target: "boot", signal = received, "Received {}; shutting down and forcing WAL commits", received);
         if let Some(d) = db_clone {
             d.force_commit_all();
         }

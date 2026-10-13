@@ -173,12 +173,12 @@ read, so both work on a host that has none:
 
 ```bash
 ./target/release/dewdb --version
-# dewdb 1.2.0
+# dewdb 1.2.1
 ./target/release/dewdb --help
 # usage, the default config path, and the five fields a single node needs
 ```
 
-`Ctrl-C` is handled: pending group-commit waiters are fsynced and the durable LSN is persisted
+`Ctrl-C` and, on Unix, `SIGTERM` are handled: pending group-commit waiters are fsynced and the durable LSN is persisted
 before the process exits.
 
 ### Test suite

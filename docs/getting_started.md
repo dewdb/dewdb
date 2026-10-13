@@ -54,7 +54,7 @@ The binary is `./target/release/dewdb`. It will tell you what it is:
 
 ```bash
 ./target/release/dewdb --version
-# dewdb 1.2.0
+# dewdb 1.2.1
 ```
 
 `--version` (or `-V`) is answered before any config file is read, so it works before you have
@@ -157,7 +157,7 @@ curl -s localhost:8081/health
  "cluster_version":1,"uptime_secs":3,"collections":0,"reasons":[]}
 ```
 
-`Ctrl-C` shuts it down cleanly: pending writes are fsynced and the durable position is recorded
+`Ctrl-C` shuts it down cleanly, as does `SIGTERM` on Linux and macOS: pending writes are fsynced and the durable position is recorded
 before the process exits.
 
 > Running several nodes on one machine? Give each its own `data_dir` and port.
