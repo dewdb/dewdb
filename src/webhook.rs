@@ -902,6 +902,38 @@ mod tests {
         assert_eq!(state.webhooks.get(&key).unwrap().delivery.gaps, 0);
     }
 
+    /// The other side of the wait above: a position this node's log never reached is one taken
+    /// against another log, so it is still a gap, and delivery resumes from where the feed is.
+    #[tokio::test]
+    async fn a_position_beyond_the_local_log_is_still_a_gap() {
+        let root = crate::test_support::temp_root();
+        let db = Arc::new(Database::new(&root).unwrap());
+        let config = serde_json::from_value(serde_json::json!({
+            "node_id": "solo", "role": "shard", "shard_role": "replica",
+            "listen_addr": "127.0.0.1:9603", "data_dir": root.to_string_lossy(),
+        })).unwrap();
+        let state = AppState::for_admission_test(config, db.clone(), false);
+        let key = ("c".to_string(), "hook".to_string());
+        let col = db.get_collection("c").unwrap();
+        let seed = col.put("seed".into(), serde_json::json!({"v": 0}), 1).unwrap().3;
+        col.apply_committed(seed).unwrap();
+        let beyond = seed + 1_000;
+        state.webhooks.upsert(spec("hook"), beyond, 4).unwrap();
+        state.webhooks.sync_pins(&db);
+        assert!(col.last_appended_lsn() < beyond);
+
+        assert!(open(&state, &key).is_none(), "a position from another log cannot be opened");
+        let delivery = state.webhooks.get(&key).unwrap().delivery;
+        assert_eq!(delivery.gaps, 1, "{:?}", delivery);
+        assert_eq!(delivery.position, seed, "{:?}", delivery);
+        assert_eq!(delivery.last_error.as_deref(),
+            Some(format!("position was above the log; resumed at {}", seed).as_str()));
+
+        let stream = open(&state, &key).expect("delivery resumes from where the feed is");
+        assert_eq!(stream.position(), seed);
+        assert_eq!(state.webhooks.get(&key).unwrap().delivery.gaps, 1);
+    }
+
     fn spec(id: &str) -> WebhookSpec {
         WebhookSpec {
             id: id.to_string(),
