@@ -660,6 +660,10 @@ fn open(state: &AppState, key: &WebhookKey) -> Option<CdcStream> {
                 "Webhook fell behind the change buffer; events before the floor were not delivered");
             None
         },
+        // This node's log holds the position, but the feed has not published it: commit is per
+        // collection, so a promoted replica can hold the group's cursor while the event it names
+        // waits on the promotion barrier. That resolves by itself, and nothing below it is lost.
+        Err(SubscribeError::Ahead(_)) if col.last_appended_lsn() >= position => None,
         // The position outlives the log it was taken against -- the collection was rebuilt under
         // this node -- so there is nothing below it left to deliver.
         Err(SubscribeError::Ahead(position)) => {
@@ -858,6 +862,76 @@ mod tests {
         let worker = store.clone();
         tokio::task::spawn_blocking(move || worker.flush()).await.unwrap();
         assert_eq!(WebhookStore::restored(&dir).get(&key).unwrap().delivery.position, 102);
+    }
+
+    /// Commit is tracked per collection, so a promoted replica can hold the group's cursor applied
+    /// while the event it names is still staged behind the promotion barrier. That is a feed that has
+    /// not caught up, not a position from another log: waiting is right, and counting a gap is not.
+    #[tokio::test]
+    async fn a_cursor_ahead_of_a_staged_tail_waits_rather_than_counting_a_gap() {
+        let root = crate::test_support::temp_root();
+        let db = Arc::new(Database::new(&root).unwrap());
+        let config = serde_json::from_value(serde_json::json!({
+            "node_id": "solo", "role": "shard", "shard_role": "replica",
+            "listen_addr": "127.0.0.1:9602", "data_dir": root.to_string_lossy(),
+        })).unwrap();
+        let state = AppState::for_admission_test(config, db.clone(), false);
+        let key = ("c".to_string(), "hook".to_string());
+        let col = db.get_collection("c").unwrap();
+        let seed = col.put("seed".into(), serde_json::json!({"v": 0}), 1).unwrap().3;
+        col.apply_committed(seed).unwrap();
+        state.webhooks.upsert(spec("hook"), seed, 4).unwrap();
+        state.webhooks.sync_pins(&db);
+
+        // `before` is held but not committed here; the cursor naming it is.
+        let before = col.put("before".into(), serde_json::json!({"v": 1}), 1).unwrap().3;
+        let log = db.get_collection(WEBHOOK_PROGRESS_LOG).unwrap();
+        let cursor = log.put(progress_key(&key), serde_json::json!({"position": before}), 1).unwrap().3;
+        log.apply_committed(cursor).unwrap();
+        assert_eq!(replicated_position(&state, &key), before);
+
+        assert!(open(&state, &key).is_none(), "the feed has not reached the cursor yet");
+        let delivery = state.webhooks.get(&key).unwrap().delivery;
+        assert_eq!(delivery.gaps, 0, "a staged tail is not a gap: {:?}", delivery);
+        assert_eq!(delivery.position, before, "the cursor must not be walked back: {:?}", delivery);
+
+        // The barrier commits the tail, and delivery resumes after the acknowledged event.
+        col.apply_committed(before).unwrap();
+        let stream = open(&state, &key).expect("the feed reached the cursor");
+        assert_eq!(stream.position(), before);
+        assert_eq!(state.webhooks.get(&key).unwrap().delivery.gaps, 0);
+    }
+
+    /// The other side of the wait above: a position this node's log never reached is one taken
+    /// against another log, so it is still a gap, and delivery resumes from where the feed is.
+    #[tokio::test]
+    async fn a_position_beyond_the_local_log_is_still_a_gap() {
+        let root = crate::test_support::temp_root();
+        let db = Arc::new(Database::new(&root).unwrap());
+        let config = serde_json::from_value(serde_json::json!({
+            "node_id": "solo", "role": "shard", "shard_role": "replica",
+            "listen_addr": "127.0.0.1:9603", "data_dir": root.to_string_lossy(),
+        })).unwrap();
+        let state = AppState::for_admission_test(config, db.clone(), false);
+        let key = ("c".to_string(), "hook".to_string());
+        let col = db.get_collection("c").unwrap();
+        let seed = col.put("seed".into(), serde_json::json!({"v": 0}), 1).unwrap().3;
+        col.apply_committed(seed).unwrap();
+        let beyond = seed + 1_000;
+        state.webhooks.upsert(spec("hook"), beyond, 4).unwrap();
+        state.webhooks.sync_pins(&db);
+        assert!(col.last_appended_lsn() < beyond);
+
+        assert!(open(&state, &key).is_none(), "a position from another log cannot be opened");
+        let delivery = state.webhooks.get(&key).unwrap().delivery;
+        assert_eq!(delivery.gaps, 1, "{:?}", delivery);
+        assert_eq!(delivery.position, seed, "{:?}", delivery);
+        assert_eq!(delivery.last_error.as_deref(),
+            Some(format!("position was above the log; resumed at {}", seed).as_str()));
+
+        let stream = open(&state, &key).expect("delivery resumes from where the feed is");
+        assert_eq!(stream.position(), seed);
+        assert_eq!(state.webhooks.get(&key).unwrap().delivery.gaps, 1);
     }
 
     fn spec(id: &str) -> WebhookSpec {
