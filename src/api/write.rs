@@ -74,6 +74,7 @@ async fn local_write_inner(
     col: &Arc<Collection>,
     key: String,
     value: Option<serde_json::Value>,
+    expire_at: Option<u64>,
     migration: bool,
 ) -> Result<PendingWrite, axum::response::Response> {
     let col_clone = col.clone();
@@ -88,7 +89,7 @@ async fn local_write_inner(
             return col_clone.migration_write(key_clone, value, term);
         }
         match value {
-            Some(v) => col_clone.put(key_clone, v, term),
+            Some(v) => col_clone.put_with_expiry(key_clone, v, expire_at, term),
             None => col_clone.delete(key_clone, term),
         }
     }).await;
@@ -213,7 +214,7 @@ pub async fn local_write(
     wc: WriteConcern,
     wtimeout: Duration,
 ) -> Result<WriteOutcome, axum::response::Response> {
-    local_write_with_origin(state, col_name, key, value, wc, wtimeout, false, &Preconditions::none()).await
+    local_write_with_origin(state, col_name, key, value, None, wc, wtimeout, false, &Preconditions::none()).await
 }
 
 pub async fn local_write_if(
@@ -225,7 +226,20 @@ pub async fn local_write_if(
     wtimeout: Duration,
     pre: &Preconditions,
 ) -> Result<WriteOutcome, axum::response::Response> {
-    local_write_with_origin(state, col_name, key, value, wc, wtimeout, false, pre).await
+    local_write_if_with_expiry(state, col_name, key, value, None, wc, wtimeout, pre).await
+}
+
+pub async fn local_write_if_with_expiry(
+    state: &AppState,
+    col_name: &str,
+    key: String,
+    value: Option<serde_json::Value>,
+    expire_at: Option<u64>,
+    wc: WriteConcern,
+    wtimeout: Duration,
+    pre: &Preconditions,
+) -> Result<WriteOutcome, axum::response::Response> {
+    local_write_with_origin(state, col_name, key, value, expire_at, wc, wtimeout, false, pre).await
 }
 
 pub async fn local_migration_write(
@@ -236,7 +250,7 @@ pub async fn local_migration_write(
     wc: WriteConcern,
     wtimeout: Duration,
 ) -> Result<WriteOutcome, axum::response::Response> {
-    local_write_with_origin(state, col_name, key, value, wc, wtimeout, true, &Preconditions::none()).await
+    local_write_with_origin(state, col_name, key, value, None, wc, wtimeout, true, &Preconditions::none()).await
 }
 
 async fn local_write_with_origin(
@@ -244,6 +258,7 @@ async fn local_write_with_origin(
     col_name: &str,
     key: String,
     value: Option<serde_json::Value>,
+    expire_at: Option<u64>,
     wc: WriteConcern,
     wtimeout: Duration,
     migration: bool,
@@ -266,7 +281,7 @@ async fn local_write_with_origin(
                 return Err(precondition_failed(current));
             }
         }
-        local_write_inner(state, &col, key, value, migration).await?
+        local_write_inner(state, &col, key, value, expire_at, migration).await?
     };
     drop(admitted);
 
@@ -278,6 +293,7 @@ pub async fn local_patch(
     col_name: &str,
     key: String,
     patch: serde_json::Value,
+    expire_at: Option<u64>,
     wc: WriteConcern,
     wtimeout: Duration,
     pre: &Preconditions,
@@ -313,8 +329,9 @@ pub async fn local_patch(
         };
 
         merge_patch(&mut doc, &patch);
+        let effective_expiry = expire_at.or_else(|| col.expire_at_including_staged(&key));
 
-        local_write_inner(state, &col, key, Some(doc), false).await?
+        local_write_inner(state, &col, key, Some(doc), effective_expiry, false).await?
     };
     drop(admitted);
 
@@ -383,6 +400,38 @@ pub async fn local_index_change(
     let term = append_term(state, col_name)?;
     let col_clone = col.clone();
     let appended = tokio::task::spawn_blocking(move || col_clone.define_index(change, term)).await;
+    let (frame, _wal_id, _offset, lsn) = match appended {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    };
+
+    let commit = col.enqueue_commit();
+    state.note_leader_append(col_name, lsn);
+    let pending = PendingWrite { frame, term, lsn, existed: true, commit: Some(commit) };
+    drop(admitted);
+
+    finish_write(state, col_name, pending, wc, wtimeout).await
+}
+
+pub async fn local_ttl_change(
+    state: &AppState,
+    col_name: &str,
+    ttl_secs: Option<u64>,
+    wc: WriteConcern,
+    wtimeout: Duration,
+) -> Result<WriteOutcome, axum::response::Response> {
+    let admitted = admit(state, col_name, 1)?;
+
+    let db = state.db.as_ref().unwrap();
+    let col = match db.get_collection(col_name) {
+        Ok(c) => c,
+        Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    };
+
+    let term = append_term(state, col_name)?;
+    let col_clone = col.clone();
+    let appended = tokio::task::spawn_blocking(move || col_clone.set_ttl(ttl_secs, term)).await;
     let (frame, _wal_id, _offset, lsn) = match appended {
         Ok(Ok(t)) => t,
         Ok(Err(e)) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
@@ -469,7 +518,7 @@ async fn finish_write_batch(
 async fn local_write_batch_inner(
     state: &AppState,
     col: &Arc<Collection>,
-    items: Vec<(String, serde_json::Value)>,
+    items: Vec<(String, serde_json::Value, Option<u64>, Option<u64>)>,
     admitted: Option<FrameReservation>,
     migration: bool,
 ) -> Result<Vec<PendingWrite>, axum::response::Response> {
@@ -478,17 +527,17 @@ async fn local_write_batch_inner(
     // cannot show that: every sample here is taken before the first `put`.
     let mut batched: HashSet<&str> = HashSet::new();
     let existed: Vec<bool> = items.iter()
-        .map(|(key, _)| !batched.insert(key.as_str()) || col.exists_including_staged(key))
+        .map(|(key, _, _, _)| !batched.insert(key.as_str()) || col.exists_including_staged(key))
         .collect();
 
     let col_clone = col.clone();
     let write_res = tokio::task::spawn_blocking(move || {
         let mut out = Vec::with_capacity(items.len());
-        for (key, value) in items {
+        for (key, value, ts, expire_at) in items {
             let (frame, wal_id, offset, lsn) = if migration {
-                col_clone.migration_write(key.clone(), Some(value), term)?
+                col_clone.migration_put(key.clone(), value, ts, expire_at, term)?
             } else {
-                col_clone.put(key.clone(), value, term)?
+                col_clone.put_with_expiry(key.clone(), value, expire_at, term)?
             };
             out.push((key, frame, wal_id, offset, lsn));
         }
@@ -522,27 +571,33 @@ async fn local_write_batch_inner(
 pub async fn local_write_batch(
     state: &AppState,
     col_name: &str,
-    items: Vec<(String, serde_json::Value)>,
+    items: Vec<(String, serde_json::Value, Option<u64>)>,
     wc: WriteConcern,
     wtimeout: Duration,
 ) -> Result<Vec<WriteOutcome>, axum::response::Response> {
+    let items = items.into_iter()
+        .map(|(k, v, exp)| (k, v, None, exp))
+        .collect();
     local_write_batch_with_origin(state, col_name, items, wc, wtimeout, false).await
 }
 
 pub async fn local_migration_write_batch(
     state: &AppState,
     col_name: &str,
-    items: Vec<(String, serde_json::Value)>,
+    items: Vec<crate::cluster::migration::MigrateDoc>,
     wc: WriteConcern,
     wtimeout: Duration,
 ) -> Result<Vec<WriteOutcome>, axum::response::Response> {
+    let items = items.into_iter()
+        .map(|d| (d.key, d.value, d.ts, d.expire_at))
+        .collect();
     local_write_batch_with_origin(state, col_name, items, wc, wtimeout, true).await
 }
 
 async fn local_write_batch_with_origin(
     state: &AppState,
     col_name: &str,
-    items: Vec<(String, serde_json::Value)>,
+    items: Vec<(String, serde_json::Value, Option<u64>, Option<u64>)>,
     wc: WriteConcern,
     wtimeout: Duration,
     migration: bool,
@@ -555,7 +610,7 @@ async fn local_write_batch_with_origin(
         Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     };
 
-    let mut stripes: Vec<usize> = items.iter().map(|(key, _)| col.key_stripe(key)).collect();
+    let mut stripes: Vec<usize> = items.iter().map(|(key, _, _, _)| col.key_stripe(key)).collect();
     stripes.sort_unstable();
     // Locking per key deadlocks as soon as two keys in the batch share a stripe.
     stripes.dedup();
@@ -568,6 +623,77 @@ async fn local_write_batch_with_origin(
     let pending = local_write_batch_inner(state, &col, items, admitted, migration).await?;
 
     finish_write_batch(state, col_name, pending, wc, wtimeout).await
+}
+
+pub async fn local_sweep_expired_batch(
+    state: &AppState,
+    col_name: &str,
+    candidates: Vec<(String, Version)>,
+    wc: WriteConcern,
+    wtimeout: Duration,
+) -> Result<usize, axum::response::Response> {
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    let admitted = admit(state, col_name, candidates.len())?;
+
+    let db = state.db.as_ref().unwrap();
+    let col = match db.get_collection(col_name) {
+        Ok(c) => c,
+        Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    };
+
+    let mut stripes: Vec<usize> = candidates.iter().map(|(key, _)| col.key_stripe(key)).collect();
+    stripes.sort_unstable();
+    stripes.dedup();
+
+    let mut _guards = Vec::with_capacity(stripes.len());
+    for stripe in stripes {
+        _guards.push(col.key_locks[stripe].lock().await);
+    }
+
+    let term = append_term(state, col_name)?;
+    // Re-check version under the key lock so a concurrent overwrite is not tombstoned.
+    let to_delete: Vec<String> = candidates.into_iter()
+        .filter(|(key, expected)| col.version_including_staged(key) == Some(*expected))
+        .map(|(key, _)| key)
+        .collect();
+    if to_delete.is_empty() {
+        return Ok(0);
+    }
+
+    let col_clone = col.clone();
+    let write_res = tokio::task::spawn_blocking(move || {
+        let mut out = Vec::with_capacity(to_delete.len());
+        for key in to_delete {
+            let (frame, _wal_id, _offset, lsn) = col_clone.delete(key, term)?;
+            out.push((frame, lsn));
+        }
+        Ok::<_, io::Error>(out)
+    }).await;
+
+    let frames = match write_res {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    };
+    drop(admitted);
+
+    match col.enqueue_commit().await {
+        Ok(Ok(())) => {},
+        Ok(Err(e)) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e)),
+        Err(e) => return Err(err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+
+    if let Some((_frame, lsn)) = frames.first() {
+        state.note_leader_append(col_name, *lsn);
+    }
+
+    let pending: Vec<PendingWrite> = frames.into_iter()
+        .map(|(frame, lsn)| PendingWrite { frame, term, lsn, existed: true, commit: None })
+        .collect();
+    let outcomes = finish_write_batch(state, col_name, pending, wc, wtimeout).await?;
+    Ok(outcomes.into_iter().filter(|o| o.met).count())
 }
 
 #[cfg(test)]
@@ -619,8 +745,8 @@ mod tests {
                     std::fs::create_dir(&blocked).unwrap();
                     let error = if batch {
                         super::local_write_batch(&state, "t", vec![
-                            ("a".into(), serde_json::json!({"v": 2})),
-                            ("b".into(), serde_json::json!({"v": 3})),
+                            ("a".into(), serde_json::json!({"v": 2}), None),
+                            ("b".into(), serde_json::json!({"v": 3}), None),
                         ], wc, timeout).await.err().unwrap()
                     } else {
                         local_write(&state, "t", "a".into(), Some(serde_json::json!({"v": 2})),
@@ -759,7 +885,7 @@ mod tests {
 
         let pending = {
             let _guard = col.key_lock("k").lock().await;
-            super::local_write_inner(&state, &col, "k".into(), Some(serde_json::json!({"v": 1})), false)
+            super::local_write_inner(&state, &col, "k".into(), Some(serde_json::json!({"v": 1})), None, false)
                 .await.unwrap()
         };
         depose(&state);

@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 pub fn idx(frame: &[u8], wal_id: u64, offset: u64) -> IndexEntry {
     let header = FrameHeader::parse(frame).expect("a test frame carries a header");
-    IndexEntry { wal_id, offset, len: (frame.len() - HEADER_LEN) as u32, inline: None, lsn: header.lsn, term: header.term }
+    IndexEntry { wal_id, offset, len: (frame.len() - HEADER_LEN) as u32, inline: None, lsn: header.lsn, term: header.term, ts: 0, expire_at: None }
 }
 
 /// The existence check is the verdict, not the removal's result: a background task still holding an
@@ -98,6 +98,7 @@ pub fn make_frame(term: u64, lsn: u64, prev_lsn: u64, prev_term: u64, key: &str,
         key: key.to_string(),
         value: serde_json::json!({"v": v}),
         ts: 0,
+        expire_at: None,
     };
     let payload = serde_json::to_vec(&entry).unwrap();
     let mut hasher = crc32fast::Hasher::new();

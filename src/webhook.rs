@@ -660,9 +660,8 @@ fn open(state: &AppState, key: &WebhookKey) -> Option<CdcStream> {
                 "Webhook fell behind the change buffer; events before the floor were not delivered");
             None
         },
-        // This node's log holds the position, but the feed has not published it: commit is per
-        // collection, so a promoted replica can hold the group's cursor while the event it names
-        // waits on the promotion barrier. That resolves by itself, and nothing below it is lost.
+        // Commit is per collection: a promoted replica can hold the group's cursor while the event
+        // it names still waits on the promotion barrier. Not a gap; the next open resolves it.
         Err(SubscribeError::Ahead(_)) if col.last_appended_lsn() >= position => None,
         // The position outlives the log it was taken against -- the collection was rebuilt under
         // this node -- so there is nothing below it left to deliver.
@@ -864,9 +863,8 @@ mod tests {
         assert_eq!(WebhookStore::restored(&dir).get(&key).unwrap().delivery.position, 102);
     }
 
-    /// Commit is tracked per collection, so a promoted replica can hold the group's cursor applied
-    /// while the event it names is still staged behind the promotion barrier. That is a feed that has
-    /// not caught up, not a position from another log: waiting is right, and counting a gap is not.
+    /// A cursor committed ahead of a staged tail is a feed that has not caught up, not a position
+    /// from another log.
     #[tokio::test]
     async fn a_cursor_ahead_of_a_staged_tail_waits_rather_than_counting_a_gap() {
         let root = crate::test_support::temp_root();

@@ -84,6 +84,8 @@ pub enum LogEntry {
         key: String,
         value: serde_json::Value,
         ts: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expire_at: Option<u64>,
     },
     Del {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -116,6 +118,10 @@ pub enum LogEntry {
     /// values it asks for; what commits is the build, since the postings derive from committed keys.
     Index {
         change: crate::storage::secondary::IndexChange,
+        ts: u64,
+    },
+    Ttl {
+        ttl_secs: Option<u64>,
         ts: u64,
     },
 }

@@ -110,7 +110,7 @@ fn presented_api_key<'a>(api_key_header: Option<&'a str>, authorization: Option<
     authorization.and_then(|a| a.strip_prefix("Bearer ")).map(|k| k.trim())
 }
 
-/// Topology, collection destruction, and index definitions. Segments are counted before percent-decoding,
+/// Topology, destruction, index definitions and TTL. Segments are counted before percent-decoding,
 /// the way axum routes them, so an encoded slash cannot make a drop look like a document delete.
 fn is_admin_route(path: &str, method: &str) -> bool {
     if path == "/cluster" || path.starts_with("/cluster/") {
@@ -127,6 +127,10 @@ fn is_admin_route(path: &str, method: &str) -> bool {
     if matches!(method, "POST" | "DELETE") && is_index_route(path) {
         return true;
     }
+    // A collection TTL can empty the collection on the next sweep, which is a drop by another name.
+    if matches!(method, "PUT" | "DELETE") && is_ttl_route(path) {
+        return true;
+    }
     // Every method, unlike indexes: a listing names the destinations this node pushes documents to.
     is_webhook_route(path)
 }
@@ -141,6 +145,15 @@ fn is_webhook_route(path: &str) -> bool {
             None => true,
             Some(id) => !id.is_empty() && parts.next().is_none(),
         }
+}
+
+/// `/collections/<name>/ttl`, and nothing deeper.
+fn is_ttl_route(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/collections/") else { return false };
+    let mut parts = rest.split('/');
+    parts.next().is_some_and(|name| !name.is_empty())
+        && parts.next() == Some("ttl")
+        && parts.next().is_none()
 }
 
 /// `/collections/<name>/indexes` and `/collections/<name>/indexes/<index>`, and nothing else under
@@ -494,6 +507,26 @@ mod tests {
         for path in ["/collections/c/docs/indexes", "/collections/c/indexes/a/b", "/collections//indexes"] {
             assert_eq!(authorize(path, "POST", &cfg, None, Some("client"), None), AuthOutcome::Allow,
                 "{}", path);
+        }
+    }
+
+    #[test]
+    fn collection_ttl_changes_are_admin_and_reading_it_is_not() {
+        let cfg = with_admin(None, &["client"], &["root"]);
+
+        for method in ["PUT", "DELETE"] {
+            assert_eq!(authorize("/collections/c/ttl", method, &cfg, None, Some("root"), None),
+                AuthOutcome::Allow, "{}", method);
+            assert_eq!(authorize("/collections/c/ttl", method, &cfg, None, Some("client"), None),
+                AuthOutcome::Deny("invalid admin key"), "a short TTL empties the collection: {}", method);
+        }
+        assert_eq!(authorize("/collections/c/ttl", "GET", &cfg, None, Some("client"), None),
+            AuthOutcome::Allow);
+
+        // A document keyed `ttl` is data path.
+        for method in ["PUT", "DELETE"] {
+            assert_eq!(authorize("/collections/c/docs/ttl", method, &cfg, None, Some("client"), None),
+                AuthOutcome::Allow, "{}", method);
         }
     }
 

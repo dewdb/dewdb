@@ -97,6 +97,8 @@ pub struct CollectionIndexes {
     pub updated_by: String,
     #[serde(default)]
     pub indexes: Vec<IndexSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
 }
 
 impl CollectionIndexes {
@@ -119,6 +121,9 @@ fn unaddressable_entry(collection: &str, entry: &CollectionIndexes) -> Option<St
     if entry.indexes.len() > MAX_INDEXES_PER_COLLECTION {
         return Some(format!("'{}' is given more than {} indexes", collection,
             MAX_INDEXES_PER_COLLECTION));
+    }
+    if entry.ttl_secs == Some(0) {
+        return Some(format!("'{}' has a zero TTL", collection));
     }
     let mut seen = HashSet::new();
     for spec in &entry.indexes {
@@ -525,6 +530,7 @@ impl ClusterMetadata {
     pub fn record_index_change(&mut self, by: &str, collection: &str, change: &IndexChange) -> bool {
         let current = self.index_catalog.get(collection);
         let mut indexes = current.map(|e| e.indexes.clone()).unwrap_or_default();
+        let ttl_secs = current.and_then(|e| e.ttl_secs);
         change.apply_to(&mut indexes);
         if current.is_some_and(|e| e.indexes == indexes) {
             return false;
@@ -542,6 +548,26 @@ impl ClusterMetadata {
             version,
             updated_by: by.to_string(),
             indexes,
+            ttl_secs,
+        });
+        true
+    }
+
+    pub fn record_ttl_change(&mut self, by: &str, collection: &str, ttl_secs: Option<u64>) -> bool {
+        let current = self.index_catalog.get(collection);
+        if current.map_or(ttl_secs.is_none(), |e| e.ttl_secs == ttl_secs) {
+            return false;
+        }
+        if current.is_none() && self.index_catalog.len() >= MAX_CATALOG_COLLECTIONS {
+            return false;
+        }
+        let indexes = current.map(|e| e.indexes.clone()).unwrap_or_default();
+        let version = current.map_or(0, |e| e.version) + 1;
+        self.index_catalog.insert(collection.to_string(), CollectionIndexes {
+            version,
+            updated_by: by.to_string(),
+            indexes,
+            ttl_secs,
         });
         true
     }
@@ -550,11 +576,11 @@ impl ClusterMetadata {
     /// that missed the drop win the merge and put the definitions back on whoever recreates it.
     pub fn forget_collection_indexes(&mut self, by: &str, collection: &str) -> bool {
         match self.index_catalog.get(collection) {
-            Some(entry) if entry.indexes.is_empty() => false,
+            Some(entry) if entry.indexes.is_empty() && entry.ttl_secs.is_none() => false,
             Some(entry) => {
                 let version = entry.version + 1;
                 self.index_catalog.insert(collection.to_string(), CollectionIndexes {
-                    version, updated_by: by.to_string(), indexes: Vec::new(),
+                    version, updated_by: by.to_string(), indexes: Vec::new(), ttl_secs: None,
                 });
                 true
             },
@@ -1115,7 +1141,7 @@ mod tests {
     }
 
     fn entry(indexes: Vec<IndexSpec>) -> CollectionIndexes {
-        CollectionIndexes { version: 1, updated_by: "n1".into(), indexes }
+        CollectionIndexes { version: 1, updated_by: "n1".into(), indexes, ttl_secs: None }
     }
 
     #[test]

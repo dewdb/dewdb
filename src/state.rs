@@ -926,6 +926,17 @@ impl AppState {
         moved
     }
 
+    pub fn record_ttl_catalog(&self, collection: &str, ttl_secs: Option<u64>) -> bool {
+        let moved = {
+            let mut view = self.cluster.write().unwrap();
+            view.record_ttl_change(&self.config.node_id, collection, ttl_secs)
+        };
+        if moved {
+            self.persist_cluster_view();
+        }
+        moved
+    }
+
     /// Empties a dropped collection's catalogue entry rather than removing it, so a node that
     /// missed the drop cannot win the merge and put the definitions back.
     pub fn forget_collection_indexes(&self, collection: &str) -> bool {

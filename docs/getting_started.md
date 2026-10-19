@@ -264,6 +264,35 @@ refused if the key already holds a document. Treat the tag as opaque; it survive
 every node in the group holds the same version, and it changes when a migration moves the key to
 another shard group. Bulk writes do not take either header.
 
+### Expiring documents
+
+Sessions, cache entries and idempotency keys usually want to disappear on their own. Give a single
+document a deadline with `expire_at`, a Unix time in milliseconds, beside `value`:
+
+```bash
+curl -s -X PUT localhost:8081/collections/sessions/docs/s1 -H 'content-type: application/json' -d '{"value":{"user":"u1"},"expire_at":1893456000000}'
+```
+
+Or give the whole collection a TTL in seconds, counted from each document's last write:
+
+```bash
+curl -s -X PUT localhost:8081/collections/sessions/ttl -H 'content-type: application/json' -d '{"ttl_secs":1800}'
+```
+
+```json
+{"acks":1,"collection":"sessions","required":1,"status":"configured","ttl_secs":1800}
+```
+
+A document's own `expire_at` wins over the collection's TTL. `PATCH` keeps the `expire_at` a
+document already has; `PUT` replaces it, so a `PUT` without one clears it. `GET` on the same path
+reads the TTL back and `DELETE` removes it. Setting and clearing it needs an admin key when
+`auth.admin_keys` is set, because a short TTL empties the collection.
+
+An expired document is not hidden from reads. The leader deletes it in a background sweep, within
+`maintenance.interval_secs` (60 s by default) of its deadline, and that delete replicates and shows
+up on the [change feed](#8-watching-for-changes) like any other. Until the sweep runs, a read still
+returns it, so do not use expiry to enforce a security deadline: check the time in your own code.
+
 ### List a collection
 
 ```bash

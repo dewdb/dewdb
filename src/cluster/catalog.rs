@@ -1,7 +1,7 @@
 //! The cluster-wide index catalogue: a record of a collection's indexes that outlives which group owns
 //! its keys, gossiped per collection so a group taking its first key appends the definitions it lacks.
 
-use crate::api::write::local_index_change;
+use crate::api::write::{local_index_change, local_ttl_change};
 use crate::cluster::metadata::{sanitize_catalog, Adoption, ClusterMetadata};
 use crate::consensus::config::is_system_collection;
 use crate::replication::write_concern::DEFAULT_WTIMEOUT_MS;
@@ -176,10 +176,6 @@ async fn reconcile_local_indexes(state: &AppState) {
         // Against the definitions *in force* rather than the committed ones, so one still staged
         // is not appended a second time.
         let (create, drop) = diff(&entry.indexes, &col.active_index_specs());
-        if create.is_empty() && drop.is_empty() {
-            continue;
-        }
-
         let changes = create.into_iter().map(|spec| IndexChange::Create { spec })
             .chain(drop.into_iter().map(|name| IndexChange::Drop { name }));
         for change in changes {
@@ -196,6 +192,18 @@ async fn reconcile_local_indexes(state: &AppState) {
                         "Could not reconcile a secondary index; the next round retries");
                     break;
                 },
+            }
+        }
+        if col.active_ttl_secs() != entry.ttl_secs {
+            match local_ttl_change(state, &name, entry.ttl_secs, WriteConcern::Majority,
+                Duration::from_millis(DEFAULT_WTIMEOUT_MS)).await
+            {
+                Ok(outcome) => info!(target: "catalog", collection = %name, ttl_secs = ?entry.ttl_secs,
+                    acks = outcome.acks, required = outcome.required,
+                    "Reconciled collection TTL against the cluster catalogue"),
+                Err(response) => warn!(target: "catalog", collection = %name, ttl_secs = ?entry.ttl_secs,
+                    status = %response.status(),
+                    "Could not reconcile collection TTL; the next round retries"),
             }
         }
     }

@@ -254,7 +254,7 @@ pub async fn bulk_router_forward(
     wc_query: &str,
 ) -> axum::response::Response {
     let n = docs.len();
-    let mut groups: HashMap<String, (String, String, Vec<String>, Vec<(usize, String, serde_json::Value)>)> = HashMap::new();
+    let mut groups: HashMap<String, (String, String, Vec<String>, Vec<(usize, String, serde_json::Value, Option<u64>)>)> = HashMap::new();
 
     for (idx, d) in docs.into_iter().enumerate() {
         let id = d.id.unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -265,7 +265,7 @@ pub async fn bulk_router_forward(
         };
         groups.entry(original_url.clone())
             .or_insert_with(|| (effective_url, original_url, replica_urls, Vec::new()))
-            .3.push((idx, id, d.value));
+            .3.push((idx, id, d.value, d.expire_at));
     }
 
     let futures = groups.into_values().map(|(effective_url, original_url, replica_urls, items)| {
@@ -274,7 +274,13 @@ pub async fn bulk_router_forward(
         let wc_query = wc_query.to_string();
         async move {
             let body: Vec<serde_json::Value> = items.iter()
-                .map(|(_, id, value)| serde_json::json!({"id": id, "value": value}))
+                .map(|(_, id, value, expire_at)| {
+                    let mut doc = serde_json::json!({"id": id, "value": value});
+                    if let Some(exp) = expire_at {
+                        doc["expire_at"] = serde_json::json!(exp);
+                    }
+                    doc
+                })
                 .collect();
             let resp = router_forward_bulk(&state, &col_name, &effective_url, &original_url, &replica_urls, &body, &wc_query).await;
             (items, resp)
@@ -294,7 +300,7 @@ pub async fn bulk_router_forward(
                     .filter(|rs| rs.len() == items.len());
                 match shard_results {
                     Some(rs) => {
-                        for ((idx, _, _), res) in items.iter().zip(rs.into_iter()) {
+                        for ((idx, _, _, _), res) in items.iter().zip(rs.into_iter()) {
                             ordered[*idx] = res;
                         }
                     }
@@ -303,7 +309,7 @@ pub async fn bulk_router_forward(
                     None if !reply.status.is_success() => {
                         let body = refusal_body(&reply);
                         let message = body.get("error").cloned().unwrap_or(serde_json::Value::Null);
-                        for (idx, id, _) in &items {
+                        for (idx, id, _, _) in &items {
                             ordered[*idx] = serde_json::json!({
                                 "id": id,
                                 "status": "error",
@@ -314,14 +320,14 @@ pub async fn bulk_router_forward(
                         refusals.push((reply.status, body));
                     }
                     None => {
-                        for (idx, id, _) in &items {
+                        for (idx, id, _, _) in &items {
                             ordered[*idx] = serde_json::json!({"id": id, "status": "error", "error": "malformed shard response"});
                         }
                     }
                 }
             }
             Err(e) => {
-                for (idx, id, _) in &items {
+                for (idx, id, _, _) in &items {
                     ordered[*idx] = serde_json::json!({"id": id, "status": "error", "error": e});
                 }
             }
@@ -535,6 +541,7 @@ async fn admin_call(client: &crate::tls::PeerClient, post: bool, url: &str) -> O
 enum AdminMethod {
     Get,
     Post,
+    Put,
     Delete,
 }
 
@@ -547,6 +554,7 @@ async fn admin_call_with(
     let rb = match method {
         AdminMethod::Get => client.get(url),
         AdminMethod::Post => client.post(url),
+        AdminMethod::Put => client.put(url),
         AdminMethod::Delete => client.delete(url),
     };
     let rb = match body {
@@ -678,6 +686,86 @@ pub async fn router_fanout_drop(
         StatusCode::MULTI_STATUS
     };
     (status, Json(serde_json::json!({"shards": results}))).into_response()
+}
+
+pub async fn router_fanout_ttl(
+    state: &AppState,
+    col_name: &str,
+    ttl_secs: Option<u64>,
+    params: &WriteConcernParams,
+) -> axum::response::Response {
+    let query = wc_query_string(params);
+    let (method, body) = match ttl_secs {
+        Some(secs) => (AdminMethod::Put, Some(serde_json::json!({"ttl_secs": secs}))),
+        None => (AdminMethod::Delete, None),
+    };
+    let results = fanout_to_owners(state, col_name, "/ttl", &query, method, body).await;
+
+    let node_status = |r: &serde_json::Value| r.get("status").and_then(|s| s.as_u64());
+    let absent = results.iter().filter(|r| node_status(r) == Some(404)).count();
+    let pending = results.iter().filter(|r| node_status(r) == Some(202)).count();
+    let done = results.iter()
+        .filter(|r| node_status(r).map_or(false, |s| s < 300 && s != 202)).count();
+    if done == 0 && pending == 0 && absent > 0 {
+        return collection_absent_response(col_name);
+    }
+    let status = if done + absent == results.len() {
+        StatusCode::OK
+    } else if done + pending + absent == results.len() {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::MULTI_STATUS
+    };
+    (status, Json(serde_json::json!({"shards": results}))).into_response()
+}
+
+pub async fn router_get_ttl(state: &AppState, col_name: &str) -> axum::response::Response {
+    let per_shard = futures::future::join_all(unique_shards(state).into_iter().map(|(original, replicas)| {
+        async move {
+            let primary = state.effective_primary(&original);
+            let mut candidates = vec![primary];
+            for node in std::iter::once(original.clone()).chain(replicas) {
+                if !candidates.contains(&node) {
+                    candidates.push(node);
+                }
+            }
+            for node in candidates {
+                let url = format!("{}/collections/{}/ttl", node, encode_path_segment(col_name));
+                if let Some((status, body)) = admin_call_with(&state.client, AdminMethod::Get, &url, None).await {
+                    if status == StatusCode::NOT_FOUND || status == StatusCode::OK {
+                        return (original, Some((status, body)));
+                    }
+                }
+            }
+            (original, None)
+        }
+    })).await;
+
+    let mut answered = 0usize;
+    let mut absent = 0usize;
+    let mut ttl_secs: Option<u64> = None;
+    for (original, reply) in per_shard {
+        let Some((status, body)) = reply else {
+            return err_json(StatusCode::BAD_GATEWAY,
+                format!("no node in shard group '{}' could report collection TTL", original));
+        };
+        if status == StatusCode::NOT_FOUND {
+            absent += 1;
+            continue;
+        }
+        answered += 1;
+        if let Some(secs) = body.get("ttl_secs").and_then(|v| v.as_u64()) {
+            ttl_secs = Some(secs);
+        }
+    }
+    if answered == 0 && absent > 0 {
+        return collection_absent_response(col_name);
+    }
+    let catalog_ttl = state.index_catalog().get(col_name).and_then(|e| e.ttl_secs);
+    (StatusCode::OK, Json(serde_json::json!({
+        "collection": col_name,
+        "ttl_secs": catalog_ttl.or(ttl_secs),
+    }))).into_response()
 }
 
 /// An index definition, to every shard group that holds the collection. A group holding none answers

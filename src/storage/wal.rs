@@ -152,6 +152,7 @@ impl Collection {
         // Committed below the watermark and in force above it, both in one list: a staged `Put`
         // has to index for every definition the log put in force before it, committed or not.
         indexes: &mut Vec<IndexSpec>,
+        ttl_secs: &mut Option<u64>,
     ) -> io::Result<(u64, u64)> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
         let file_len = file.metadata()?.len();
@@ -202,7 +203,7 @@ impl Collection {
                     // Uncommitted at the last shutdown: keep it durable but unpublished.
                     let migration = entry.is_migration();
                     let effect = match entry {
-                        LogEntry::Put { key, value, .. } => {
+                        LogEntry::Put { key, value, ts, expire_at, .. } => {
                             let inline = if len <= cache.inline_max_value_bytes
                                 && *inline_used + *staged_inline + len as u64 <= cache.inline_budget_bytes
                             {
@@ -213,7 +214,7 @@ impl Collection {
                             };
                             StagedEffect::Put {
                                 key,
-                                entry: IndexEntry { wal_id, offset, len, inline, lsn, term },
+                                entry: IndexEntry { wal_id, offset, len, inline, lsn, term, ts, expire_at },
                                 indexed: index_values(indexes, &value),
                             }
                         },
@@ -231,6 +232,7 @@ impl Collection {
                             change.apply_to(indexes);
                             StagedEffect::DefineIndex(change)
                         },
+                        LogEntry::Ttl { ttl_secs: next, .. } => StagedEffect::SetTtl(next),
                     };
                     pending.insert(lsn, StagedApply { wal_id, offset, term, effect, migration });
                     if lsn > max_lsn {
@@ -242,7 +244,7 @@ impl Collection {
                     continue;
                 }
                 match entry {
-                    LogEntry::Put { key, .. } => {
+                    LogEntry::Put { key, ts, expire_at, .. } => {
                         let inline = if len as u32 <= cache.inline_max_value_bytes
                             && *inline_used + len as u64 <= cache.inline_budget_bytes
                         {
@@ -251,7 +253,7 @@ impl Collection {
                         } else {
                             None
                         };
-                        if let Some(old) = index.insert(key, IndexEntry { wal_id, offset, len: len as u32, inline, lsn, term }) {
+                        if let Some(old) = index.insert(key, IndexEntry { wal_id, offset, len: len as u32, inline, lsn, term, ts, expire_at }) {
                             *inline_used -= old.inline_bytes();
                         }
                         *dropped = false;
@@ -270,11 +272,13 @@ impl Collection {
                         *inline_used = 0;
                         *dropped = true;
                         indexes.clear();
+                        *ttl_secs = None;
                     },
                     // Append order again: the last one below the watermark is the committed one.
                     LogEntry::Config { config: c, .. } => *config = Some(c),
                     LogEntry::Handover { handover: h, .. } => *handover = Some(h),
                     LogEntry::Index { change, .. } => change.apply_to(indexes),
+                    LogEntry::Ttl { ttl_secs: next, .. } => *ttl_secs = next,
                 }
                 if lsn > max_lsn {
                     max_lsn = lsn;

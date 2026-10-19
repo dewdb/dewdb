@@ -3,7 +3,7 @@
 use super::frame::{Configuration, HandoverRecord, LogEntry};
 use super::index::{
     AppliedMeta, AppliedPos, IndexEntry, IndexSnapshot, LsnMeta, ReadCacheConfig, Version,
-    INDEX_FILENAME, LEGACY_INDEX_FILENAME,
+    INDEX_FILENAME, LEGACY_INDEX_FILENAMES,
 };
 use super::secondary::{index_values, IndexChange, IndexKey, IndexSpec, IndexStatus, Indexes, Selection, BUILD_CHUNK};
 use super::wal::{WalCut, WalsState};
@@ -68,6 +68,7 @@ pub struct Collection {
     /// Committed secondary index definitions, and the postings derived from them. The definitions
     /// ride `applied.meta`; the postings are rebuilt by `start_index_task`, never persisted.
     committed_indexes: std::sync::Mutex<Vec<IndexSpec>>,
+    committed_ttl: std::sync::Mutex<Option<u64>>,
     pub indexes: RwLock<Indexes>,
     index_signal: Arc<tokio::sync::Notify>,
     /// Fed from `apply_committed` and nowhere else: a staged entry can still be truncated, and a
@@ -135,6 +136,8 @@ pub enum StagedEffect {
     RecordHandover(HandoverRecord),
     /// A secondary index definition. Registered on commit, which is where its build starts.
     DefineIndex(IndexChange),
+    /// Collection-level TTL in seconds, or `None` to clear it.
+    SetTtl(Option<u64>),
 }
 
 /// A committed effect the changefeed still owes an event for. Collected under the index lock,
@@ -183,6 +186,7 @@ impl Collection {
         let mut committed_config = applied.as_ref().and_then(|m| m.config.clone())
             .map(Configuration::canonicalized);
         let mut committed_indexes = applied.as_ref().map(|m| m.indexes.clone()).unwrap_or_default();
+        let mut committed_ttl = applied.as_ref().and_then(|m| m.ttl_secs);
         let mut committed_handover = applied.and_then(|m| m.handover);
 
         let mut index = BTreeMap::new();
@@ -191,10 +195,13 @@ impl Collection {
         let mut staged_inline: u64 = 0;
         let mut wal_files = Vec::new();
 
-        match fs::remove_file(root_path.join(LEGACY_INDEX_FILENAME)) {
-            Ok(()) => info!(target: "storage", collection = %name, "Retired the pre-v2 index snapshot; replaying"),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {},
-            Err(e) => return Err(e),
+        for legacy in LEGACY_INDEX_FILENAMES {
+            match fs::remove_file(root_path.join(legacy)) {
+                Ok(()) => info!(target: "storage", collection = %name, file = legacy,
+                    "Retired an older index snapshot; replaying"),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {},
+                Err(e) => return Err(e),
+            }
         }
 
         let index_path = root_path.join(INDEX_FILENAME);
@@ -259,7 +266,7 @@ impl Collection {
         if !snapshot_loaded {
             info!(target: "storage", collection = %name, "Replaying all WALs");
              for (id, path) in &wal_files {
-                let r = Self::replay_file_from(*id, path, 0, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut staged_inline, &mut dropped, &mut committed_config, &mut committed_handover, &mut committed_indexes)?;
+                let r = Self::replay_file_from(*id, path, 0, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut staged_inline, &mut dropped, &mut committed_config, &mut committed_handover, &mut committed_indexes, &mut committed_ttl)?;
                 fold(r, &mut max_lsn, &mut max_term);
             }
         } else {
@@ -268,10 +275,10 @@ impl Collection {
                      continue;
                  } else if *id == snapshot_wal_id {
                      info!(target: "storage", collection = %name, wal_id = id, offset = snapshot_offset, "Resuming WAL from snapshot offset");
-                     let r = Self::replay_file_from(*id, path, snapshot_offset, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut staged_inline, &mut dropped, &mut committed_config, &mut committed_handover, &mut committed_indexes)?;
+                     let r = Self::replay_file_from(*id, path, snapshot_offset, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut staged_inline, &mut dropped, &mut committed_config, &mut committed_handover, &mut committed_indexes, &mut committed_ttl)?;
                      fold(r, &mut max_lsn, &mut max_term);
                  } else {
-                     let r = Self::replay_file_from(*id, path, 0, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut staged_inline, &mut dropped, &mut committed_config, &mut committed_handover, &mut committed_indexes)?;
+                     let r = Self::replay_file_from(*id, path, 0, &mut index, &mut pending, applied_through, &cache, &mut inline_used, &mut staged_inline, &mut dropped, &mut committed_config, &mut committed_handover, &mut committed_indexes, &mut committed_ttl)?;
                      fold(r, &mut max_lsn, &mut max_term);
                  }
              }
@@ -338,6 +345,7 @@ impl Collection {
             // the keys this replay just published rather than trusting a file beside them.
             indexes: RwLock::new(Indexes::seed(&committed_indexes)),
             committed_indexes: std::sync::Mutex::new(committed_indexes),
+            committed_ttl: std::sync::Mutex::new(committed_ttl),
             index_signal: Arc::new(tokio::sync::Notify::new()),
             changefeed: Arc::new(Changefeed::new(feed, applied_at)),
             committed_config: std::sync::Mutex::new(committed_config),
@@ -379,7 +387,11 @@ impl Collection {
         } else {
             None
         };
-        IndexEntry { wal_id, offset, len, inline, lsn, term }
+        let (ts, expire_at) = match serde_json::from_slice::<LogEntry>(payload) {
+            Ok(LogEntry::Put { ts, expire_at, .. }) => (ts, expire_at),
+            _ => (0, None),
+        };
+        IndexEntry { wal_id, offset, len, inline, lsn, term, ts, expire_at }
     }
 
     /// Committed plus staged inline bytes -- the budget bounds resident memory, and a staged frame's
@@ -452,11 +464,22 @@ impl Collection {
     }
 
     pub fn put(&self, key: String, value: serde_json::Value, term: u64) -> io::Result<(Vec<u8>, u64, u64, u64)> {
+        self.put_with_expiry(key, value, None, term)
+    }
+
+    pub fn put_with_expiry(
+        &self,
+        key: String,
+        value: serde_json::Value,
+        expire_at: Option<u64>,
+        term: u64,
+    ) -> io::Result<(Vec<u8>, u64, u64, u64)> {
         let entry = LogEntry::Put {
             migration: false,
             key: key.clone(),
             value,
             ts: Self::current_timestamp(),
+            expire_at,
         };
         self.append(entry, term)
     }
@@ -473,8 +496,26 @@ impl Collection {
     pub fn migration_write(&self, key: String, value: Option<serde_json::Value>, term: u64) -> io::Result<(Vec<u8>, u64, u64, u64)> {
         let ts = Self::current_timestamp();
         let entry = match value {
-            Some(value) => LogEntry::Put { key, value, ts, migration: true },
+            Some(value) => LogEntry::Put { key, value, ts, expire_at: None, migration: true },
             None => LogEntry::Del { key, ts, migration: true },
+        };
+        self.append(entry, term)
+    }
+
+    pub fn migration_put(
+        &self,
+        key: String,
+        value: serde_json::Value,
+        ts: Option<u64>,
+        expire_at: Option<u64>,
+        term: u64,
+    ) -> io::Result<(Vec<u8>, u64, u64, u64)> {
+        let entry = LogEntry::Put {
+            key,
+            value,
+            ts: ts.unwrap_or_else(Self::current_timestamp),
+            expire_at,
+            migration: true,
         };
         self.append(entry, term)
     }
@@ -507,6 +548,56 @@ impl Collection {
     /// above stages the values it asks for; the build that fills in everything below runs on commit.
     pub fn define_index(&self, change: IndexChange, term: u64) -> io::Result<(Vec<u8>, u64, u64, u64)> {
         self.append(LogEntry::Index { change, ts: Self::current_timestamp() }, term)
+    }
+
+    pub fn set_ttl(&self, ttl_secs: Option<u64>, term: u64) -> io::Result<(Vec<u8>, u64, u64, u64)> {
+        self.append(LogEntry::Ttl { ttl_secs, ts: Self::current_timestamp() }, term)
+    }
+
+    pub fn committed_ttl(&self) -> Option<u64> {
+        *self.committed_ttl.lock().unwrap()
+    }
+
+    pub fn active_ttl_secs(&self) -> Option<u64> {
+        let pending = self.pending.lock().unwrap();
+        let mut ttl = self.committed_ttl();
+        for staged in pending.values() {
+            match &staged.effect {
+                StagedEffect::SetTtl(next) => ttl = *next,
+                StagedEffect::Clear => ttl = None,
+                _ => {},
+            }
+        }
+        ttl
+    }
+
+    pub fn expire_at_including_staged(&self, key: &str) -> Option<u64> {
+        let staged = {
+            let pending = self.pending.lock().unwrap();
+            pending.values().rev().find_map(|s| s.effect.resolve(key)).map(|e| e.and_then(|entry| entry.expire_at))
+        };
+        staged.unwrap_or_else(|| self.index.read().unwrap().get(key).and_then(|e| e.expire_at))
+    }
+
+    pub fn entry_meta(&self, key: &str) -> Option<(u64, Option<u64>)> {
+        self.index.read().unwrap().get(key).map(|e| (e.ts, e.expire_at))
+    }
+
+    pub fn expired_keys(&self, now_ms: u64, owned: &dyn Fn(&str) -> bool) -> Vec<(String, Version)> {
+        let ttl_secs = self.committed_ttl();
+        let index = self.index.read().unwrap();
+        let mut expired = Vec::new();
+        for (key, entry) in index.iter() {
+            if !owned(key) {
+                continue;
+            }
+            if let Some(deadline) = entry.expires_at(ttl_secs) {
+                if deadline <= now_ms {
+                    expired.push((key.clone(), entry.version()));
+                }
+            }
+        }
+        expired
     }
 
     pub fn committed_indexes(&self) -> Vec<IndexSpec> {
@@ -1197,6 +1288,7 @@ impl Collection {
             LogEntry::Config { config, .. } => StagedEffect::Configure(config.clone().canonicalized()),
             LogEntry::Handover { handover, .. } => StagedEffect::RecordHandover(handover.clone()),
             LogEntry::Index { change, .. } => StagedEffect::DefineIndex(change.clone()),
+            LogEntry::Ttl { ttl_secs, .. } => StagedEffect::SetTtl(*ttl_secs),
         };
         // A frame landing on an LSN we already hold displaces it; its reservation goes with it.
         if let Some(old) = pending.insert(lsn, StagedApply { wal_id, offset, term, effect, migration: entry.is_migration() }) {
@@ -1270,6 +1362,7 @@ impl Collection {
                 config: self.committed_config(),
                 handover: self.committed_handover(),
                 indexes: self.committed_indexes(),
+                ttl_secs: self.committed_ttl(),
             }
         };
         let covered = meta.applied_lsn;
@@ -1368,6 +1461,9 @@ impl Collection {
                                 self.committed_indexes.lock().unwrap().clear();
                                 self.rich_gen.fetch_add(1, Ordering::SeqCst);
                             }
+                            if self.committed_ttl.lock().unwrap().take().is_some() {
+                                self.rich_gen.fetch_add(1, Ordering::SeqCst);
+                            }
                             if !self.dropped.swap(true, Ordering::SeqCst) {
                                 self.rich_gen.fetch_add(1, Ordering::SeqCst);
                             }
@@ -1379,6 +1475,13 @@ impl Collection {
                             change.apply_to(&mut self.committed_indexes.lock().unwrap());
                             self.rich_gen.fetch_add(1, Ordering::SeqCst);
                             build_wanted = true;
+                        },
+                        StagedEffect::SetTtl(ttl_secs) => {
+                            let mut current = self.committed_ttl.lock().unwrap();
+                            if *current != *ttl_secs {
+                                *current = *ttl_secs;
+                                self.rich_gen.fetch_add(1, Ordering::SeqCst);
+                            }
                         },
                         // Already in force since it was appended; committing it is what makes it
                         // survive compaction retiring its frame.
@@ -1509,7 +1612,7 @@ impl Collection {
             map: index.clone(),
         };
 
-        let temp_path = self.root_path.join("index-v2.tmp");
+        let temp_path = self.root_path.join("index-v3.tmp");
         let path = self.root_path.join(INDEX_FILENAME);
 
         let file = File::create(&temp_path)?;
@@ -1945,14 +2048,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opening_retires_the_pre_v2_snapshot_so_a_downgrade_replays() {
+    async fn opening_retires_older_snapshots_so_a_downgrade_replays() {
         let root = temp_root();
         let dir = root.join("c");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(LEGACY_INDEX_FILENAME), b"not a v2 snapshot").unwrap();
+        for legacy in LEGACY_INDEX_FILENAMES {
+            fs::write(dir.join(legacy), b"not a v3 snapshot").unwrap();
+        }
         let db = Database::new(&root).unwrap();
         db.get_collection("c").unwrap();
-        assert!(!dir.join(LEGACY_INDEX_FILENAME).exists());
+        for legacy in LEGACY_INDEX_FILENAMES {
+            assert!(!dir.join(legacy).exists(), "{} survived the open", legacy);
+        }
     }
 
     fn inline_count(col: &Arc<Collection>) -> usize {
@@ -2449,7 +2556,7 @@ mod tests {
 
         assert!(AppliedMeta::load(&root).unwrap().is_none(), "absent is 'no consensus history'");
 
-        AppliedMeta { applied_lsn: 7, dropped: true, config: None, handover: None, indexes: Vec::new() }
+        AppliedMeta { applied_lsn: 7, dropped: true, config: None, handover: None, indexes: Vec::new(), ttl_secs: None }
             .save(&root).unwrap();
         let back = AppliedMeta::load(&root).unwrap().unwrap();
         assert_eq!((back.applied_lsn, back.dropped), (7, true));

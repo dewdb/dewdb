@@ -336,9 +336,8 @@ pub async fn migrate_handler(
 
     let (wc, wtimeout) = handover_write_concern();
     let written = batch.docs.len();
-    let items = batch.docs.into_iter().map(|doc| (doc.key, doc.value)).collect();
     let outcomes = match crate::api::write::local_migration_write_batch(
-        &state, &batch.collection, items, wc, wtimeout,
+        &state, &batch.collection, batch.docs, wc, wtimeout,
     ).await {
         Ok(outcomes) => outcomes,
         Err(resp) => return resp,

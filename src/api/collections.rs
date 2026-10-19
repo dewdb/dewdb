@@ -1,10 +1,12 @@
 //! Collection administration endpoints.
 
 use crate::api::middleware::{client_collection, CollectionPath};
-use crate::api::write::local_drop;
+use crate::api::write::{local_drop, local_ttl_change};
+use crate::cluster::catalog::schema_lock;
 use crate::cluster::metadata::MigrationPhase;
 use crate::cluster::router::{
-    router_fanout_drop, router_fanout_maintenance, router_list_collections,
+    router_fanout_drop, router_fanout_maintenance, router_fanout_ttl, router_get_ttl,
+    router_list_collections,
 };
 use crate::model::err_json;
 use crate::replication::write_concern::{
@@ -15,9 +17,15 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
+use serde::Deserialize;
 use std::io;
 use std::time::Duration;
 use tracing::info;
+
+#[derive(Deserialize)]
+pub struct TtlPayload {
+    pub ttl_secs: u64,
+}
 
 pub async fn list_collections(
     State(state): State<AppState>,
@@ -181,6 +189,141 @@ pub async fn snapshot_collection(
         Ok(Err(e)) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
         Err(e) => err_json(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
+}
+
+pub async fn get_ttl(
+    State(state): State<AppState>,
+    CollectionPath(col_name): CollectionPath<String>,
+) -> impl axum::response::IntoResponse {
+    if state.config.role == "router" {
+        return router_get_ttl(&state, &col_name).await;
+    }
+
+    let col = match client_collection(&state, &col_name) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "collection": col_name,
+        "ttl_secs": col.committed_ttl(),
+    }))).into_response()
+}
+
+pub async fn set_ttl(
+    State(state): State<AppState>,
+    CollectionPath(col_name): CollectionPath<String>,
+    Query(params): Query<WriteConcernParams>,
+    Json(payload): Json<TtlPayload>,
+) -> impl axum::response::IntoResponse {
+    if payload.ttl_secs == 0 {
+        return err_json(StatusCode::BAD_REQUEST,
+            "ttl_secs must be greater than 0; use DELETE to remove a collection TTL".to_string());
+    }
+
+    if state.config.role == "router" {
+        let reply = router_fanout_ttl(&state, &col_name, Some(payload.ttl_secs), &params).await;
+        if reply.status() != StatusCode::NOT_FOUND {
+            state.record_ttl_catalog(&col_name, Some(payload.ttl_secs));
+        }
+        return reply;
+    }
+
+    if state.is_shard() && !state.is_leader() {
+        return (StatusCode::FORBIDDEN, "Replica nodes reject direct writes").into_response();
+    }
+
+    let wc = match parse_write_concern(params.w.as_deref()) {
+        Ok(wc) => wc,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
+    };
+    let wtimeout = Duration::from_millis(params.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
+
+    let _write_gate = state.write_gate.read().await;
+
+    if let Err(resp) = client_collection(&state, &col_name) {
+        return resp;
+    }
+
+    let schema = schema_lock(&state, &col_name);
+    let _schema = schema.lock().await;
+
+    state.record_ttl_catalog(&col_name, Some(payload.ttl_secs));
+
+    let outcome = match local_ttl_change(&state, &col_name, Some(payload.ttl_secs), wc, wtimeout).await {
+        Ok(o) => o,
+        Err(response) => return response,
+    };
+
+    let status = if outcome.met { StatusCode::OK } else { StatusCode::ACCEPTED };
+    (status, Json(serde_json::json!({
+        "collection": col_name,
+        "ttl_secs": payload.ttl_secs,
+        "status": if outcome.met { "configured" } else { "staged" },
+        "acks": outcome.acks,
+        "required": outcome.required,
+    }))).into_response()
+}
+
+pub async fn delete_ttl(
+    State(state): State<AppState>,
+    CollectionPath(col_name): CollectionPath<String>,
+    Query(params): Query<WriteConcernParams>,
+) -> impl axum::response::IntoResponse {
+    if state.config.role == "router" {
+        let reply = router_fanout_ttl(&state, &col_name, None, &params).await;
+        if reply.status() != StatusCode::NOT_FOUND {
+            state.record_ttl_catalog(&col_name, None);
+        }
+        return reply;
+    }
+
+    if state.is_shard() && !state.is_leader() {
+        return (StatusCode::FORBIDDEN, "Replica nodes reject direct writes").into_response();
+    }
+
+    let wc = match parse_write_concern(params.w.as_deref()) {
+        Ok(wc) => wc,
+        Err(e) => return err_json(StatusCode::BAD_REQUEST, e),
+    };
+    let wtimeout = Duration::from_millis(params.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
+
+    let _write_gate = state.write_gate.read().await;
+
+    let col = match client_collection(&state, &col_name) {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+
+    let schema = schema_lock(&state, &col_name);
+    let _schema = schema.lock().await;
+
+    let existed = col.active_ttl_secs().is_some();
+    state.record_ttl_catalog(&col_name, None);
+
+    if !existed {
+        return (StatusCode::OK, Json(serde_json::json!({
+            "collection": col_name,
+            "ttl_secs": serde_json::Value::Null,
+            "status": "cleared",
+            "existed": false,
+        }))).into_response();
+    }
+
+    let outcome = match local_ttl_change(&state, &col_name, None, wc, wtimeout).await {
+        Ok(o) => o,
+        Err(response) => return response,
+    };
+
+    let status = if outcome.met { StatusCode::OK } else { StatusCode::ACCEPTED };
+    (status, Json(serde_json::json!({
+        "collection": col_name,
+        "ttl_secs": serde_json::Value::Null,
+        "status": if outcome.met { "cleared" } else { "staged" },
+        "existed": true,
+        "acks": outcome.acks,
+        "required": outcome.required,
+    }))).into_response()
 }
 
 #[cfg(test)]

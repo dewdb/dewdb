@@ -18,6 +18,7 @@ and no separate metadata service.
 | Area | What you get |
 |---|---|
 | Data model | Schemaless JSON documents in auto-created collections, string keys |
+| Expiry | Per-document `expire_at` or a collection TTL, removed by replicated deletes that reach the change feed |
 | API | REST over HTTP: CRUD with `ETag` and `If-Match`, bulk writes, query, aggregation, collection admin, cluster control |
 | Query | Equality, comparison, string, existence, type and array predicates with `$and`/`$or`/`$nor`, dotted paths, multi-field sort, projection, cursor paging sorted or not |
 | Aggregation | Shard-side `count`, `sum`, `avg`, `min`, `max`, grouped on dotted fields, merged across shards through the totals rather than the answers |
@@ -32,7 +33,7 @@ and no separate metadata service.
 | Scale-out | Consistent-hash ring or explicit ranges, online migration, optional auto-rebalancing |
 | Membership | Runtime join as a learner, and voting-set changes through joint consensus |
 | Operations | Structured logs, JSON and Prometheus metrics, health checks, background maintenance |
-| Security | API keys or bearer tokens on the public API, an admin tier over topology, drops and index definitions, shared secret on internal routes |
+| Security | API keys or bearer tokens on the public API, an admin tier over topology, drops, index definitions and collection TTLs, shared secret on internal routes |
 
 ---
 
@@ -94,6 +95,22 @@ and no separate metadata service.
 a conditional one is applied only if the document is still at the version it names.
 **Scope.** Writes are per document — there are no multi-document transactions, and a bulk write
 cannot be conditional.
+
+- **Document expiry.** A write can carry `expire_at`, a Unix time in milliseconds, and a collection
+  can carry a TTL in seconds counted from each document's last write. A document's own `expire_at`
+  wins over the collection's TTL. `PATCH` keeps the existing `expire_at` unless it sends a new one;
+  `PUT` replaces it along with the document.
+- **An expiry is a delete.** The leader's background sweep deletes expired documents through the
+  ordinary write path, so the delete replicates, commits under a majority, appears on the change
+  feed as a `delete`, and survives a failover like any other.
+- **Never a race with a writer.** A document rewritten between the sweep finding it and deleting it
+  is left alone.
+
+**Guarantee.** Every replica agrees on whether an expired document exists, because only a committed
+delete removes it.
+**Limit.** A document stays readable after its deadline until the sweep runs, which is up to one
+`maintenance.interval_secs` (60 s by default) on a healthy leader, longer while there is no leader,
+and never with `maintenance.enabled: false`. A document's expiry is not returned on reads.
 
 ---
 
@@ -511,7 +528,8 @@ SSE stream through a same-origin proxy, since it cannot set headers on a WebSock
   fsync.
 - **Background maintenance.** Compaction fires when a collection's dead-byte ratio and total size
   both cross their thresholds; index snapshots are written on an interval and skipped when nothing
-  was appended. Both are configurable, and the whole scheduler can be turned off.
+  was appended; on the leader, expired documents are deleted. All are configurable, and the whole
+  scheduler can be turned off, which also stops expiry.
 - **Clean shutdown.** `Ctrl-C`, and `SIGTERM` on Unix (what `docker stop` sends), fsync pending
   group-commit waiters and persist the durable LSN before exit.
 - **Concurrent reads.** Reads and scans run on a blocking pool, and every WAL file is opened four
@@ -888,7 +906,8 @@ are right, and a direct request to the shard gives the precise message.
   `internal_secret` and `upstream_api_key` reload too: `internal_secret` can be a list, so a node
   accepts the old and new secret while a rotation rolls through the cluster.
 - **An admin tier over topology, destruction and schema.** `admin_keys` guards every `/cluster/*`
-  route, `DELETE /collections/:name`, index definitions and every webhook route; leaving it empty
+  route, `DELETE /collections/:name`, index definitions, setting or clearing a collection TTL and
+  every webhook route; leaving it empty
   falls back to `api_keys`, so an existing deployment is unchanged. An admin key opens the public API
   as well, so one credential covers reading a collection and dropping it.
 - **Shared secret on internal routes**, so node-to-node endpoints are not open to clients.
@@ -1015,4 +1034,5 @@ The shape of what DewDB does today, in one place:
 | WebSocket auth | The handshake carries a credential header, so a browser reaches an authenticated feed through SSE and a same-origin proxy. |
 | TLS | In the process; an existing plaintext cluster switches with a full stop, keeping its cluster view; the CA bundle reloads live. |
 | Audit | Collected in front of the node. |
+| Expiry | Removed by a background sweep within one maintenance interval of the deadline; readable until then. |
 | Cross-shard work | Per-key or fan-out; joins are done in the client. |

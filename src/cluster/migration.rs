@@ -63,6 +63,10 @@ pub struct MigrateBatch {
 pub struct MigrateDoc {
     pub key: String,
     pub value: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ts: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expire_at: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -490,8 +494,14 @@ async fn push_all(
                 for key in chunk {
                     // Read committed state only. An uncommitted write may still be revoked by a
                     // leader change, and handing it over would make it durable somewhere else.
+                    let meta = col.entry_meta(key);
                     match col.get(key) {
-                        Ok(Some(value)) => docs.push(MigrateDoc { key: key.clone(), value }),
+                        Ok(Some(value)) => docs.push(MigrateDoc {
+                            key: key.clone(),
+                            value,
+                            ts: meta.map(|(ts, _)| ts).filter(|&ts| ts > 0),
+                            expire_at: meta.and_then(|(_, exp)| exp),
+                        }),
                         Ok(None) => continue,
                         Err(e) => return Err(format!("reading {}/{}: {}", collection, key, e)),
                     }
@@ -701,6 +711,8 @@ mod tests {
         sizes.iter().enumerate().map(|(i, n)| MigrateDoc {
             key: format!("k{}", i),
             value: serde_json::json!({"pad": "x".repeat(*n)}),
+            ts: None,
+            expire_at: None,
         }).collect()
     }
 

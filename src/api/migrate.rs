@@ -811,7 +811,7 @@ mod tests {
         let batch = MigrateBatch {
             migration_id: "m1".into(), phase: MigrationPhase::Finalizing,
             collection: "t".into(),
-            docs: vec![MigrateDoc { key: key.clone(), value: serde_json::json!({"v": 7}) }],
+            docs: vec![MigrateDoc { key: key.clone(), value: serde_json::json!({"v": 7}), ts: None, expire_at: None }],
             lsn_floor: 0,
         };
         assert_eq!(client.post(format!("{}/internal/migrate", c)).json(&batch)
@@ -872,7 +872,7 @@ mod tests {
             MigrateBatch {
                 migration_id: "m1".into(), phase: MigrationPhase::Finalizing,
                 collection: "t".into(),
-                docs: vec![MigrateDoc { key: self.key.clone(), value: serde_json::json!({"v": v}) }],
+                docs: vec![MigrateDoc { key: self.key.clone(), value: serde_json::json!({"v": v}), ts: None, expire_at: None }],
                 lsn_floor: 0,
             }
         }

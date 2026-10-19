@@ -1,7 +1,7 @@
 //! Document endpoints.
 
 use super::precondition::{parse_or_refuse, with_etag, CONDITIONAL_HEADERS};
-use super::write::{local_patch, local_write_if, local_write_batch};
+use super::write::{local_patch, local_write_if, local_write_if_with_expiry, local_write_batch};
 use crate::aggregate::{
     budget_spent, parse_group, parse_metrics, AggregateSpec, DEFAULT_AGGREGATE_SCAN,
     MAX_AGGREGATE_SCAN, SCAN_ADMISSION_WAIT_MS,
@@ -83,6 +83,14 @@ pub(super) fn not_the_primary(state: &AppState, pref: &ReadPreference) -> Option
     ).into_response())
 }
 
+fn validate_expire_at(expire_at: Option<u64>) -> Result<(), axum::response::Response> {
+    if expire_at == Some(0) {
+        return Err(err_json(StatusCode::BAD_REQUEST,
+            "expire_at must be a positive Unix epoch timestamp in milliseconds".to_string()));
+    }
+    Ok(())
+}
+
 pub async fn create_doc(
     State(state): State<AppState>,
     CollectionPath(col_name): CollectionPath<String>,
@@ -92,6 +100,9 @@ pub async fn create_doc(
 ) -> impl axum::response::IntoResponse {
     if state.is_shard() && !state.is_leader() {
         return (StatusCode::FORBIDDEN, "Replica nodes reject direct writes").into_response();
+    }
+    if let Err(resp) = validate_expire_at(payload.expire_at) {
+        return resp;
     }
 
     let pre = match parse_or_refuse(&headers) {
@@ -124,7 +135,7 @@ pub async fn create_doc(
     };
     let wtimeout = Duration::from_millis(wcp.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
 
-    match local_write_if(&state, &col_name, id.clone(), Some(payload.value), wc, wtimeout, &pre).await {
+    match local_write_if_with_expiry(&state, &col_name, id.clone(), Some(payload.value), payload.expire_at, wc, wtimeout, &pre).await {
         Ok(o) if o.met => with_etag((StatusCode::CREATED, Json(serde_json::json!({"id": id, "status": "created"}))).into_response(), o.version),
         Ok(o) => with_etag((StatusCode::ACCEPTED, Json(serde_json::json!({
             "id": id,
@@ -146,6 +157,9 @@ pub async fn put_doc(
 ) -> impl axum::response::IntoResponse {
     if state.is_shard() && !state.is_leader() {
         return (StatusCode::FORBIDDEN, "Replica nodes reject direct writes").into_response();
+    }
+    if let Err(resp) = validate_expire_at(payload.expire_at) {
+        return resp;
     }
 
     let pre = match parse_or_refuse(&headers) {
@@ -173,7 +187,7 @@ pub async fn put_doc(
     };
     let wtimeout = Duration::from_millis(wcp.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
 
-    match local_write_if(&state, &col_name, id.clone(), Some(payload.value), wc, wtimeout, &pre).await {
+    match local_write_if_with_expiry(&state, &col_name, id.clone(), Some(payload.value), payload.expire_at, wc, wtimeout, &pre).await {
         Ok(o) if o.met => {
             let status = if o.existed { StatusCode::OK } else { StatusCode::CREATED };
             let label = if o.existed { "replaced" } else { "created" };
@@ -203,6 +217,11 @@ pub async fn bulk_create_docs(
 
     if payload.is_empty() {
         return err_json(StatusCode::BAD_REQUEST, "bulk request must contain at least one document".to_string());
+    }
+    for d in &payload {
+        if let Err(resp) = validate_expire_at(d.expire_at) {
+            return resp;
+        }
     }
 
     // One header cannot name a version per document, and applying it to all of them is not a guard.
@@ -236,8 +255,9 @@ pub async fn bulk_create_docs(
             return refusal;
         }
     }
-    let items: Vec<(String, serde_json::Value)> = ids.iter().cloned()
-        .zip(payload.into_iter().map(|d| d.value))
+    let items: Vec<(String, serde_json::Value, Option<u64>)> = ids.iter().cloned()
+        .zip(payload.into_iter())
+        .map(|(id, d)| (id, d.value, d.expire_at))
         .collect();
 
     match local_write_batch(&state, &col_name, items, wc, wtimeout).await {
@@ -344,6 +364,9 @@ pub async fn update_doc(
     if payload.value.is_null() {
         return err_json(StatusCode::BAD_REQUEST, "PATCH body must not be null; use DELETE to remove a document".to_string());
     }
+    if let Err(resp) = validate_expire_at(payload.expire_at) {
+        return resp;
+    }
 
     let pre = match parse_or_refuse(&headers) {
         Ok(p) => p,
@@ -370,7 +393,7 @@ pub async fn update_doc(
     };
     let wtimeout = Duration::from_millis(wcp.wtimeout.unwrap_or(DEFAULT_WTIMEOUT_MS));
 
-    match local_patch(&state, &col_name, id.clone(), payload.value, wc, wtimeout, &pre).await {
+    match local_patch(&state, &col_name, id.clone(), payload.value, payload.expire_at, wc, wtimeout, &pre).await {
         Ok(None) => err_json(StatusCode::NOT_FOUND, "not found".to_string()),
         Ok(Some(o)) if o.met => with_etag((StatusCode::OK, Json(serde_json::json!({"id": id, "status": "updated"}))).into_response(), o.version),
         Ok(Some(o)) => with_etag((StatusCode::ACCEPTED, Json(serde_json::json!({

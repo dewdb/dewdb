@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize)]
 pub struct CreateDoc {
     pub value: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expire_at: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -15,6 +17,8 @@ pub struct BulkDoc {
     #[serde(default)]
     pub id: Option<String>,
     pub value: serde_json::Value,
+    #[serde(default)]
+    pub expire_at: Option<u64>,
 }
 
 /// Upper bound on `?limit`. A page is preallocated from this number, so an unbounded one is an

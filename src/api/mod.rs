@@ -16,7 +16,10 @@ pub mod write;
 pub mod ws;
 
 use changes::stream_changes;
-use collections::{compact_collection, drop_collection, list_collections, snapshot_collection};
+use collections::{
+    compact_collection, delete_ttl, drop_collection, get_ttl, list_collections, set_ttl,
+    snapshot_collection,
+};
 use crate::cluster::rebalance::rebalance_status_handler;
 use docs::{aggregate_docs, bulk_create_docs, create_doc, delete_doc, get_doc, list_docs, put_doc,
     query_docs, update_doc};
@@ -62,6 +65,7 @@ pub fn build_app(state: &AppState) -> Router {
         .route("/collections/:name/compact", post(compact_collection))
         .route("/collections/:name/indexes", get(list_indexes).post(create_index))
         .route("/collections/:name/indexes/:index", delete(drop_index))
+        .route("/collections/:name/ttl", get(get_ttl).put(set_ttl).delete(delete_ttl))
         .route("/collections/:name/snapshot", post(snapshot_collection))
         .route("/collections/:name/docs", post(create_doc).get(list_docs))
         .route("/collections/:name/docs/bulk", post(bulk_create_docs))

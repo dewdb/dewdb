@@ -1,5 +1,9 @@
-//! Background compaction and index-snapshot scheduling.
+//! Background compaction, TTL expiry sweeping, and index-snapshot scheduling.
 
+use crate::api::write::local_sweep_expired_batch;
+use crate::cluster::ownership::Ownership;
+use crate::consensus::config::is_system_collection;
+use crate::replication::{WriteConcern, DEFAULT_WTIMEOUT_MS};
 use crate::state::AppState;
 use crate::storage::{Collection, Retention, SpaceUsage};
 use serde::Deserialize;
@@ -7,8 +11,10 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
+
+const SWEEP_BATCH_SIZE: usize = 64;
 
 #[derive(Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
@@ -85,6 +91,54 @@ pub fn retention_for(state: &AppState, collection: &str, cfg: &MaintenanceConfig
     }
 }
 
+/// Sweeps expired keys on the leader through the normal replicated delete path.
+pub async fn sweep_collection(state: &AppState, name: &str, col: &Arc<Collection>) -> usize {
+    if !state.is_leader() || is_system_collection(name) || col.is_dropped() {
+        return 0;
+    }
+    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    let ownership = state.scan_ownership(name);
+    let expired = col.expired_keys(now_ms, &|k| ownership.includes(k));
+    if expired.is_empty() {
+        return 0;
+    }
+
+    let mut total_deleted = 0;
+    for chunk in expired.chunks(SWEEP_BATCH_SIZE) {
+        if !state.is_leader() || col.is_dropped() {
+            break;
+        }
+        let _gate = state.write_gate.read().await;
+        let mut owned_chunk = Vec::with_capacity(chunk.len());
+        for (k, exp) in chunk {
+            if matches!(state.ownership(name, k), None | Some(Ownership::Ours)) {
+                owned_chunk.push((k.clone(), *exp));
+            }
+        }
+        if !owned_chunk.is_empty() {
+            match local_sweep_expired_batch(
+                state,
+                name,
+                owned_chunk,
+                WriteConcern::Majority,
+                Duration::from_millis(DEFAULT_WTIMEOUT_MS),
+            ).await {
+                Ok(n) => total_deleted += n,
+                Err(resp) => {
+                    warn!(target: "maintenance", collection = %name, status = %resp.status(), "TTL sweep batch failed");
+                    break;
+                }
+            }
+        }
+        drop(_gate);
+        tokio::task::yield_now().await;
+    }
+    if total_deleted > 0 {
+        info!(target: "maintenance", collection = %name, expired = total_deleted, "Swept expired documents");
+    }
+    total_deleted
+}
+
 // Index snapshots are not gated: they add a file and remove nothing, and a replica that never
 // snapshots replays every WAL at boot.
 pub fn maintenance_task(state: AppState, cfg: MaintenanceConfig) {
@@ -110,6 +164,10 @@ pub fn maintenance_task(state: AppState, cfg: MaintenanceConfig) {
                 if col.released.load(Ordering::SeqCst) {
                     last_snapshot.remove(&name);
                     continue;
+                }
+
+                if state.is_leader() && !is_system_collection(&name) {
+                    sweep_collection(&state, &name, &col).await;
                 }
 
                 let probe = col.clone();
@@ -351,4 +409,274 @@ mod tests {
                 "maintenance":{"interval_secs":0}}"#).unwrap();
         assert!(zero.validate().is_err(), "a zero interval would spin the scheduler");
     }
+
+    #[tokio::test]
+    async fn ttl_and_expire_at_lifecycle_crud_patch_bulk_and_precedence() {
+        use crate::test_support::{next_test_port, temp_root, TestNode};
+        use reqwest::StatusCode;
+
+        let root = temp_root();
+        let mut node = TestNode::new("solo", next_test_port(), &root, "primary");
+        node.start();
+        let url = node.url();
+        let client = reqwest::Client::new();
+        let state = node.state.clone().unwrap();
+
+        let r = client.post(format!("{}/collections/c/docs", url))
+            .json(&serde_json::json!({"value": {"v": 1}, "expire_at": 0}))
+            .send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+
+        let r = client.put(format!("{}/collections/c/docs/bad", url))
+            .json(&serde_json::json!({"value": {"v": 1}, "expire_at": 0}))
+            .send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+
+        let r = client.put(format!("{}/collections/c/docs/keep", url))
+            .json(&serde_json::json!({"value": {"v": 1}}))
+            .send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
+
+        let r = client.put(format!("{}/collections/c/ttl", url))
+            .json(&serde_json::json!({"ttl_secs": 0}))
+            .send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+
+        let r = client.patch(format!("{}/collections/c/docs/keep", url))
+            .json(&serde_json::json!({"value": {"v": 2}, "expire_at": 0}))
+            .send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+
+        let r = client.post(format!("{}/collections/c/docs/bulk", url))
+            .json(&serde_json::json!([{"id": "b1", "value": {"v": 1}, "expire_at": 0}]))
+            .send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+
+        let r = client.put(format!("{}/collections/c/docs/past", url))
+            .json(&serde_json::json!({"value": {"v": 10}, "expire_at": 1000}))
+            .send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
+
+        // A PATCH without `expire_at` keeps the one the document has.
+        let r = client.patch(format!("{}/collections/c/docs/past", url))
+            .json(&serde_json::json!({"value": {"v": 11}}))
+            .send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        // Expiry is not a read filter: only the sweep removes the document.
+        let r = client.get(format!("{}/collections/c/docs/past", url)).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.json::<serde_json::Value>().await.unwrap()["v"], 11);
+
+        let far_future = 9_999_999_999_999u64;
+        let r = client.post(format!("{}/collections/c/docs/bulk", url))
+            .json(&serde_json::json!([
+                {"id": "bulk_past", "value": {"v": 1}, "expire_at": 2000},
+                {"id": "bulk_future", "value": {"v": 2}, "expire_at": far_future}
+            ]))
+            .send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
+
+        let col = state.db.as_ref().unwrap().get_collection("c").unwrap();
+        let swept = sweep_collection(&state, "c", &col).await;
+        assert_eq!(swept, 2);
+
+        assert_eq!(client.get(format!("{}/collections/c/docs/past", url)).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert_eq!(client.get(format!("{}/collections/c/docs/bulk_past", url)).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert_eq!(client.get(format!("{}/collections/c/docs/bulk_future", url)).send().await.unwrap().status(), StatusCode::OK);
+        assert_eq!(client.get(format!("{}/collections/c/docs/keep", url)).send().await.unwrap().status(), StatusCode::OK);
+
+        let r = client.get(format!("{}/collections/c/ttl", url)).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.json::<serde_json::Value>().await.unwrap()["ttl_secs"], serde_json::Value::Null);
+
+        let r = client.put(format!("{}/collections/c/ttl", url))
+            .json(&serde_json::json!({"ttl_secs": 3600}))
+            .send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        let r = client.get(format!("{}/collections/c/ttl", url)).send().await.unwrap();
+        assert_eq!(r.json::<serde_json::Value>().await.unwrap()["ttl_secs"], 3600);
+
+        // A document's own `expire_at` wins over the collection TTL, earlier or later.
+        let r = client.put(format!("{}/collections/c/docs/override_short", url))
+            .json(&serde_json::json!({"value": {"v": 1}, "expire_at": 500}))
+            .send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
+        assert_eq!(sweep_collection(&state, "c", &col).await, 1);
+        assert_eq!(client.get(format!("{}/collections/c/docs/override_short", url)).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+
+        client.put(format!("{}/collections/c/ttl", url))
+            .json(&serde_json::json!({"ttl_secs": 1}))
+            .send().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        // `keep` has no `expire_at`, so the collection TTL applies to it.
+        assert_eq!(sweep_collection(&state, "c", &col).await, 1);
+        assert_eq!(client.get(format!("{}/collections/c/docs/keep", url)).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert_eq!(client.get(format!("{}/collections/c/docs/bulk_future", url)).send().await.unwrap().status(), StatusCode::OK);
+
+        let r = client.delete(format!("{}/collections/c/ttl", url)).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let r = client.get(format!("{}/collections/c/ttl", url)).send().await.unwrap();
+        assert_eq!(r.json::<serde_json::Value>().await.unwrap()["ttl_secs"], serde_json::Value::Null);
+
+        node.kill();
+    }
+
+    #[tokio::test]
+    async fn sweep_emits_tombstones_replicates_appears_on_cdc_and_guards_against_concurrent_overwrite() {
+        use crate::api::write::local_sweep_expired_batch;
+        use crate::replication::WriteConcern;
+        use crate::test_support::{
+            stream_client, temp_root, voter_group, wait_for, SseTap, DEFAULT_HEARTBEAT_TIMEOUT_SECS,
+        };
+        use reqwest::StatusCode;
+
+        let root = temp_root();
+        let mut nodes = voter_group(&root, 2, DEFAULT_HEARTBEAT_TIMEOUT_SECS).await;
+        let leader_url = nodes[0].url();
+        let client = reqwest::Client::new();
+
+        let r = client.put(format!("{}/collections/c/docs/exp1?w=majority", leader_url))
+            .json(&serde_json::json!({"value": {"v": 1}, "expire_at": 1000}))
+            .send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
+
+        // A candidate sampled before an overwrite must not delete the new version.
+        let leader_state = nodes[0].state.clone().unwrap();
+        let col = leader_state.db.as_ref().unwrap().get_collection("c").unwrap();
+        let stale_candidates = col.expired_keys(5000, &|_| true);
+        assert_eq!(stale_candidates.len(), 1);
+
+        let r = client.put(format!("{}/collections/c/docs/exp1?w=majority", leader_url))
+            .json(&serde_json::json!({"value": {"v": 2}, "expire_at": 9_999_999_999_999u64}))
+            .send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        let deleted = local_sweep_expired_batch(
+            &leader_state,
+            "c",
+            stale_candidates,
+            WriteConcern::Majority,
+            Duration::from_secs(5),
+        ).await.unwrap();
+        assert_eq!(deleted, 0, "stale sweep candidate must not delete a concurrently overwritten key");
+        assert_eq!(client.get(format!("{}/collections/c/docs/exp1", leader_url)).send().await.unwrap().status(), StatusCode::OK);
+
+        // The feed records only while subscribed, so the tap opens before `exp2` is written.
+        let opened = stream_client().get(format!("{}/collections/c/changes", leader_url))
+            .send().await.unwrap();
+        assert_eq!(opened.status(), StatusCode::OK);
+        let tap = SseTap::open(opened);
+        assert_eq!(tap.wait_for_events("open", 1, Duration::from_secs(5)).await.len(), 1);
+
+        let r = client.put(format!("{}/collections/c/docs/exp2?w=majority", leader_url))
+            .json(&serde_json::json!({"value": {"v": 99}, "expire_at": 1000}))
+            .send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
+
+        let swept = sweep_collection(&leader_state, "c", &col).await;
+        assert_eq!(swept, 1);
+
+        let rep_state = nodes[1].state.clone().unwrap();
+        wait_for(Duration::from_secs(5), || {
+            rep_state.db.as_ref().unwrap().get_collection("c").unwrap().get("exp2").unwrap().is_none()
+        }).await;
+        assert!(rep_state.db.as_ref().unwrap().get_collection("c").unwrap().get("exp2").unwrap().is_none());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let is_sweep = |e: &crate::test_support::SseEvent| e.data["key"] == "exp2" && e.data["op"] == "delete";
+        while std::time::Instant::now() < deadline && !tap.named("change").iter().any(is_sweep) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(tap.named("change").iter().any(is_sweep),
+            "expiry sweep must appear on the change feed as an ordinary delete: {:?}", tap.events());
+        drop(tap);
+
+        for n in &mut nodes {
+            n.kill();
+        }
+    }
+
+    #[tokio::test]
+    async fn router_fanout_ttl_and_bulk_expire_at_across_shards() {
+        use crate::test_support::{sharded_cluster, temp_root};
+        use reqwest::StatusCode;
+
+        let root = temp_root();
+        let (mut shards, mut router) = sharded_cluster(&root, 2).await;
+        let rurl = router.url();
+        let client = reqwest::Client::new();
+
+        let r = client.post(format!("{}/collections/c/docs/bulk", rurl))
+            .json(&serde_json::json!([
+                {"id": "k1", "value": {"v": 1}, "expire_at": 1000},
+                {"id": "k2", "value": {"v": 2}, "expire_at": 1000},
+                {"id": "k3", "value": {"v": 3}, "expire_at": 9_999_999_999_999u64}
+            ]))
+            .send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
+
+        let r = client.put(format!("{}/collections/c/ttl", rurl))
+            .json(&serde_json::json!({"ttl_secs": 600}))
+            .send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+
+        let r = client.get(format!("{}/collections/c/ttl", rurl)).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(r.json::<serde_json::Value>().await.unwrap()["ttl_secs"], 600);
+
+        for s in &shards {
+            let col = s.state.as_ref().unwrap().db.as_ref().unwrap().get_collection("c").unwrap();
+            assert_eq!(col.committed_ttl(), Some(600));
+            sweep_collection(s.state.as_ref().unwrap(), "c", &col).await;
+        }
+
+        assert_eq!(client.get(format!("{}/collections/c/docs/k1", rurl)).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert_eq!(client.get(format!("{}/collections/c/docs/k2", rurl)).send().await.unwrap().status(), StatusCode::NOT_FOUND);
+        assert_eq!(client.get(format!("{}/collections/c/docs/k3", rurl)).send().await.unwrap().status(), StatusCode::OK);
+
+        let r = client.delete(format!("{}/collections/c/ttl", rurl)).send().await.unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let r = client.get(format!("{}/collections/c/ttl", rurl)).send().await.unwrap();
+        assert_eq!(r.json::<serde_json::Value>().await.unwrap()["ttl_secs"], serde_json::Value::Null);
+
+        router.kill();
+        for s in &mut shards {
+            s.kill();
+        }
+    }
+
+    #[tokio::test]
+    async fn wal_replay_and_snapshot_preserve_ttl_and_expire_at() {
+        use crate::storage::Database;
+        use crate::test_support::temp_root;
+
+        let root = temp_root();
+        {
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("c").unwrap();
+            let (_, lsn1, _, _) = col.set_ttl(Some(120), 1).unwrap();
+            col.apply_committed(lsn1).unwrap();
+            let (_, lsn2, _, _) = col.put_with_expiry("k1".into(), serde_json::json!({"a": 1}), Some(5000), 1).unwrap();
+            col.apply_committed(lsn2).unwrap();
+            col.save_index().unwrap();
+            col.flush_watermark_full().unwrap();
+        }
+        {
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("c").unwrap();
+            assert_eq!(col.committed_ttl(), Some(120));
+            assert_eq!(col.expire_at_including_staged("k1"), Some(5000));
+            // Without the snapshot the next open replays the WALs.
+            let _ = std::fs::remove_file(root.join("c").join(crate::storage::index::INDEX_FILENAME));
+        }
+        {
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("c").unwrap();
+            assert_eq!(col.committed_ttl(), Some(120));
+            assert_eq!(col.expire_at_including_staged("k1"), Some(5000));
+        }
+    }
 }
+

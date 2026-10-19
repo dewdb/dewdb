@@ -9,10 +9,11 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
-// Compatibility: bincode carries no tag, so the name is the format. v2 added the version per entry.
-pub const INDEX_FILENAME: &str = "index-v2.bin";
+// Compatibility: bincode carries no tag, so the name is the format. v2 added the version per entry,
+// v3 the write time and expiry.
+pub const INDEX_FILENAME: &str = "index-v3.bin";
 /// Removed on open: a downgraded binary would resume from it over WALs compaction has since rewritten.
-pub const LEGACY_INDEX_FILENAME: &str = "index-current.bin";
+pub const LEGACY_INDEX_FILENAMES: [&str; 2] = ["index-current.bin", "index-v2.bin"];
 
 /// The frame that last wrote a key. `(term, lsn)` names one entry of a group's log, on every member
 /// of it, and compaction and snapshot installs copy frame headers verbatim, so it survives both.
@@ -37,6 +38,10 @@ pub struct IndexEntry {
     pub inline: Option<Box<[u8]>>,
     pub lsn: u64,
     pub term: u64,
+    #[serde(default)]
+    pub ts: u64,
+    #[serde(default)]
+    pub expire_at: Option<u64>,
 }
 
 impl IndexEntry {
@@ -50,6 +55,14 @@ impl IndexEntry {
 
     pub fn inline_bytes(&self) -> u64 {
         self.inline.as_ref().map_or(0, |b| b.len() as u64)
+    }
+
+    pub fn expires_at(&self, collection_ttl_secs: Option<u64>) -> Option<u64> {
+        self.expire_at.or_else(|| {
+            collection_ttl_secs.and_then(|secs| {
+                (self.ts > 0).then(|| self.ts.saturating_add(secs.saturating_mul(1000)))
+            })
+        })
     }
 }
 
@@ -111,6 +124,8 @@ pub struct AppliedMeta {
     /// index and compaction retires its frame. Definitions only -- postings rebuild on open.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub indexes: Vec<IndexSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
 }
 
 pub const APPLIED_FILENAME: &str = "applied.meta";

@@ -111,6 +111,9 @@ ownership are the same data structure everywhere.
   made conditional on the version a read returned: every read and write returns an `ETag`, and
   `If-Match` refuses the write with `412` if the document moved. See
   [Conditional writes](#conditional-writes).
+- A document can expire, by its own `expire_at` or by a collection TTL. Expiry is a replicated
+  delete made by the leader's background sweep, not a read filter. See
+  [Document expiry](#document-expiry).
 - A single document write is atomic. A bulk write is one group commit and one replication round,
   reported per document, and its write concern is decided for the whole run — a replica that
   acknowledges the last frame holds every frame below it.
@@ -123,8 +126,8 @@ ownership are the same data structure everywhere.
   aliases. The name is checked after percent-decoding, so `%5Fconfig` is judged as `_config`, and
   again before it becomes a directory under the data root. Keys carry no such restriction.
 
-A document has no reserved fields and no metadata stored alongside it: what you `PUT` is what you
-`GET`.
+A document has no reserved fields. `expire_at` travels beside `value` in a write, never inside it,
+and is not returned by a read: what you `PUT` as `value` is what you `GET`.
 
 ---
 
@@ -423,9 +426,11 @@ data_dir/
 ├── <collection>/
 │   ├── wal-00001.log     append-only frames
 │   ├── wal-00002.log
-│   ├── index-current.bin key → frame location snapshot, plus a replay resume point
+│   ├── index-v3.bin      key → frame location, version, write time and expiry, plus a
+│   │                     replay resume point
 │   ├── applied.meta      applied watermark, drop tombstone, newest committed configuration
-│   │                     and handover record, and the secondary index definitions
+│   │                     and handover record, the secondary index definitions and the
+│   │                     collection TTL
 │   └── applied.pos       the applied watermark alone, rewritten in place on every commit
 ├── <collection>.tmp      staged snapshot directory during install (not listed as a collection)
 ├── <collection>.old      previous live directory during the install swap (not listed)
@@ -660,7 +665,10 @@ The scheduler wakes every `interval_secs` and, per collection:
   dead-byte ratio is at least `compaction_dead_ratio`, and the run would reclaim at least
   `compaction_min_wal_bytes` after retention takes its share;
 - saves an index snapshot when `snapshot_interval_secs` has passed or a compaction just ran, and
-  skips it when nothing has been appended since the last one.
+  skips it when nothing has been appended since the last one;
+- on the leader, deletes the documents past their [expiry](#document-expiry) through the ordinary
+  write path at `w=majority`, 64 per batch. Each candidate is re-checked under its key lock, so a
+  document rewritten since the scan is kept, and a key this group no longer owns is left alone.
 
 Snapshots are never gated on leadership: they only add a file, and a replica that never snapshots
 replays every WAL at boot.
@@ -1660,21 +1668,23 @@ All bodies are JSON. Errors are `{"error":"…"}`.
 
 | Method | Path | Notes |
 |---|---|---|
-| `POST` | `/collections/:name/docs` | Body `{"value":…}`. Server-generated UUID key. `201 {"id","status":"created"}`. |
+| `POST` | `/collections/:name/docs` | Body `{"value":…,"expire_at"?}`. Server-generated UUID key. `201 {"id","status":"created"}`. |
 | `PUT` | `/collections/:name/docs/:id` | Full replace. `201` when created, `200` when replaced. |
 | `PATCH` | `/collections/:name/docs/:id` | JSON Merge Patch. `404` if absent; a `null` body is rejected. |
 | `GET` | `/collections/:name/docs/:id` | The stored value, or `404` — for the document or for the collection. Accepts `?read=`. |
 | `DELETE` | `/collections/:name/docs/:id` | `200 {"status":"deleted","existed":bool}`. |
-| `POST` | `/collections/:name/docs/bulk` | Body `[{"id"?,"value"},…]`. One group commit and one replication round, per-document results. `201` when every item met its write concern, `207` when some did not, and the shard's own status when a refusal answered for the whole batch. |
+| `POST` | `/collections/:name/docs/bulk` | Body `[{"id"?,"value","expire_at"?},…]`. One group commit and one replication round, per-document results. `201` when every item met its write concern, `207` when some did not, and the shard's own status when a refusal answered for the whole batch. |
 | `GET` | `/collections/:name/docs` | An ownership-filtered query page (`items`, `next_cursor`), or `404` if there is no such collection. Takes the same `keys=true`/`keys=embed` shapes as `/query`. Default limit 100, maximum 10 000. Shard-only; a router answers `501` and points at `/query`. |
 | `GET` | `/collections/:name/query` | See [Querying](#17-querying). |
 | `GET` | `/collections/:name/aggregate` | Totals over the same filter, grouped on dotted fields, within a per-shard read budget. See [Aggregation](#17a-aggregation). |
 | `GET` | `/collections/:name/changes` | A server-sent-events stream of committed changes, from one shard group or, on a router, from all of them. See [Change streams](#17b-change-streams). |
 | `GET` | `/collections/:name/changes/ws` | The same stream as a WebSocket, with the same parameters and the same refusals. |
 
-Mutating requests accept `?w=` and `?wtimeout=`, and single-document writes accept `If-Match` and
-`If-None-Match` — see [Conditional writes](#conditional-writes). Merge-patch semantics are the
-standard ones: a `null` value removes a field, nested objects merge, anything else replaces.
+`POST`, `PUT`, `PATCH` and each bulk item take an optional `"expire_at"` beside `"value"` — see
+[Document expiry](#document-expiry). Mutating requests accept `?w=` and `?wtimeout=`, and
+single-document writes accept `If-Match` and `If-None-Match` — see
+[Conditional writes](#conditional-writes). Merge-patch semantics are the standard ones: a `null`
+value removes a field, nested objects merge, anything else replaces.
 
 `?read=` on `GET /collections/:name/docs/:id`, `/query` and `/aggregate`:
 
@@ -1725,6 +1735,31 @@ header is `400`: one header cannot name a version per document.
 A bulk write checks ownership for every key before writing anything: the batch is accepted whole or
 refused whole. [Admission](#11-flow-control) is whole-batch for the same reason.
 
+### Document expiry
+
+A write can carry `"expire_at"`, a Unix time in milliseconds, beside `"value"`:
+
+```json
+{"value": {"user": "u1"}, "expire_at": 1767225600000}
+```
+
+A collection can carry a TTL in seconds (`PUT /collections/:name/ttl`), counted from each
+document's last write as the leader stamped it. A document's own `expire_at` wins over the
+collection TTL. `PATCH` keeps the document's `expire_at` unless the request sends one; `PUT` is a
+full replace, so a `PUT` without `expire_at` clears it. `expire_at: 0` and `ttl_secs: 0` are `400`.
+
+Nothing filters reads. The leader's [maintenance scheduler](#background-maintenance) deletes
+documents past their deadline through the ordinary write path, so the delete replicates, commits
+under a majority, appears on the change feed as a `delete` event, and survives a failover. Until
+then the document is readable: expect it to disappear within one `maintenance.interval_secs`
+(60 s by default) of its deadline on a healthy leader, later while the group has none, and never
+with `maintenance.enabled: false`. Every replica agrees on whether it exists, because only a
+committed delete removes it. A document's expiry is not returned by reads.
+
+A migration carries each document's write time and `expire_at`, so a moved document keeps its
+deadline. A collection TTL is recorded in the cluster catalogue, so a shard group that takes its
+first key for the collection later enforces it too.
+
 ### Collections
 
 | Method | Path | Notes |
@@ -1733,6 +1768,9 @@ refused whole. [Admission](#11-flow-control) is whole-batch for the same reason.
 | `DELETE` | `/collections/:name` | Leader-only, and behind `auth.admin_keys` when set. A replicated log entry: accepts `?w=`/`?wtimeout=` and answers `202 {"status":"staged"}` when the quorum is short. Through a router, `202` when any group staged and `207` when any group failed. |
 | `POST` | `/collections/:name/compact` | Leader-only. `404` if there is no such collection, `409` if a compaction or snapshot transfer is running. Reports bytes before and after. |
 | `POST` | `/collections/:name/snapshot` | Writes an index snapshot. Allowed on any node. `404` if there is no such collection. |
+| `GET` | `/collections/:name/ttl` | `{"collection","ttl_secs"}`, `ttl_secs` `null` when unset. `404` if there is no such collection. A router answers from the cluster catalogue, falling back to the groups. |
+| `PUT` | `/collections/:name/ttl` | Body `{"ttl_secs":n}`, `n > 0`. Leader-only, and behind `auth.admin_keys` when set. A replicated log entry: `200 {"status":"configured"}`, or `202 {"status":"staged"}` when the quorum is short. `404` if there is no such collection. Through a router, graded like an index definition, and recorded in the cluster catalogue. See [Document expiry](#document-expiry). |
+| `DELETE` | `/collections/:name/ttl` | Clears the collection TTL. Same tier, write concern and router grading as `PUT`. `200 {"existed":false}` when none was set, which writes nothing. Documents' own `expire_at` still apply. |
 
 ### Secondary indexes
 
@@ -2526,8 +2564,9 @@ none does, the subscription is disabled the same way a `410` disables it.
   recent counters; acknowledged positions still pass through the majority-committed log.
 - **A failover resumes at the last acknowledgement the promoted node can see.** Promotion waits for
   inherited staged `_webhooks` entries to settle, then opens the sender at the greater of that group
-  cursor and any legacy local cursor. Budget for a redelivery around any failover: at-least-once and
-  the two dedup keys are the guarantee, not the cursor.
+  cursor and any legacy local cursor. If the promoted node holds the event that cursor names but has
+  not yet committed it, the sender waits for it rather than counting a gap. Budget for a redelivery
+  around any failover: at-least-once and the two dedup keys are the guarantee, not the cursor.
 - **Shard-local.** A router answers `501` and names the groups: a webhook is delivered by the group
   that holds the keys, and on a sharded collection each group needs its own registration.
 
@@ -2547,7 +2586,9 @@ Three independent credentials, all optional and all off by default:
   rotate by appending one and removing the old one later. While the list is empty the public API is
   open, and a warning says so at boot.
 - **`auth.admin_keys`** guards the admin surface: every `/cluster/*` route, read and write,
-  `DELETE /collections/:name`, `POST`/`DELETE` on `/collections/:name/indexes`, and every method on
+  `DELETE /collections/:name`, `POST`/`DELETE` on `/collections/:name/indexes`, `PUT`/`DELETE` on
+  `/collections/:name/ttl` — a short TTL empties the collection on the next sweep — and every
+  method on
   `/collections/:name/webhooks` — a webhook listing names the destinations this node posts documents
   to, and its registration carries a secret, so reads are gated there too. While it is empty those
   routes fall back to `api_keys`, which is what they did before the tier existed. Same headers as
@@ -2566,9 +2607,10 @@ value that could not go in a header fails the boot instead of silently disabling
 
 The admin surface is topology, destruction and schema, not maintenance:
 `POST /collections/:name/compact` and `/snapshot` stay on the public tier, and so do
-`DELETE /collections/:name/docs/:id` and `GET /collections/:name/indexes` — listing the definitions
-is a read of the collection. Route segments are counted before percent-decoding, the way axum routes
-them, so an encoded slash in a collection name cannot make a drop look like a document delete.
+`DELETE /collections/:name/docs/:id`, `GET /collections/:name/indexes` and
+`GET /collections/:name/ttl` — listing the definitions is a read of the collection. Route segments
+are counted before percent-decoding, the way axum routes them, so an encoded slash in a collection
+name cannot make a drop look like a document delete.
 
 Every outbound internal request also carries `x-dew-node: <own url>`, which names the sender. It is
 identification, not authentication — the internal secret is what authorises the call — and it is what
