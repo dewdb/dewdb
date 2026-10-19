@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="360" viewBox="0 0 880 360" role="img" aria-label="A typical distributed database runs separate processes for routing, metadata and data. DewDB runs one binary in every role.">
+  <style>
+    .bg { fill: #0d1117; }
+    .panel { fill: #161b22; stroke: #30363d; }
+    .box { fill: #0d1117; stroke: #484f58; }
+    .extra { fill: #2a1a0c; stroke: #c2410c; }
+    .dew { fill: #0b2622; stroke: #70EFC6; }
+    .h { font: 700 16px -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; fill: #e6edf3; }
+    .t { font: 600 13px -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; fill: #e6edf3; }
+    .s { font: 11px -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; fill: #8b949e; }
+    .c { font: 13px -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; fill: #c9d1d9; }
+    .line { stroke: #6e7681; stroke-width: 1.5; fill: none; }
+    .dash { stroke: #f97316; stroke-width: 1.5; stroke-dasharray: 4 4; fill: none; }
+    .dline { stroke: #70EFC6; stroke-width: 1.5; fill: none; }
+  </style>
+  <rect class="bg" width="880" height="360"/>
+
+  <!-- Left: the usual shape -->
+  <rect class="panel" x="16" y="16" width="412" height="328" rx="12"/>
+  <text class="h" x="36" y="46">A typical distributed database</text>
+
+  <rect class="box" x="132" y="64" width="160" height="40" rx="8"/>
+  <text class="t" x="212" y="82" text-anchor="middle">Application</text>
+  <text class="s" x="212" y="97" text-anchor="middle">+ language driver</text>
+
+  <path class="line" d="M212 104 V132"/>
+  <rect class="extra" x="132" y="132" width="160" height="40" rx="8"/>
+  <text class="t" x="212" y="150" text-anchor="middle">Query router</text>
+  <text class="s" x="212" y="165" text-anchor="middle">separate process</text>
+
+  <rect class="extra" x="316" y="112" width="96" height="74" rx="8"/>
+  <text class="t" x="364" y="134" text-anchor="middle">Coordinator</text>
+  <text class="s" x="364" y="150" text-anchor="middle">metadata /</text>
+  <text class="s" x="364" y="164" text-anchor="middle">config service</text>
+  <text class="s" x="364" y="178" text-anchor="middle">own cluster</text>
+  <path class="dash" d="M292 152 H316"/>
+
+  <path class="line" d="M212 172 V196 M80 196 H344 M80 196 V236 M212 196 V236 M344 196 V236"/>
+  <path class="dash" d="M372 186 V236"/>
+  <rect class="box" x="32" y="236" width="96" height="40" rx="8"/>
+  <text class="t" x="80" y="261" text-anchor="middle">Data node</text>
+  <rect class="box" x="164" y="236" width="96" height="40" rx="8"/>
+  <text class="t" x="212" y="261" text-anchor="middle">Data node</text>
+  <rect class="box" x="296" y="236" width="96" height="40" rx="8"/>
+  <text class="t" x="344" y="261" text-anchor="middle">Data node</text>
+
+  <text class="c" x="222" y="316" text-anchor="middle">Separate processes for routing, metadata and data,</text>
+  <text class="c" x="222" y="334" text-anchor="middle">each deployed, configured and upgraded on its own.</text>
+
+  <!-- Right: DewDB -->
+  <rect class="panel" x="452" y="16" width="412" height="328" rx="12"/>
+  <text class="h" x="472" y="46">DewDB</text>
+
+  <rect class="box" x="578" y="64" width="160" height="40" rx="8"/>
+  <text class="t" x="658" y="82" text-anchor="middle">Application</text>
+  <text class="s" x="658" y="97" text-anchor="middle">curl, fetch, any HTTP client</text>
+
+  <path class="dline" d="M658 104 V150 M526 150 H790 M526 150 V176 M658 150 V176 M790 150 V176"/>
+  <text class="s" x="668" y="132">HTTP + JSON</text>
+
+  <rect class="dew" x="472" y="176" width="108" height="100" rx="8"/>
+  <text class="t" x="526" y="198" text-anchor="middle">dewdb</text>
+  <text class="s" x="526" y="218" text-anchor="middle">storage</text>
+  <text class="s" x="526" y="232" text-anchor="middle">consensus</text>
+  <text class="s" x="526" y="246" text-anchor="middle">routing</text>
+  <text class="s" x="526" y="260" text-anchor="middle">change feed</text>
+
+  <rect class="dew" x="604" y="176" width="108" height="100" rx="8"/>
+  <text class="t" x="658" y="198" text-anchor="middle">dewdb</text>
+  <text class="s" x="658" y="218" text-anchor="middle">storage</text>
+  <text class="s" x="658" y="232" text-anchor="middle">consensus</text>
+  <text class="s" x="658" y="246" text-anchor="middle">routing</text>
+  <text class="s" x="658" y="260" text-anchor="middle">change feed</text>
+
+  <rect class="dew" x="736" y="176" width="108" height="100" rx="8"/>
+  <text class="t" x="790" y="198" text-anchor="middle">dewdb</text>
+  <text class="s" x="790" y="218" text-anchor="middle">storage</text>
+  <text class="s" x="790" y="232" text-anchor="middle">consensus</text>
+  <text class="s" x="790" y="246" text-anchor="middle">routing</text>
+  <text class="s" x="790" y="260" text-anchor="middle">change feed</text>
+
+  <text class="c" x="658" y="316" text-anchor="middle">One binary under 15 MB, the same in every role:</text>
+  <text class="c" x="658" y="334" text-anchor="middle">primary, replica or router. Nothing else to run.</text>
+</svg>
