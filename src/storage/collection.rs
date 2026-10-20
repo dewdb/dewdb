@@ -82,6 +82,8 @@ pub struct Collection {
     pub rewriting: std::sync::Mutex<()>,
     pub cache: ReadCacheConfig,
     pub inline_bytes: AtomicU64,
+    /// Committed entries with `expire_at`; zero and no collection TTL means the sweep skips the walk.
+    pub expiring_entries: AtomicU64,
     /// Inline bytes held by staged frames, which the committed-only index cannot count. The same
     /// budget, since it is the same memory; released when the frame commits or is truncated away.
     pub staged_inline: AtomicU64,
@@ -307,6 +309,7 @@ impl Collection {
 
         let current_wal_size = file.metadata()?.len();
         let inline_total = inline_used;
+        let expiring = index.values().filter(|e| e.expire_at.is_some()).count() as u64;
 
         // Also where the changefeed opens: a subscriber resuming from below the committed log is
         // refused, rather than joined to a stream that starts in the middle.
@@ -355,6 +358,7 @@ impl Collection {
             rewriting: std::sync::Mutex::new(()),
             cache,
             inline_bytes: AtomicU64::new(inline_total),
+            expiring_entries: AtomicU64::new(expiring),
             staged_inline: AtomicU64::new(staged_inline),
             durable_lsn: AtomicU64::new(boot_lsn),
             pending: std::sync::Mutex::new(pending),
@@ -417,23 +421,35 @@ impl Collection {
 
     pub fn apply_index_put(&self, index: &mut BTreeMap<String, IndexEntry>, key: String, entry: IndexEntry) {
         let added = entry.inline_bytes();
-        let replaced = index.insert(key, entry).map_or(0, |old| old.inline_bytes());
+        let expires = entry.expire_at.is_some();
+        let old = index.insert(key, entry);
+        let replaced = old.as_ref().map_or(0, |old| old.inline_bytes());
         if added >= replaced {
             self.inline_bytes.fetch_add(added - replaced, Ordering::Relaxed);
         } else {
             self.inline_bytes.fetch_sub(replaced - added, Ordering::Relaxed);
+        }
+        let was_expiring = old.is_some_and(|old| old.expire_at.is_some());
+        if expires && !was_expiring {
+            self.expiring_entries.fetch_add(1, Ordering::Relaxed);
+        } else if was_expiring && !expires {
+            self.expiring_entries.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
     pub fn apply_index_remove(&self, index: &mut BTreeMap<String, IndexEntry>, key: &str) {
         if let Some(old) = index.remove(key) {
             self.inline_bytes.fetch_sub(old.inline_bytes(), Ordering::Relaxed);
+            if old.expire_at.is_some() {
+                self.expiring_entries.fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
 
     fn clear_index(&self, index: &mut BTreeMap<String, IndexEntry>) {
         index.clear();
         self.inline_bytes.store(0, Ordering::Relaxed);
+        self.expiring_entries.store(0, Ordering::Relaxed);
     }
 
     // Striped: distinct keys share locks, and batch callers must dedupe stripes or self-deadlock.
@@ -585,6 +601,10 @@ impl Collection {
 
     pub fn expired_keys(&self, now_ms: u64, owned: &dyn Fn(&str) -> bool) -> Vec<(String, Version)> {
         let ttl_secs = self.committed_ttl();
+        // A stale zero read outside the lock only defers an expiry to the next sweep.
+        if ttl_secs.is_none() && self.expiring_entries.load(Ordering::Relaxed) == 0 {
+            return Vec::new();
+        }
         let index = self.index.read().unwrap();
         let mut expired = Vec::new();
         for (key, entry) in index.iter() {
@@ -1402,8 +1422,7 @@ impl Collection {
     /// Drains in log order; staged frames can arrive out of order.
     pub fn apply_committed(&self, committed_lsn: u64) -> io::Result<usize> {
         let mut build_wanted = false;
-        // Decided once for the batch and outside the locks: whether a document has to be resolved
-        // is not a per-entry question, and the answer is almost always no.
+        // Sampled once per batch, outside the locks; usually false.
         let watched = self.changefeed.active();
         let mut changes: Vec<PendingChange> = Vec::new();
         // The pending -> index order keeps index visibility atomic with the snapshot watermark.

@@ -110,7 +110,9 @@ cannot be conditional.
 delete removes it.
 **Limit.** A document stays readable after its deadline until the sweep runs, which is up to one
 `maintenance.interval_secs` (60 s by default) on a healthy leader, longer while there is no leader,
-and never with `maintenance.enabled: false`. A document's expiry is not returned on reads.
+and never with `maintenance.enabled: false`. A document's expiry is not returned on reads. A
+collection that uses neither a TTL nor `expire_at` costs the sweep nothing; one that does is scanned
+in full each sweep, about 13 ms per million keys.
 
 ---
 

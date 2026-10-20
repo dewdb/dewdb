@@ -65,8 +65,7 @@ fn has_collection_dirs(data_dir: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// The durable view wins over config. Config is a bootstrap seed, so an edit to it after the first
-/// boot is silently ignored -- warn loudly rather than let an operator think their change took.
+/// The durable view wins; config is only a first-boot seed, so a later edit to it is warned about.
 fn load_cluster_view(config: &NodeConfig) -> ClusterMetadata {
     let stored = ClusterMetadata::load(&config.data_dir)
         .expect("Cannot read cluster.meta; delete it to re-seed the topology from config");
@@ -95,20 +94,10 @@ fn load_cluster_view(config: &NodeConfig) -> ClusterMetadata {
     }
 }
 
-/// The one line that says which node this process is and where its state lives, emitted once the
-/// listener is bound and the node is about to serve.
-///
-/// Two apps pointed at the same default port is a silent mistake: the second one writes its
-/// collections into the first one's database and nothing in the log says so. `/health` has carried
-/// `node_id` all along, but only for someone who already suspects it. Fields rather than a
-/// preformatted string, so `logging.format = "json"` keeps them separate.
-///
-/// Config is the source: no secret, no key, and nothing derived is in here.
+/// Identity and data_dir as separate fields, so two apps sharing one default port show up in the log.
+/// Config fields only: nothing secret or derived.
 fn log_listening(config: &NodeConfig) {
-    // Every shard reports the role it runs as, including the one that left `shard_role` out of its
-    // file -- an operator reading the log cares which node is leading, not which fields were typed.
-    // The answer comes from the same accessor the boot path leads with, never restated here.
-    // A router has no shard role at all, so it has none to report.
+    // Same accessor the boot path uses, so an omitted `shard_role` logs the role actually run.
     match config.effective_shard_role() {
         Some(shard_role) => info!(target: "boot",
             node_id = %config.node_id, role = %config.role, shard_role = %shard_role,
@@ -119,8 +108,7 @@ fn log_listening(config: &NodeConfig) {
     }
 }
 
-/// Between reads of the config file for a credential change. A rotation is operator-driven, so
-/// this is a bound on noticing one rather than something a request waits on.
+/// Bound on noticing an operator's credential rotation; no request waits on it.
 const AUTH_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Re-reads `auth` when the config file changes, ending the streams and subscriptions opened under a
@@ -201,8 +189,7 @@ fn reload_auth(path: &str) -> Result<crate::auth::AuthConfig, String> {
     Ok(auth)
 }
 
-/// Resolves on the first stop request, naming it. SIGTERM is what `docker stop`, systemd and
-/// Kubernetes send, so on Unix it has to take the same clean path as Ctrl-C.
+/// SIGTERM (docker stop, systemd, Kubernetes) takes the same clean path as Ctrl-C.
 #[cfg(unix)]
 async fn shutdown_signal() -> &'static str {
     use tokio::signal::unix::{signal, SignalKind};
@@ -223,8 +210,7 @@ async fn shutdown_signal() -> &'static str {
 async fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    // Answered before the config file is read: asking a binary what it is, how to run it, or to
-    // write a config has to work on a host that has no dew.json yet.
+    // Before the config is read: version, help and init must work on a host with no dew.json.
     let config_path = match cli::parse(&args) {
         Cli::Version => {
             println!("dewdb {}", env!("CARGO_PKG_VERSION"));
@@ -247,7 +233,7 @@ async fn main() -> io::Result<()> {
         Cli::Start(config) => config,
     };
 
-    // A config that is not there is the user's typo, not a bug in the node: say which path and stop.
+    // A missing or malformed config is a user error: name it and exit, no panic or backtrace.
     let config_content = match cli::read_config(&config_path) {
         Ok(body) => body,
         Err(e) => {
@@ -257,9 +243,6 @@ async fn main() -> io::Result<()> {
     };
     let config_path = config_path.path;
 
-    // Same for a config that is there and wrong. The reasons are the ones these two have always
-    // given -- serde's line and column, and the rule `validate` refused on -- without the panic
-    // frame and backtrace note wrapped around them, which never told the writer of the file anything.
     let config: NodeConfig = match serde_json::from_str(&config_content) {
         Ok(config) => config,
         Err(e) => {
@@ -292,8 +275,7 @@ async fn main() -> io::Result<()> {
 
     info!(target: "boot", role = %config.role, shard_role = ?config.shard_role, "Booting node");
 
-    // Routers keep cluster.meta in data_dir, so the directory existing is expected now;
-    // collection subdirectories in it are not.
+    // A router's data_dir holds cluster.meta; only collection subdirectories are suspect.
     if config.role == "router" && has_collection_dirs(&config.data_dir) {
         warn!(target: "boot", "Router node should not use local storage");
     }
@@ -424,16 +406,13 @@ async fn main() -> io::Result<()> {
     if config.role == "shard" {
         // A node admitted last time comes back knowing only what the durable view says.
         state.follow_from_view();
-        // Before any task can decide anything: the configuration in force is a log entry, and this
-        // node's own log is the only copy of it that survived the restart.
+        // Before any task runs: the configuration in force survives a restart only in the local log.
         state.refresh_configuration();
         state.react_to_migration();
         if state.is_leader() {
             seed_leader_progress(&state);
-            // A solo primary booting on an uncommitted tail is the same stranded state a promotion
-            // inherits, and has the same floor to set.
+            // An uncommitted tail at boot is the stranded state a promotion inherits; same floor.
             publish_inherited_tails(&state);
-            // Same for a change the previous process was in the middle of.
             crate::consensus::reconfigure::resume_change(&state);
         }
         progress_flush_task(state.clone());
@@ -457,8 +436,7 @@ async fn main() -> io::Result<()> {
         router_probe_task(state.clone());
     }
 
-    // Both roles: a shard reconciles its own definitions, and a router is the only node that can
-    // name every shard group, so it is what carries a definition between them.
+    // Both roles: a shard reconciles its own definitions; only a router can carry one across groups.
     index_catalog_task(state.clone());
     webhook_task(state.clone());
     auth_reload_task(state.clone(), config_path.clone());
@@ -501,9 +479,7 @@ mod tests {
         render_events(&cfg, &config.node_id, || log_listening(&config))
     }
 
-    /// The wrong-node mistake: two apps on one machine, one default port, and the second one seeding
-    /// its collections into the first one's database. This line is what makes that visible at a
-    /// glance, so it has to carry the identity and the storage location as separate greppable fields.
+    /// Two apps on one default port share a database silently; this line is what exposes it.
     #[test]
     fn the_startup_line_names_the_node_and_where_its_state_lives() {
         let line = rendered("text", r#"{"node_id":"kanban-1","role":"shard","shard_role":"primary",
@@ -518,8 +494,6 @@ mod tests {
         assert!(line.contains("[boot]"), "it belongs to the boot target: {}", line);
     }
 
-    /// `logging.format = "json"` has to keep them as fields rather than one preformatted string,
-    /// which is the whole reason they are recorded as fields and not interpolated into the message.
     #[test]
     fn the_startup_line_stays_structured_under_json_logging() {
         let line = rendered("json", r#"{"node_id":"kanban-1","role":"shard","shard_role":"primary",
@@ -537,12 +511,7 @@ mod tests {
         assert_eq!(event["level"], "INFO");
     }
 
-    /// Every shard says which role it runs as; a router has none to say.
-    ///
-    /// The omitted case is the point: `shard_role` is optional, and an operator reading the log wants
-    /// to know which node is leading, not which fields someone typed. The expected value is not
-    /// hardcoded here -- it is read back from `runs_as_primary`, the same call the boot path leads
-    /// with, so if that default ever changes this test follows it instead of pinning the old answer.
+    /// Expected roles come from `runs_as_primary`, so a changed default moves this test with it.
     #[test]
     fn every_shard_reports_the_role_it_runs_as_and_a_router_reports_none() {
         let shard = |json: &str| -> serde_json::Value {
@@ -566,7 +535,6 @@ mod tests {
         assert_eq!(shard(PRIMARY)["shard_role"], "primary");
         assert_eq!(shard(REPLICA)["shard_role"], "replica");
 
-        // Omitted is a replica because leadership says so, not because the logger decided it is.
         assert_eq!(runtime_role(OMITTED), "replica",
             "the runtime default for an omitted shard_role is what the line must report");
         assert_eq!(shard(OMITTED)["shard_role"], runtime_role(OMITTED));
@@ -574,7 +542,6 @@ mod tests {
         assert!(!config_from(OMITTED).runs_as_primary(),
             "a shard that names no shard_role does not lead, so it is not logged as one");
 
-        // And the logged value is the runtime's answer for each of the three, not a parallel reading.
         for json in [PRIMARY, REPLICA, OMITTED] {
             assert_eq!(shard(json)["shard_role"], runtime_role(json), "config: {}", json);
             assert_eq!(config_from(json).effective_shard_role(), Some(runtime_role(json)));
@@ -589,8 +556,7 @@ mod tests {
         assert_eq!(event["data_dir"], "./data", "a router still says where its cluster view lives");
     }
 
-    /// The line is built from four config fields by name. If it ever grows to log the config itself,
-    /// this is what fails.
+    /// Guards against the line ever growing to log the config itself.
     #[test]
     fn the_startup_line_carries_no_credentials() {
         let line = rendered("json", r#"{"node_id":"n1","role":"shard","shard_role":"primary",
@@ -603,8 +569,7 @@ mod tests {
         }
     }
 
-    /// A running node never unlocks `/internal/*` from a file edit, and the rest of that file is not
-    /// taken either.
+    /// A file edit never unlocks `/internal/*`, and the refused file's other tiers are not taken.
     #[test]
     fn a_reload_that_removes_the_internal_secret_is_refused_whole() {
         use crate::auth::{authorize, AuthConfig, AuthOutcome};

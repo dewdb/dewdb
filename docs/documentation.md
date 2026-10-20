@@ -669,6 +669,9 @@ The scheduler wakes every `interval_secs` and, per collection:
 - on the leader, deletes the documents past their [expiry](#document-expiry) through the ordinary
   write path at `w=majority`, 64 per batch. Each candidate is re-checked under its key lock, so a
   document rewritten since the scan is kept, and a key this group no longer owns is left alone.
+  A collection with no TTL and no document carrying `expire_at` is skipped without reading its
+  keys. One that has either is scanned in full, about 13 ms per million keys, and commits to that
+  collection wait for the scan.
 
 Snapshots are never gated on leadership: they only add a file, and a replica that never snapshots
 replays every WAL at boot.

@@ -311,8 +311,7 @@ impl AppState {
         self.leader_term() == Some(term)
     }
 
-    // Acks from an older term are recorded but never advance the watermark:
-    // only current-term entries count toward a quorum.
+    // Older-term acks are recorded but never advance the watermark; only current-term entries count.
     pub fn note_ack(&self, replica: &str, collection: &str, lsn: u64, ack_term: u64) -> io::Result<u64> {
         let repl = match self.replication.as_ref() {
             Some(r) => r,

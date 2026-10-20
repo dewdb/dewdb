@@ -21,8 +21,7 @@ pub struct BulkDoc {
     pub expire_at: Option<u64>,
 }
 
-/// Upper bound on `?limit`. A page is preallocated from this number, so an unbounded one is an
-/// allocation the process aborts on rather than a slow query. Callers page with `cursor` instead.
+/// Pages are preallocated from `?limit`, so an unbounded one aborts the process; page with `cursor`.
 pub const MAX_QUERY_LIMIT: usize = 10_000;
 
 pub const DEFAULT_QUERY_LIMIT: usize = 100;
@@ -44,14 +43,12 @@ pub struct QueryParams {
 }
 
 impl QueryParams {
-    /// Absent is the same as `keys=false`: no key anywhere in the answer.
     pub fn key_mode(&self) -> KeyMode {
         self.keys.unwrap_or(KeyMode::None)
     }
 }
 
-/// Which of the two shapes a page reports its keys in, parsed once at the edge so the paths that
-/// build a page match on a mode rather than re-reading a query string.
+/// Parsed once at the edge so page builders match on a mode, not the query string.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum KeyMode {
     /// `keys=false`, or omitted: the keys stay out of the response.
@@ -65,8 +62,7 @@ pub enum KeyMode {
 
 impl<'de> Deserialize<'de> for KeyMode {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        // 1.0 parsed this as a `bool`, which accepted `true` and `false` and nothing else. `embed`
-        // joins that set rather than widening it: every spelling that was a `400` still is.
+        // 1.0 parsed a `bool`; `embed` is the only addition, so every spelling that was a `400` still is.
         match String::deserialize(deserializer)?.as_str() {
             "true" => Ok(KeyMode::Parallel),
             "false" => Ok(KeyMode::None),
@@ -77,9 +73,7 @@ impl<'de> Deserialize<'de> for KeyMode {
     }
 }
 
-/// Projects a row's key into the response without touching the document it belongs to. `{id,value}`
-/// rather than `{id, ...fields}` because a stored value is arbitrary JSON: it may be an array or a
-/// scalar with nowhere to put an id, and an object may already have an `id` of its own.
+/// `{id, value}`, not merged fields: a stored value may be a scalar, an array, or carry its own `id`.
 pub fn embed_key(key: &str, value: serde_json::Value) -> serde_json::Value {
     serde_json::json!({"id": key, "value": value})
 }

@@ -518,3 +518,51 @@ async fn bench_changefeed_write_cost() {
         }
     }
 }
+
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn bench_expiry_sweep_walk() {
+    use crate::storage::index::IndexEntry;
+    use crate::storage::Database;
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let entry = |i: u64, expire_at: Option<u64>| IndexEntry {
+        wal_id: 1, offset: i * 64, len: 64, inline: None, lsn: i + 1, term: 1, ts: now_ms, expire_at,
+    };
+
+    println!("\n=== IB-068: one sweep's walk under the index read lock, nothing due ===");
+    for keys in [1_000_000u64, 5_000_000] {
+        for case in ["nothing expiring", "one expire_at", "collection TTL"] {
+            let root = temp_root();
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("bench").unwrap();
+            if case == "collection TTL" {
+                let lsn = col.set_ttl(Some(86_400), 1).unwrap().3;
+                col.apply_committed(lsn).unwrap();
+            }
+            {
+                let mut index = col.index.write().unwrap();
+                for i in 0..keys {
+                    let expire_at = (case == "one expire_at" && i == keys / 2).then_some(u64::MAX);
+                    col.apply_index_put(&mut index, format!("k{:08}", i), entry(i, expire_at));
+                }
+            }
+
+            let mut walks = Vec::new();
+            for _ in 0..SAMPLES {
+                let start = Instant::now();
+                let expired = col.expired_keys(now_ms, &|_| true);
+                walks.push(start.elapsed().as_secs_f64() * 1000.0);
+                assert!(expired.is_empty(), "nothing is due, so the sample measures the walk alone");
+            }
+            let lo = walks.iter().cloned().fold(f64::INFINITY, f64::min);
+            let hi = walks.iter().cloned().fold(0.0, f64::max);
+            println!("{:>9} keys, {:<17} walk p50={:>8.2} ms [{:.2}-{:.2}]",
+                keys, case, median(walks), lo, hi);
+            drop(col);
+            drop(db);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+}

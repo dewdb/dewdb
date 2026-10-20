@@ -652,30 +652,114 @@ mod tests {
         use crate::storage::Database;
         use crate::test_support::temp_root;
 
+        let check = |col: &Collection, ts: u64| {
+            assert!(col.pending.lock().unwrap().is_empty(), "everything was committed before the restart");
+            assert_eq!(col.committed_ttl(), Some(120));
+            assert_eq!(col.entry_meta("k1").map(|(_, expire_at)| expire_at), Some(Some(5000)));
+            assert_eq!(col.entry_meta("k2"), Some((ts, None)), "the TTL deadline is measured from ts");
+            let expired: Vec<String> = col.expired_keys(6000, &|_| true).into_iter().map(|(k, _)| k).collect();
+            assert_eq!(expired, vec!["k1".to_string()]);
+        };
+
+        let root = temp_root();
+        let ts = {
+            let db = Database::new(&root).unwrap();
+            let col = db.get_collection("c").unwrap();
+            let (_, _, _, lsn) = col.set_ttl(Some(120), 1).unwrap();
+            col.apply_committed(lsn).unwrap();
+            let (_, _, _, lsn) = col.put_with_expiry("k1".into(), serde_json::json!({"a": 1}), Some(5000), 1).unwrap();
+            col.apply_committed(lsn).unwrap();
+            let (_, _, _, lsn) = col.put("k2".into(), serde_json::json!({"a": 2}), 1).unwrap();
+            col.apply_committed(lsn).unwrap();
+            col.save_index().unwrap();
+            col.flush_watermark_full().unwrap();
+            col.entry_meta("k2").unwrap().0
+        };
+        assert!(ts > 0);
+        {
+            let db = Database::new(&root).unwrap();
+            check(&db.get_collection("c").unwrap(), ts);
+            // Without the snapshot the next open replays the WALs.
+            let _ = std::fs::remove_file(root.join("c").join(crate::storage::index::INDEX_FILENAME));
+        }
+        {
+            let db = Database::new(&root).unwrap();
+            check(&db.get_collection("c").unwrap(), ts);
+        }
+    }
+
+    #[tokio::test]
+    async fn ib068_a_collection_with_nothing_expiring_is_not_walked() {
+        use crate::storage::compaction::Retention;
+        use crate::storage::Database;
+        use crate::test_support::temp_root;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let visited = |col: &Collection| {
+            let seen = AtomicUsize::new(0);
+            let expired = col.expired_keys(u64::MAX, &|_| { seen.fetch_add(1, Ordering::Relaxed); true });
+            (seen.load(Ordering::Relaxed), expired.len())
+        };
+        let put = |col: &Collection, key: &str, expire_at: Option<u64>| {
+            let lsn = col.put_with_expiry(key.into(), serde_json::json!({"k": key}), expire_at, 1).unwrap().3;
+            col.apply_committed(lsn).unwrap();
+        };
+        let expiring = |col: &Collection| col.expiring_entries.load(Ordering::Relaxed);
+
         let root = temp_root();
         {
             let db = Database::new(&root).unwrap();
             let col = db.get_collection("c").unwrap();
-            let (_, lsn1, _, _) = col.set_ttl(Some(120), 1).unwrap();
-            col.apply_committed(lsn1).unwrap();
-            let (_, lsn2, _, _) = col.put_with_expiry("k1".into(), serde_json::json!({"a": 1}), Some(5000), 1).unwrap();
-            col.apply_committed(lsn2).unwrap();
+            for i in 0..50 {
+                put(&col, &format!("plain{}", i), None);
+            }
+            assert_eq!(visited(&col), (0, 0), "no TTL and no expire_at: the sweep must not walk");
+
+            put(&col, "e", Some(5000));
+            assert_eq!(expiring(&col), 1);
+            assert_eq!(visited(&col), (51, 1));
+
+            put(&col, "e", None);
+            assert_eq!(expiring(&col), 0, "an overwrite without expire_at leaves nothing to expire");
+            assert_eq!(visited(&col), (0, 0));
+
+            put(&col, "e", Some(5000));
+            put(&col, "e", Some(6000));
+            assert_eq!(expiring(&col), 1, "re-arming a deadline is one expiring entry, not two");
+            let lsn = col.delete("e".into(), 1).unwrap().3;
+            col.apply_committed(lsn).unwrap();
+            assert_eq!(expiring(&col), 0);
+
+            let lsn = col.set_ttl(Some(60), 1).unwrap().3;
+            col.apply_committed(lsn).unwrap();
+            assert_eq!(visited(&col).0, 50, "a collection TTL covers every key, so the walk runs");
+            let lsn = col.set_ttl(None, 1).unwrap().3;
+            col.apply_committed(lsn).unwrap();
+            assert_eq!(visited(&col), (0, 0));
+
+            put(&col, "x", Some(5000));
+            put(&col, "y", Some(5000));
+            col.compact(Retention::none()).unwrap();
+            assert_eq!(expiring(&col), 2, "relocation keeps a key's deadline");
             col.save_index().unwrap();
             col.flush_watermark_full().unwrap();
         }
         {
             let db = Database::new(&root).unwrap();
             let col = db.get_collection("c").unwrap();
-            assert_eq!(col.committed_ttl(), Some(120));
-            assert_eq!(col.expire_at_including_staged("k1"), Some(5000));
-            // Without the snapshot the next open replays the WALs.
+            assert_eq!(expiring(&col), 2, "counted from the index snapshot");
             let _ = std::fs::remove_file(root.join("c").join(crate::storage::index::INDEX_FILENAME));
         }
         {
             let db = Database::new(&root).unwrap();
             let col = db.get_collection("c").unwrap();
-            assert_eq!(col.committed_ttl(), Some(120));
-            assert_eq!(col.expire_at_including_staged("k1"), Some(5000));
+            assert_eq!(expiring(&col), 2, "counted from WAL replay");
+            assert_eq!(visited(&col).1, 2);
+
+            let lsn = col.drop_marker(1).unwrap().3;
+            col.apply_committed(lsn).unwrap();
+            assert_eq!(expiring(&col), 0, "a drop clears the count with the index");
+            assert_eq!(visited(&col), (0, 0));
         }
     }
 }
