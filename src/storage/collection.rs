@@ -6,7 +6,7 @@ use super::index::{
     INDEX_FILENAME, LEGACY_INDEX_FILENAMES,
 };
 use super::secondary::{index_values, IndexChange, IndexKey, IndexSpec, IndexStatus, Indexes, Selection, BUILD_CHUNK};
-use super::wal::{WalCut, WalsState};
+use super::wal::{RecentFrames, WalCut, WalsState};
 use crate::model::MAX_QUERY_LIMIT;
 use crate::aggregate::{AggregateResult, AggregateSpec, Aggregator};
 use crate::changefeed::{ChangeEvent, ChangeOp, Changefeed, ChangefeedConfig};
@@ -48,6 +48,8 @@ pub struct Collection {
     pub data_root: PathBuf,
     pub index: RwLock<BTreeMap<String, IndexEntry>>,
     pub wal_writer: std::sync::Mutex<WalsState>,
+    /// Taken inside `wal_writer` when both are held.
+    pub recent_frames: std::sync::Mutex<RecentFrames>,
     pub key_locks: Vec<tokio::sync::Mutex<()>>,
     pub commit_notifiers: Arc<std::sync::Mutex<Vec<tokio::sync::oneshot::Sender<Result<(), String>>>>>,
     pub commit_signal: Arc<tokio::sync::Notify>,
@@ -334,6 +336,8 @@ impl Collection {
                 last_appended_lsn: boot_lsn,
                 last_appended_term: max_term,
             }),
+            // Positions are learned as frames are appended; anything older is read by a scan.
+            recent_frames: std::sync::Mutex::new(RecentFrames::new(boot_lsn)),
             key_locks: (0..KEY_LOCK_STRIPES).map(|_| tokio::sync::Mutex::new(())).collect(),
             commit_notifiers: Arc::new(std::sync::Mutex::new(Vec::new())),
             commit_signal: Arc::new(tokio::sync::Notify::new()),

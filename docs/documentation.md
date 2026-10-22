@@ -1266,7 +1266,11 @@ of starting a transfer. A peer that reports no watermark gets a snapshot.
 A gap is normal, not a fault. The leader rewinds that replica's cursor to the reported tail and
 starts a repair, at most one per `(replica, collection)`:
 
-1. Read the frames after the replica's tail from the WALs, refusing a set with a hole in it.
+1. Read the frames after the replica's tail from the WALs, refusing a set with a hole in it. Each
+   collection remembers where its last 4 096 appended frames sit, so a replica that is only a few
+   frames behind, which is most repairs under concurrent writes, is served by reading just those
+   frames. Each is checked against its LSN, term and CRC. Further back, or across a restart, the
+   WALs are scanned from the start.
 2. Verify the frames form an unbroken `prev_lsn`/`prev_term` chain from that tail.
 3. If the chain does not reach the collection's tail — because the replica is below the floor a
    compaction retained, or further behind than the retention budget covers — trigger a snapshot

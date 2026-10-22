@@ -566,3 +566,72 @@ async fn bench_expiry_sweep_walk() {
         }
     }
 }
+
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn bench_majority_over_time() {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    const WINDOWS: usize = 8;
+    const WINDOW: Duration = Duration::from_secs(4);
+    const WRITERS: usize = 8;
+
+    println!("\n=== w=majority over time, healthy groups, {} writers, {:?} windows ===", WRITERS, WINDOW);
+    // A healthy group has no reason to slow down as it runs; a rate that falls window over window is
+    // a cost that grows with the log, not with load.
+    for voters in [2usize, 3] {
+        let root = temp_root();
+        let nodes = voter_group(&root, voters, 5).await;
+        let client = bench_client();
+        let url = nodes[0].url();
+        let state = nodes[0].state.clone().unwrap();
+        let done = Arc::new(AtomicU64::new(0));
+        let failed = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let mut writers = Vec::new();
+        for w in 0..WRITERS {
+            let (client, url, done, failed, stop) =
+                (client.clone(), url.clone(), done.clone(), failed.clone(), stop.clone());
+            writers.push(tokio::spawn(async move {
+                let mut i = 0i64;
+                while !stop.load(Ordering::Relaxed) {
+                    let status = put_doc_at(&client, &url, "bench", &format!("t-{}-{}", w, i), i,
+                        "?w=majority&wtimeout=15000").await;
+                    if status.is_success() && status != axum::http::StatusCode::ACCEPTED {
+                        done.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    i += 1;
+                }
+            }));
+        }
+
+        let mut rates = Vec::new();
+        let (mut last_done, mut last_batches) = (0u64, state.metrics.batch_counts());
+        for window in 0..WINDOWS {
+            tokio::time::sleep(WINDOW).await;
+            let now = done.load(Ordering::Relaxed);
+            let batches = state.metrics.batch_counts();
+            let rate = (now - last_done) as f64 / WINDOW.as_secs_f64();
+            let (b, f) = (batches.0 - last_batches.0, batches.1 - last_batches.1);
+            println!("{} voters  window {}  {:>6.0} writes/s  batches={:<5} frames/batch={:.1}",
+                voters, window, rate, b, if b == 0 { 0.0 } else { f as f64 / b as f64 });
+            rates.push(rate);
+            last_done = now;
+            last_batches = batches;
+        }
+        stop.store(true, Ordering::Relaxed);
+        for w in writers {
+            let _ = w.await;
+        }
+        println!("{} voters  first {:.0} -> last {:.0} writes/s ({:.2}x), {} failed",
+            voters, rates[0], rates[WINDOWS - 1], rates[WINDOWS - 1] / rates[0], failed.load(Ordering::Relaxed));
+        drop(state);
+        drop(nodes);
+        cleanup(&root).await;
+    }
+}
+
+

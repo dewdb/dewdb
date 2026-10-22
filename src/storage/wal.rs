@@ -4,7 +4,7 @@ use super::collection::{Collection, StagedApply, StagedEffect, READ_POOL_HANDLES
 use super::frame::{Configuration, FrameHeader, HandoverRecord, LogEntry, ReplicaApply, HEADER_LEN, MAX_RECORD_SIZE};
 use super::index::{IndexEntry, ReadCacheConfig};
 use super::secondary::{index_values, IndexSpec};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -14,6 +14,9 @@ use tracing::warn;
 
 const WAL_ROTATION_LIMIT: u64 = 50 * 1024 * 1024;
 const DRAIN_ATTEMPTS: usize = 5;
+/// Frame positions held per collection, 32 bytes each. A healthy replica trails by a handful of
+/// frames; one further behind than this is backfilling, and pays for a scan of the log.
+const RECENT_FRAMES: usize = 4096;
 const CUT_FILENAME: &str = "wal.cut";
 
 /// A truncation decided and not yet known finished on disk. Written before the first byte moves and
@@ -131,6 +134,85 @@ pub struct WalsState {
     pub current_wal_size: u64,
     pub last_appended_lsn: u64,
     pub last_appended_term: u64,
+}
+
+#[derive(Clone, Copy)]
+pub struct FrameSpot {
+    lsn: u64,
+    term: u64,
+    wal_id: u64,
+    offset: u64,
+}
+
+/// Where the newest frames sit. Without it every repair read the whole log from its first byte, and
+/// under concurrent writers most frames go out through repair, so throughput fell as the log grew.
+pub struct RecentFrames {
+    /// Every frame above this LSN, through the tail, is in `spots`.
+    floor: u64,
+    spots: VecDeque<FrameSpot>,
+}
+
+impl RecentFrames {
+    pub fn new(tail: u64) -> Self {
+        RecentFrames { floor: tail, spots: VecDeque::new() }
+    }
+
+    fn push(&mut self, spot: FrameSpot) {
+        if self.spots.back().is_some_and(|last| last.lsn >= spot.lsn) {
+            // Out of order, which no append path does. Held from here on rather than trusted.
+            self.reset(spot.lsn);
+            return;
+        }
+        if self.spots.len() == RECENT_FRAMES {
+            if let Some(oldest) = self.spots.pop_front() {
+                self.floor = oldest.lsn;
+            }
+        }
+        self.spots.push_back(spot);
+    }
+
+    fn cut(&mut self, prev_lsn: u64) {
+        while self.spots.back().is_some_and(|last| last.lsn > prev_lsn) {
+            self.spots.pop_back();
+        }
+        self.floor = self.floor.min(prev_lsn);
+    }
+
+    fn reset(&mut self, tail: u64) {
+        self.spots.clear();
+        self.floor = tail;
+    }
+
+    /// Follows the frames a compaction carried into `compact_id` as bytes. A frozen frame it did not
+    /// carry has no position once its WAL retires, so everything up to the last of those is dropped.
+    pub fn relocate(&mut self, frozen_through: u64, compact_id: u64, moved: &HashMap<(u64, u64), u64>) {
+        let mut lost = None;
+        for (i, spot) in self.spots.iter_mut().enumerate() {
+            if spot.wal_id > frozen_through {
+                continue;
+            }
+            match moved.get(&(spot.wal_id, spot.offset)) {
+                Some(offset) => {
+                    spot.wal_id = compact_id;
+                    spot.offset = *offset;
+                },
+                None => lost = Some(i),
+            }
+        }
+        if let Some(i) = lost {
+            self.floor = self.spots[i].lsn;
+            self.spots.drain(..=i);
+        }
+    }
+
+    /// The spots in `(after_lsn, up_to_lsn]`, or `None` when some of that range is older than what is held.
+    fn range(&self, after_lsn: u64, up_to_lsn: u64) -> Option<Vec<FrameSpot>> {
+        if after_lsn < self.floor {
+            return None;
+        }
+        let start = self.spots.partition_point(|s| s.lsn <= after_lsn);
+        Some(self.spots.range(start..).take_while(|s| s.lsn <= up_to_lsn).copied().collect())
+    }
 }
 
 impl Collection {
@@ -354,6 +436,8 @@ impl Collection {
         let wal_id = wal.current_wal_id;
         wal.last_appended_lsn = lsn;
         wal.last_appended_term = term;
+        // Under the append lock, so positions are recorded in log order.
+        self.recent_frames.lock().unwrap().push(FrameSpot { lsn, term, wal_id, offset });
         self.db_last_log_term.store(term, Ordering::SeqCst);
 
         self.stage_appended(lsn, term, &entry, wal_id, offset, &json_bytes);
@@ -444,6 +528,7 @@ impl Collection {
         }
         wal.last_appended_lsn = cut.prev_lsn;
         wal.last_appended_term = cut.prev_term;
+        self.recent_frames.lock().unwrap().cut(cut.prev_lsn);
         // The fsynced tail is now the cut. Left high, a promotion would count durability this
         // node no longer has toward the quorum that decides a commit index.
         self.durable_lsn.store(cut.prev_lsn, Ordering::SeqCst);
@@ -549,6 +634,7 @@ impl Collection {
         wal.current_wal_size += frame_len;
         wal.last_appended_lsn = header.lsn;
         wal.last_appended_term = header.term;
+        self.recent_frames.lock().unwrap().push(FrameSpot { lsn: header.lsn, term: header.term, wal_id, offset });
         self.db_next_lsn.fetch_max(header.lsn, Ordering::SeqCst);
         self.db_last_log_term.store(header.term, Ordering::SeqCst);
 
@@ -560,6 +646,13 @@ impl Collection {
     /// Frames in `(after_lsn, up_to_lsn]`, LSN-ordered and deduplicated. Refuses a set with a hole in
     /// it: the caller cannot tell a compaction race from a genuine loss, so both become a snapshot.
     pub fn read_frames_after(&self, after_lsn: u64, up_to_lsn: u64) -> io::Result<Vec<(u64, Vec<u8>)>> {
+        match self.read_recent_frames(after_lsn, up_to_lsn) {
+            Some(frames) => Ok(frames),
+            None => self.scan_frames_after(after_lsn, up_to_lsn),
+        }
+    }
+
+    fn scan_frames_after(&self, after_lsn: u64, up_to_lsn: u64) -> io::Result<Vec<(u64, Vec<u8>)>> {
         let retired = self.retired_through.load(Ordering::SeqCst);
 
         let mut wal_files: Vec<(u64, PathBuf)> = Vec::new();
@@ -640,6 +733,48 @@ impl Collection {
         }
 
         Ok(out.into_iter().collect())
+    }
+
+    /// The same frames by position, when every one of them is recent enough to have one. `None` on
+    /// anything unexpected, which the full scan then answers: it is slower, never wrong.
+    fn read_recent_frames(&self, after_lsn: u64, up_to_lsn: u64) -> Option<Vec<(u64, Vec<u8>)>> {
+        let retired = self.retired_through.load(Ordering::SeqCst);
+        // Not the append lock, which `sync_wal` holds across an fsync.
+        let spots = self.recent_frames.lock().unwrap().range(after_lsn, up_to_lsn)?;
+        let mut out = Vec::with_capacity(spots.len());
+        for spot in spots {
+            if spot.wal_id <= retired {
+                return None;
+            }
+            out.push((spot.lsn, self.read_frame_at(spot).ok()?));
+        }
+        // A cut or a compaction since the copy can leave a spot naming other bytes; each frame was
+        // checked against its own LSN, term and CRC, and this catches a retirement mid-read.
+        (self.retired_through.load(Ordering::SeqCst) == retired).then_some(out)
+    }
+
+    fn read_frame_at(&self, spot: FrameSpot) -> io::Result<Vec<u8>> {
+        let file_arc = self.wal_reader(spot.wal_id)?;
+        let mut file = file_arc.lock().unwrap();
+        file.seek(SeekFrom::Start(spot.offset))?;
+
+        let mut header = [0u8; HEADER_LEN];
+        file.read_exact(&mut header)?;
+        let parsed = FrameHeader::parse(&header)
+            .ok_or_else(|| bad_frame(spot.wal_id, spot.offset, "unparseable header"))?;
+        if parsed.lsn != spot.lsn || parsed.term != spot.term
+            || parsed.len == 0 || parsed.len as u64 > MAX_RECORD_SIZE
+        {
+            return Err(bad_frame(spot.wal_id, spot.offset, "not the frame recorded there"));
+        }
+
+        let mut frame = vec![0u8; HEADER_LEN + parsed.len as usize];
+        frame[..HEADER_LEN].copy_from_slice(&header);
+        file.read_exact(&mut frame[HEADER_LEN..])?;
+        if !parsed.payload_valid(&frame[HEADER_LEN..]) {
+            return Err(bad_frame(spot.wal_id, spot.offset, "CRC mismatch"));
+        }
+        Ok(frame)
     }
 
     fn wal_reader(&self, wal_id: u64) -> io::Result<Arc<std::sync::Mutex<File>>> {
@@ -1566,5 +1701,107 @@ mod tests {
             ReplicaApply::Applied { lsn, .. } => assert_eq!(lsn, 2),
             other => panic!("a new term appending onto agreed history must apply, got {:?}", other),
         }
+    }
+
+
+    /// Whether a read of `(after, up_to]` is answered from positions rather than by a scan.
+    fn served_by_position(col: &Collection, after: u64, up_to: u64) -> bool {
+        col.recent_frames.lock().unwrap().range(after, up_to).is_some()
+    }
+
+    fn assert_matches_scan(col: &Collection, after: u64, up_to: u64) {
+        assert_eq!(col.read_frames_after(after, up_to).unwrap(), col.scan_frames_after(after, up_to).unwrap(),
+            "frames read by position must be exactly the ones the scan finds in ({}, {}]", after, up_to);
+    }
+
+    /// The healthy-cluster decline: every repair rescanned the log from its first byte, so its cost
+    /// grew with the log. Recent frames are now read where they were written, across a rotation too.
+    #[tokio::test]
+    async fn recent_frames_are_read_by_position_and_match_a_scan() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+        for i in 0..10 {
+            live_put(&col, &format!("k{}", i), i);
+        }
+        col.open_next_wal(&mut col.wal_writer.lock().unwrap()).unwrap();
+        for i in 10..20 {
+            live_put(&col, &format!("k{}", i), i);
+        }
+        let tail = col.last_appended_lsn();
+
+        for (after, up_to) in [(0, tail), (tail - 3, tail), (5, 15), (tail - 1, tail), (tail, tail)] {
+            assert!(served_by_position(&col, after, up_to), "everything since boot has a position");
+            assert_matches_scan(&col, after, up_to);
+        }
+        assert_eq!(col.read_frames_after(tail - 3, tail).unwrap().len(), 3);
+
+        // Reopened, the positions are gone: the frames written before boot are read by the scan.
+        drop(col);
+        drop(db);
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+        assert!(!served_by_position(&col, tail - 3, tail));
+        assert_eq!(col.read_frames_after(tail - 3, tail).unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_replica_far_enough_behind_is_read_by_the_scan() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+        for i in 0..(RECENT_FRAMES + 10) {
+            live_put(&col, "k", i as i64);
+        }
+        let tail = col.last_appended_lsn();
+
+        assert!(!served_by_position(&col, 0, tail), "the oldest positions were let go");
+        assert_eq!(col.read_frames_after(0, tail).unwrap().len(), RECENT_FRAMES + 10);
+        assert!(served_by_position(&col, tail - RECENT_FRAMES as u64, tail));
+        assert_matches_scan(&col, tail - RECENT_FRAMES as u64, tail);
+    }
+
+    /// A truncated tail must not be served from the positions of the frames it removed.
+    #[test]
+    fn a_rewound_tail_reads_back_the_frames_that_replaced_it() {
+        let root = temp_root();
+        let col = ib007_open(&root);
+        for lsn in 1..=5 {
+            col.append_raw_frame(&make_frame(1, lsn, lsn - 1, if lsn == 1 { 0 } else { 1 }, "k", lsn as i64)).unwrap();
+        }
+        assert!(matches!(col.append_raw_frame(&make_frame(2, 4, 3, 1, "k", 40)).unwrap(),
+            ReplicaApply::Applied { lsn: 4 }));
+
+        assert!(served_by_position(&col, 0, 5));
+        let frames = col.read_frames_after(0, 5).unwrap();
+        assert_eq!(frames.iter().map(|(l, _)| *l).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        assert_eq!(FrameHeader::parse(&frames[3].1).unwrap().term, 2, "lsn 4 is the replacement");
+        assert_matches_scan(&col, 0, 5);
+    }
+
+    /// The retained tail moves into the compacted WAL as bytes, so its positions move with it.
+    #[tokio::test]
+    async fn positions_follow_a_tail_that_compaction_moved() {
+        let root = temp_root();
+        let db = Database::new(&root).unwrap();
+        let col = db.get_collection("c").unwrap();
+        for i in 0..5 {
+            disk_put(&col, &format!("old{}", i), "o");
+        }
+        col.enqueue_commit().await.unwrap().unwrap();
+        let below = col.last_appended_lsn();
+        for i in 0..5 {
+            disk_put(&col, &format!("new{}", i), "n");
+        }
+        col.enqueue_commit().await.unwrap().unwrap();
+        let tail = col.last_appended_lsn();
+
+        col.compact(Retention { above_lsn: below, max_bytes: u64::MAX, min_reclaim_bytes: 0 }).unwrap();
+        assert!(col.retired_through.load(Ordering::SeqCst) > 0, "the frozen WALs must be gone for this to test anything");
+
+        assert!(served_by_position(&col, below, tail), "the moved tail keeps its positions");
+        assert_eq!(col.read_frames_after(below, tail).unwrap().len(), 5);
+        assert_matches_scan(&col, below, tail);
+        assert!(!served_by_position(&col, 0, tail), "frames relocated by key are left to the scan");
     }
 }

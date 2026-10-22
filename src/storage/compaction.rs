@@ -410,6 +410,7 @@ impl Collection {
         let mut superseded = 0usize;
         {
             let _wal = self.wal_writer.lock().unwrap();
+            self.recent_frames.lock().unwrap().relocate(frozen_through, compact_id, &written.moved);
             let mut index = self.index.write().unwrap();
 
             // Remap only entries still pointing at the location we read; a concurrent overwrite wins.
