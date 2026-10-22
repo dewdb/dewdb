@@ -126,9 +126,9 @@ pub struct AppState {
     /// a bulk request and a set of concurrent writes each pass one pre-append sample (IB-014).
     pub(crate) frame_reservations: Arc<std::sync::Mutex<HashMap<String, usize>>>,
     pub metrics: Arc<Metrics>,
-    /// Node-wide cap on concurrent outbound replication requests. Shared across every write, unlike
-    /// a per-call semaphore, which bounds one write's fan-out and nothing else.
-    pub replication_slots: Arc<tokio::sync::Semaphore>,
+    /// Cap on concurrent outbound replication requests, per peer and shared across every write to
+    /// it. Per peer, because one node-wide cap let a peer that never answers hold all of it.
+    pub peer_budgets: Arc<crate::replication::budget::PeerBudgets>,
     /// Node-wide cap on concurrent aggregation and sorted-query scans. A request's `max_docs` bounds one walk;
     /// this bounds how many of them hold blocking threads at once (IB-025).
     pub scan_slots: Arc<tokio::sync::Semaphore>,
@@ -595,7 +595,7 @@ impl AppState {
         Self {
             db: None,
             replication: None,
-            replication_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            peer_budgets: Arc::new(crate::replication::budget::PeerBudgets::new(1)),
             scan_slots: Arc::new(tokio::sync::Semaphore::new(crate::aggregate::MAX_CONCURRENT_SCANS)),
             client: reqwest::Client::new().into(),
             stream_client: reqwest::Client::new().into(),
@@ -653,8 +653,8 @@ impl AppState {
                 leader_matched: HashMap::new(),
                 configuration: None,
             }))),
-            replication_slots: Arc::new(tokio::sync::Semaphore::new(
-                config.flow_control.max_inflight_requests.max(1))),
+            peer_budgets: Arc::new(crate::replication::budget::PeerBudgets::new(
+                config.flow_control.max_inflight_requests)),
             scan_slots: Arc::new(tokio::sync::Semaphore::new(crate::aggregate::MAX_CONCURRENT_SCANS)),
             client: reqwest::Client::new().into(),
             stream_client: reqwest::Client::new().into(),

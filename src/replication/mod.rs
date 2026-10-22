@@ -1,5 +1,6 @@
 //! Replication: ship frames to replicas, repair stragglers, gate write acks.
 
+pub mod budget;
 pub mod protocol;
 pub mod snapshot;
 pub mod stream;

@@ -5,6 +5,7 @@ use super::protocol::{
 };
 use crate::consensus::demote;
 use crate::replication::protocol::forbidden_term;
+use crate::replication::budget::{answered, WriteDone};
 use crate::replication::write_concern::WriteQuorum;
 use crate::state::AppState;
 use crate::storage::frame::MAX_FRAME_SIZE;
@@ -83,7 +84,7 @@ pub fn replicate_to_peers(
             let frame = frame.clone();
             let state = state.clone();
             handles.push(tokio::spawn(async move {
-                if stream_backlog_if_behind(&state, &replica_url, &col, prev_lsn, lsn).await.is_some() {
+                if stream_backlog_if_behind(&state, &replica_url, &col, prev_lsn, lsn, None).await.is_some() {
                     return;
                 }
 
@@ -97,11 +98,11 @@ pub fn replicate_to_peers(
                     wal_frame: frame,
                     frames: Vec::new(),
                 };
-                // Released before any repair below, which acquires its own slots per batch.
-                let slots = state.replication_slots.clone();
-                let slot = slots.acquire().await;
+                // Released before any repair below, which acquires its own slots per batch. No slot
+                // is a peer known to be down: the cursor stays put, and the backlog path resends.
+                let Some(slot) = state.peer_budgets.acquire(&replica_url, None).await else { return };
                 let response = client.post(&url).json(&req_body).send().await;
-                drop(slot);
+                slot.settle(response.is_ok());
                 match response {
                     Ok(r) if r.status().is_success() => {
                         state.note_sent(&replica_url, &col, lsn);
@@ -122,7 +123,7 @@ pub fn replicate_to_peers(
                                     Some(watermark) => {
                                         warn!(target: "replication", "Replica {} diverges from us at lsn {} (its last_lsn={}); resuming from its watermark {}", replica_url, lsn, last_lsn, watermark);
                                         state.rewind_replica(&replica_url, &col, watermark);
-                                        let _ = repair_replica(state.clone(), replica_url.clone(), col, watermark, None, 0).await;
+                                        let _ = repair_replica(state.clone(), replica_url.clone(), col, watermark, None, 0, None).await;
                                     },
                                     None => {
                                         warn!(target: "replication", "Replica {} diverges from us at lsn {} (its last_lsn={}) and reports no watermark; snapshotting it", replica_url, lsn, last_lsn);
@@ -136,7 +137,7 @@ pub fn replicate_to_peers(
                                 state.metrics.note_gap();
                                 warn!(target: "replication", "Replica {} gap at lsn {} (its last_lsn={}), starting repair", replica_url, lsn, last_lsn);
                                 state.rewind_replica(&replica_url, &col, last_lsn);
-                                let _ = repair_replica(state, replica_url.clone(), col, last_lsn, Some(last_term), 0).await;
+                                let _ = repair_replica(state, replica_url.clone(), col, last_lsn, Some(last_term), 0, None).await;
                             }
                         }
                     },
@@ -231,7 +232,7 @@ pub fn replication_drive_task(state: AppState) {
                         return (replica.clone(), confirm_tail(&state, &replica, &name).await);
                     }
                     let before = state.sent_through(&replica, &name).unwrap_or(cursor);
-                    let _ = repair_replica(state.clone(), replica.clone(), name.clone(), cursor, None, 0).await;
+                    let _ = repair_replica(state.clone(), replica.clone(), name.clone(), cursor, None, 0, None).await;
                     // Judged on whether the cursor moved, not on the return value: a repair that
                     // coalesced behind another worker reports false without anything being wrong.
                     let moved = state.sent_through(&replica, &name).unwrap_or(before) > before;
@@ -271,7 +272,7 @@ pub(crate) async fn catch_up_replica(state: &AppState, replica: &str) -> bool {
         match state.sent_through(replica, &name) {
             Some(cursor) if cursor < tail => {
                 repair_replica(state.clone(), replica.to_string(), name.clone(),
-                    cursor, None, tail).await;
+                    cursor, None, tail, None).await;
             },
             // Nothing to send, or no cursor to send from: the tail frame asks either way (C30).
             // Streaming from 0 snapshots over a retired chain, under transfer.rs's gate (IB-058).
@@ -373,8 +374,10 @@ async fn confirm_tail(state: &AppState, replica_url: &str, collection: &str) -> 
         frames: Vec::new(),
     };
     let url = format!("{}/internal/replicate", replica_url);
-    let _slot = state.replication_slots.acquire().await;
-    match state.client.post(&url).json(&req).send().await {
+    let Some(slot) = state.peer_budgets.acquire(replica_url, None).await else { return false };
+    let response = state.client.post(&url).json(&req).send().await;
+    slot.settle(response.is_ok());
+    match response {
         Ok(r) if r.status().is_success() => {
             let body = r.json::<serde_json::Value>().await.ok();
             // Never above our own tail: a replica whose log runs past ours is evidence for its own
@@ -423,6 +426,7 @@ const REPAIR_PASSES: usize = 8;
 
 /// At most one repairer per replica; callers that find one running return false and rely on the holder,
 /// which re-checks the tail before it exits. Returns whether the replica reached `needed_lsn`.
+/// `write_done` is the write waiting on the answer, if any; nothing here waits longer than it does.
 async fn repair_replica(
     state: AppState,
     replica_url: String,
@@ -430,7 +434,13 @@ async fn repair_replica(
     reported_last_lsn: u64,
     reported_last_term: Option<u64>,
     needed_lsn: u64,
+    mut write_done: Option<WriteDone>,
 ) -> bool {
+    // A peer known to be down would cost a backlog read for a send that cannot go. Nobody waits on
+    // this caller's answer, so it leaves; a write's caller waits out the probe below instead.
+    if write_done.is_none() && !state.peer_budgets.admits(&replica_url) {
+        return false;
+    }
     let lock = repair_lock(&state, &replica_url, &collection);
     let _guard = match lock.try_lock() {
         Ok(g) => g,
@@ -439,8 +449,16 @@ async fn repair_replica(
         Err(_) if needed_lsn == 0 => return false,
         // A write concern does need the answer, and reporting a miss without waiting fails a write a
         // majority holds (H11). A repair that read its target too early never carried this frame.
+        // Not past the write, though: a repair stalled on a dead peer queued every later write's
+        // caller here, one task per write for as long as the peer stayed down.
         Err(_) => {
-            let queued = lock.lock().await;
+            let queued = match write_done.as_mut() {
+                Some(done) => tokio::select! {
+                    queued = lock.lock() => queued,
+                    _ = answered(done) => return false,
+                },
+                None => lock.lock().await,
+            };
             if state.matched_lsn(&replica_url, &collection) >= needed_lsn {
                 return true;
             }
@@ -448,11 +466,19 @@ async fn repair_replica(
         },
     };
 
+    // Before the backlog read, which a peer that is down would have every waiting write pay for.
+    if let Some(done) = write_done.as_mut() {
+        if !state.peer_budgets.wait_admitted(&replica_url, done).await {
+            return false;
+        }
+    }
+
     let mut after = reported_last_lsn;
     let mut after_term = reported_last_term;
 
     for _ in 0..REPAIR_PASSES {
-        match stream_chain_once(&state, &replica_url, &collection, after, after_term).await {
+        match stream_chain_once(&state, &replica_url, &collection, after, after_term,
+            write_done.as_mut()).await {
             Some(reached) if reached > after => {
                 after = reached;
                 // Past the first pass we are chaining within our own log.
@@ -496,6 +522,7 @@ async fn stream_chain_once(
     collection: &str,
     reported_last_lsn: u64,
     reported_last_term: Option<u64>,
+    mut write_done: Option<&mut WriteDone>,
 ) -> Option<u64> {
     let replica_url = replica_url.to_string();
     let collection = collection.to_string();
@@ -563,12 +590,13 @@ async fn stream_chain_once(
             frames: batch[1..].iter().map(|(_, f)| f.clone()).collect(),
         };
         let url = format!("{}/internal/replicate", replica_url);
-        state.metrics.note_batch(batch.len());
         // Released before the next chunk, so a long backfill yields slots instead of holding one
         // for its whole duration.
-        let slot = state.replication_slots.acquire().await;
+        let Some(slot) = state.peer_budgets.acquire(&replica_url, write_done.as_deref_mut()).await
+            else { return None };
+        state.metrics.note_batch(batch.len());
         let response = state.client.post(&url).json(&req).send().await;
-        drop(slot);
+        slot.settle(response.is_ok());
         match response {
             Ok(r) if r.status().is_success() => {
                 let body = r.json::<serde_json::Value>().await.ok();
@@ -653,11 +681,12 @@ async fn stream_backlog_if_behind(
     collection: &str,
     prev_lsn: u64,
     needed_lsn: u64,
+    write_done: Option<WriteDone>,
 ) -> Option<bool> {
     match state.sent_through(replica_url, collection) {
         Some(cursor) if cursor < prev_lsn => Some(
             repair_replica(state.clone(), replica_url.to_string(), collection.to_string(), cursor,
-                None, needed_lsn).await,
+                None, needed_lsn, write_done).await,
         ),
         _ => None,
     }
@@ -672,8 +701,10 @@ async fn replicate_one_await(
     commit_index: u64,
     lsn: u64,
     prev_lsn: u64,
+    mut write_done: Option<WriteDone>,
 ) -> bool {
-    if let Some(caught_up) = stream_backlog_if_behind(state, replica_url, collection, prev_lsn, lsn).await {
+    if let Some(caught_up) = stream_backlog_if_behind(state, replica_url, collection, prev_lsn, lsn,
+        write_done.clone()).await {
         return caught_up;
     }
 
@@ -687,8 +718,12 @@ async fn replicate_one_await(
         wal_frame: frame.to_vec(),
         frames: Vec::new(),
     };
-    let _slot = state.replication_slots.acquire().await;
-    match state.client.post(&url).json(&req).send().await {
+    // Waits on the peer only while the write does: once it is answered `write_done` closes and the
+    // frame is the cursor's to resend. Waiting on for a slow peer is a queue growing at the write rate.
+    let Some(slot) = state.peer_budgets.acquire(replica_url, write_done.as_mut()).await else { return false };
+    let response = state.client.post(&url).json(&req).send().await;
+    slot.settle(response.is_ok());
+    match response {
         Ok(r) if r.status().is_success() => {
             state.note_sent(replica_url, collection, lsn);
             if let Err(e) = state.note_ack(replica_url, collection, lsn, term) {
@@ -710,7 +745,7 @@ async fn replicate_one_await(
                             warn!(target: "replication", "Replica {} diverges from us at lsn {} (its last_lsn={}); resuming from its watermark {}", replica_url, lsn, last_lsn, watermark);
                             state.rewind_replica(replica_url, collection, watermark);
                             repair_replica(state.clone(), replica_url.to_string(), collection.to_string(),
-                                watermark, None, lsn).await
+                                watermark, None, lsn, write_done.clone()).await
                         },
                         None => {
                             warn!(target: "replication", "Replica {} diverges from us at lsn {} (its last_lsn={}) and reports no watermark; snapshotting it", replica_url, lsn, last_lsn);
@@ -726,7 +761,7 @@ async fn replicate_one_await(
                     state.metrics.note_gap();
                     state.rewind_replica(replica_url, collection, last_lsn);
                     repair_replica(state.clone(), replica_url.to_string(), collection.to_string(), last_lsn,
-                        Some(last_term), lsn).await
+                        Some(last_term), lsn, write_done.clone()).await
                 }
             }
         },
@@ -763,6 +798,7 @@ pub async fn replicate_and_await(
     }
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Option<String>>(replicas.len());
+    let (write_done, done_rx) = tokio::sync::watch::channel(());
     for replica_url in replicas {
         // Learners are shipped the frame but report nothing: counting them would let a write concern
         // be met by nodes outside the quorum, and an election without them would lose their entries.
@@ -771,8 +807,10 @@ pub async fn replicate_and_await(
         let col = collection.clone();
         let frame = frame.clone();
         let tx = tx.clone();
+        let done = done_rx.clone();
         tokio::spawn(async move {
-            let ok = replicate_one_await(&state, &replica_url, &col, &frame, term, commit_index, lsn, prev_lsn).await;
+            let ok = replicate_one_await(&state, &replica_url, &col, &frame, term, commit_index, lsn,
+                prev_lsn, Some(done)).await;
             let _ = tx.send((ok && counts).then_some(replica_url)).await;
         });
     }
@@ -792,6 +830,7 @@ pub async fn replicate_and_await(
             }
         }
     }).await;
+    drop(write_done);
 
     let out = holders.lock().unwrap().clone();
     out
@@ -895,7 +934,7 @@ mod tests {
         let tail = state.db.as_ref().unwrap().get_collection("t").unwrap().last_appended_lsn();
         assert_eq!(tail, 20);
 
-        let acked = repair_replica(state.clone(), stub, "t".to_string(), 0, None, tail).await;
+        let acked = repair_replica(state.clone(), stub, "t".to_string(), 0, None, tail, None).await;
         let passes = hits.load(Ordering::SeqCst);
 
         assert_eq!(passes, REPAIR_PASSES,
@@ -1014,7 +1053,7 @@ mod tests {
         let prev_lsn = FrameHeader::parse(&frame).unwrap().prev_lsn;
 
         let held = replicate_one_await(&state, &stub_url, "t", &frame, state.current_term(),
-            tail, lsn, prev_lsn).await;
+            tail, lsn, prev_lsn, None).await;
 
         let seen = stub.prev_lsns.lock().unwrap().clone();
         assert!(held, "the replica holds the frame once the backed-up stream lands; saw {:?}", seen);
@@ -1080,12 +1119,12 @@ mod tests {
         }
         let tail = state.db.as_ref().unwrap().get_collection("t").unwrap().last_appended_lsn();
 
-        assert!(!repair_replica(state.clone(), too_large, "t".into(), 0, None, tail).await,
+        assert!(!repair_replica(state.clone(), too_large, "t".into(), 0, None, tail, None).await,
             "a refused batch is not an ack");
         assert_eq!(refuser.resyncs.load(Ordering::SeqCst), 1,
             "no retry changes this answer, so the frames have to travel as a snapshot instead");
 
-        assert!(!repair_replica(state.clone(), installing, "t".into(), 0, None, tail).await);
+        assert!(!repair_replica(state.clone(), installing, "t".into(), 0, None, tail, None).await);
         assert_eq!(installer.resyncs.load(Ordering::SeqCst), 0,
             "503 is a snapshot already installing there; asking for a second one buys nothing");
 

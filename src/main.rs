@@ -385,8 +385,8 @@ async fn main() -> io::Result<()> {
         routed_reads: Arc::new(std::sync::Mutex::new(HashMap::new())),
         frame_reservations: Arc::new(std::sync::Mutex::new(HashMap::new())),
         metrics: Arc::new(Metrics::new()),
-        replication_slots: Arc::new(tokio::sync::Semaphore::new(
-            config.flow_control.max_inflight_requests.max(1))),
+        peer_budgets: Arc::new(crate::replication::budget::PeerBudgets::new(
+            config.flow_control.max_inflight_requests)),
         scan_slots: Arc::new(tokio::sync::Semaphore::new(crate::aggregate::MAX_CONCURRENT_SCANS)),
         cluster,
         ring_cache: Arc::new(std::sync::Mutex::new(Default::default())),

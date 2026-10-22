@@ -102,7 +102,8 @@ mod tests {
 mod cluster {
     use super::*;
     use crate::test_support::{
-        leaders, node_by_id, put_doc_http, settle_leader, temp_root, three_node_cluster, wait_for,
+        leaders, node_by_id, put_doc_at, put_doc_http, settle_leader, temp_root, three_node_cluster,
+        voter_group, voter_group_starting, wait_for, DEFAULT_HEARTBEAT_TIMEOUT_SECS,
     };
     use crate::util::same_endpoint;
 
@@ -245,6 +246,103 @@ mod cluster {
         assert!(took < Duration::from_millis(2500),
             "the write waited on the slow voter: {:?}", took);
         assert!(held, "leader {} stepped down over one slow voter", leader);
+    }
+
+    /// Acknowledged `w=majority` writes per second from `clients` writers over `window`. A `202`
+    /// missed its concern, so it is not counted: that is how a starved quorum shows up.
+    async fn quorum_writes_per_sec(leader: &str, clients: usize, window: Duration, tag: &str) -> f64 {
+        let client = reqwest::Client::builder()
+            .pool_max_idle_per_host(clients * 2)
+            .timeout(Duration::from_secs(10))
+            .build().unwrap();
+        let until = std::time::Instant::now() + window;
+        let writers = (0..clients).map(|w| {
+            let (client, leader, tag) = (client.clone(), leader.to_string(), tag.to_string());
+            tokio::spawn(async move {
+                let mut acked = 0usize;
+                let mut i = 0i64;
+                while std::time::Instant::now() < until {
+                    let key = format!("{}-{}-{}", tag, w, i);
+                    let status = put_doc_at(&client, &leader, "t", &key, i, "?w=majority&wtimeout=5000").await;
+                    if status.is_success() && status != axum::http::StatusCode::ACCEPTED {
+                        acked += 1;
+                    }
+                    i += 1;
+                }
+                acked
+            })
+        }).collect::<Vec<_>>();
+        let mut acked = 0;
+        for w in writers {
+            acked += w.await.unwrap();
+        }
+        acked as f64 / window.as_secs_f64()
+    }
+
+    const STARVATION_CLIENTS: usize = 8;
+    const STARVATION_WINDOW: Duration = Duration::from_secs(4);
+
+    /// With one of three voters gone, `w=majority` is the leader and the one that is left: the same
+    /// work as a two-voter group, which is the rate this has to stay near.
+    async fn two_voter_quorum_rate() -> f64 {
+        let root = temp_root();
+        let pair = voter_group(&root, 2, DEFAULT_HEARTBEAT_TIMEOUT_SECS).await;
+        let leader = pair[0].url();
+        quorum_writes_per_sec(&leader, STARVATION_CLIENTS, Duration::from_secs(1), "warm").await;
+        quorum_writes_per_sec(&leader, STARVATION_CLIENTS, STARVATION_WINDOW, "pair").await
+    }
+
+    /// `compare_couchdb.md` diagnostic 2. Every replica's sends shared one node-wide budget of
+    /// `max_inflight_requests`, so requests to a voter that never answers held all of it and the
+    /// live voter's waited behind their timeouts: 8 writes a second for 250. The link is cut rather
+    /// than the node stopped because a hung request is what a powered-off host gives on any OS.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn an_unreachable_voter_does_not_starve_the_quorum_that_is_left() {
+        let baseline = two_voter_quorum_rate().await;
+
+        let root = temp_root();
+        let (n1, n2, n3) = three_node_cluster(&root).await;
+        let nodes = [&n1, &n2, &n3];
+        let leader = settle_leader(&nodes, SETTLE).await.expect("no initial leader");
+        let leader_node = node_by_id(&nodes, &leader);
+        let leader_url = leader_node.url();
+        let gone = nodes.iter().find(|n| n.node_id != leader).unwrap().url();
+
+        // Before the first write, so the leader holds no send cursor for it: every frame then goes
+        // out as its own request, which is what a member missing since boot or a failed-over-from
+        // leader gets. A peer with a cursor is sent its backlog by one repair at a time instead.
+        cut(&leader_url, &gone);
+        quorum_writes_per_sec(&leader_url, STARVATION_CLIENTS, Duration::from_secs(1), "warm").await;
+        let degraded = quorum_writes_per_sec(&leader_url, STARVATION_CLIENTS, STARVATION_WINDOW, "cut").await;
+        heal(&leader_url, &gone);
+
+        // And the peer cannot be shut out for good: a probe finds it back and the cursor resends.
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+        assert!(put_doc_at(&client, &leader_url, "t", "after-heal", 1, "?w=all&wtimeout=15000").await
+                == axum::http::StatusCode::CREATED,
+            "the healed voter never rejoined the quorum");
+
+        assert!(degraded >= baseline * 0.5,
+            "one unreachable voter cut quorum writes to {:.0}/s against {:.0}/s for a two-voter group",
+            degraded, baseline);
+    }
+
+    /// The same defect from boot: a group restarted with one member missing. On Windows a connect
+    /// to a closed port takes about a second to be refused, which held the shared budget as surely
+    /// as a hung request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn a_voter_that_never_started_does_not_starve_the_quorum_that_is_left() {
+        let baseline = two_voter_quorum_rate().await;
+
+        let root = temp_root();
+        let group = voter_group_starting(&root, 3, DEFAULT_HEARTBEAT_TIMEOUT_SECS, 2).await;
+        let leader = group[0].url();
+        quorum_writes_per_sec(&leader, STARVATION_CLIENTS, Duration::from_secs(1), "warm").await;
+        let degraded = quorum_writes_per_sec(&leader, STARVATION_CLIENTS, STARVATION_WINDOW, "absent").await;
+
+        assert!(degraded >= baseline * 0.5,
+            "a member that never started cut quorum writes to {:.0}/s against {:.0}/s for a \
+             two-voter group", degraded, baseline);
     }
 
     /// The injector itself: a cut has to look like a partition to the sender -- an error on its own

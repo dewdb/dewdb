@@ -890,9 +890,11 @@ are right, and a direct request to the shard gives the precise message.
   check until the append stages it, so a bulk request is admitted as a whole or not at all and
   concurrent writes cannot each pass the same pre-append count. A batch wider than the whole bound is
   refused with `413` rather than retriable backpressure — no amount of draining admits it.
-- **Bounded outbound concurrency.** A node-wide semaphore caps concurrent replication requests across
-  every write and repair, rather than bounding one write's fan-out and nothing else. Available
-  permits are exported.
+- **Bounded outbound concurrency, per peer.** Each replica has its own cap on concurrent replication
+  requests, shared by every write and repair sent to it, so a replica that is down or slow uses up
+  only its own budget and never the live replicas'. An unreachable replica is probed one request at
+  a time on a widening interval, and a write waits on it only as long as the write itself waits.
+  Free slots and reachability are exported per replica.
 - **Backpressure end to end.** Snapshot streaming, the migration batch pacing and the group-commit
   queue all push back rather than buffer without limit.
 
