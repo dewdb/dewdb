@@ -33,6 +33,9 @@ pub struct AppendOrder {
     pub(crate) after_term_check: PauseSlot,
     #[cfg(test)]
     pub(crate) after_tail_sample: PauseSlot,
+    /// Not an append: a campaign that has waited out its jitter and found no leader serving.
+    #[cfg(test)]
+    pub(crate) after_campaign_wait: PauseSlot,
 }
 
 #[cfg(test)]
@@ -321,6 +324,7 @@ async fn ask_peers(
 pub async fn run_election(state: &AppState, max_delay_ms: u64, forced_by: Option<String>) {
     let Ok(_campaign) = state.campaign.try_lock() else { return };
     let forced = forced_by.is_some();
+    let began = std::time::Instant::now();
     if !forced {
         let delay_ms = election_jitter(&state.config.node_id, max_delay_ms);
         info!(target: "election", "Waiting {}ms before requesting votes...", delay_ms);
@@ -344,6 +348,12 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64, forced_by: Option
 
     if !forced && adopt_existing_leader(state).await {
         info!(target: "election", "A leader is already serving; aborting election and following it");
+        return;
+    }
+    #[cfg(test)]
+    Pause::hold(&state.append_order.after_campaign_wait).await;
+    if !forced && heard_from_leader_since(state, began) {
+        info!(target: "election", "Heard from a leader, or voted for one, while waiting; not standing");
         return;
     }
 
@@ -386,6 +396,12 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64, forced_by: Option
             }
             return;
         }
+    }
+
+    // The pre-vote round is a network round trip: a vote granted during it is just as fresh.
+    if !forced && heard_from_leader_since(state, began) {
+        info!(target: "election", "Heard from a leader, or voted for one, during the pre-vote; not standing");
+        return;
     }
 
     // Standing is a self-vote: saved before memory holds it (IB-049), or a restart forgets it and
@@ -431,6 +447,15 @@ pub async fn run_election(state: &AppState, max_delay_ms: u64, forced_by: Option
         info!(target: "election", "Votes {:?} are short of a quorum for term {}; election failed, will retry",
             granted, new_term);
     }
+}
+
+/// Whether leader contact arrived, or this node granted a vote, after `since`. Both stamp the contact
+/// clocks. Two followers of a dead leader go quiet together, and the one with the longer jitter votes
+/// for the other before its own sleep ends; standing anyway deposes that winner a moment after it won.
+fn heard_from_leader_since(state: &AppState, since: std::time::Instant) -> bool {
+    let Some(repl) = state.replication.as_ref() else { return false };
+    let g = repl.read().unwrap();
+    [g.last_heartbeat, g.last_replication].into_iter().flatten().any(|at| at > since)
 }
 
 /// Seeds every replica's send cursor from our own log, lowered by any persisted hint.

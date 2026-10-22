@@ -627,7 +627,9 @@ pub async fn pre_vote_handler(
 
     let (term, granted) = {
         let g = repl.read().unwrap();
-        let must_withhold = lease::withholds_vote(
+        // A leader knows of a leader without any contact clock. Its own clocks lapsed before it won,
+        // so read alone they would back a rival a moment after the election that seated this node.
+        let must_withhold = g.is_leader || lease::withholds_vote(
             lease::contact_age(g.last_heartbeat, g.last_replication),
             g.novote_until,
             g.booted_at.elapsed(),
@@ -1099,6 +1101,42 @@ mod tests {
         assert_eq!(state.current_term(), term, "still without a term moving, which the real vote does");
 
         follower.kill();
+    }
+
+    /// Raft §9.6: a leader knows a leader exists without any contact clock. Its own clocks stopped
+    /// when it went quiet as a follower, so read alone they let it back the first rival to ask.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_leader_refuses_a_pre_vote_however_old_its_own_contact() {
+        let root = temp_root();
+        let group = crate::test_support::voter_group(&root, 3, 30).await;
+        let term = group[0].term();
+        let body = serde_json::json!({
+            "term": term + 1, "candidate_id": "n2", "candidate_url": group[1].url(),
+            "last_lsn": 100, "last_term": term + 1});
+        let ask = |node: &TestNode| {
+            let url = format!("{}/internal/pre-vote", node.url());
+            let body = body.clone();
+            async move {
+                reqwest::Client::new().post(url).json(&body).send().await.unwrap()
+                    .json::<VoteResponse>().await.unwrap()
+            }
+        };
+        let silence = |node: &TestNode| {
+            let state = node.state.as_ref().unwrap();
+            let mut g = state.replication.as_ref().unwrap().write().unwrap();
+            g.last_heartbeat = Some(std::time::Instant::now() - Duration::from_secs(60));
+            g.last_replication = None;
+            g.novote_until = None;
+            g.booted_at = std::time::Instant::now() - Duration::from_secs(60);
+        };
+
+        silence(&group[2]);
+        assert!(ask(&group[2]).await.vote_granted,
+            "premise: a follower whose leader is quiet backs this candidate");
+        silence(&group[0]);
+        assert!(group[0].is_leader());
+        assert!(!ask(&group[0]).await.vote_granted, "the leader backed a rival against itself");
+        assert_eq!(group[0].term(), term);
     }
 
     fn assert_no_watermark(hb: &serde_json::Value) {

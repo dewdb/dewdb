@@ -345,6 +345,38 @@ mod cluster {
              two-voter group", degraded, baseline);
     }
 
+    /// Both followers of a dead leader go quiet together, and the one with the longer jitter votes for
+    /// the other while it waits. It used to stand anyway, and the leader it had just elected granted it
+    /// a pre-vote and a vote, so leadership moved twice in a second and writes pinned to the first
+    /// winner got 403 (dbbench diag 3 at ~700 writes/s, one run in five).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_follower_that_votes_while_waiting_to_stand_leaves_the_winner_leading() {
+        use crate::consensus::election::Pause;
+        let root = temp_root();
+        let mut group = voter_group(&root, 3, 2).await;
+        let (n2, n3) = (group[1].url(), group[2].url());
+        let late = group[2].state.clone().unwrap();
+
+        // n2's campaign reaches n3 a second late, so n3 is past its own search for a leader, and
+        // holding there, before n2 can win. The hold is where n3's jitter and search used to end.
+        let wait = Pause::arm(&late.append_order.after_campaign_wait);
+        delay(&n2, &n3, Duration::from_secs(1));
+        group[0].kill();
+        tokio::time::timeout(SETTLE, wait.entered.notified()).await
+            .expect("n3 never went quiet and began a campaign");
+        let won = wait_for(SETTLE, || group[1].is_leader()).await;
+        heal(&n2, &n3);
+        let term = group[1].term();
+        wait.release.notify_one();
+
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(won, "premise: n2 wins with n3's vote while n3 waits to stand");
+        assert!(group[1].is_leader() && group[1].term() == term,
+            "the winner of term {} was deposed: n2 at term {} leading {}, n3 at term {} leading {}",
+            term, group[1].term(), group[1].is_leader(), group[2].term(), group[2].is_leader());
+        assert!(!group[2].is_leader(), "n3 stood after voting for n2");
+    }
+
     /// The injector itself: a cut has to look like a partition to the sender -- an error on its own
     /// timeout -- and not like a peer that is up and answering.
     #[tokio::test]
