@@ -313,7 +313,7 @@ config edit is logged as ignored rather than applied. Delete `cluster.meta` to r
 | `heartbeat_timeout_secs` | 6 | Silence from the leader before a follower stands for election. Must be at least 1. |
 | `election_delay_ms` | 2000 | Upper bound on the per-node jitter before requesting votes. |
 | `flow_control.max_uncommitted_frames` | 4096 | Durable-but-uncommitted frames allowed per collection before writes are refused. `0` disables the bound. |
-| `flow_control.max_inflight_requests` | 16 | Node-wide cap on concurrent outbound replication requests. |
+| `flow_control.max_inflight_requests` | 16 | Cap on concurrent outbound replication requests to each peer. See [Flow control](#11-flow-control). |
 | `flow_control.drive_interval_ms` | 500 | How often the leader looks for replicas that are behind. |
 | `maintenance.interval_secs` | 60 | Scheduler tick for compaction and index snapshots. |
 | `maintenance.compaction_dead_ratio` | 0.4 | Dead-byte fraction that triggers compaction. |
@@ -1190,7 +1190,8 @@ ticks every `drive_interval_ms`, compares each replica's cursor against each col
 streams whatever is missing — so an idle cluster still heals and a failed send is retried.
 
 A replica that makes no progress for two consecutive rounds is polled on a widening interval, up to
-sixteen ticks. A write still triggers repair immediately regardless of backoff.
+sixteen ticks. A write still triggers repair immediately regardless of that backoff, unless the
+replica is unreachable, in which case it is probed as [Flow control](#11-flow-control) describes.
 
 A third case is neither: there is nothing to send, and yet nothing records that the replica holds
 the tail. That is the state a promotion leaves — evidence belongs to the term it was gathered in —
@@ -1401,9 +1402,37 @@ on the rest of the group.
 Migration pushes go through the same admission, so keep `max_uncommitted_frames` above any source's
 `data_movement.batch_size` — the two live on different nodes and nothing can validate the pair.
 
-**Outbound concurrency.** A node-wide semaphore of `max_inflight_requests` permits caps concurrent
-replication requests across every write and repair, rather than bounding one write's fan-out.
-Available permits are exposed in metrics.
+**Outbound concurrency.** Each peer has its own budget of `max_inflight_requests` concurrent
+replication requests, shared by every write and repair sent to it, rather than bounding one write's
+fan-out. It was once a single node-wide budget, and a peer that never answers held all of it: each
+request to that peer waits out its timeout (about a second, on Windows, for a refused connect),
+and the live replicas' requests queued behind them. A three-node group with one member down wrote
+at 8/s against ~240. With a budget per peer, a slow or silent peer can only use up its own.
+
+A peer whose last request failed in transport (refused, unreachable or timed out; any HTTP status
+counts as an answer) is marked unreachable and probed: one request at a time, outside its budget,
+on an interval that starts at 100 ms and doubles to 2 s. Until a probe is answered:
+
+- A send that nobody waits on skips the peer. That covers a `w=1` write's frame, the background
+  driver, gap repair and a leadership handover's catch-up. The cursor does not move, so the backlog
+  path sends those frames once the peer answers.
+- A send that a write concern waits on waits for the probe instead, holding no slot and sending
+  nothing. A peer that comes back inside `wtimeout` can still meet a `w=all`.
+
+A write's send waits for no longer than the write does, whether it is waiting for a probe, for a
+slot or for a repair already running against that peer. Once the write is answered, met by other
+voters or timed out, the send gives up and its frame is left to the cursor. Without this a slow peer
+would build up one waiting task per write.
+
+The per-peer budget is the mechanism because it is the only option that holds from the first
+request. Failing fast protects nothing until a failure has been seen, which takes up to the 5 s
+request timeout for a host that is powered off. It also does nothing about a peer that is slow
+rather than gone. A short connect timeout makes each wasted request shorter, but the requests still
+share one budget, and it does not help with a peer that accepts the connection and then stalls. The
+probe is what keeps a dead peer's budget from turning into a queue.
+
+`flow_control.inflight_slots_available` in metrics is the fewest free slots of any replica. Each
+entry under `replicas` reports its own `inflight_slots_available` and whether it is `reachable`.
 
 ---
 
@@ -2761,8 +2790,9 @@ router state; and per-route request counts with errors, average and p50/p95/p99 
 The replication block differs by role. A leader reports term, durable LSN, commit index and the
 committed watermark per collection, replica count split into voting replicas and learners, worst
 replica lag, per-replica matched LSNs, repair counters (gaps, divergences, resyncs triggered),
-batching counters (batches and frames sent, widest batch, frames per batch) and flow-control counters
-(writes rejected, inflight slots available). A follower reports its primary, that primary's commit
+batching counters (batches and frames sent, widest batch, frames per batch), flow-control counters
+(writes rejected, the fewest inflight slots free for any replica), and each replica's own free slots
+and reachability. A follower reports its primary, that primary's commit
 index, its own lag, and seconds since the last replication.
 
 `GET /metrics?format=prometheus` exposes the same data as Prometheus text, including `dewdb_up`,

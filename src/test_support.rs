@@ -375,8 +375,8 @@ impl TestNode {
                     routed_reads: Arc::new(std::sync::Mutex::new(HashMap::new())),
                     frame_reservations: Arc::new(std::sync::Mutex::new(HashMap::new())),
                     metrics: Arc::new(Metrics::new()),
-                    replication_slots: Arc::new(tokio::sync::Semaphore::new(
-                        config.flow_control.max_inflight_requests.max(1))),
+                    peer_budgets: Arc::new(crate::replication::budget::PeerBudgets::new(
+                        config.flow_control.max_inflight_requests)),
                     scan_slots: Arc::new(tokio::sync::Semaphore::new(crate::aggregate::MAX_CONCURRENT_SCANS)),
                     cluster: Arc::new(RwLock::new(
                         ClusterMetadata::load(&config.data_dir)
@@ -913,6 +913,17 @@ pub async fn three_node_cluster_with_timeout(
 /// One shard group of `n` voters, `n1` leading and the rest following it. `w=majority` needs
 /// `n / 2 + 1`, so this is how a wider quorum's cost is measured against a narrower one.
 pub async fn voter_group(root: &Path, n: usize, heartbeat_timeout_secs: u64) -> Vec<TestNode> {
+    voter_group_starting(root, n, heartbeat_timeout_secs, n).await
+}
+
+/// An `n`-voter group of which only the first `started` run: the rest are configured everywhere and
+/// never come up, which is a cluster restarted with a node missing. Returns all `n`.
+pub async fn voter_group_starting(
+    root: &Path,
+    n: usize,
+    heartbeat_timeout_secs: u64,
+    started: usize,
+) -> Vec<TestNode> {
     let ports: Vec<u16> = (0..n).map(|_| free_port()).collect();
     let urls: Vec<String> = ports.iter().map(|p| format!("http://127.0.0.1:{}", p)).collect();
 
@@ -930,11 +941,11 @@ pub async fn voter_group(root: &Path, n: usize, heartbeat_timeout_secs: u64) -> 
         nodes.push(node);
     }
 
-    for node in nodes.iter_mut() {
+    for node in nodes.iter_mut().take(started) {
         node.start();
     }
 
-    await_converged(&nodes.iter().collect::<Vec<_>>()).await;
+    await_converged(&nodes.iter().take(started).collect::<Vec<_>>()).await;
     nodes
 }
 

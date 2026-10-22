@@ -101,6 +101,13 @@ fn replication_metrics(state: &AppState) -> serde_json::Value {
         }
 
         let max_lag = per_replica.values().map(|(_, l)| *l).max().unwrap_or(0);
+        // Per peer, so a replica starved of slots shows as itself rather than as a node-wide figure.
+        let budgets = state.peer_budgets.snapshot();
+        let budget_of = |url: &str| budgets.iter()
+            .find(|(peer, _, _)| *peer == crate::util::node_key(url))
+            .map_or((state.peer_budgets.per_peer(), true), |(_, free, up)| (*free, *up));
+        let fewest_free = replicas.iter().map(|url| budget_of(url).0).min()
+            .unwrap_or(state.peer_budgets.per_peer());
         serde_json::json!({
             "role": "primary",
             "term": term,
@@ -127,15 +134,20 @@ fn replication_metrics(state: &AppState) -> serde_json::Value {
             "flow_control": {
                 "writes_rejected": state.metrics.writes_rejected(),
                 "max_uncommitted_frames": state.config.flow_control.max_uncommitted_frames,
-                "inflight_slots_available": state.replication_slots.available_permits(),
+                "inflight_slots_available": fewest_free,
                 "max_inflight_requests": state.config.flow_control.max_inflight_requests,
             },
-            "replicas": per_replica.into_iter().map(|(url, (matched, l))| serde_json::json!({
-                "voting": voting.iter().any(|v| crate::util::same_endpoint(v, &url)),
-                "url": url,
-                "matched": matched,
-                "lag": l,
-            })).collect::<Vec<_>>(),
+            "replicas": per_replica.into_iter().map(|(url, (matched, l))| {
+                let (free, reachable) = budget_of(&url);
+                serde_json::json!({
+                    "voting": voting.iter().any(|v| crate::util::same_endpoint(v, &url)),
+                    "url": url,
+                    "matched": matched,
+                    "lag": l,
+                    "inflight_slots_available": free,
+                    "reachable": reachable,
+                })
+            }).collect::<Vec<_>>(),
         })
     } else {
         serde_json::json!({
